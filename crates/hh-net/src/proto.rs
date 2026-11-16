@@ -44,7 +44,7 @@
 //! | 3 | CLOSE | u32 handle | – (no response is sent) |
 //! | 4 | READ | u32 handle, u32 n, n × (u64 addr, u32 len) | n × result: (u8 0, u32 k, k bytes) or (u8 1, error) |
 //! | 5 | WRITE | u32 handle, u64 addr, u32 k, k bytes | – |
-//! | 6 | REGIONS | u32 handle | u32 n, n × (u64 start, u64 size, u8 prot, u8 kind, u8 shared, opt str path) |
+//! | 6 | REGIONS | u32 handle | u32 n, n × (u64 start, u64 size, u8 prot, u8 kind, u8 flags (bit0 shared, bit1 cow), opt str path) |
 //! | 7 | MODULES | u32 handle | u32 n, n × (str name, str path, u64 base, u64 size) |
 //! | 8 | THREADS | u32 handle | u32 n, n × u32 tid |
 //! | 9 | IS_ALIVE | u32 handle | u8 alive |
@@ -376,21 +376,28 @@ pub fn enc_region(e: &mut Enc, r: &Region) {
         RegionKind::Mapped => 1,
         RegionKind::Private => 2,
     });
-    e.u8(r.shared as u8);
+    e.u8(r.shared as u8 | (r.cow as u8) << 1);
     e.opt_str(r.path.as_deref());
 }
 pub fn dec_region(d: &mut Dec) -> Result<Region> {
+    let (start, size, prot) = (d.u64()?, d.u64()?, d.prot()?);
+    let kind = match d.u8()? {
+        0 => RegionKind::Image,
+        1 => RegionKind::Mapped,
+        2 => RegionKind::Private,
+        _ => return Err(bad("region kind")),
+    };
+    let flags = d.u8()?;
+    if flags > 3 {
+        return Err(bad("region flags"));
+    }
     Ok(Region {
-        start: d.u64()?,
-        size: d.u64()?,
-        prot: d.prot()?,
-        kind: match d.u8()? {
-            0 => RegionKind::Image,
-            1 => RegionKind::Mapped,
-            2 => RegionKind::Private,
-            _ => return Err(bad("region kind")),
-        },
-        shared: d.bool()?,
+        start,
+        size,
+        prot,
+        kind,
+        shared: flags & 1 != 0,
+        cow: flags & 2 != 0,
         path: d.opt_str()?,
     })
 }

@@ -60,6 +60,7 @@ impl Process for TestProc {
                 prot: Prot { r: true, w: true, x: true },
                 kind: RegionKind::Private,
                 shared: false,
+                cow: false,
                 path: None,
             })
             .collect())

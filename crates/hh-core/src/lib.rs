@@ -57,6 +57,10 @@ pub struct Region {
     pub kind: RegionKind,
     /// True for shared mappings (Linux maps flag `s`); false for private / copy-on-write ones.
     pub shared: bool,
+    /// True only for pages still in the write-copy state (Windows PAGE_WRITECOPY /
+    /// PAGE_EXECUTE_WRITECOPY). Always false on Linux, where maps cannot tell.
+    #[serde(default)]
+    pub cow: bool,
     /// Backing file or tag such as "[heap]" / "[stack]".
     pub path: Option<String>,
 }
@@ -191,6 +195,7 @@ impl Process for MockProcess {
             },
             kind: RegionKind::Private,
             shared: false,
+            cow: false,
             path: None,
         }])
     }

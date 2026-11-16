@@ -33,6 +33,7 @@ impl Fake {
                 },
                 kind,
                 shared: false,
+                cow: false,
                 path: path.map(Into::into),
             },
             vec![0; size as usize],
@@ -528,6 +529,7 @@ fn unreadable_memory_is_skipped() {
                 },
                 kind: RegionKind::Private,
                 shared: false,
+                cow: false,
                 path: None,
             });
             Ok(r)

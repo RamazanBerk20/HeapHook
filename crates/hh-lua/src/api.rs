@@ -753,7 +753,7 @@ pub(crate) fn lua_block_hook(
             };
             g.set("memrec", mr)?;
             g.set("syntaxcheck", check)?;
-            let r = lua.load(&src).set_name("={$lua}").set_mode(mlua::chunk::ChunkMode::Text).eval::<Value>();
+            let r = lua.load(&src).set_name("={$lua}").set_mode(mlua::chunk::ChunkMode::Text).into_function().and_then(|f| f.call::<Value>(())); // call, not eval: `eval` would turn a bare call statement into `return call()`
             g.set("memrec", old.0)?;
             g.set("syntaxcheck", old.1)?;
             r

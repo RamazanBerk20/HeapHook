@@ -85,6 +85,7 @@ impl Process for TestProc {
                 },
                 kind: RegionKind::Private,
                 shared: false,
+                cow: false,
                 path: None,
             })
             .collect())

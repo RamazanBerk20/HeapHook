@@ -438,6 +438,7 @@ fn parse_maps(maps: &str) -> Vec<Region> {
                 },
                 kind,
                 shared: bytes.get(3) == Some(&b's'),
+                cow: false,
                 path: (!l.path.is_empty()).then(|| l.path.to_owned()),
             }
         })

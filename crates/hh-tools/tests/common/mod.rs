@@ -19,7 +19,7 @@ impl FakeProc {
         FakeProc { regions: RwLock::new(Vec::new()), modules: Vec::new(), ptr: 8 }
     }
     pub fn add(&mut self, start: Addr, data: Vec<u8>, prot: Prot, kind: RegionKind, path: Option<&str>) {
-        let r = Region { start, size: data.len() as u64, prot, kind, shared: false, path: path.map(Into::into) };
+        let r = Region { start, size: data.len() as u64, prot, kind, shared: false, cow: false, path: path.map(Into::into) };
         let mut v = self.regions.write().unwrap();
         v.push((r, data));
         v.sort_by_key(|x| x.0.start);

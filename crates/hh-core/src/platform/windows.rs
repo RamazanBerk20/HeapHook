@@ -18,7 +18,7 @@ use windows_sys::Win32::System::Diagnostics::ToolHelp::{
 use windows_sys::Win32::System::Memory::{
     MEM_COMMIT, MEM_FREE, MEM_IMAGE, MEM_MAPPED, MEM_RELEASE, MEM_RESERVE,
     MEMORY_BASIC_INFORMATION, PAGE_EXECUTE, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE,
-    PAGE_EXECUTE_WRITECOPY, PAGE_GUARD, PAGE_NOACCESS, PAGE_PROTECTION_FLAGS, PAGE_READONLY,
+    PAGE_EXECUTE_WRITECOPY, PAGE_GUARD, PAGE_NOACCESS, PAGE_NOCACHE, PAGE_WRITECOMBINE, PAGE_PROTECTION_FLAGS, PAGE_READONLY,
     PAGE_READWRITE, PAGE_WRITECOPY, VirtualAllocEx, VirtualFreeEx, VirtualProtectEx,
     VirtualQueryEx,
 };
@@ -352,6 +352,10 @@ impl Process for WinProcess {
                     prot: prot_from(m.Protect),
                     kind,
                     shared: m.Type == MEM_MAPPED && m.Protect & (PAGE_WRITECOPY | PAGE_EXECUTE_WRITECOPY) == 0,
+                    cow: matches!(
+                        m.Protect & !(PAGE_GUARD | PAGE_NOCACHE | PAGE_WRITECOMBINE),
+                        PAGE_WRITECOPY | PAGE_EXECUTE_WRITECOPY
+                    ),
                     path,
                 });
             }

@@ -15,8 +15,8 @@ struct Fake {
     suspends: AtomicU32,
     resumes: AtomicU32,
     read_delay: AtomicU64,
-    /// Start addresses of regions reported as shared mappings.
-    shared: Vec<Addr>,
+    /// Start addresses of regions reported as write-copy pages.
+    cow: Vec<Addr>,
     pid: AtomicU32,
 }
 
@@ -31,7 +31,7 @@ impl Fake {
             suspends: AtomicU32::new(0),
             resumes: AtomicU32::new(0),
             read_delay: AtomicU64::new(0),
-            shared: Vec::new(),
+            cow: Vec::new(),
             pid: AtomicU32::new(1),
         }
     }
@@ -84,7 +84,7 @@ impl Process for Fake {
         Ok(self
             .regions
             .iter()
-            .map(|(a, m, p, k)| Region { start: *a, size: m.read().unwrap().len() as u64, prot: *p, kind: *k, shared: self.shared.contains(a), path: None })
+            .map(|(a, m, p, k)| Region { start: *a, size: m.read().unwrap().len() as u64, prot: *p, kind: *k, shared: false, cow: self.cow.contains(a), path: None })
             .collect())
     }
     fn suspend(&self) -> Result<()> {
@@ -99,6 +99,7 @@ impl Process for Fake {
 
 const A: Addr = 0x10000;
 const B: Addr = 0x800000;
+const C: Addr = 0x900000;
 
 /// Two rw regions (64 KiB, 9 MiB so it spans several work units) and one rx region.
 fn fake() -> Arc<Fake> {
@@ -479,20 +480,24 @@ fn ranges_filters_alignment() {
     f.opts.copy_on_write = Tri::Yes; // only the image region would qualify, and it is not writable
     assert_eq!(s.first_scan(&f).unwrap().count, 0);
     f.opts.copy_on_write = Tri::Any;
-    // A shared writable mapping is not copy-on-write; a private one is.
+    // Only write-copy pages are copy-on-write; writable private image data (.data/.bss) is not.
     let mut fk = Fake::new(vec![
-        (A, 0x1000, RW, RegionKind::Mapped),
+        (A, 0x1000, RW, RegionKind::Image),
         (B, 0x1000, RW, RegionKind::Mapped),
+        (C, 0x1000, RW, RegionKind::Private),
     ]);
-    fk.shared = vec![A];
+    fk.cow = vec![B];
     let fk = Arc::new(fk);
-    fk.put(A, &[0x77]);
-    fk.put(B, &[0x77]);
+    for a in [A, B, C] {
+        fk.put(a, &[0x77]);
+    }
     let mut g = first(VType::Byte, ScanType::Exact, "119");
     g.opts.copy_on_write = Tri::Yes;
     assert_eq!(addrs(scanner(&fk).tap(|s| s.first_scan(&g).unwrap())), [B]);
     g.opts.copy_on_write = Tri::No;
-    assert_eq!(addrs(scanner(&fk).tap(|s| s.first_scan(&g).unwrap())), [A]);
+    assert_eq!(addrs(scanner(&fk).tap(|s| s.first_scan(&g).unwrap())), [A, C]);
+    g.opts.copy_on_write = Tri::Any;
+    assert_eq!(addrs(scanner(&fk).tap(|s| s.first_scan(&g).unwrap())), [A, B, C]);
     f.opts.alignment = Some(8);
     assert_eq!(addrs(s.tap(|s| s.first_scan(&f).unwrap())), [A + 0x10, A + 0x1a8, B + 0x2a8]);
     f.opts.last_digits = Some("A8".into());

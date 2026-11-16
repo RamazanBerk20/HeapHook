@@ -67,6 +67,7 @@ impl Process for TestProc {
             prot: Prot { r: true, w: false, x: true },
             kind: RegionKind::Image,
             shared: true,
+            cow: false,
             path: Some("/usr/lib/libé.so".into()),
         });
         Ok(r)
@@ -151,7 +152,7 @@ fn error_roundtrip_every_variant() {
 #[test]
 fn types_roundtrip() {
     let p = ProcessInfo { pid: 5, name: "a".into(), exe: None };
-    let r = Region { start: 1, size: 2, prot: Prot { r: true, w: false, x: true }, kind: RegionKind::Mapped, shared: true, path: Some("[heap]".into()) };
+    let r = Region { start: 1, size: 2, prot: Prot { r: true, w: false, x: true }, kind: RegionKind::Mapped, shared: true, cow: true, path: Some("[heap]".into()) };
     let m = Module { name: "n".into(), path: "p".into(), base: 3, size: 4 };
     let mut e = Enc(Vec::new());
     proto::enc_list(&mut e, &[p.clone(), p], proto::enc_process);
@@ -160,7 +161,7 @@ fn types_roundtrip() {
     let mut e = Enc(Vec::new());
     proto::enc_list(&mut e, std::slice::from_ref(&r), proto::enc_region);
     let l = proto::dec_list(&e.0, 20, proto::dec_region).unwrap();
-    assert_eq!((l[0].start, l[0].size, l[0].prot, l[0].kind, l[0].shared, l[0].path.as_deref()), (1, 2, r.prot, RegionKind::Mapped, true, Some("[heap]")));
+    assert_eq!((l[0].start, l[0].size, l[0].prot, l[0].kind, l[0].shared, l[0].cow, l[0].path.as_deref()), (1, 2, r.prot, RegionKind::Mapped, true, true, Some("[heap]")));
     let mut e = Enc(Vec::new());
     proto::enc_list(&mut e, std::slice::from_ref(&m), proto::enc_module);
     let l = proto::dec_list(&e.0, 24, proto::dec_module).unwrap();

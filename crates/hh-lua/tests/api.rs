@@ -277,6 +277,16 @@ fn lua_blocks_in_aa_scripts() {
 }
 
 #[test]
+fn lua_block_without_return_is_nil() {
+    let (e, p, _) = engine();
+    let mut syms = e.symbols().lock().unwrap().clone();
+    // No return value means nil: the block's side effect happens and nothing is inserted.
+    let noret = "[ENABLE]\n{$lua}\nwriteInteger(0x%X, 7)\n{$asm}\n[DISABLE]\n".replace("%X", &format!("{:X}", GAME + 0x3020));
+    hh_asm::aa_execute(&*p, &mut syms, &noret, true, None, &mut e.aa_hooks(None, false)).unwrap();
+    assert_eq!(read_u32(&*p, GAME + 0x3020), 7);
+}
+
+#[test]
 fn memory_records() {
     let (e, p, cap) = engine();
     e.lua().globals().set("SCRIPT", HEALTH_SCRIPT.replace("[ENABLE]", "[ENABLE]\n{$lua}\nif not syntaxcheck then seen = memrec.Description end\n{$asm}")).unwrap();

@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
-use hh_core::{Addr, Error, Memory, Process, RegionKind, Result};
+use hh_core::{Addr, Error, Memory, Process, Result};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
@@ -456,7 +456,7 @@ impl Scanner {
         regs.sort_by_key(|r| r.start);
         let mut out = Vec::new();
         for r in regs {
-            let cow = r.prot.w && !r.shared && r.kind != RegionKind::Private;
+            let cow = r.cow;
             if !r.prot.r || !o.writable.ok(r.prot.w) || !o.executable.ok(r.prot.x) || !o.copy_on_write.ok(cow) {
                 continue;
             }
