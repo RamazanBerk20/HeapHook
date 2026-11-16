@@ -40,17 +40,6 @@
     ],
     "category": "DeveloperTool",
     "shortDescription": "Memory scanner and debugger for Linux and Windows",
-    "longDescription": "HeapHook is an open-source memory scanner, editor and debugger for Linux and Windows. It scans a running process for values, edits and freezes them, disassembles code, sets breakpoints, scans for pointers and loads Cheat Engine tables.",
-    "fileAssociations": [
-      {
-        "ext": [
-          "CT",
-          "ct"
-        ],
-        "name": "Cheat table",
-        "mimeType": "application/x-cheat-table",
-        "role": "Editor"
-      }
-    ]
+    "longDescription": "HeapHook is an open-source memory scanner, editor and debugger for Linux and Windows. It scans a running process for values, edits and freezes them, disassembles code, sets breakpoints, scans for pointers and loads Cheat Engine tables."
   }
 }

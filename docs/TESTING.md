@@ -219,7 +219,7 @@ Use two machines if you can, or one machine and a loopback address.
 - [ ] Install the deb (or rpm) on a clean system or container. `dpkg -L heap-hook` (or `rpm -ql`) shows `libhh_speedhack.so` under `lib/HeapHook`.
 - [ ] HeapHook appears in the application menu with its icon and the category for developer tools. Launch it from the menu.
 - [ ] From the installed app: Create process with the speedhack finds the library (the speed button appears).
-- [ ] Double-click a `.CT` file in the file manager, or "Open with" HeapHook: it opens the table (the package declares the `.CT` file type; check that it works).
+- [ ] Open a table from the command line: `heaphook /path/to/table.CT` opens it and shows the consent prompt if it carries Lua. (The package does not register a `.CT` file association; double-click is not expected to work.)
 - [ ] Uninstall the package. The files are removed. Settings in the user config directory remain (they are not part of the package).
 - [ ] Known limit to confirm: a final `1.0.0` package is treated as older than `1.0.0+rc.1` by dpkg and rpm, so the release-candidate package must be uninstalled first. Check that uninstalling leaves nothing behind (`dpkg -L heap-hook` or `rpm -ql heap-hook` reports the package is not installed).
 
