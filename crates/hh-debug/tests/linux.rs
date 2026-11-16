@@ -602,7 +602,9 @@ fn software_breakpoint_hot_loop_from_many_threads() {
     let (threads, iters) = (4u64, 5000u64);
     t.send(&format!("hot {threads} {iters}"));
     assert_eq!(
-        t.lines.recv_timeout(Duration::from_secs(60)).unwrap(),
+        t.lines
+            .recv_timeout(Duration::from_secs(60))
+            .unwrap_or_else(|_| fail(&d, "hot loop did not finish")),
         format!("hot {}", threads * iters)
     );
     let info = &d.breakpoints().unwrap()[0];
@@ -1198,15 +1200,21 @@ fn stepping_rep_recursion_and_run_to_thread() {
         .add_breakpoint(Breakpoint::execute(hot), Hooks::default())
         .unwrap();
     t.send("hot 3 3000");
-    let (first, _, _) = wait_break(&d);
+    // The first worker may break before the others exist: keep going until one does.
+    let other = loop {
+        let (first, _, _) = wait_break(&d);
+        let other = d
+            .threads()
+            .unwrap()
+            .into_iter()
+            .map(|th| th.tid)
+            .find(|&x| x != first && x != t.pid());
+        match other {
+            Some(o) => break o,
+            None => d.cont(false).unwrap(),
+        }
+    };
     d.remove_breakpoint(b).unwrap();
-    let other = d
-        .threads()
-        .unwrap()
-        .into_iter()
-        .map(|th| th.tid)
-        .find(|&x| x != first && x != t.pid())
-        .unwrap();
     d.run_to_thread(other, hot).unwrap();
     let (tid, r, c) = wait_break(&d);
     assert_eq!((tid, r, c.rip), (other, BreakReason::Step, hot));
@@ -1361,4 +1369,593 @@ fn records_are_capped() {
     let info = &d.breakpoints().unwrap()[0];
     assert_eq!((info.hits, info.records_dropped), (total, 100));
     assert_eq!(d.records(id).unwrap().len(), MAX_RECORDS);
+}
+
+// ---- stress: invariants that must hold after any combination of breakpoints ------------
+//
+// Iterations per scenario come from HH_STRESS (default 4); run with HH_STRESS=200 for the
+// long version. A failure prints the engine's recent event history.
+
+fn stress_iters() -> usize {
+    std::env::var("HH_STRESS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(4)
+}
+
+fn fail(d: &Debugger, msg: &str) -> ! {
+    let h = d.history().unwrap_or_default();
+    panic!("{msg}\n--- engine history ---\n{}", h.join("\n"));
+}
+
+fn tasks(pid: u32) -> Vec<u32> {
+    std::fs::read_dir(format!("/proc/{pid}/task"))
+        .map(|r| {
+            r.flatten()
+                .filter_map(|e| e.file_name().to_str()?.parse().ok())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// (state, context switches) of a task.
+fn task_sample(pid: u32, tid: u32) -> Option<(char, u64)> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/task/{tid}/stat")).ok()?;
+    let st = stat[stat.rfind(')')? + 2..].chars().next()?;
+    let status = std::fs::read_to_string(format!("/proc/{pid}/task/{tid}/status")).ok()?;
+    let sw: u64 = status
+        .lines()
+        .filter(|l| l.contains("ctxt_switches:"))
+        .filter_map(|l| l.split_whitespace().nth(1)?.parse::<u64>().ok())
+        .sum();
+    Some((st, sw))
+}
+
+fn task_tracer(pid: u32, tid: u32) -> Option<u32> {
+    let s = std::fs::read_to_string(format!("/proc/{pid}/task/{tid}/status")).ok()?;
+    s.lines()
+        .find(|l| l.starts_with("TracerPid:"))
+        .and_then(|l| l[10..].trim().parse().ok())
+}
+
+/// Recoveries the engine's watchdog made (from the history summary line).
+fn recoveries(d: &Debugger) -> u64 {
+    let h = d.history().unwrap_or_default();
+    h.first()
+        .and_then(|l| l.split("recoveries=").nth(1))
+        .and_then(|v| v.split_whitespace().next()?.parse().ok())
+        .unwrap_or(0)
+}
+
+/// No task sits in a tracing stop (unchanged, for 300 ms) while the engine says Running.
+fn assert_no_stuck(d: &Debugger, pid: u32, what: &str) {
+    let first: Vec<(u32, (char, u64))> = tasks(pid)
+        .into_iter()
+        .filter_map(|t| Some((t, task_sample(pid, t)?)))
+        .collect();
+    let mut stuck: Vec<u32> = first
+        .iter()
+        .filter(|(_, s)| s.0 == 't')
+        .map(|x| x.0)
+        .collect();
+    for _ in 0..15 {
+        if stuck.is_empty() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+        stuck.retain(|&t| {
+            let f = first.iter().find(|x| x.0 == t).unwrap().1;
+            task_sample(pid, t).is_some_and(|s| s.0 == 't' && s.1 == f.1)
+        });
+    }
+    if stuck.is_empty() {
+        return;
+    }
+    let st = d.state().unwrap();
+    if !matches!(st, State::Broken { .. } | State::Suspended) {
+        fail(
+            d,
+            &format!("{what}: tasks {stuck:?} stuck in tracing stop while {st:?}"),
+        );
+    }
+}
+
+/// Stops the process with `pause`, checks every task is stopped, continues.
+fn pause_cont(d: &Debugger, pid: u32, what: &str) {
+    if let Err(e) = d.pause() {
+        fail(d, &format!("{what}: pause: {e}"));
+    }
+    if !matches!(d.state().unwrap(), State::Broken { .. }) {
+        fail(d, &format!("{what}: not broken after pause"));
+    }
+    for t in tasks(pid) {
+        if let Some((s, _)) = task_sample(pid, t)
+            && !matches!(s, 't' | 'Z' | 'X')
+        {
+            // A thread past its exit event may still be on its way out.
+            std::thread::sleep(Duration::from_millis(20));
+            if task_sample(pid, t).is_some_and(|x| !matches!(x.0, 't' | 'Z' | 'X')) {
+                fail(d, &format!("{what}: task {t} in state {s} while broken"));
+            }
+        }
+    }
+    if let Err(e) = d.cont(false) {
+        fail(d, &format!("{what}: cont: {e}"));
+    }
+}
+
+fn prog(t: &mut Target) -> Vec<u64> {
+    let l = t.recv_after("prog");
+    l.split_whitespace()
+        .skip(1)
+        .map(|w| w.parse().unwrap())
+        .collect()
+}
+
+impl Target {
+    /// Sends `c`, skipping answers of earlier commands, until a line starting like `c`.
+    fn recv_after(&mut self, c: &str) -> String {
+        self.send(c);
+        loop {
+            let l = self.recv();
+            if l.starts_with(c) {
+                return l;
+            }
+        }
+    }
+}
+
+/// After detach: alive, untraced, no int3 left, pages writable again, still progressing.
+fn assert_detached(t: &mut Target, int3s: &[(u64, u8)], what: &str) {
+    let pid = t.pid();
+    for tid in tasks(pid) {
+        // A churn thread may be gone by now.
+        if let Some(tp) = task_tracer(pid, tid) {
+            assert_eq!(tp, 0, "{what}: task {tid} still traced");
+        }
+        if let Some((s, _)) = task_sample(pid, tid) {
+            assert!(!matches!(s, 't' | 'T'), "{what}: task {tid} stopped ({s})");
+        }
+    }
+    assert!(t.child.try_wait().unwrap().is_none(), "{what}: target died");
+    for &(a, b) in int3s {
+        assert_eq!(raw_byte(pid, a), b, "{what}: byte at {a:#x}");
+    }
+    let buf = t.addr("buf");
+    let r = hh_core::open(pid)
+        .unwrap()
+        .regions()
+        .unwrap()
+        .into_iter()
+        .find(|r| buf >= r.start && buf < r.start + r.size)
+        .unwrap();
+    assert!(r.prot.r && r.prot.w, "{what}: buf protection {:?}", r.prot);
+    let a = prog(t);
+    std::thread::sleep(Duration::from_millis(30));
+    let b = prog(t);
+    assert!(
+        b[0] > a[0] && b[1] > a[1],
+        "{what}: no progress {a:?} -> {b:?}"
+    );
+}
+
+/// Continues every breakpoint break from its own thread (like the app's Lua driver);
+/// returns the events it saw.
+struct Continuer {
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    h: std::thread::JoinHandle<(Vec<Event>, Vec<String>)>,
+}
+
+impl Continuer {
+    fn start(d: Arc<Debugger>) -> Self {
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let s = stop.clone();
+        let h = std::thread::spawn(move || {
+            let (mut evs, mut errs) = (Vec::new(), Vec::new());
+            while !s.load(std::sync::atomic::Ordering::SeqCst) {
+                let Some(e) = d.next_event(Duration::from_millis(5)) else {
+                    continue;
+                };
+                if let Event::Break {
+                    reason: BreakReason::Breakpoint(_),
+                    ..
+                } = &e
+                    && let Err(err) = d.cont(false)
+                {
+                    errs.push(err.to_string());
+                }
+                evs.push(e);
+            }
+            (evs, errs)
+        });
+        Continuer { stop, h }
+    }
+
+    /// Stops it; a break it did not get to is continued here.
+    fn finish(self, d: &Debugger) -> Vec<Event> {
+        self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        let (mut evs, errs) = self.h.join().unwrap();
+        evs.extend(d.events());
+        if !errs.is_empty() {
+            fail(d, &format!("cont from the continuer failed: {errs:?}"));
+        }
+        if let State::Broken { .. } = d.state().unwrap() {
+            d.cont(false).unwrap();
+        }
+        evs
+    }
+}
+
+fn no_signal_breaks(d: &Debugger, evs: &[Event], what: &str) {
+    for e in evs {
+        if let Event::Break {
+            reason: r @ BreakReason::Signal { .. },
+            tid,
+            ..
+        } = e
+        {
+            fail(d, &format!("{what}: spurious {r:?} on {tid}"));
+        }
+        if let Event::ProcessExited { .. } = e {
+            fail(d, &format!("{what}: target exited"));
+        }
+    }
+}
+
+fn hits(d: &Debugger, id: BpId) -> u64 {
+    d.breakpoints()
+        .unwrap()
+        .into_iter()
+        .find(|i| i.id == id)
+        .map_or(0, |i| i.hits)
+}
+
+/// A software and a hardware execute breakpoint on one address: each counts every
+/// execution once and each execution gives one break, continued from another thread.
+#[test]
+fn stress_same_address_sw_hw_breaks() {
+    let mut t = Target::spawn();
+    let pid = t.pid();
+    let hot = t.addr("hot");
+    assert_eq!(t.cmd("bg 3 1 1 200"), "ok");
+    let d = Arc::new(Debugger::attach(pid).unwrap());
+    let hw = Breakpoint {
+        method: BpMethod::Hardware,
+        ..Breakpoint::execute(hot)
+    };
+    for i in 0..stress_iters() {
+        let what = format!("iteration {i}");
+        d.pause().unwrap();
+        // Either order of creation.
+        let (a, b) = match i % 2 {
+            0 => (Breakpoint::execute(hot), hw.clone()),
+            _ => (hw.clone(), Breakpoint::execute(hot)),
+        };
+        let a = d.add_breakpoint(a, Hooks::default()).unwrap();
+        let b = d.add_breakpoint(b, Hooks::default()).unwrap();
+        d.cont(false).unwrap();
+        let c = Continuer::start(d.clone());
+        std::thread::sleep(Duration::from_millis(40));
+        let mut evs = c.finish(&d);
+        d.pause().unwrap();
+        evs.extend(d.events());
+        let breaks = evs
+            .iter()
+            .filter(|e| {
+                matches!(e, Event::Break { reason: BreakReason::Breakpoint(x), .. }
+                    if *x == a || *x == b)
+            })
+            .count() as u64;
+        let (ha, hb) = (hits(&d, a), hits(&d, b));
+        if ha != hb || ha != breaks || ha == 0 {
+            fail(&d, &format!("{what}: hits {ha} / {hb}, breaks {breaks}"));
+        }
+        no_signal_breaks(&d, &evs, &what);
+        d.remove_breakpoint(a).unwrap();
+        d.remove_breakpoint(b).unwrap();
+        d.cont(false).unwrap();
+        assert_no_stuck(&d, pid, &what);
+    }
+    pause_cont(&d, pid, "end");
+    assert_eq!(recoveries(&d), 0, "{:#?}", d.history().unwrap());
+    Arc::try_unwrap(d).ok().unwrap().detach().unwrap();
+    assert_detached(&mut t, &[(hot, 0xf0)], "end");
+}
+
+/// Page watches with a small hit limit, re-armed again and again while threads keep
+/// writing to the page: no fault may surface as the program's own.
+#[test]
+fn stress_page_watch_hit_limit_rearmed() {
+    let mut t = Target::spawn();
+    let pid = t.pid();
+    let buf = t.addr("buf");
+    assert_eq!(t.cmd("bg 2 3 1 0"), "ok");
+    let d = Debugger::attach(pid).unwrap();
+    let mut evs = Vec::new();
+    for i in 0..stress_iters() * 3 {
+        let what = format!("iteration {i}");
+        let opts = BpOptions {
+            max_hits: Some(1 + i as u64 % 4),
+            ..BpOptions::default()
+        };
+        let w = d
+            .add_watch_range(
+                buf,
+                64,
+                BpKind::Write,
+                Action::Record,
+                Hooks::default(),
+                opts,
+            )
+            .unwrap();
+        loop {
+            match d.next_event(T) {
+                Some(Event::BreakpointDisabled { bp }) if bp == w => break,
+                Some(e) => evs.push(e),
+                None => fail(&d, &format!("{what}: watch never reached its limit")),
+            }
+        }
+        let h = hits(&d, w);
+        if h != 1 + i as u64 % 4 {
+            fail(&d, &format!("{what}: {h} hits"));
+        }
+        if i % 2 == 0 {
+            d.remove_breakpoint(w).unwrap();
+        }
+        evs.extend(d.events());
+        no_signal_breaks(&d, &evs, &what);
+        if let State::Broken { .. } = d.state().unwrap() {
+            fail(&d, &format!("{what}: left broken"));
+        }
+    }
+    assert_no_stuck(&d, pid, "end");
+    pause_cont(&d, pid, "end");
+    assert_eq!(recoveries(&d), 0, "{:#?}", d.history().unwrap());
+    d.detach().unwrap();
+    assert_detached(&mut t, &[], "end");
+}
+
+/// run_to_thread while breakpoints on the same code are hot, including a run-to onto the
+/// address of a software + hardware breakpoint pair.
+#[test]
+fn stress_run_to_thread_while_hot() {
+    let mut t = Target::spawn();
+    let pid = t.pid();
+    let hot = t.addr("hot");
+    assert_eq!(t.cmd("bg 3 1 1 100"), "ok");
+    let d = Debugger::attach(pid).unwrap();
+    let rec = Breakpoint {
+        action: Action::Record,
+        ..Breakpoint::execute(hot)
+    };
+    let hw = Breakpoint {
+        method: BpMethod::Hardware,
+        ..rec.clone()
+    };
+    // Added while paused, so both see the same executions.
+    d.pause().unwrap();
+    let r1 = d.add_breakpoint(rec, Hooks::default()).unwrap();
+    let r2 = d.add_breakpoint(hw, Hooks::default()).unwrap();
+    d.cont(false).unwrap();
+    d.events();
+    for i in 0..stress_iters() * 2 {
+        let what = format!("iteration {i}");
+        // Learn a thread that runs `hot` from a one-shot break on it.
+        let once = d
+            .add_breakpoint_with(
+                Breakpoint {
+                    method: BpMethod::Hardware,
+                    ..Breakpoint::execute(hot + 4)
+                },
+                Hooks::default(),
+                BpOptions {
+                    one_shot: true,
+                    ..BpOptions::default()
+                },
+            )
+            .unwrap();
+        let (tid, r) = loop {
+            match d.next_event(T) {
+                Some(Event::Break { tid, reason, .. }) => break (tid, reason),
+                Some(_) => {}
+                None => fail(&d, &format!("{what}: no break on the one-shot")),
+            }
+        };
+        if r != BreakReason::Breakpoint(once) {
+            fail(&d, &format!("{what}: {r:?}"));
+        }
+        d.remove_breakpoint(once).unwrap();
+        let to = if i % 2 == 0 { hot } else { hot + 4 };
+        if d.run_to_thread(tid, to).is_err() {
+            // The thread (a churn one) exited meanwhile.
+            d.cont(false).unwrap();
+            continue;
+        }
+        let deadline = std::time::Instant::now() + T;
+        loop {
+            if std::time::Instant::now() > deadline {
+                fail(&d, &format!("{what}: no stop"));
+            }
+            let e = d
+                .next_event(T)
+                .unwrap_or_else(|| fail(&d, &format!("{what}: no stop")));
+            match e {
+                Event::Break {
+                    tid: x,
+                    reason,
+                    context,
+                } => {
+                    if x != tid || reason != BreakReason::Step || context.rip != to {
+                        fail(&d, &format!("{what}: {x} {reason:?} {:#x}", context.rip));
+                    }
+                    break;
+                }
+                Event::ThreadExited { tid: x } if x == tid => {
+                    // A churn thread that left before reaching it: nothing to stop at.
+                    d.pause().unwrap();
+                    wait_break(&d);
+                    break;
+                }
+                Event::ProcessExited { .. } => fail(&d, "exited"),
+                _ => {}
+            }
+        }
+        if hits(&d, r1) != hits(&d, r2) {
+            fail(
+                &d,
+                &format!("{what}: hits {} / {}", hits(&d, r1), hits(&d, r2)),
+            );
+        }
+        d.cont(false).unwrap();
+        assert_no_stuck(&d, pid, &what);
+    }
+    pause_cont(&d, pid, "end");
+    assert_eq!(recoveries(&d), 0, "{:#?}", d.history().unwrap());
+    d.detach().unwrap();
+    assert_detached(&mut t, &[(hot, 0xf0)], "end");
+}
+
+/// Attach, arm everything, detach (or drop) in every state, again and again.
+#[test]
+fn stress_attach_detach_under_load() {
+    let mut t = Target::spawn();
+    let pid = t.pid();
+    let (hot, store, buf) = (t.addr("hot"), t.addr("store"), t.addr("buf"));
+    assert_eq!(t.cmd("bg 3 2 1 100"), "ok");
+    for i in 0..stress_iters() * 2 {
+        let what = format!("iteration {i}");
+        let d = Arc::new(Debugger::attach(pid).unwrap());
+        d.add_breakpoint(Breakpoint::execute(hot), Hooks::default())
+            .unwrap();
+        d.add_breakpoint(
+            Breakpoint {
+                method: BpMethod::Hardware,
+                ..Breakpoint::execute(hot)
+            },
+            Hooks::default(),
+        )
+        .unwrap();
+        d.add_breakpoint(
+            Breakpoint {
+                action: Action::Record,
+                ..Breakpoint::execute(store)
+            },
+            Hooks::default(),
+        )
+        .unwrap();
+        d.add_watch_range(
+            buf,
+            64,
+            BpKind::Write,
+            Action::Record,
+            Hooks::default(),
+            BpOptions {
+                max_hits: Some(1 + i as u64 % 5),
+                ..BpOptions::default()
+            },
+        )
+        .unwrap();
+        let c = Continuer::start(d.clone());
+        std::thread::sleep(Duration::from_millis(10 + (i as u64 % 4) * 10));
+        let evs = match i % 3 {
+            // Detach while it runs (the continuer still going).
+            0 => {
+                c.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+                let (evs, _) = c.h.join().unwrap();
+                evs
+            }
+            // Detach while broken.
+            1 => {
+                let evs = c.finish(&d);
+                d.pause().unwrap();
+                evs
+            }
+            _ => c.finish(&d),
+        };
+        no_signal_breaks(&d, &evs, &what);
+        assert_eq!(recoveries(&d), 0, "{what}: {:#?}", d.history().unwrap());
+        let d = Arc::try_unwrap(d).ok().unwrap();
+        if i % 2 == 0 {
+            d.detach().unwrap();
+        } else {
+            drop(d);
+        }
+        assert_detached(&mut t, &[(hot, 0xf0), (store, 0x48)], &what);
+    }
+}
+
+/// The host waiting on its child (`waitpid(pid, WNOHANG)`, as `Child::try_wait` does) takes
+/// the main thread's ptrace stops away from the debugger. The reported stall: the main
+/// thread left in a tracing stop while the engine believes it runs. The engine must notice
+/// and recover, and detach must not kill the target.
+#[test]
+fn stress_stolen_main_thread_stops() {
+    let mut t = Target::spawn();
+    let pid = t.pid();
+    let (hot, buf) = (t.addr("hot"), t.addr("buf"));
+    assert_eq!(t.cmd("bg 1 1 0 300"), "ok");
+    let d = Arc::new(Debugger::attach(pid).unwrap());
+    d.add_breakpoint(Breakpoint::execute(hot), Hooks::default())
+        .unwrap();
+    d.add_breakpoint(
+        Breakpoint {
+            method: BpMethod::Hardware,
+            ..Breakpoint::execute(hot)
+        },
+        Hooks::default(),
+    )
+    .unwrap();
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let s = stop.clone();
+    let thief = std::thread::spawn(move || {
+        let mut stolen = 0u32;
+        while !s.load(std::sync::atomic::Ordering::SeqCst) {
+            let mut st = 0;
+            let r = unsafe { libc::waitpid(pid as i32, &mut st, libc::WNOHANG) };
+            if r > 0 && libc::WIFSTOPPED(st) {
+                stolen += 1;
+            }
+            // Far more often than the app's once a second, so the race is hit every run.
+            std::thread::sleep(Duration::from_micros(500));
+        }
+        stolen
+    });
+    let c = Continuer::start(d.clone());
+    let n = 100 * stress_iters() as u64;
+    for i in 0..stress_iters() {
+        let w = d
+            .add_watch_range(
+                buf,
+                64,
+                BpKind::Write,
+                Action::Record,
+                Hooks::default(),
+                BpOptions {
+                    max_hits: Some(3),
+                    ..BpOptions::default()
+                },
+            )
+            .unwrap();
+        t.send(&format!("mainhot {} 0", n / stress_iters() as u64));
+        let l = t
+            .lines
+            .recv_timeout(Duration::from_secs(20))
+            .unwrap_or_else(|_| fail(&d, &format!("iteration {i}: main thread stalled")));
+        assert!(l.starts_with("hot "), "{l}");
+        let _ = d.remove_breakpoint(w);
+    }
+    stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    let stolen = thief.join().unwrap();
+    let evs = c.finish(&d);
+    no_signal_breaks(&d, &evs, "end");
+    assert_no_stuck(&d, pid, "end");
+    pause_cont(&d, pid, "end");
+    eprintln!("stolen stops: {stolen}, recoveries: {}", recoveries(&d));
+    assert!(
+        recoveries(&d) >= stolen as u64,
+        "{:#?}",
+        d.history().unwrap()
+    );
+    Arc::try_unwrap(d).ok().unwrap().detach().unwrap();
+    assert_detached(&mut t, &[(hot, 0xf0)], "end");
 }

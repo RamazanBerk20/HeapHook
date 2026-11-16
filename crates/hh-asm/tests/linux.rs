@@ -104,6 +104,20 @@ fn live_symbols_disassembly_and_script() {
         format!("{}.malloc", libc.name)
     );
 
+    // 2b. Rust symbols are shown demangled; both forms read back.
+    let rust = module_symbols(p, exe)
+        .into_iter()
+        .find(|s| s.name.starts_with("_RNvNtCs") && s.name.contains("lang_start_internal"))
+        .expect("a mangled Rust symbol in hh-target");
+    let shown = symbol_at(p, &syms, rust.addr).unwrap();
+    assert!(
+        !shown.contains("_RNv") && shown.contains("std::rt::lang_start_internal"),
+        "{shown}"
+    );
+    assert_eq!(r(&shown), rust.addr, "{shown}");
+    assert_eq!(r(&format!("{shown}+4")), rust.addr + 4, "{shown}");
+    assert_eq!(r(&format!("{}.{}", exe.name, rust.name)), rust.addr);
+
     // 3. Some call/jmp in the executable is annotated with a libc symbol.
     let code: Vec<_> = p
         .regions()

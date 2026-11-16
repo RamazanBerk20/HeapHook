@@ -68,6 +68,21 @@ pub(crate) struct Os {
     cursor: Tid,
     /// Events a timed-out halt collected, delivered by `poll`.
     backlog: Vec<(Tid, Raw)>,
+    /// Stops recovered after someone else's waitpid took them (see `stolen`), for the
+    /// engine's history.
+    notes: Vec<String>,
+}
+
+/// waitpid status of a ptrace stop rebuilt from its siginfo: event stops carry
+/// `SIGTRAP | event << 8` (or the stop signal for group stops) in `si_code`.
+fn status_of(si: &libc::siginfo_t) -> i32 {
+    let (sig, code) = (si.si_signo, si.si_code);
+    let ev = if code > 0 && code >> 8 != 0 && code & 0xff == sig {
+        code >> 8
+    } else {
+        0
+    };
+    0x7f | (sig << 8) | (ev << 16)
 }
 
 const HALT_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
@@ -186,6 +201,7 @@ impl Os {
             gadget: None,
             cursor: 0,
             backlog: Vec::new(),
+            notes: Vec::new(),
         };
         // Threads may appear while we seize; clones of seized threads are traced automatically,
         // the rest show up on the next listing.
@@ -206,6 +222,9 @@ impl Os {
                         new = true;
                     }
                     Err(e) if is_esrch(&e) => {}
+                    // Permission is per process: once one thread was seized, EPERM means this
+                    // one is exiting (the kernel refuses tasks with an exit state).
+                    Err(e) if e.raw_os_error() == Some(libc::EPERM) && !os.th.is_empty() => {}
                     Err(e) => {
                         let _ = os.halt_all();
                         let _ = os.detach();
@@ -389,13 +408,10 @@ impl Os {
                     return Ok(Some(Raw::GuestCreated(new)));
                 }
                 // Wait for its first stop so it can be cleaned up and detached.
-                loop {
-                    match wait(new, 0) {
-                        Ok(Some(st)) if libc::WIFSTOPPED(st) => return Ok(Some(Raw::Forked(new))),
-                        Ok(Some(_)) | Err(_) => return Ok(None), // already gone
-                        Ok(None) => {}
-                    }
-                }
+                Ok(match self.wait_stop(new) {
+                    Ok(st) if libc::WIFSTOPPED(st) => Some(Raw::Forked(new)),
+                    _ => None, // already gone (or never stops: left alone)
+                })
             }
             libc::PTRACE_EVENT_EXEC if t.guest => {
                 // A guest got its own image: nothing of ours left in it.
@@ -484,6 +500,87 @@ impl Os {
         }
     }
 
+    /// Like `wait(tid, WNOHANG)`, but also finds a stop whose status someone else's waitpid
+    /// took: the host waiting on its child (`waitpid(pid)`, e.g. `Child::try_wait`) is handed
+    /// the main thread's ptrace stops, since the tracer and the parent are one process. Such a
+    /// thread sits in a ptrace stop (PTRACE_GETSIGINFO only works then) with nothing to wait
+    /// for; its status is rebuilt from the siginfo.
+    fn wait_or_stolen(&mut self, tid: Tid) -> io::Result<Option<i32>> {
+        if let Some(st) = wait(tid, libc::WNOHANG)? {
+            return Ok(Some(st));
+        }
+        let Ok(si) = self.siginfo(tid) else {
+            return Ok(None);
+        };
+        // It is stopped; a status reported meanwhile is pending now.
+        if let Some(st) = wait(tid, libc::WNOHANG)? {
+            return Ok(Some(st));
+        }
+        let st = status_of(&si);
+        self.notes.push(format!(
+            "recovered a stop of {tid} taken by another waitpid: {st:#x}"
+        ));
+        Ok(Some(st))
+    }
+
+    /// Recoveries since the last call.
+    pub fn take_notes(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.notes)
+    }
+
+    /// Last resort: every thread we believe running that actually sits in a ptrace stop
+    /// whose status is gone (see `wait_or_stolen`) gets its stop handled now.
+    pub fn watchdog(&mut self) -> Result<Vec<(Tid, Raw)>> {
+        let tids: Vec<Tid> = self
+            .th
+            .iter()
+            .filter(|(_, t)| !t.stopped && !t.exiting && !t.vforking)
+            .map(|(&k, _)| k)
+            .collect();
+        let mut out = Vec::new();
+        for tid in tids {
+            // Cheap for running threads: GETSIGINFO fails at once.
+            if self.siginfo(tid).is_err() {
+                continue;
+            }
+            if let Ok(Some(st)) = self.wait_or_stolen(tid)
+                && let Some(raw) = self.decode(tid, st, false)?
+            {
+                out.push((tid, raw));
+            }
+        }
+        Ok(out)
+    }
+
+    /// Waits up to `HALT_WAIT` for the next stop of `tid` (stolen ones included).
+    fn wait_stop(&mut self, tid: Tid) -> Result<i32> {
+        let deadline = std::time::Instant::now() + HALT_WAIT;
+        let mut spins = 0u32;
+        loop {
+            let r = if spins < 100 {
+                wait(tid, libc::WNOHANG)
+            } else {
+                self.wait_or_stolen(tid)
+            };
+            match r {
+                Ok(Some(st)) => return Ok(st),
+                Ok(None) if std::time::Instant::now() > deadline => {
+                    return Err(Error::Other(format!("thread {tid} does not stop")));
+                }
+                Ok(None) => {
+                    spins += 1;
+                    if spins < 2000 {
+                        std::thread::yield_now();
+                    } else {
+                        std::thread::sleep(std::time::Duration::from_micros(50));
+                    }
+                }
+                Err(e) if e.raw_os_error() == Some(libc::ECHILD) => return Err(Error::ProcessGone),
+                Err(e) => return Err(Error::Io(e)),
+            }
+        }
+    }
+
     pub fn poll(&mut self) -> Result<Option<(Tid, Raw)>> {
         if !self.backlog.is_empty() {
             return Ok(Some(self.backlog.remove(0)));
@@ -543,7 +640,12 @@ impl Os {
                     .get(&t)
                     .is_some_and(|x| !x.stopped && !x.exiting && !x.vforking)
                 {
-                    match wait(t, libc::WNOHANG) {
+                    // After a while, look for a stop someone else's waitpid took.
+                    let r = match spins < 200 {
+                        true => wait(t, libc::WNOHANG),
+                        false => self.wait_or_stolen(t),
+                    };
+                    match r {
                         Ok(Some(st)) => {
                             if let Some(raw) = self.decode(t, st, true)? {
                                 out.push((t, raw));
@@ -593,8 +695,14 @@ impl Os {
                 t.stopped = false;
             }
             let deadline = std::time::Instant::now() + HALT_WAIT;
+            let mut spins = 0u32;
             while self.th.get(&tid).is_some_and(|t| !t.stopped && !t.exiting) {
-                match wait(tid, libc::WNOHANG) {
+                spins += 1;
+                let r = match spins < 200 {
+                    true => wait(tid, libc::WNOHANG),
+                    false => self.wait_or_stolen(tid),
+                };
+                match r {
                     Ok(Some(st)) => {
                         if let Some(raw) = self.decode(tid, st, true)? {
                             out.push((tid, raw));
@@ -849,15 +957,60 @@ impl Os {
         Ok(())
     }
 
+    /// Detaches every task of the process, from /proc as well as our list (whatever our
+    /// bookkeeping missed): a task still traced when the tracer thread exits would be
+    /// released with its stop's signal (SIGTRAP: killed).
     pub fn detach(&mut self) -> Result<()> {
-        for (&tid, t) in &self.th {
-            if t.stopped {
-                let sig = if t.pass { t.sig } else { 0 };
-                let _ = pt(libc::PTRACE_DETACH, tid, 0, sig as usize);
+        let mut done = std::collections::BTreeSet::new();
+        // A thread still traced while we go may clone; its child is traced by us too, so
+        // list again until a pass finds nobody new.
+        for _ in 0..16 {
+            let mut tids: Vec<Tid> = self.th.keys().copied().collect();
+            if let Ok(rd) = std::fs::read_dir(format!("/proc/{}/task", self.pid)) {
+                tids.extend(
+                    rd.flatten()
+                        .filter_map(|e| e.file_name().to_str()?.parse::<Tid>().ok()),
+                );
+            }
+            tids.retain(|t| !done.contains(t));
+            tids.sort_unstable();
+            tids.dedup();
+            if tids.is_empty() {
+                break;
+            }
+            for tid in tids {
+                done.insert(tid);
+                self.detach_one(tid);
             }
         }
         self.th.clear();
         Ok(())
+    }
+
+    fn detach_one(&mut self, tid: Tid) {
+        let sig = self
+            .th
+            .get(&tid)
+            .filter(|t| t.stopped && t.pass)
+            .map_or(0, |t| t.sig);
+        if pt(libc::PTRACE_DETACH, tid, 0, sig as usize).is_ok() {
+            return;
+        }
+        // Not in a ptrace stop: running, ours or not (ESRCH either way). If it is traced by
+        // us, stop it, then detach.
+        if pt(libc::PTRACE_INTERRUPT, tid, 0, 0).is_err() {
+            return;
+        }
+        let pass = match self.wait_stop(tid) {
+            Ok(st) if libc::WIFSTOPPED(st) && st >> 16 == 0 => {
+                // A real signal arrived instead of our stop: deliver it, unless it is a trap.
+                let s = libc::WSTOPSIG(st);
+                if s == libc::SIGTRAP { 0 } else { s }
+            }
+            Ok(st) if libc::WIFSTOPPED(st) => 0,
+            _ => return,
+        };
+        let _ = pt(libc::PTRACE_DETACH, tid, 0, pass as usize);
     }
 
     /// Runs syscall `nr` in a stopped thread (the main one if possible) by pointing it at a
@@ -910,10 +1063,10 @@ impl Os {
             if let Err(e) = pt(libc::PTRACE_SINGLESTEP, tid, 0, 0) {
                 break Err(perr(e));
             }
-            let st = match wait(tid, 0) {
-                Ok(Some(st)) => st,
-                Ok(None) => continue,
-                Err(e) => break Err(Error::Io(e)),
+            // Never a blocking wait: a stop taken by another waitpid would hang us forever.
+            let st = match self.wait_stop(tid) {
+                Ok(st) => st,
+                Err(e) => break Err(e),
             };
             if !libc::WIFSTOPPED(st) {
                 self.th.remove(&tid);

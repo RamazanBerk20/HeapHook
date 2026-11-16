@@ -28,6 +28,7 @@ const PAGE: u64 = 4096;
 
 /// What the backend saw. `Trap` is any debug trap (int3, single-step, debug register);
 /// the engine works out which.
+#[derive(Debug)]
 pub(crate) enum Raw {
     Trap {
         code: u32,
@@ -69,12 +70,14 @@ pub(crate) enum Mode {
     Step,
 }
 
+#[derive(Debug)]
 pub(crate) enum StepKind {
     Into,
     Over,
     Out,
 }
 
+#[derive(Debug)]
 enum Stop {
     Trap {
         stepped: bool,
@@ -125,7 +128,8 @@ struct Th {
     at_bp: bool,
     /// Lifts in flight for this thread's step: int3 byte, its DR7 execute slot, pages.
     lift_sw: Option<Addr>,
-    lift_hw: bool,
+    /// The address of the hardware execute breakpoint disabled for this thread's step.
+    lift_hw: Option<Addr>,
     lift_pages: Vec<Addr>,
     /// Some lift of this thread needs the other threads held.
     lift_excl: bool,
@@ -134,17 +138,19 @@ struct Th {
     page_hit: Option<PageHit>,
     /// The instruction being stepped (step out) is a `ret`.
     was_ret: bool,
+    /// Where it last re-ran an instruction that faulted on a page we had just unprotected.
+    page_retry: Option<Addr>,
 }
 
 impl Th {
     fn lifting(&self) -> bool {
-        self.lift_sw.is_some() || self.lift_hw || !self.lift_pages.is_empty()
+        self.lift_sw.is_some() || self.lift_hw.is_some() || !self.lift_pages.is_empty()
     }
 }
 
 struct Plan {
     sw: Option<(Addr, bool)>,
-    hw: Option<usize>,
+    hw: Option<(usize, Addr)>,
     pages: Vec<Addr>,
 }
 
@@ -265,9 +271,29 @@ pub(crate) struct Engine {
     /// Recently disarmed int3 addresses: a thread that executed one just before it was
     /// removed traps at A+1 and must be rewound, not treated as the program's own SIGTRAP.
     recent: VecDeque<Addr>,
+    /// Pages recently given back their protection: a fault on one that was already queued
+    /// is ours, not the program's.
+    recent_pages: VecDeque<Addr>,
+    /// Watchdog: last run, and since when the process looks stalled.
+    last_dog: Instant,
+    stall_since: Option<Instant>,
     /// Last time an event came in: right after one, poll without sleeping for a while.
     last_event: Instant,
+    /// Recent events, commands and recoveries, for diagnostics ([`crate::Debugger::history`]).
+    history: VecDeque<String>,
+    started: Instant,
+    /// Times the watchdog had to repair a stall (see `watchdog`).
+    recoveries: u64,
 }
+
+/// Entries kept in the event history.
+const HISTORY: usize = 512;
+/// How often the watchdog looks for threads left stopped while the process runs (one
+/// PTRACE_GETSIGINFO per running thread, which fails at once for a running one).
+const DOG_EVERY: Duration = Duration::from_millis(10);
+/// How long a thread may stay stopped by our bookkeeping, while it should run, before the
+/// watchdog resumes it.
+const STALL: Duration = Duration::from_millis(250);
 
 impl Engine {
     fn start(
@@ -310,7 +336,13 @@ impl Engine {
             entry: None,
             modules: Vec::new(),
             recent: VecDeque::new(),
+            recent_pages: VecDeque::new(),
+            last_dog: Instant::now(),
+            stall_since: None,
             last_event: Instant::now(),
+            history: VecDeque::with_capacity(HISTORY),
+            started: Instant::now(),
+            recoveries: 0,
         };
         let r = e.init(raws);
         if r.is_err() {
@@ -355,6 +387,10 @@ impl Engine {
                     }
                 }
                 self.take_dropped();
+                if self.last_dog.elapsed() >= DOG_EVERY {
+                    self.last_dog = Instant::now();
+                    self.watchdog();
+                }
                 if let Some(t0) = self.lift_since
                     && !self.lift_released
                     && t0.elapsed() > LIFT_WAIT
@@ -399,6 +435,100 @@ impl Engine {
         }
     }
 
+    /// Appends to the bounded event history.
+    pub(crate) fn note(&mut self, what: String) {
+        if self.history.len() >= HISTORY {
+            self.history.pop_front();
+        }
+        let t = self.started.elapsed().as_secs_f64();
+        self.history.push_back(format!("{t:9.3} {what}"));
+    }
+
+    /// A summary line, then the history oldest first.
+    pub(crate) fn history(&self) -> Vec<String> {
+        let summary = format!(
+            "summary: state={:?} recoveries={} threads={:?} deferred={}",
+            self.state(),
+            self.recoveries,
+            self.threads.keys().collect::<Vec<_>>(),
+            self.deferred.len()
+        );
+        std::iter::once(summary)
+            .chain(self.history.iter().cloned())
+            .collect()
+    }
+
+    /// Last resort against a stalled target (a bug, or a stop another waitpid took):
+    /// 1. threads that sit in a ptrace stop the backend never saw get that stop handled;
+    /// 2. threads stopped for longer than `STALL` while the process runs, nothing is deferred
+    ///    and no step-over holds them, are resumed. Each repair is counted and logged.
+    fn watchdog(&mut self) {
+        match self.os.watchdog() {
+            Ok(raws) if !raws.is_empty() => {
+                // Deferred, like a halt's: handling one resumes threads whose stop is still
+                // in this batch otherwise.
+                for (t, raw) in raws {
+                    let _ = self.on_raw(t, raw, true);
+                }
+                if self.resume_all().is_err() {
+                    let _ = self.resume_all();
+                }
+            }
+            Ok(_) => {}
+            Err(e) => self.note(format!("watchdog: {e}")),
+        }
+        self.drain_notes();
+        for t in self.os.tids() {
+            if !self.threads.contains_key(&t) && self.os.is_stopped(t) {
+                // Known to the backend only (its creation event is still queued): adopt it
+                // so it gets resumed.
+                self.threads.insert(t, Th::default());
+            }
+        }
+        let holding = self.lift_since.is_some() && !self.lift_released;
+        let stalled = self.running()
+            && !holding
+            && (!self.deferred.is_empty()
+                || self
+                    .threads
+                    .keys()
+                    .any(|&t| self.os.is_stopped(t) && !self.held(t)));
+        if !stalled {
+            self.stall_since = None;
+            return;
+        }
+        let since = *self.stall_since.get_or_insert_with(Instant::now);
+        if since.elapsed() < STALL {
+            return;
+        }
+        self.stall_since = None;
+        self.recoveries += 1;
+        self.note("watchdog: stopped threads while running, resuming them".into());
+        if let Err(e) = self.resume_all() {
+            self.note(format!(
+                "watchdog: resume failed ({e}), continuing them plainly"
+            ));
+            let free: Vec<Tid> = self
+                .threads
+                .keys()
+                .copied()
+                .filter(|&t| !self.held(t))
+                .collect();
+            let _ = self.os.resume(&|t| match free.contains(&t) {
+                true => Mode::Cont,
+                false => Mode::Stay,
+            });
+        }
+    }
+
+    /// Moves the backend's recovery notes into the history.
+    pub(crate) fn drain_notes(&mut self) {
+        for n in self.os.take_notes() {
+            self.recoveries += 1;
+            self.note(format!("watchdog: {n}"));
+        }
+    }
+
     fn emit(&self, e: Event) {
         let _ = self.events.send(e);
     }
@@ -418,6 +548,10 @@ impl Engine {
     // ---- events -------------------------------------------------------------------------
 
     fn on_raw(&mut self, tid: Tid, raw: Raw, defer: bool) -> Result<()> {
+        self.note(format!(
+            "event {tid} {raw:?}{}",
+            if defer { " (deferred)" } else { "" }
+        ));
         let stop = match raw {
             Raw::Trap { code, int3 } => self.classify(tid, code, int3)?,
             Raw::Signal {
@@ -624,7 +758,7 @@ impl Engine {
         if stepped {
             th.want_step = false;
         }
-        let hw = (self.os.take_dr6(tid)? & 0xf) as u8;
+        let mut hw = (self.os.take_dr6(tid)? & 0xf) as u8;
         let mut sw = None;
         if !stepped && int3 {
             // int3 traps after itself: rewind onto the breakpoint.
@@ -634,6 +768,18 @@ impl Engine {
             {
                 self.os.set_pc(tid, a)?;
                 sw = Some(a);
+            }
+        }
+        if !stepped {
+            // One execution of an instruction under both an int3 and a debug register traps
+            // once (the debug register first, or the int3 when RF suppressed it): count it for
+            // both, so each kind sees every execution exactly once and breaks once.
+            let (pc, _) = self.os.pc_sp(tid)?;
+            let exec_here = self.hw_exec_slots(pc).fold(0u8, |m, i| m | 1 << i);
+            if sw.is_some() {
+                hw |= exec_here;
+            } else if hw & exec_here != 0 && self.sw.contains_key(&pc) {
+                sw = Some(pc);
             }
         }
         if !stepped && hw == 0 && sw.is_none() && int3 {
@@ -676,6 +822,12 @@ impl Engine {
                     self.page_fault(tid, page, addr)?;
                     return self.resume_all();
                 }
+                if code == Os::PAGE_FAULT && self.stale_fault(tid, addr)? {
+                    // Queued before the page got its protection back: just run it again.
+                    self.note(format!("stale fault of {tid} at {addr:x?}: re-run"));
+                    self.os.set_pass(tid, false);
+                    return self.resume_all();
+                }
                 if self.is_guest(tid) {
                     self.os.set_pass(tid, true);
                     return self.resume_all();
@@ -705,6 +857,11 @@ impl Engine {
                 self.resume_all()
             }
             Stop::Trap { stepped, hw, sw } => {
+                if let Ok((pc, _)) = self.os.pc_sp(tid) {
+                    self.note(format!(
+                        "trap {tid} at {pc:#x} stepped={stepped} hw={hw:#x} sw={sw:x?}"
+                    ));
+                }
                 let (page_hit, lifted) = if stepped {
                     self.rearm(tid)?
                 } else {
@@ -712,10 +869,15 @@ impl Engine {
                 };
                 // Still on the lifted int3 after its step: a `rep` iteration. Step it on
                 // without counting another hit.
+                let mut hw = hw;
                 if let Some(a) = lifted
                     && self.os.pc_sp(tid)?.0 == a
                 {
                     self.th(tid).at_bp = true;
+                    // Nor count the debug register on it again.
+                    for i in self.hw_exec_slots(a).collect::<Vec<_>>() {
+                        hw &= !(1 << i);
+                    }
                 }
                 if self.is_guest(tid) {
                     if sw.is_some() {
@@ -1043,6 +1205,35 @@ impl Engine {
         (p.lifts == 0 && p.applied != p.orig).then_some(page)
     }
 
+    /// A fault on a page we unprotected a moment ago (its watch was disabled while this fault
+    /// was already queued) is ours. On a read-write page that is certain; otherwise re-running
+    /// the instruction tells: a second fault at the same instruction is the program's own.
+    fn stale_fault(&mut self, tid: Tid, addr: Option<Addr>) -> Result<bool> {
+        let Some(page) = addr.map(|a| a & !(PAGE - 1)) else {
+            return Ok(false);
+        };
+        if !self.recent_pages.contains(&page) || self.pages.contains_key(&page) {
+            return Ok(false);
+        }
+        // On a page readable and writable again no access can fault for protection.
+        let open = self.mem.regions().ok().and_then(|rs| {
+            rs.into_iter()
+                .find(|r| page >= r.start && page - r.start < r.size)
+                .map(|r| r.prot.r && r.prot.w)
+        });
+        if open == Some(true) {
+            return Ok(true);
+        }
+        let (pc, _) = self.os.pc_sp(tid)?;
+        let th = self.th(tid);
+        if th.page_retry == Some(pc) {
+            th.page_retry = None;
+            return Ok(false);
+        }
+        th.page_retry = Some(pc);
+        Ok(true)
+    }
+
     fn page_fault(&mut self, tid: Tid, page: Addr, fault: Option<Addr>) -> Result<()> {
         let guest = self.is_guest(tid);
         let ctx = match guest || self.th(tid).page_hit.is_some() {
@@ -1148,7 +1339,12 @@ impl Engine {
             }
             let applied = if lifts == 0 { want } else { applied };
             if applied == orig && lifts == 0 {
-                self.pages.remove(&page);
+                if self.pages.remove(&page).is_some() {
+                    self.recent_pages.push_back(page);
+                    if self.recent_pages.len() > 64 {
+                        self.recent_pages.pop_front();
+                    }
+                }
             } else {
                 self.pages.insert(
                     page,
@@ -1192,7 +1388,11 @@ impl Engine {
     // ---- stopping and resuming ------------------------------------------------------------
 
     fn halt(&mut self) -> Result<()> {
-        for (t, raw) in self.os.halt_all()? {
+        let raws = self
+            .os
+            .halt_all()
+            .inspect_err(|e| self.note(format!("halt failed: {e}")))?;
+        for (t, raw) in raws {
             self.on_raw(t, raw, true)?;
         }
         Ok(())
@@ -1217,17 +1417,13 @@ impl Engine {
             pages: th.want_pages.clone(),
         };
         if !th.lifting() && (th.want_step || th.at_bp) {
+            // Both an int3 and a debug register may sit on one instruction: lift both, or
+            // the step would trap again on the one left armed.
             let (pc, _) = self.os.pc_sp(t)?;
             if self.sw.contains_key(&pc) {
                 plan.sw = Some((pc, !self.may_block(pc)));
-            } else {
-                let (addrs, _) = self.dr_config();
-                plan.hw = (0..4).find(|&i| {
-                    addrs[i] == pc
-                        && self.slots[i]
-                            .is_some_and(|id| self.bps[&id].info.bp.kind == BpKind::Execute)
-                });
             }
+            plan.hw = self.hw_exec_slots(pc).next().map(|i| (i, pc));
         }
         Ok((plan.sw.is_some() || plan.hw.is_some() || !plan.pages.is_empty()).then_some(plan))
     }
@@ -1239,10 +1435,10 @@ impl Engine {
             th.lift_sw = Some(a);
             th.lift_excl |= excl;
         }
-        if let Some(i) = p.hw {
+        if let Some((i, a)) = p.hw {
             let (addrs, dr7) = self.dr_config();
             self.os.set_dr(Some(t), addrs, dr7 & !(3 << (2 * i)))?;
-            self.th(t).lift_hw = true;
+            self.th(t).lift_hw = Some(a);
         }
         for page in p.pages {
             self.lift_page(page)?;
@@ -1272,7 +1468,7 @@ impl Engine {
             return Ok((None, None));
         };
         let sw = th.lift_sw.take();
-        let hw = std::mem::take(&mut th.lift_hw);
+        let hw = th.lift_hw.take();
         let pages = std::mem::take(&mut th.lift_pages);
         th.lift_excl = false;
         let hit = match pages.is_empty() {
@@ -1283,7 +1479,7 @@ impl Engine {
         if let Some(a) = sw {
             r = r.and(self.unlift_sw(a));
         }
-        if hw {
+        if hw.is_some() {
             let (addrs, dr7) = self.dr_config();
             r = r.and(self.os.set_dr(Some(tid), addrs, dr7));
         }
@@ -1291,7 +1487,7 @@ impl Engine {
             r = r.and(self.unlift_page(p));
         }
         self.lift_done();
-        r.map(|_| (hit, sw))
+        r.map(|_| (hit, sw.or(hw)))
     }
 
     fn lift_sw(&mut self, a: Addr) -> Result<()> {
@@ -1372,11 +1568,15 @@ impl Engine {
             th.stepped = th.want_step || th.lifting();
             modes.insert(t, if th.stepped { Mode::Step } else { Mode::Cont });
         }
+        let mut list: Vec<String> = modes.iter().map(|(t, m)| format!("{t}:{m:?}")).collect();
+        list.sort();
+        self.note(format!("resume {}", list.join(" ")));
         self.os
             .resume(&|t| modes.get(&t).copied().unwrap_or(Mode::Stay))
     }
 
     fn enter_break(&mut self, tid: Tid, reason: BreakReason) -> Result<()> {
+        self.note(format!("break {tid} {reason:?}"));
         self.halt()?;
         for th in self.threads.values_mut() {
             th.goal = Goal::Idle;
@@ -1459,6 +1659,15 @@ impl Engine {
             self.mem.write(addr, &[b])?;
         }
         Ok(())
+    }
+
+    /// Debug register slots holding an enabled execute breakpoint at `pc`.
+    fn hw_exec_slots(&self, pc: Addr) -> impl Iterator<Item = usize> + '_ {
+        (0..4).filter(move |&i| {
+            self.slots[i]
+                .and_then(|id| self.bps.get(&id))
+                .is_some_and(|b| b.info.bp.kind == BpKind::Execute && b.info.bp.address == pc)
+        })
     }
 
     fn dr_config(&self) -> ([u64; 4], u64) {
@@ -1551,6 +1760,7 @@ impl Engine {
             bp.size = 1;
         }
         let len = len.unwrap_or(bp.size as u64);
+        self.note(format!("cmd add {bp:?} {options:?} len={len}"));
         match bp.method {
             BpMethod::Software if bp.kind != BpKind::Execute => {
                 return Err(Error::Unsupported(
@@ -1610,6 +1820,7 @@ impl Engine {
     }
 
     pub(crate) fn remove_bp(&mut self, id: BpId) -> Result<()> {
+        self.note(format!("cmd remove {id}"));
         self.bp(id)?;
         let r = match self.alive {
             true => self.with_halted(|e| e.set_enabled_raw(id, false)),
@@ -1620,6 +1831,7 @@ impl Engine {
     }
 
     pub(crate) fn set_enabled(&mut self, id: BpId, on: bool) -> Result<()> {
+        self.note(format!("cmd enable {id} {on}"));
         self.bp(id)?;
         self.with_halted(|e| e.set_enabled_raw(id, on))
     }
@@ -1756,6 +1968,7 @@ impl Engine {
     }
 
     pub(crate) fn suspend_process(&mut self, on: bool) -> Result<()> {
+        self.note(format!("cmd suspend {on}"));
         self.live()?;
         if on && !self.suspended {
             if self.running() {
@@ -1770,6 +1983,7 @@ impl Engine {
     }
 
     pub(crate) fn pause(&mut self) -> Result<()> {
+        self.note("cmd pause".into());
         self.live()?;
         if self.broken.is_some() {
             return Ok(());
@@ -1803,6 +2017,7 @@ impl Engine {
     }
 
     pub(crate) fn cont(&mut self, pass: bool) -> Result<()> {
+        self.note(format!("cmd cont pass={pass} state={:?}", self.state()));
         let (tid, signal) = self.take_break()?;
         if signal {
             self.os.set_pass(tid, pass);
@@ -1811,6 +2026,7 @@ impl Engine {
     }
 
     pub(crate) fn step(&mut self, tid: Tid, kind: StepKind) -> Result<()> {
+        self.note(format!("cmd step {tid} {kind:?}"));
         self.broken_tid()?;
         self.stopped(tid)?;
         let (pc, sp) = self.os.pc_sp(tid)?;
@@ -1833,6 +2049,7 @@ impl Engine {
     }
 
     pub(crate) fn run_to(&mut self, addr: Addr, tid: Option<Tid>) -> Result<()> {
+        self.note(format!("cmd run_to {addr:#x} {tid:?}"));
         let btid = self.broken_tid()?;
         if let Some(t) = tid {
             self.user_thread(t)?;
@@ -1868,6 +2085,7 @@ impl Engine {
     /// Restores every patch and detaches. Whatever fails on the way, the remaining steps
     /// still run so the target ends up running, untraced and unpatched.
     pub(crate) fn detach(&mut self) -> Result<()> {
+        self.note("cmd detach".into());
         self.done = true;
         if !self.alive {
             return Ok(());
@@ -1880,7 +2098,8 @@ impl Engine {
             .iter()
             .filter(|(_, s)| {
                 matches!(s, Stop::Signal { code, addr: Some(a), .. }
-                    if *code == Os::PAGE_FAULT && self.watched_fault(*a).is_some())
+                    if *code == Os::PAGE_FAULT && (self.watched_fault(*a).is_some()
+                        || self.recent_pages.contains(&(*a & !(PAGE - 1)))))
             })
             .map(|d| d.0)
             .collect();

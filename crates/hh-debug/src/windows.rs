@@ -818,6 +818,15 @@ impl Os {
         Ok(())
     }
 
+    /// Nothing to recover on Windows: debug events cannot be taken by another waiter.
+    pub fn watchdog(&mut self) -> Result<Vec<(Tid, Raw)>> {
+        Ok(Vec::new())
+    }
+
+    pub fn take_notes(&mut self) -> Vec<String> {
+        Vec::new()
+    }
+
     pub fn detach(&mut self) -> Result<()> {
         if self.ev.is_none() {
             let _ = self.halt_all(); // best effort: detaching matters more

@@ -9,6 +9,8 @@ hh-core.workspace = true
 serde.workspace = true
 iced-x86 = { version = "1.21", default-features = false, features = ["std", "decoder", "encoder", "intel", "op_code_info", "instr_info"] }
 memchr = "2.7"
+rustc-demangle = "0.1"
+cpp_demangle = { version = "0.5", default-features = false, features = ["std"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

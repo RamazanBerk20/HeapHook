@@ -744,6 +744,15 @@ mod session {
             self.call(|e| Ok(e.state()))
         }
 
+        /// The most recent raw events, commands, resumes and recoveries of this session,
+        /// oldest first, one line each (bounded). For diagnostics and bug reports.
+        pub fn history(&self) -> Result<Vec<String>> {
+            self.call(|e| {
+                e.drain_notes();
+                Ok(e.history())
+            })
+        }
+
         pub fn add_breakpoint(&self, bp: Breakpoint, hooks: Hooks) -> Result<BpId> {
             self.add_breakpoint_with(bp, hooks, BpOptions::default())
         }

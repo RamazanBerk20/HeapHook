@@ -24,6 +24,11 @@
 //! `spawntrue` (posix_spawn /bin/true; `spawn <status>`), `exec` (re-executes itself, which
 //! prints a new info line), `exitmain` (`ok`, then the main thread exits and a second thread
 //! keeps serving), `raise <sig>` (`sig <SIGUSR1 count> <SIGUSR2 count>`), `sigs` (same).
+//! Stress (Linux): `bg <hot> <writers> <churn> <sleep_us>` starts background threads until
+//! `bgstop` (`ok`): `hot` threads call hot(&counter) in a loop, `writers` threads store to
+//! buf+8, `churn` threads keep creating short-lived threads that call hot(&counter);
+//! `sleep_us` pauses between iterations. `mainhot <iters> <sleep_us>` calls hot(&counter)
+//! on the main thread (`hot <counter>`). `prog` answers `prog <counter> <writes> <churned>`.
 use std::io::{BufRead, Write};
 
 #[cfg(target_arch = "x86_64")]
@@ -84,6 +89,17 @@ mod lx {
     pub static USR1: AtomicU64 = AtomicU64::new(0);
     pub static USR2: AtomicU64 = AtomicU64::new(0);
     pub static SLEEP_MS: AtomicU64 = AtomicU64::new(0);
+    pub static WRITES: AtomicU64 = AtomicU64::new(0);
+    pub static CHURNED: AtomicU64 = AtomicU64::new(0);
+    pub static BG_STOP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    pub static BG: std::sync::Mutex<Vec<std::thread::JoinHandle<()>>> =
+        std::sync::Mutex::new(Vec::new());
+
+    pub fn nap(us: u64) {
+        if us > 0 {
+            std::thread::sleep(std::time::Duration::from_micros(us));
+        }
+    }
 
     extern "C" fn on_sig(s: libc::c_int) {
         let c = if s == libc::SIGUSR1 { &USR1 } else { &USR2 };
@@ -328,6 +344,67 @@ fn linux_command(st: &State, cmd: &str, num: &mut dyn FnMut() -> u64) -> String 
                 lx::sigs()
             }
             "sigs" => lx::sigs(),
+            "bg" => {
+                let (hot, writers, churn, us) = (num(), num(), num(), num());
+                let (c, w) = (st.counter, st.buf + 8);
+                lx::BG_STOP.store(false, Ordering::SeqCst);
+                let run = || !lx::BG_STOP.load(Ordering::SeqCst);
+                let mut g = lx::BG.lock().unwrap();
+                for _ in 0..hot {
+                    g.push(std::thread::spawn(move || {
+                        while run() {
+                            hh_hot(c as *mut u64);
+                            lx::nap(us);
+                        }
+                    }));
+                }
+                for _ in 0..writers {
+                    g.push(std::thread::spawn(move || {
+                        while run() {
+                            hh_store(w as *mut u64, hh_load(w as *const u64) + 1);
+                            lx::WRITES.fetch_add(1, Ordering::SeqCst);
+                            lx::nap(us);
+                        }
+                    }));
+                }
+                for _ in 0..churn {
+                    g.push(std::thread::spawn(move || {
+                        while run() {
+                            std::thread::spawn(move || {
+                                for _ in 0..3 {
+                                    hh_hot(c as *mut u64);
+                                }
+                            })
+                            .join()
+                            .unwrap();
+                            lx::CHURNED.fetch_add(1, Ordering::SeqCst);
+                            lx::nap(us);
+                        }
+                    }));
+                }
+                "ok".into()
+            }
+            "bgstop" => {
+                lx::BG_STOP.store(true, Ordering::SeqCst);
+                for h in lx::BG.lock().unwrap().drain(..) {
+                    h.join().unwrap();
+                }
+                "ok".into()
+            }
+            "mainhot" => {
+                let (iters, us) = (num(), num());
+                for _ in 0..iters {
+                    hh_hot(st.counter as *mut u64);
+                    lx::nap(us);
+                }
+                format!("hot {}", hh_load(st.counter as *const u64))
+            }
+            "prog" => format!(
+                "prog {} {} {}",
+                hh_load(st.counter as *const u64),
+                lx::WRITES.load(Ordering::SeqCst),
+                lx::CHURNED.load(Ordering::SeqCst)
+            ),
             _ => "error".into(),
         }
     }

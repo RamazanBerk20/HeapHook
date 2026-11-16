@@ -21,6 +21,6 @@ pub use asm::{assemble, assemble_line};
 pub use disasm::{DisasmLine, disassemble, previous_instruction};
 pub use expr::{Ctx, MAX_EXPR_DEPTH, SymbolTable, eval, module_offset, parse_num, resolve_address};
 pub use symbols::{
-    MAX_MODULE_FILE, MAX_SYMBOLS_PER_MODULE, Symbol, module_file_reader, module_symbols,
+    MAX_MODULE_FILE, MAX_SYMBOLS_PER_MODULE, Symbol, demangle, module_file_reader, module_symbols,
     parse_symbols, symbol_at,
 };

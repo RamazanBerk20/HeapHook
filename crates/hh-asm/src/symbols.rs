@@ -544,11 +544,26 @@ pub fn parse_symbols(file: &[u8], base: Addr) -> Result<Vec<Symbol>> {
 
 // ------------------------------------------------------------------------------- cache
 
+/// Readable form of a mangled name: Rust (legacy and v0, without the hash) or Itanium C++
+/// (`_Z...`, GCC / Clang). `None` for names that are not mangled (C, PE exports) or that do
+/// not parse. MSVC (`?...`) names are not demangled.
+pub fn demangle(name: &str) -> Option<String> {
+    if let Ok(d) = rustc_demangle::try_demangle(name) {
+        return Some(format!("{d:#}"));
+    }
+    if name.starts_with("_Z") {
+        return cpp_demangle::Symbol::new(name).ok()?.demangle().ok();
+    }
+    None
+}
+
 #[derive(Default)]
 struct Table {
     by_name: HashMap<String, Addr>,
     /// By address; aliases at one address keep globals first.
     sorted: Vec<Symbol>,
+    /// Demangled names, built on the first lookup of one.
+    by_demangled: OnceLock<HashMap<String, Addr>>,
 }
 
 impl Table {
@@ -563,10 +578,27 @@ impl Table {
         Table {
             by_name,
             sorted: syms.into_iter().map(|s| s.0).collect(),
+            by_demangled: OnceLock::new(),
         }
     }
+    /// By the mangled (stored) name, or by the demangled one shown by `symbol_at`.
     fn get(&self, name: &str) -> Option<Addr> {
-        self.by_name.get(&name.to_ascii_lowercase()).copied()
+        let key = name.to_ascii_lowercase();
+        if let Some(&a) = self.by_name.get(&key) {
+            return Some(a);
+        }
+        self.by_demangled
+            .get_or_init(|| {
+                let mut m = HashMap::new();
+                for s in &self.sorted {
+                    if let Some(d) = demangle(&s.name) {
+                        m.entry(d.to_ascii_lowercase()).or_insert(s.addr);
+                    }
+                }
+                m
+            })
+            .get(&key)
+            .copied()
     }
     /// Symbol containing `a` (exactly at it when the size is unknown) and the offset.
     fn at(&self, a: Addr) -> Option<(&Symbol, u64)> {
@@ -645,9 +677,11 @@ pub(crate) fn lookup(p: &dyn Process, mods: &[Module], name: &str) -> Option<Add
         }
     }
     // Plain names: hex-looking ones are numbers, and operators are never part of a symbol.
-    let plain = name
-        .chars()
-        .all(|c| c.is_alphanumeric() || "_.@$?".contains(c));
+    // Demangled names (`ns::f`, `<T as Tr>::f`) only come quoted, never from `a+b`.
+    let plain = name.contains("::")
+        || name
+            .chars()
+            .all(|c| c.is_alphanumeric() || "_.@$?".contains(c));
     if !plain || parse_num(name).is_some() {
         return None;
     }
@@ -672,7 +706,11 @@ pub(crate) fn symbol_for(
     }
     let m = mods.iter().find(|m| a >= m.base && a - m.base < m.size)?;
     if let Some((s, off)) = table(p, m).at(a) {
-        let name = format!("{}.{}", quote_name(&m.name), s.name);
+        let name = match demangle(&s.name) {
+            // Quoted as a whole, so it reads back through `resolve_address`.
+            Some(d) => quote_name(&format!("{}.{d}", m.name)),
+            None => format!("{}.{}", quote_name(&m.name), s.name),
+        };
         return Some(if off == 0 {
             name
         } else {
@@ -680,4 +718,37 @@ pub(crate) fn symbol_for(
         });
     }
     module_offset(mods, a)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::demangle;
+
+    #[test]
+    fn demangles_rust_and_cpp() {
+        let d = |n: &str| demangle(n);
+        // Rust legacy (hash dropped) and v0 (crate disambiguator dropped).
+        assert_eq!(
+            d("_ZN4core3fmt5write17h0123456789abcdefE").as_deref(),
+            Some("core::fmt::write")
+        );
+        assert_eq!(
+            d("_ZN8heaphook4tick17hfedcba9876543210E.llvm.123").as_deref(),
+            Some("heaphook::tick")
+        );
+        assert_eq!(
+            d("_RNvCs1234_7mycrate4tick").as_deref(),
+            Some("mycrate::tick")
+        );
+        // Itanium C++ (GCC / Clang).
+        assert_eq!(d("_ZN3foo3barEi").as_deref(), Some("foo::bar(int)"));
+        assert_eq!(
+            d("_ZNSt6vectorIiSaIiEE9push_backERKi").as_deref(),
+            Some("std::vector<int, std::allocator<int> >::push_back(int const&)")
+        );
+        // Not mangled, or not parseable: shown as is.
+        for n in ["malloc", "main", "_Zgarbage", "?f@@YAXXZ", "_R"] {
+            assert_eq!(d(n), None, "{n}");
+        }
+    }
 }
