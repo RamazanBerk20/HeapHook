@@ -10,9 +10,13 @@ const VSIZE = { byte: 1, binary: 1, '2bytes': 2, '4bytes': 4, '8bytes': 8, float
 const GPR = ['rax', 'rbx', 'rcx', 'rdx', 'rsi', 'rdi', 'rbp', 'rsp', 'r8', 'r9', 'r10', 'r11', 'r12', 'r13', 'r14', 'r15', 'rip'];
 const FLAGS = [['CF', 0], ['PF', 2], ['AF', 4], ['ZF', 6], ['SF', 7], ['TF', 8], ['IF', 9], ['DF', 10], ['OF', 11]];
 const SEGS = ['cs', 'ds', 'es', 'fs', 'gs', 'ss'];
-const KIND = { write: 'Writes', access: 'Accesses', ea: 'Addresses', trace: 'Trace' };
+const KIND = { write: 'Writes', access: 'Accesses', ea: 'Addresses', trace: 'Trace', range: 'Range' };
 const WL_COLS = '64px 116px minmax(0, 1fr) 116px';
 const COND_HINT = 'Condition, e.g. rax==5 && rcx>0x100  (rax..r15, eax..r15d, rip, rflags; + - * & | ^  == != < <= > >=  ! && ||  parentheses)';
+const RANGE_WARN = 'A range watch takes write access (or all access) away from every memory page the range touches. '
+  + 'Every access to those pages, also outside the range, stops the process for a moment, so the target runs much slower while the watch is on. '
+  + 'System calls that write into a watched page fail instead of being seen, and a program that changes the protection itself breaks the watch. '
+  + 'Never use it on stack memory: HeapHook refuses ranges inside a stack. For 8 bytes or less, Find out what writes / accesses (debug registers) is faster.';
 
 const r64 = (v) => BigInt(v).toString(16).toUpperCase().padStart(16, '0');
 /** xmm hex (little-endian bytes) -> dwords high to low, and float lanes. */
@@ -28,7 +32,7 @@ export function initDebugger({ showView, mem }) {
   let curTid = null, lastCtx = null, prevCtx = null;
   const watches = [];
   let active = null;
-  let codes = [], codeKey = '', codeSel = 0, bpSel = 0;
+  let codes = [], codeKey = '', codeSel = 0, bpSel = 0, logSince = 0;
 
   // ---------- attach state ----------
   function renderChip() {
@@ -39,7 +43,7 @@ export function initDebugger({ showView, mem }) {
         : s === 'suspended' ? 'Suspended' : 'Running';
     b.title = (dbg.reason && s === 'broken' ? `Stopped: ${dbg.reason}. ` : '') + (dbg.attached ? 'Detach the debugger' : 'Attach the debugger') + ' (Ctrl Shift D)';
     $('#dbg-ctl').hidden = !dbg.attached;
-    for (const id of ['dc-cont', 'dc-into', 'dc-over', 'dc-out', 'dc-runto']) $('#' + id).disabled = s !== 'broken';
+    for (const id of ['dc-cont', 'dc-into', 'dc-over', 'dc-out', 'dc-runto', 'dc-runto-t']) $('#' + id).disabled = s !== 'broken';
     $('#dc-pause').disabled = s !== 'running';
     for (const t of $$('#mem-side .dbg-only')) {
       t.hidden = !dbg.attached;
@@ -67,7 +71,8 @@ export function initDebugger({ showView, mem }) {
   function reset() {
     Object.assign(dbg, { attached: false, state: 'detached', tid: null, rip: null, reason: null, exit_code: null, bps: [] });
     dbg.bpAddrs = new Set();
-    curTid = null; lastCtx = prevCtx = null;
+    curTid = null; lastCtx = prevCtx = null; logSince = 0;
+    $('#dlog-list').replaceChildren(h('p.empty', null, 'Exec, fork and breakpoints the debugger switched off are noted here.'));
     for (const w of watches) w.stopped = true;
     renderChip(); renderBps(); renderTabs(); renderBreak(); emit('debug:marks');
   }
@@ -99,14 +104,16 @@ export function initDebugger({ showView, mem }) {
   }
   const pause = run(() => api.debugPause());
   const step = (kind) => run(() => api.debugStep(tid(), kind))();
-  const runTo = (addr) => run(() => api.debugRunTo(addr))();
+  const runTo = (addr, thread = false) => run(() => api.debugRunTo(addr, thread ? tid() : null))();
   $('#dc-cont').addEventListener('click', cont);
   $('#dc-pause').addEventListener('click', pause);
   $('#dc-into').addEventListener('click', () => step('into'));
   $('#dc-over').addEventListener('click', () => step('over'));
   $('#dc-out').addEventListener('click', () => step('out'));
   $('#dc-runto').addEventListener('click', () => { const a = mem.cursor(); if (a) runTo(a); });
+  $('#dc-runto-t').addEventListener('click', () => { const a = mem.cursor(); if (a) runTo(a, true); });
   on('debug:run-to', (a) => { if (dbg.state === 'broken') runTo(a); else toast('Run to cursor needs the process stopped at a break'); });
+  on('debug:run-to-thread', (a) => { if (dbg.state === 'broken') runTo(a, true); else toast('Run to cursor needs the process stopped at a break'); });
 
   function onBreak(fresh) {
     curTid = dbg.tid;
@@ -125,6 +132,7 @@ export function initDebugger({ showView, mem }) {
     dbg.bpAddrs = addrs;
     if (changed) emit('debug:marks');
     renderBps();
+    if (watches.length) renderTabs();
   }
   const bpList = $('#bp-list');
   function renderBps() {
@@ -136,24 +144,38 @@ export function initDebugger({ showView, mem }) {
     },
     h('span.box', { 'data-act': 'toggle', role: 'checkbox', 'aria-checked': String(b.enabled), 'aria-label': 'Enabled', html: b.enabled ? '<svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" aria-hidden="true"><path d="m5 12 5 5 9-10"/></svg>' : '' }),
     h('span.mono', null, fmtAddr(b.addr)),
-    h('span', null, `${b.kind}${b.kind !== 'execute' ? ' ' + b.size : ''}`),
+    h('span', null, `${b.kind}${b.kind !== 'execute' ? ' ' + nf.format(b.len ?? b.size) : ''}`),
     bpInfo(b),
-    h('span.mono.muted.hits', { title: 'Hits' }, nf.format(b.hits)))));
+    h('span.mono.muted.hits', { title: b.records_dropped ? `Hits; ${nf.format(b.records_dropped)} not recorded (record list full)` : 'Hits' },
+      b.records_dropped ? h('span.dropped', { 'aria-label': 'record list full' }, '! ') : null, nf.format(b.hits)))));
     bpList.setAttribute('aria-activedescendant', bps[bpSel] ? 'bp-' + bps[bpSel].id : '');
     if (!bps.length) bpList.append(h('p.empty', null, dbg.attached ? 'No breakpoints. F5 in the disassembler sets one.' : 'Debugger not attached.'));
   }
+  /** Method, action, hit options and condition; why it is off when the debugger switched it off. */
   function bpInfo(b) {
-    const t = `${b.method === 'hardware' ? 'hw' + (b.slot != null ? ' DR' + b.slot : '') : 'int3'} · ${b.ea ? 'addresses' : b.action}${b.condition ? ' · if ' + b.condition : ''}`;
-    return h('span.muted' + (b.condition ? '.mono' : ''), { title: b.condition ? t : null }, t);
+    const o = b.options || {};
+    const parts = [b.method === 'hardware' ? 'hw' + (b.slot != null ? ' DR' + b.slot : '') : b.method === 'page' ? 'page' : 'int3', b.ea ? 'addresses' : b.action];
+    if (o.skip_hits) parts.push(`after ${nf.format(o.skip_hits)}`);
+    if (o.one_shot) parts.push('one-shot');
+    if (o.max_hits) parts.push(`stop at ${nf.format(o.max_hits)}`);
+    if (b.condition) parts.push('if ' + b.condition);
+    const t = !b.enabled && b.note ? 'off: ' + b.note : parts.join(' · ');
+    return h('span.bp-info', { title: [t, b.owner === 'script' ? 'Set by a Lua script (debug_setBreakpoint)' : null].filter(Boolean).join('\n') },
+      b.owner === 'script' ? h('span.badge.blue', null, 'Lua') : null,
+      h('span.muted' + (b.condition ? '.mono' : '') + (!b.enabled && b.note ? '.note' : ''), null, t));
   }
-  bpList.title = 'Insert: add · E or F2: condition · H: software / hardware · Space: enable · Del: remove';
-  /** Add dialog (no `bp`) or condition editor (`bp`: the other fields stay as they are). */
+  bpList.title = 'Insert: add · E or F2: condition and hit options · H: software / hardware · Space: enable · Del: remove';
+  /** Add dialog (no `bp`) or the editor of an existing one (`bp`: condition and hit options change in place). */
   function bpDialog({ addr = '', bp = null } = {}) {
     const sel = (name, vals, v) => h('select', { name }, vals.map((x) => h('option', { value: x, selected: String(x) === String(v) }, String(x))));
     const addrI = h('input.mono', { type: 'text', value: bp ? fmtAddr(bp.addr) : addr ? fmtAddr(addr) : '', spellcheck: 'false', autocomplete: 'off', placeholder: 'address or expression', disabled: !!bp });
     const kind = sel('kind', ['execute', 'write', 'access'], bp?.kind ?? 'execute'), size = sel('size', [1, 2, 4, 8], bp?.size ?? 4);
     const method = sel('method', ['software', 'hardware'], bp?.method ?? state.settings.bp_method);
     const cond = h('input.mono', { type: 'text', value: bp?.condition ?? '', spellcheck: 'false', autocomplete: 'off', placeholder: 'rax==5 && rcx>0x100' });
+    const o = bp?.options || {};
+    const num = (v, label) => h('input.mono.num', { type: 'number', min: '0', value: v || 0, 'aria-label': label });
+    const skip = num(o.skip_hits, 'Break after this many hits'), maxH = num(o.max_hits, 'Stop after this many hits');
+    const oneShot = h('input', { type: 'checkbox', checked: !!o.one_shot });
     const err = h('p.hint.mono', { role: 'alert' });
     const syncOpts = () => {
       const x = kind.value === 'execute';
@@ -164,28 +186,37 @@ export function initDebugger({ showView, mem }) {
     };
     kind.addEventListener('change', syncOpts);
     const form = h('form', { method: 'dialog' },
-      h('h2', null, bp ? 'Breakpoint condition' : 'Add breakpoint'),
+      h('h2', null, bp ? 'Edit breakpoint' : 'Add breakpoint'),
       h('label.field', null, h('span', null, 'Address'), addrI),
       h('div.row2.row2-even', null, h('label.field', null, h('span', null, 'Kind'), kind), h('label.field', null, h('span', null, 'Size (write / access)'), size)),
       h('label.field', null, h('span', null, 'Method (watches always use hardware)'), method),
       h('label.field', null, h('span', null, 'Condition (optional)'), cond),
-      h('p.hint.mono', null, COND_HINT), err,
+      h('p.hint.mono', null, COND_HINT),
+      h('fieldset.group', null, h('legend', null, 'Hits (counted only when the condition holds)'),
+        h('div.bp-opts', null,
+          h('label.field', null, h('span', null, 'Break after N hits'), skip),
+          h('label.field', null, h('span', null, 'Stop after N hits (0 = never)'), maxH),
+          h('label.check', null, oneShot, ' One-shot: switch off after it acted once'))),
+      bp ? h('p.hint', null, `Changes apply in place: ${nf.format(bp.hits)} hit(s) so far still count.`) : null, err,
       h('div.dlg-actions', null,
         h('button.btn.primary', { value: 'ok', type: 'submit' }, bp ? 'Set ' : 'Add ', h('kbd', null, 'Enter')),
         h('button.btn', { value: 'cancel', type: 'submit', formnovalidate: true }, 'Cancel ', h('kbd', null, 'Esc'))));
-    const d = h('dialog.dlg.dlg-sm', { 'aria-label': bp ? 'Breakpoint condition' : 'Add breakpoint' }, form);
+    const d = h('dialog.dlg.dlg-sm', { 'aria-label': bp ? 'Edit breakpoint' : 'Add breakpoint' }, form);
     form.addEventListener('submit', async (e) => {
       if (e.submitter?.value === 'cancel') return;
       e.preventDefault();
       err.textContent = '';
       const c = cond.value.trim() || null;
+      const options = { skip_hits: Math.max(0, Math.round(+skip.value || 0)), one_shot: oneShot.checked, max_hits: Math.round(+maxH.value || 0) || null };
       try {
-        if (bp) await api.debugSetCondition(bp.id, c ?? '');
-        else {
+        if (bp) {
+          if ((bp.condition ?? null) !== c) await api.debugSetCondition(bp.id, c ?? '');
+          await api.debugSetOptions(bp.id, options);
+        } else {
           const t = addrI.value.trim();
           if (!t) throw 'Enter an address';
           const a = isHexAddr(t) ? '0x' + t.replace(/^0x/i, '') : await api.resolveAddress(t), k = kind.value;
-          await api.debugAddBreakpoint({ addr: a, kind: k, ...(k === 'execute' ? {} : { size: +size.value }), method: k === 'execute' ? method.value : 'hardware', action: 'break', condition: c });
+          await api.debugAddBreakpoint({ addr: a, kind: k, ...(k === 'execute' ? {} : { size: +size.value }), method: k === 'execute' ? method.value : 'hardware', action: 'break', condition: c ?? '', ...options });
         }
       } catch (ex) { err.textContent = String(ex?.message || ex); return; }
       d.close('ok');
@@ -200,7 +231,9 @@ export function initDebugger({ showView, mem }) {
   /** Switches an execute breakpoint between int3 and a debug register: re-added with the same settings. */
   async function swapMethod(b) {
     if (!b || b.kind !== 'execute') return;
-    const mk = (method) => ({ addr: b.addr, kind: b.kind, size: b.size, method, action: b.action, ea: b.ea, condition: b.condition || null });
+    if (b.hits && (await modal({ title: 'Switch the method?', text: `The breakpoint is removed and set again with the other method; its ${nf.format(b.hits)} hit(s) and records start over.`,
+      buttons: [{ label: 'Switch', value: 'ok', primary: true }, { label: 'Cancel', value: 'cancel', kbd: 'Esc' }] })).value !== 'ok') return;
+    const mk = (method) => ({ addr: b.addr, kind: b.kind, size: b.size, method, action: b.action, ea: b.ea, condition: b.condition || '', ...(b.options || {}) });
     const to = b.method === 'hardware' ? 'software' : 'hardware';
     if (!(await attempt(async () => { await api.debugRemoveBreakpoint(b.id); return true; }))) return;
     let id = await attempt(() => api.debugAddBreakpoint(mk(to)));
@@ -263,7 +296,7 @@ export function initDebugger({ showView, mem }) {
     count: () => active?.rows.length ?? 0,
     item: (i) => active?.rows[i] ?? null,
     cells(r, i) {
-      const trace = active.kind === 'trace', ea = active.kind === 'ea', [m, ...rest] = r.text.split(' ');
+      const trace = active.kind === 'trace', ea = active.kind === 'ea' || active.kind === 'range', [m, ...rest] = r.text.split(' ');
       return [trace ? String(i + 1) : nf.format(r.count), fmtAddr(ea ? r.address : r.addr),
         h('span.c-text', { role: 'gridcell' }, h('b', null, m), rest.length ? ' ' + rest.join(' ') : ''), h('span.muted', null, ea ? fmtAddr(r.addr) : '')];
     },
@@ -276,6 +309,7 @@ export function initDebugger({ showView, mem }) {
       if (k === 'n' && r) addToCode(r, true);
       else if (k === 'l' && r) addToCode(r, false);
       else if (k === 's') stopWatch();
+      else if (k === 'r') rangeDialog();
       else if (e.key === 'Delete') closeWatch();
       else return false;
       return true;
@@ -293,9 +327,10 @@ export function initDebugger({ showView, mem }) {
     const req = kind === 'ea' ? { addr: d.addr, kind: 'execute', method: state.settings.bp_method, action: 'record', ea: true }
       : kind === 'trace' ? { addr: d.addr, kind: 'execute', method: state.settings.bp_method, action: 'trace', steps: d.steps, step_over_calls: d.step_over_calls }
         : { addr: d.addr, kind, size: VSIZE[d.vtype] ?? 4, method: 'hardware', action: 'record' };
-    const id = await attempt(() => api.debugAddBreakpoint(req));
+    const id = await attempt(() => (kind === 'range' ? api.debugWatchRange(d.req) : api.debugAddBreakpoint(req)));
     if (id == null) return;
-    const w = { id, kind, addr: d.addr, label: `${KIND[kind]} · ${fmtAddr(d.addr)}`, rows: [], sel: 0, stopped: false, key: '' };
+    const label = kind === 'range' ? `${d.req.kind === 'access' ? 'Accesses' : 'Writes'} · ${fmtAddr(d.addr)} +${nf.format(d.req.len)}` : `${KIND[kind]} · ${fmtAddr(d.addr)}`;
+    const w = { id, kind, addr: d.addr, label, rows: [], sel: 0, stopped: false, key: '' };
     watches.push(w);
     active = w;
     showWatch(w);
@@ -307,6 +342,44 @@ export function initDebugger({ showView, mem }) {
   on('debug:writes', (d) => addWatch('write', d));
   on('debug:accesses', (d) => addWatch('access', d));
   on('debug:ea', (d) => addWatch('ea', d));
+  /** Range watch dialog: address, length, writes or accesses, with the plain warning about its cost. */
+  function rangeDialog({ addr = '', len = 16, kind = 'write' } = {}) {
+    const addrI = h('input.mono', { type: 'text', value: addr ? fmtAddr(addr) : '', spellcheck: 'false', autocomplete: 'off', placeholder: 'address or expression' });
+    const lenI = h('input.mono', { type: 'text', value: String(len), spellcheck: 'false', autocomplete: 'off', 'aria-describedby': 'rw-lenhint' });
+    const kindS = h('select', { name: 'kind' }, h('option', { value: 'write', selected: kind === 'write' }, 'Writes'), h('option', { value: 'access', selected: kind === 'access' }, 'Reads and writes'));
+    const maxH = h('input.mono.num', { type: 'number', min: '0', value: '0', 'aria-label': 'Stop after this many hits' });
+    const err = h('p.hint.mono', { role: 'alert' });
+    const form = h('form', { method: 'dialog' },
+      h('h2', null, 'Watch a memory range'),
+      h('div.row2', null, h('label.field', null, h('span', null, 'Start address'), addrI), h('label.field', null, h('span', null, 'Length (bytes)'), lenI)),
+      h('p#rw-lenhint.hint', null, 'Decimal, or hex with 0x. Any length; debug registers only cover 8 bytes.'),
+      h('div.row2.row2-even', null, h('label.field', null, h('span', null, 'Find out what'), kindS), h('label.field', null, h('span', null, 'Stop after N hits (0 = never)'), maxH)),
+      h('p.warn', { role: 'note' }, h('b', null, 'Slows the target. '), RANGE_WARN), err,
+      h('div.dlg-actions', null,
+        h('button.btn.primary', { value: 'ok', type: 'submit' }, 'Watch ', h('kbd', null, 'Enter')),
+        h('button.btn', { value: 'cancel', type: 'submit', formnovalidate: true }, 'Cancel ', h('kbd', null, 'Esc'))));
+    const d = h('dialog.dlg.dlg-sm', { 'aria-label': 'Watch a memory range' }, form);
+    form.addEventListener('submit', async (e) => {
+      if (e.submitter?.value === 'cancel') return;
+      e.preventDefault();
+      err.textContent = '';
+      try {
+        const t = addrI.value.trim();
+        if (!t) throw 'Enter an address';
+        const a = isHexAddr(t) ? '0x' + t.replace(/^0x/i, '') : await api.resolveAddress(t);
+        const n = Number(lenI.value.trim());
+        if (!Number.isInteger(n) || n < 1) throw 'Enter a length of at least 1 byte';
+        if (!(await attach())) return;
+        d.close('ok');
+        addWatch('range', { addr: a, req: { addr: a, len: n, kind: kindS.value, max_hits: Math.round(+maxH.value || 0) || null } });
+      } catch (ex) { err.textContent = String(ex?.message || ex); }
+    });
+    d.addEventListener('close', () => d.remove());
+    document.body.append(d);
+    d.showModal();
+    (addrI.value ? lenI : addrI).select();
+  }
+  on('debug:watch-range', (d) => rangeDialog(d));
   on('debug:trace', (d) => {
     const dlg = $('#dlg-trace'), f = dlg.querySelector('form');
     $('#tr-at').textContent = `${fmtAddr(d.addr)}  ${d.text || ''}`;
@@ -328,10 +401,18 @@ export function initDebugger({ showView, mem }) {
     renderTabs();
   }
   function renderTabs() {
-    tabs.replaceChildren(...watches.map((w) => h('button', {
-      role: 'tab', type: 'button', 'aria-selected': String(w === active), tabindex: w === active ? '0' : '-1', 'data-id': w.id, class: w.stopped ? 'stopped' : null,
-      title: w.stopped ? 'Stopped' : 'Live',
-    }, w.label, h('span.count.mono', null, w.kind === 'trace' ? (w.rows.length ? nf.format(w.rows.length) : '') : nf.format(w.rows.reduce((s, r) => s + r.count, 0))))));
+    tabs.replaceChildren(...watches.map((w) => {
+      const b = dbg.bps.find((x) => x.id === w.id), off = !w.stopped && b && !b.enabled;
+      return h('button', {
+        role: 'tab', type: 'button', 'aria-selected': String(w === active), tabindex: w === active ? '0' : '-1', 'data-id': w.id, class: w.stopped ? 'stopped' : off ? 'paused' : null,
+        title: w.stopped ? 'Stopped' : off ? 'Switched off' + (b.note ? ': ' + b.note : '') : 'Live',
+      }, w.label, h('span.count.mono', null, w.kind === 'trace' ? (w.rows.length ? nf.format(w.rows.length) : '') : nf.format(w.rows.reduce((s, r) => s + r.count, 0))));
+    }));
+    const ab = active && !active.stopped && dbg.bps.find((x) => x.id === active.id);
+    const dropped = $('#wl-dropped');
+    dropped.hidden = !ab?.records_dropped;
+    dropped.textContent = ab?.records_dropped ? `List full · ${nf.format(ab.records_dropped)} not recorded` : '';
+    dropped.title = 'The watch keeps at most 65,536 distinct instruction and address pairs; hits on new pairs are counted but not listed. Clear the counts to make room.';
     const none = !watches.length;
     $('#wl-empty').hidden = !none;
     list.hidden = none;
@@ -367,9 +448,9 @@ export function initDebugger({ showView, mem }) {
     const trace = w.kind === 'trace';
     const head = $('#wl-head').children;
     head[0].textContent = trace ? 'Step' : 'Count';
-    head[1].textContent = w.kind === 'ea' ? 'Accessed address' : 'Address';
+    head[1].textContent = w.kind === 'ea' || w.kind === 'range' ? 'Accessed address' : 'Address';
     head[2].textContent = 'Instruction';
-    head[3].textContent = w.kind === 'ea' ? 'Instruction address' : '';
+    head[3].textContent = w.kind === 'ea' || w.kind === 'range' ? 'Instruction address' : '';
     w.sel = Math.max(0, Math.min(w.sel, w.rows.length - 1));
     wl.refresh({ force: true });
     if (w.rows.length && wl.sel !== w.sel) wl.select(w.sel, { quiet: true });
@@ -405,6 +486,7 @@ export function initDebugger({ showView, mem }) {
   $('#wl-clear').addEventListener('click', async () => { if (active && await attempt(async () => { await api.debugClearRecords(active.id); return true; })) await attempt(loadWatch); });
   $('#wl-stop').addEventListener('click', () => stopWatch());
   $('#wl-close').addEventListener('click', closeWatch);
+  $('#wl-range').addEventListener('click', () => rangeDialog());
 
   // ---------- code list ----------
   // The backend owns it (it is saved with the cheat table); this only shows and drives it.
@@ -483,20 +565,21 @@ export function initDebugger({ showView, mem }) {
   on('table:version', (v) => { if (v !== codeVer) { codeVer = v; reloadCode(); } });
 
   // ---------- break state: registers, stack, threads ----------
-  const cpu = $('#cpu-list'), stk = $('#stk-list'), thr = $('#thr-list');
+  const cpu = $('#cpu-list'), stk = $('#stk-list'), thr = $('#thr-list'), bt = $('#bt-list');
   const broken = () => dbg.attached && dbg.state === 'broken';
   async function loadBreak() {
     if (!broken()) { renderBreak(); return; }
     const t = tid();
-    const [ctx, stack, threads] = await Promise.all([api.debugContext(t).catch(() => null), api.debugStack(t, 64).catch(() => []), api.debugThreads().catch(() => [])]);
+    const [ctx, stack, threads, frames] = await Promise.all([api.debugContext(t).catch(() => null), api.debugStack(t, 64).catch(() => []),
+      api.debugThreads().catch(() => []), api.debugBacktrace(t, 64).catch(() => [])]);
     if (lastCtx && lastCtx.rip !== ctx?.rip) prevCtx = lastCtx;
     lastCtx = ctx;
-    renderBreak(ctx, stack, threads);
+    renderBreak(ctx, stack, threads, frames);
   }
-  function renderBreak(ctx = null, stack = [], threads = []) {
+  function renderBreak(ctx = null, stack = [], threads = [], frames = []) {
     const msg = dbg.attached ? 'The process is running. Registers and stack are shown while it is stopped at a break (Shift F9).' : 'Debugger not attached.';
     if (!broken() || !ctx) {
-      cpu.replaceChildren(h('p.empty', null, msg)); stk.replaceChildren(h('p.empty', null, msg));
+      cpu.replaceChildren(h('p.empty', null, msg)); stk.replaceChildren(h('p.empty', null, msg)); bt.replaceChildren(h('p.empty', null, msg));
       if (!dbg.attached) thr.replaceChildren(h('p.empty', null, msg));
       else attempt(async () => renderThreads(await api.debugThreads()));
       return;
@@ -520,6 +603,10 @@ export function initDebugger({ showView, mem }) {
       ...fpu.xmm.map((x, i) => { const [dw, fl] = xmmText(x); return h('div.reg.ro.xmm', { title: fl }, h('span.rn', null, 'XMM' + i), h('span.rv.mono', null, dw)); }));
     stk.replaceChildren(...stack.map((s) => h('button.li.stk-row', { type: 'button', title: 'Show in the hex view', onclick: () => emit('mem:goto', { addr: s.value, pane: 'hex' }) },
       h('span.mono.muted', null, fmtAddr(s.addr)), h('span.mono', null, r64(s.value)), h('span.path', null, s.comment))));
+    bt.replaceChildren(h('div.cpu-sec', null, `Thread ${tid()} · call chain`),
+      ...frames.map((f, i) => h('button.li.bt-row', { type: 'button', title: 'Disassemble here', onclick: () => emit('mem:goto', { addr: f.addr, pane: 'da' }) },
+        h('span.mono.muted', null, '#' + i), h('span.mono', null, fmtAddr(f.addr)), h('span.mono.bt-sym', { title: f.symbol || f.module || '' }, f.symbol || f.module || ''))),
+      h('p.hint.bt-hint', null, 'Walked through frame pointers: code built without them shows a shorter chain.'));
     renderThreads(threads);
   }
   function renderThreads(threads) {
@@ -567,7 +654,22 @@ export function initDebugger({ showView, mem }) {
       e.preventDefault(); e.stopPropagation();
     }
   });
-  on('mem:side', (id) => { if (['cpu-list', 'stk-list', 'thr-list'].includes(id)) attempt(loadBreak); });
+  on('mem:side', (id) => { if (['cpu-list', 'stk-list', 'thr-list', 'bt-list'].includes(id)) attempt(loadBreak); });
+
+  // ---------- debugger log: exec, fork, breakpoints the debugger switched off ----------
+  async function loadLog() {
+    const r = await api.debugLog(logSince);
+    if (!r.lines.length) return;
+    logSince = r.next;
+    const box = $('#dlog-list');
+    box.querySelector('.empty')?.remove();
+    for (const l of r.lines) {
+      box.append(h('div.dlog-line', null, h('span.muted', null, '#' + l.seq), ' ', l.text));
+      if (state.view !== 'dbg') toast('Debugger: ' + l.text, 'info');
+    }
+    while (box.childElementCount > 300) box.firstElementChild.remove();
+    box.scrollTop = box.scrollHeight;
+  }
 
   // ---------- polling ----------
   addTicker(async () => {
@@ -575,6 +677,7 @@ export function initDebugger({ showView, mem }) {
     if (state.view === 'dbg') await loadCode().catch(() => {});
     if (!dbg.attached) return;
     await refresh();
+    await loadLog().catch(() => {});
     if (state.view === 'dbg' || state.view === 'mem') await loadBps();
     if (state.view === 'dbg') await loadWatch();
   });
@@ -584,7 +687,8 @@ export function initDebugger({ showView, mem }) {
     wl.refresh({ reset: true });
     renderCode(); reloadCode();
   };
-  on('process:opened', fresh);
+  // After a page reload the backend may still be attached: pick its state up.
+  on('process:opened', () => { fresh(); api.debugStatus().then((st) => { if (st.attached) { apply(st); loadBps().catch(() => {}); } }).catch(() => {}); });
   on('process:closed', fresh);
   splitter($('#div-dbg'), $('#dbg-side'), { axis: 'x', key: 'split.dbgSide', min: 260, max: () => innerWidth * 0.5, sign: -1, initial: 380 });
   reset(); renderCode();

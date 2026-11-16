@@ -41,7 +41,8 @@ pub struct Session {
     pub(crate) switch: Arc<Switch>,
     pub(crate) raw: Arc<dyn Process>,
     pub info: Opened,
-    pub scanner: Scanner,
+    /// Shared with Lua's `getCurrentMemscan()`.
+    pub scanner: Arc<Scanner>,
     pub(crate) freezer: Freezer,
     /// Shared with the Lua engine (`registerSymbol`, AA `registersymbol` from either side).
     pub(crate) syms: Arc<Mutex<SymbolTable>>,
@@ -108,10 +109,19 @@ impl Process for Switch {
 }
 
 /// Command state. Cheap to clone; every clone is the same app.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct App {
     sess: Arc<Mutex<Option<Arc<Session>>>>,
     pub(crate) x: Arc<Shared>,
+}
+
+impl Default for App {
+    fn default() -> Self {
+        let app = App { sess: Arc::default(), x: Arc::default() };
+        // The Lua hosts call back into the app (create process, load table, debugger).
+        let _ = app.x.lua.console.app.set(app.downgrade());
+        app
+    }
 }
 
 /// App-wide state that outlives process switches.
@@ -230,6 +240,11 @@ impl App {
     /// The settings the backend enforces itself; the UI applies the rest.
     fn apply_settings(&self, s: &Settings) {
         self.x.lua.engine.set_budget((s.lua_budget_ms > 0).then(|| Duration::from_millis(s.lua_budget_ms)));
+        {
+            let _g = self.x.lua.enter();
+            // mlua: 0 = no limit.
+            let _ = self.x.lua.engine.lua().set_memory_limit((s.lua_memory_mb as usize) << 20);
+        }
         if let Ok(sess) = self.session() {
             sess.freezer.set_interval(Duration::from_millis(s.freeze_interval_ms));
         }
@@ -255,7 +270,7 @@ impl App {
         let syms = self.x.lua.engine.symbols();
         *lock(&syms) = SymbolTable::default();
         let sess = Session {
-            scanner: Scanner::new(proc.clone()),
+            scanner: Arc::new(Scanner::new(proc.clone())),
             freezer,
             proc: proc.clone(),
             switch,

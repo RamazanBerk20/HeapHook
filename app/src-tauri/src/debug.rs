@@ -2,13 +2,15 @@
 //! explicitly; while attached every other command reaches the target through
 //! `Debugger::process()` (the session's `Switch`).
 //!
-//! Breakpoints get app-level ids so they survive disable/enable (hh-debug has no disable:
-//! a disabled breakpoint is removed from the engine and re-added on enable).
-use std::collections::HashMap;
+//! Breakpoint ids are hh-debug's: enable/disable, conditions and hit options change in
+//! place, so hits and records survive. Breakpoints set from Lua (`debug_setBreakpoint`) are
+//! listed too, marked as script-owned; their hits run the script's function (see
+//! [`App::dispatch_lua_break`]).
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
 use hh_core::{Addr, Process};
-use hh_debug::{Action, AddressOf, BpId, BpKind, BpMethod, BreakReason, Breakpoint, Context, Debugger, Event, Hooks, SignalAction, State, ThreadInfo, Tid};
+use hh_debug::{Action, AddressOf, BpId, BpKind, BpMethod, BpOptions, BreakReason, Breakpoint, Context, Debugger, Event, Hooks, SignalAction, State, ThreadInfo, Tid};
 use iced_x86::{Decoder, DecoderOptions, OpKind, Register};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -17,6 +19,8 @@ use crate::commands::{App, R, Session, hex_addr, hex_bytes, lock, parse_addr, s}
 
 /// Most trace steps returned with full registers (the UI shows one at a time).
 const MAX_TRACE: usize = 100_000;
+/// Debugger log lines kept.
+const LOG_CAP: usize = 500;
 
 pub struct Dbg {
     d: Debugger,
@@ -24,19 +28,39 @@ pub struct Dbg {
     last: Option<(Tid, String)>,
     exit_code: Option<Option<i32>>,
     bps: Vec<AppBp>,
-    next_id: u32,
-    /// Trap ip -> (instruction address, its bytes, text), for record lists.
-    insns: HashMap<(Addr, bool), (Addr, Vec<u8>, String)>,
+    /// Instruction address -> (its bytes, text), for record lists.
+    insns: HashMap<Addr, (Vec<u8>, String)>,
+    log: VecDeque<LogLine>,
+    log_seq: u64,
+    /// A break the Lua engine handles before the UI sees it: (tid, breakpoint, registers).
+    lua_break: Option<(Tid, BpId, Box<Context>)>,
 }
 
+/// What the app adds to an hh-debug breakpoint.
 struct AppBp {
-    id: u32,
-    bp: Breakpoint,
+    id: BpId,
+    addr: Addr,
     /// Record the effective address the instruction accesses.
     ea: bool,
     /// Condition over registers; hits where it is false are ignored.
     cond: Option<String>,
-    engine: Option<BpId>,
+    /// Set from Lua (`debug_setBreakpoint`).
+    script: bool,
+    /// Why the engine disabled it (exec, one-shot, max hits, overwritten).
+    note: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct LogLine {
+    pub seq: u64,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DebugLog {
+    pub lines: Vec<LogLine>,
+    /// Pass back as `since`.
+    pub next: u64,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -57,6 +81,23 @@ pub struct BpReq {
     pub ea: bool,
     /// Break only when this holds, e.g. `rax==5 && rcx>0x100` (see [`Cond`]); empty = always.
     pub condition: String,
+    /// Ignore the first N hits ("break after N hits").
+    pub skip_hits: u64,
+    /// Disable after the action ran once.
+    pub one_shot: bool,
+    /// Disable once the hit count reaches this (recorders: stop recording after N hits).
+    pub max_hits: Option<u64>,
+}
+
+/// `debug_watch_range`: a page-protection watch of any length.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct RangeReq {
+    pub addr: String,
+    pub len: u64,
+    /// `write` / `access`.
+    pub kind: String,
+    pub max_hits: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -76,6 +117,9 @@ pub struct BpOut {
     pub addr: String,
     pub kind: &'static str,
     pub size: u8,
+    /// Watched length (`size`, or the length of a range watch).
+    pub len: u64,
+    /// `software` / `hardware` / `page`.
     pub method: &'static str,
     pub action: &'static str,
     pub ea: bool,
@@ -83,6 +127,13 @@ pub struct BpOut {
     pub hits: u64,
     pub slot: Option<u8>,
     pub condition: Option<String>,
+    pub options: BpOptions,
+    /// Hits not recorded because the record list is full.
+    pub records_dropped: u64,
+    /// `user` or `script` (set from Lua).
+    pub owner: &'static str,
+    /// Why it is disabled, when the debugger disabled it.
+    pub note: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -94,7 +145,7 @@ pub struct RecordOut {
     pub bytes: String,
     pub text: String,
     pub count: u64,
-    /// Accessed address, for `ea` breakpoints.
+    /// Accessed address, for `ea` breakpoints and range watches.
     pub address: Option<String>,
     pub context: Value,
 }
@@ -111,6 +162,13 @@ pub struct StackOut {
     pub addr: String,
     pub value: String,
     pub comment: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct FrameOut {
+    pub addr: String,
+    pub module: Option<String>,
+    pub symbol: Option<String>,
 }
 
 /// Editable 64-bit registers, in display order.
@@ -237,52 +295,143 @@ fn ea_hook(p: &dyn Process, addr: Addr) -> R<AddressOf> {
     Ok(Arc::new(move |c: &Context| ins.virtual_address(op, 0, |r, _, _| reg_value(c, r))))
 }
 
-fn reason_text(r: &BreakReason, bps: &[AppBp]) -> String {
-    let app_id = |e: BpId| bps.iter().find(|b| b.engine == Some(e)).map_or(e, |b| b.id);
+fn reason_text(r: &BreakReason) -> String {
     match r {
-        BreakReason::Breakpoint(id) => format!("breakpoint {}", app_id(*id)),
+        BreakReason::Breakpoint(id) => format!("breakpoint {id}"),
         BreakReason::Step => "step".into(),
         BreakReason::Pause => "paused".into(),
         BreakReason::Signal { code, address: Some(a) } => format!("signal {code} at {a:#x}"),
         BreakReason::Signal { code, address: None } => format!("signal {code}"),
-        BreakReason::TraceStop(id) => format!("trace stop, breakpoint {}", app_id(*id)),
+        BreakReason::TraceStop(id) => format!("trace stop, breakpoint {id}"),
     }
 }
 
+fn condition_hook(cond: &Option<String>) -> R<Option<hh_debug::Predicate>> {
+    Ok(match cond {
+        Some(c) => {
+            let c = Arc::new(Cond::parse(c)?);
+            Some(Arc::new(move |x: &Context| c.eval(x) != 0) as hh_debug::Predicate)
+        }
+        None => None,
+    })
+}
+
+fn opts_of(req: &BpReq) -> BpOptions {
+    BpOptions { skip_hits: req.skip_hits, one_shot: req.one_shot, max_hits: req.max_hits.filter(|&m| m > 0) }
+}
+
+/// Registers as hh-lua's breakpoint functions see them.
+fn reg_ctx(c: &Context) -> hh_lua::RegContext {
+    hh_lua::RegContext {
+        rax: c.rax, rbx: c.rbx, rcx: c.rcx, rdx: c.rdx, rsi: c.rsi, rdi: c.rdi, rbp: c.rbp, rsp: c.rsp, r8: c.r8, r9: c.r9,
+        r10: c.r10, r11: c.r11, r12: c.r12, r13: c.r13, r14: c.r14, r15: c.r15, rip: c.rip, rflags: c.rflags,
+    }
+}
+
+/// `r` written over the general registers of `c`.
+fn merge_ctx(c: &mut Context, r: &hh_lua::RegContext) {
+    (c.rax, c.rbx, c.rcx, c.rdx, c.rsi, c.rdi, c.rbp, c.rsp) = (r.rax, r.rbx, r.rcx, r.rdx, r.rsi, r.rdi, r.rbp, r.rsp);
+    (c.r8, c.r9, c.r10, c.r11, c.r12, c.r13, c.r14, c.r15) = (r.r8, r.r9, r.r10, r.r11, r.r12, r.r13, r.r14, r.r15);
+    (c.rip, c.rflags) = (r.rip, r.rflags);
+}
+
 impl Dbg {
-    fn add_engine(&self, b: &AppBp, proc: &dyn Process) -> R<BpId> {
-        let condition = match &b.cond {
-            Some(c) => {
-                let c = Arc::new(Cond::parse(c)?);
-                Some(Arc::new(move |x: &Context| c.eval(x) != 0) as hh_debug::Predicate)
-            }
-            None => None,
-        };
-        let hooks = Hooks { address_of: if b.ea { Some(ea_hook(proc, b.bp.address)?) } else { None }, condition, ..Hooks::default() };
-        self.d.add_breakpoint(b.bp.clone(), hooks).map_err(s)
+    fn new(d: Debugger) -> Dbg {
+        Dbg { d, last: None, exit_code: None, bps: Vec::new(), insns: HashMap::new(), log: VecDeque::new(), log_seq: 0, lua_break: None }
+    }
+
+    fn note(&mut self, text: String) {
+        self.log_seq += 1;
+        self.log.push_back(LogLine { seq: self.log_seq, text });
+        while self.log.len() > LOG_CAP {
+            self.log.pop_front();
+        }
     }
 
     fn bp(&self, id: u32) -> R<&AppBp> {
         self.bps.iter().find(|b| b.id == id).ok_or_else(|| format!("no breakpoint {id}"))
     }
 
-    /// Instruction for a record: the one ending at `ip` (`before`, data watchpoints trap after
-    /// the access) or the one at `ip`. Cached while its bytes stay the same.
-    fn insn(&mut self, sess: &Session, ip: Addr, before: bool) -> (Addr, Vec<u8>, String) {
+    fn bp_mut(&mut self, id: u32) -> R<&mut AppBp> {
+        self.bps.iter_mut().find(|b| b.id == id).ok_or_else(|| format!("no breakpoint {id}"))
+    }
+
+    fn hooks(&self, b: &AppBp, proc: &dyn Process) -> R<Hooks> {
+        Ok(Hooks { address_of: if b.ea { Some(ea_hook(proc, b.addr)?) } else { None }, condition: condition_hook(&b.cond)?, ..Hooks::default() })
+    }
+
+    /// Drains debugger events into the session state and the log. `lua_onbp`: the script
+    /// defines `debugger_onBreakpoint`, so every breakpoint hit goes to Lua first.
+    fn pump(&mut self, lua_onbp: bool) {
+        for e in self.d.events() {
+            self.handle(e, lua_onbp);
+        }
+    }
+
+    /// Resumed: the next break brings its own reason.
+    fn resumed(&mut self) {
+        self.last = None;
+        self.lua_break = None;
+    }
+
+    fn handle(&mut self, e: Event, lua_onbp: bool) {
+        {
+            match e {
+                Event::Break { tid, reason, context } => {
+                    if let BreakReason::Breakpoint(id) = reason
+                        && (lua_onbp || self.bps.iter().any(|b| b.id == id && b.script))
+                    {
+                        self.lua_break = Some((tid, id, context));
+                    }
+                    self.last = Some((tid, reason_text(&reason)));
+                }
+                Event::ProcessExited { code } => {
+                    self.exit_code = Some(code);
+                    self.note(match code {
+                        Some(c) => format!("the process exited with code {c}"),
+                        None => "the process was killed by a signal".into(),
+                    });
+                }
+                Event::Exec => {
+                    for b in &mut self.bps {
+                        b.note = Some("the process replaced its program (exec); enable it to arm it at this address in the new program".into());
+                    }
+                    self.insns.clear();
+                    self.note("the process ran exec: every breakpoint is disabled (hits and records kept)".into());
+                }
+                Event::Forked { child } => self.note(format!("the process forked: child {child} runs undebugged (breakpoints removed from it)")),
+                Event::BreakpointDisabled { bp } => {
+                    let info = self.d.breakpoints().unwrap_or_default().into_iter().find(|i| i.id == bp);
+                    let why = match info {
+                        Some(i) if i.options.one_shot => "one-shot: it ran once".to_string(),
+                        Some(i) if i.options.max_hits.is_some_and(|m| i.hits >= m) => format!("stopped after {} hits", i.hits),
+                        _ => "code was written over it".to_string(),
+                    };
+                    self.note(format!("breakpoint {bp} disabled: {why}"));
+                    if let Ok(b) = self.bp_mut(bp) {
+                        b.note = Some(why);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Instruction at `at`, cached while its bytes stay the same.
+    fn insn(&mut self, sess: &Session, at: Addr) -> (Vec<u8>, String) {
         let p = &*sess.proc;
-        if let Some(c) = self.insns.get(&(ip, before)) {
-            let mut b = vec![0u8; c.1.len()];
-            if p.read_exact(c.0, &mut b).is_ok() && b == c.1 {
+        if let Some(c) = self.insns.get(&at) {
+            let mut b = vec![0u8; c.0.len()];
+            if p.read_exact(at, &mut b).is_ok() && b == c.0 {
                 return c.clone();
             }
         }
-        let at = if before { hh_asm::previous_instruction(p, ip).unwrap_or(ip) } else { ip };
         let syms = lock(&sess.syms).clone();
         let v = match hh_asm::disassemble(p, &syms, at, 1).ok().and_then(|l| l.into_iter().next()) {
-            Some(l) => (at, l.bytes, l.text),
-            None => (at, Vec::new(), "??".into()),
+            Some(l) => (l.bytes, l.text),
+            None => (Vec::new(), "??".into()),
         };
-        self.insns.insert((ip, before), v.clone());
+        self.insns.insert(at, v.clone());
         v
     }
 }
@@ -305,7 +454,7 @@ impl App {
                 let d = Debugger::attach(sess.info.pid).map_err(s)?;
                 sess.switch.set(d.process());
                 apply_signals(&d, &lock(&self.x.settings).signals);
-                *g = Some(Dbg { d, last: None, exit_code: None, bps: Vec::new(), next_id: 1, insns: HashMap::new() });
+                *g = Some(Dbg::new(d));
             }
         }
         self.debug_status()
@@ -317,33 +466,41 @@ impl App {
         let sess = self.session()?;
         let d = lock(&sess.dbg).take();
         sess.switch.set(sess.raw.clone());
+        self.x.lua.engine.debug_resumed();
         match d {
             Some(d) => d.d.detach().map_err(s),
             None => Ok(()),
         }
     }
 
-    /// Current state; drains debugger events (break reasons, exit).
+    /// Current state; drains debugger events (break reasons, exit, notices).
     pub fn debug_status(&self) -> R<DebugStatus> {
         let sess = self.session()?;
+        let onbp = self.x.lua.onbp.load(std::sync::atomic::Ordering::SeqCst);
         let mut g = lock(&sess.dbg);
         let Some(d) = g.as_mut() else {
             return Ok(DebugStatus { attached: false, state: "detached", tid: None, reason: None, rip: None, exit_code: None });
         };
-        for e in d.d.events() {
-            match e {
-                Event::Break { tid, reason, .. } => d.last = Some((tid, reason_text(&reason, &d.bps))),
-                Event::ProcessExited { code } => d.exit_code = Some(code),
-                _ => {}
-            }
-        }
+        d.pump(onbp);
         let st = if d.exit_code.is_some() { State::Exited } else { d.d.state().unwrap_or(State::Exited) };
         let mut out = DebugStatus { attached: true, state: "running", tid: None, reason: None, rip: None, exit_code: d.exit_code.flatten() };
         match st {
             State::Running => {}
+            // A Lua breakpoint function is about to run (or running): not a stop for the UI.
+            State::Broken { tid } if d.lua_break.as_ref().is_some_and(|l| l.0 == tid) => {}
             State::Suspended => out.state = "suspended",
             State::Exited => out.state = "exited",
             State::Broken { tid } => {
+                // The stop can be visible before its event arrives.
+                if d.last.is_none()
+                    && let Some(e) = d.d.next_event(std::time::Duration::from_millis(200))
+                {
+                    d.handle(e, onbp);
+                    d.pump(onbp);
+                }
+                if d.lua_break.as_ref().is_some_and(|l| l.0 == tid) {
+                    return Ok(out);
+                }
                 out.state = "broken";
                 out.tid = Some(tid);
                 out.reason = d.last.as_ref().filter(|l| l.0 == tid).map(|l| l.1.clone()).or(Some("break".into()));
@@ -353,8 +510,21 @@ impl App {
         Ok(out)
     }
 
+    /// Debugger notices (exec, fork, breakpoints the debugger disabled, exit) after `since`.
+    pub fn debug_log(&self, since: u64) -> R<DebugLog> {
+        let onbp = self.x.lua.onbp.load(std::sync::atomic::Ordering::SeqCst);
+        self.with_dbg(|d, _| {
+            d.pump(onbp);
+            Ok(DebugLog { lines: d.log.iter().filter(|l| l.seq > since).cloned().collect(), next: d.log_seq })
+        })
+    }
+
     /// Adds a breakpoint/watchpoint; returns its id.
     pub fn debug_add_breakpoint(&self, req: &BpReq) -> R<u32> {
+        self.add_bp(req, false)
+    }
+
+    fn add_bp(&self, req: &BpReq, script: bool) -> R<u32> {
         let address = parse_addr(&req.addr)?;
         let kind = match req.kind.as_str() {
             "" | "execute" => BpKind::Execute,
@@ -366,6 +536,7 @@ impl App {
             (BpKind::Execute, "" | "software") => BpMethod::Software,
             (_, "" | "hardware") => BpMethod::Hardware,
             (_, "software") => return Err("software breakpoints only break on execute; use hardware".into()),
+            (_, "page") => return Err("page watches take a range: use debug_watch_range".into()),
             (_, m) => return Err(format!("unknown breakpoint method {m:?}")),
         };
         let action = match req.action.as_str() {
@@ -379,62 +550,103 @@ impl App {
         while method == BpMethod::Hardware && !address.is_multiple_of(size as u64) {
             size /= 2;
         }
+        let cond = Some(req.condition.trim().to_string()).filter(|c| !c.is_empty());
         self.with_dbg(|d, sess| {
-            let id = d.next_id;
-            let cond = Some(req.condition.trim().to_string()).filter(|c| !c.is_empty());
-            let mut b = AppBp { id, bp: Breakpoint { address, kind, size, method, action }, ea: req.ea, cond, engine: None };
-            b.engine = Some(d.add_engine(&b, &*sess.proc)?);
-            d.next_id += 1;
+            let mut b = AppBp { id: 0, addr: address, ea: req.ea, cond, script, note: None };
+            let hooks = d.hooks(&b, &*sess.proc)?;
+            b.id = d.d.add_breakpoint_with(Breakpoint { address, kind, size, method, action }, hooks, opts_of(req)).map_err(s)?;
+            let id = b.id;
             d.bps.push(b);
             Ok(id)
         })
     }
 
+    /// "Find out what writes / accesses this range": a page-protection watch that records.
+    /// Refuses stack memory (every call and local variable would fault).
+    pub fn debug_watch_range(&self, req: &RangeReq) -> R<u32> {
+        let start = parse_addr(&req.addr)?;
+        if req.len == 0 {
+            return Err("the range is empty".into());
+        }
+        let kind = match req.kind.as_str() {
+            "" | "write" => BpKind::Write,
+            "access" => BpKind::Access,
+            k => return Err(format!("unknown watch kind {k:?}")),
+        };
+        let end = start.checked_add(req.len).ok_or("the range wraps around")?;
+        self.check_not_stack(start, end)?;
+        self.with_dbg(|d, _| {
+            let opts = BpOptions { max_hits: req.max_hits.filter(|&m| m > 0), ..BpOptions::default() };
+            let id = d.d.add_watch_range(start, req.len, kind, Action::Record, Hooks::default(), opts).map_err(s)?;
+            d.bps.push(AppBp { id, addr: start, ea: false, cond: None, script: false, note: None });
+            Ok(id)
+        })
+    }
+
+    /// Errors when `start..end` touches a stack: the `[stack]` region, or the region holding
+    /// a thread's stack pointer (thread stacks are anonymous mappings).
+    fn check_not_stack(&self, start: Addr, end: Addr) -> R<()> {
+        let sess = self.session()?;
+        let regions = sess.proc.regions().map_err(s)?;
+        let mut sps = thread_stack_pointers(sess.info.pid);
+        if let Some(d) = lock(&sess.dbg).as_ref() {
+            for t in d.d.threads().unwrap_or_default() {
+                if let Ok(c) = d.d.context(t.tid) {
+                    sps.push(c.rsp);
+                }
+            }
+        }
+        for r in regions.iter().filter(|r| r.start < end && start < r.start + r.size) {
+            let tagged = r.path.as_deref().is_some_and(|p| p.starts_with("[stack"));
+            if tagged || sps.iter().any(|&sp| sp >= r.start && sp < r.start + r.size) {
+                return Err(format!(
+                    "{start:#x}..{end:#x} is on a thread's stack ({:#x}..{:#x}): a page watch there would fault on every call and local variable. Watch it with a hardware watchpoint (8 bytes or less) instead",
+                    r.start,
+                    r.start + r.size
+                ));
+            }
+        }
+        Ok(())
+    }
+
     pub fn debug_remove_breakpoint(&self, id: u32) -> R<()> {
         self.with_dbg(|d, _| {
             let i = d.bps.iter().position(|b| b.id == id).ok_or_else(|| format!("no breakpoint {id}"))?;
-            if let Some(e) = d.bps[i].engine {
-                d.d.remove_breakpoint(e).map_err(s)?;
-            }
+            d.d.remove_breakpoint(id).map_err(s)?;
             d.bps.remove(i);
             Ok(())
         })
     }
 
+    /// In place: hits, records and trace are kept.
     pub fn debug_set_enabled(&self, id: u32, enabled: bool) -> R<()> {
-        self.with_dbg(|d, sess| {
-            let b = d.bp(id)?;
-            match (enabled, b.engine) {
-                (true, None) => {
-                    let e = d.add_engine(b, &*sess.proc)?;
-                    d.bps.iter_mut().filter(|b| b.id == id).for_each(|b| b.engine = Some(e));
-                }
-                (false, Some(e)) => {
-                    d.d.remove_breakpoint(e).map_err(s)?;
-                    d.bps.iter_mut().filter(|b| b.id == id).for_each(|b| b.engine = None);
-                }
-                _ => {}
+        self.with_dbg(|d, _| {
+            d.bp(id)?;
+            d.d.set_enabled(id, enabled).map_err(s)?;
+            if enabled {
+                d.bp_mut(id)?.note = None;
             }
             Ok(())
         })
     }
 
-    /// Sets (empty = clears) a breakpoint's condition. The engine has no way to change a
-    /// hook in place, so an enabled breakpoint is re-added (its hit count restarts).
+    /// Sets (empty = clears) a breakpoint's condition, in place.
     pub fn debug_set_condition(&self, id: u32, condition: &str) -> R<()> {
         let cond = Some(condition.trim().to_string()).filter(|c| !c.is_empty());
-        if let Some(c) = &cond {
-            Cond::parse(c)?;
-        }
-        self.with_dbg(|d, sess| {
-            let i = d.bps.iter().position(|b| b.id == id).ok_or_else(|| format!("no breakpoint {id}"))?;
-            d.bps[i].cond = cond;
-            if let Some(e) = d.bps[i].engine.take() {
-                d.d.remove_breakpoint(e).map_err(s)?;
-                let n = d.add_engine(&d.bps[i], &*sess.proc)?;
-                d.bps[i].engine = Some(n);
-            }
+        let hook = condition_hook(&cond)?;
+        self.with_dbg(|d, _| {
+            d.bp(id)?;
+            d.d.set_condition(id, hook).map_err(s)?;
+            d.bp_mut(id)?.cond = cond;
             Ok(())
+        })
+    }
+
+    /// Replaces the hit options (`skip_hits`, `one_shot`, `max_hits`); hits so far count.
+    pub fn debug_set_options(&self, id: u32, opts: BpOptions) -> R<()> {
+        self.with_dbg(|d, _| {
+            d.bp(id)?;
+            d.d.set_options(id, BpOptions { max_hits: opts.max_hits.filter(|&m| m > 0), ..opts }).map_err(s)
         })
     }
 
@@ -448,29 +660,40 @@ impl App {
     }
 
     pub fn debug_breakpoints(&self) -> R<Vec<BpOut>> {
+        let onbp = self.x.lua.onbp.load(std::sync::atomic::Ordering::SeqCst);
         self.with_dbg(|d, _| {
+            d.pump(onbp);
             let live = d.d.breakpoints().map_err(s)?;
             Ok(d.bps
                 .iter()
-                .map(|b| {
-                    let info = live.iter().find(|i| Some(i.id) == b.engine);
-                    BpOut {
+                .filter_map(|b| {
+                    let i = live.iter().find(|i| i.id == b.id)?;
+                    Some(BpOut {
                         id: b.id,
-                        addr: hex_addr(b.bp.address),
-                        kind: kind_str(b.bp.kind),
-                        size: b.bp.size,
-                        method: if b.bp.method == BpMethod::Software { "software" } else { "hardware" },
-                        action: match b.bp.action {
+                        addr: hex_addr(i.bp.address),
+                        kind: kind_str(i.bp.kind),
+                        size: i.bp.size,
+                        len: i.len.max(i.bp.size as u64),
+                        method: match i.bp.method {
+                            BpMethod::Software => "software",
+                            BpMethod::Hardware => "hardware",
+                            BpMethod::Page => "page",
+                        },
+                        action: match i.bp.action {
                             Action::Break => "break",
                             Action::Record => "record",
                             Action::Trace { .. } => "trace",
                         },
                         ea: b.ea,
-                        enabled: b.engine.is_some(),
-                        hits: info.map_or(0, |i| i.hits),
-                        slot: info.and_then(|i| i.slot),
+                        enabled: i.enabled,
+                        hits: i.hits,
+                        slot: i.slot,
                         condition: b.cond.clone(),
-                    }
+                        options: i.options.clone(),
+                        records_dropped: i.records_dropped,
+                        owner: if b.script { "script" } else { "user" },
+                        note: if i.enabled { None } else { b.note.clone() },
+                    })
                 })
                 .collect())
         })
@@ -479,14 +702,13 @@ impl App {
     /// Hit records of a `record` breakpoint, one row per (instruction, accessed address).
     pub fn debug_records(&self, id: u32) -> R<Vec<RecordOut>> {
         self.with_dbg(|d, sess| {
-            let b = d.bp(id)?;
-            let Some(e) = b.engine else { return Ok(Vec::new()) };
-            let before = b.bp.kind != BpKind::Execute;
-            let recs = d.d.records(e).map_err(s)?;
+            d.bp(id)?;
+            let recs = d.d.records(id).map_err(s)?;
             Ok(recs
                 .into_iter()
                 .map(|r| {
-                    let (at, bytes, text) = d.insn(sess, r.ip, before);
+                    let at = r.insn.unwrap_or(r.ip);
+                    let (bytes, text) = d.insn(sess, at);
                     RecordOut {
                         addr: hex_addr(at),
                         ip: hex_addr(r.ip),
@@ -502,22 +724,22 @@ impl App {
     }
 
     pub fn debug_clear_records(&self, id: u32) -> R<()> {
-        self.with_dbg(|d, _| match d.bp(id)?.engine {
-            Some(e) => d.d.clear_records(e).map_err(s),
-            None => Ok(()),
+        self.with_dbg(|d, _| {
+            d.bp(id)?;
+            d.d.clear_records(id).map_err(s)
         })
     }
 
     /// Steps of the last trace of a `trace` breakpoint.
     pub fn debug_trace(&self, id: u32) -> R<Vec<TraceOut>> {
         self.with_dbg(|d, sess| {
-            let Some(e) = d.bp(id)?.engine else { return Ok(Vec::new()) };
-            let log = d.d.trace(e).map_err(s)?;
+            d.bp(id)?;
+            let log = d.d.trace(id).map_err(s)?;
             Ok(log
                 .iter()
                 .take(MAX_TRACE)
                 .map(|c| {
-                    let (_, _, text) = d.insn(sess, c.rip, false);
+                    let (_, text) = d.insn(sess, c.rip);
                     TraceOut { addr: hex_addr(c.rip), text, context: ctx_json(c, false) }
                 })
                 .collect())
@@ -565,8 +787,22 @@ impl App {
         })
     }
 
+    /// The thread's call chain (frame-pointer walk) with module and symbol names.
+    pub fn debug_backtrace(&self, tid: Tid, max: usize) -> R<Vec<FrameOut>> {
+        self.with_dbg(|d, _| {
+            let f = d.d.backtrace_frames(tid, max.clamp(1, 256)).map_err(s)?;
+            Ok(f.into_iter().map(|f| FrameOut { addr: hex_addr(f.addr), module: f.module, symbol: f.symbol }).collect())
+        })
+    }
+
     pub fn debug_continue(&self, pass_signal: bool) -> R<()> {
-        self.with_dbg(|d, _| d.d.cont(pass_signal).map_err(s))
+        self.with_dbg(|d, _| {
+            d.d.cont(pass_signal).map_err(s)?;
+            d.resumed();
+            Ok(())
+        })?;
+        self.x.lua.engine.debug_resumed();
+        Ok(())
     }
 
     pub fn debug_pause(&self) -> R<()> {
@@ -582,13 +818,28 @@ impl App {
                 "out" => d.d.step_out(tid),
                 k => return Err(format!("unknown step kind {k:?}")),
             }
-            .map_err(s)
-        })
+            .map_err(s)?;
+            d.resumed();
+            Ok(())
+        })?;
+        self.x.lua.engine.debug_resumed();
+        Ok(())
     }
 
-    pub fn debug_run_to(&self, addr: &str) -> R<()> {
+    /// Continues until a thread reaches `addr`: any thread, or only `tid` (others pass it).
+    pub fn debug_run_to(&self, addr: &str, tid: Option<Tid>) -> R<()> {
         let a = parse_addr(addr)?;
-        self.with_dbg(|d, _| d.d.run_to(a).map_err(s))
+        self.with_dbg(|d, _| {
+            match tid {
+                Some(t) => d.d.run_to_thread(t, a),
+                None => d.d.run_to(a),
+            }
+            .map_err(s)?;
+            d.resumed();
+            Ok(())
+        })?;
+        self.x.lua.engine.debug_resumed();
+        Ok(())
     }
 
     /// Replaces the instruction at `addr` with NOPs; returns its original bytes (hex) for
@@ -598,24 +849,152 @@ impl App {
         let p = hh_asm::nop_instruction(&*sess.proc, parse_addr(addr)?).map_err(s)?;
         Ok(hex_bytes(&p.original, "").to_lowercase())
     }
+
+    // ------------------------------------------------------------ Lua (hh-lua DebugHost)
+
+    /// Breakpoint for `debug_setBreakpoint`; attaches first like CE. Returns its id.
+    pub(crate) fn lua_set_breakpoint(&self, spec: &hh_lua::BreakpointSpec) -> R<u32> {
+        self.debug_attach()?;
+        let addr = hex_addr(spec.address);
+        // The same address set again replaces the old one.
+        let _ = self.lua_remove_breakpoint(spec.address);
+        use hh_lua::{BpMethod as M, BpTrigger as T};
+        if spec.trigger != T::Execute && spec.method == M::Exception {
+            let kind = if spec.trigger == T::Write { "write" } else { "access" };
+            let start = spec.address;
+            self.check_not_stack(start, start + spec.size.max(1) as u64)?;
+            return self.with_dbg(|d, _| {
+                let k = if kind == "write" { BpKind::Write } else { BpKind::Access };
+                let id = d.d.add_watch_range(start, spec.size.max(1) as u64, k, Action::Break, Hooks::default(), BpOptions::default()).map_err(s)?;
+                d.bps.push(AppBp { id, addr: start, ea: false, cond: None, script: true, note: None });
+                Ok(id)
+            });
+        }
+        let (kind, method) = match (spec.trigger, spec.method) {
+            (T::Execute, M::DebugRegister) => ("execute", "hardware"),
+            (T::Execute, _) => ("execute", "software"),
+            (T::Write, _) => ("write", "hardware"),
+            (T::Access, _) => ("access", "hardware"),
+        };
+        let req = BpReq { addr, kind: kind.into(), size: spec.size.clamp(1, 8) as u8, method: method.into(), action: "break".into(), ..BpReq::default() };
+        self.add_bp(&req, true)
+    }
+
+    /// Removes the script-owned breakpoint at `addr`.
+    pub(crate) fn lua_remove_breakpoint(&self, addr: Addr) -> R<()> {
+        let id = self.with_dbg(|d, _| d.bps.iter().find(|b| b.script && b.addr == addr).map(|b| b.id).ok_or_else(|| format!("no breakpoint at {addr:#x}")))?;
+        self.debug_remove_breakpoint(id)
+    }
+
+    pub(crate) fn lua_continue(&self, tid: Tid, mode: hh_lua::ContinueMode, ctx: Option<&hh_lua::RegContext>) -> R<()> {
+        self.with_dbg(|d, _| {
+            if let Some(r) = ctx {
+                let mut c = d.d.context(tid).map_err(s)?;
+                merge_ctx(&mut c, r);
+                d.d.set_context(tid, c).map_err(s)?;
+            }
+            match mode {
+                hh_lua::ContinueMode::StepInto => d.d.step_into(tid),
+                hh_lua::ContinueMode::StepOver => d.d.step_over(tid),
+                _ => d.d.cont(false),
+            }
+            .map_err(s)?;
+            d.resumed();
+            Ok(())
+        })
+    }
+
+    pub(crate) fn lua_debugging(&self) -> bool {
+        self.session().is_ok_and(|s| lock(&s.dbg).is_some())
+    }
+
+    /// Runs the Lua function of a breakpoint hit (driver thread): sets the register globals,
+    /// applies the registers the function changed and resumes when it returned true.
+    pub(crate) fn dispatch_lua_break(&self) {
+        let Ok(sess) = self.session() else { return };
+        let onbp = self.x.lua.onbp.load(std::sync::atomic::Ordering::SeqCst);
+        let ev = {
+            let mut g = lock(&sess.dbg);
+            let Some(d) = g.as_mut() else { return };
+            d.pump(onbp);
+            d.lua_break.as_ref().and_then(|(tid, id, c)| Some((*tid, d.bp(*id).ok()?.addr, reg_ctx(c))))
+        };
+        let Some((tid, addr, context)) = ev else { return };
+        let r = {
+            let _g = self.x.lua.enter();
+            let r = self.x.lua.engine.on_breakpoint(&hh_lua::BreakEvent { thread_id: tid, address: addr, context });
+            self.x.lua.refresh_onbp();
+            r
+        };
+        let mut g = lock(&sess.dbg);
+        let Some(d) = g.as_mut() else { return };
+        // The function may have continued the thread itself (debug_continueFromBreakpoint).
+        let still = d.lua_break.take().is_some() && matches!(d.d.state(), Ok(State::Broken { tid: t }) if t == tid);
+        match r {
+            Ok(res) if still => {
+                if let Some(rc) = res.context
+                    && let Ok(mut c) = d.d.context(tid)
+                {
+                    merge_ctx(&mut c, &rc);
+                    if let Err(e) = d.d.set_context(tid, c) {
+                        self.x.lua.console.push("err", &format!("breakpoint at {addr:#x}: setting registers: {e}"));
+                    }
+                }
+                if res.resume {
+                    match d.d.cont(false) {
+                        Ok(()) => d.resumed(),
+                        Err(e) => self.x.lua.console.push("err", &format!("breakpoint at {addr:#x}: {e}")),
+                    }
+                }
+            }
+            Ok(_) => {}
+            Err(e) => self.x.lua.console.push("err", &format!("breakpoint at {addr:#x}: {e}")),
+        }
+    }
 }
 
-/// Linux signals the UI offers, with hh-debug's default action.
-pub const SIGNALS: [(u32, &str, &str); 14] = [
-    (2, "SIGINT", "pass"), (4, "SIGILL", "break"), (6, "SIGABRT", "pass"), (7, "SIGBUS", "break"), (8, "SIGFPE", "break"),
-    (10, "SIGUSR1", "pass"), (11, "SIGSEGV", "break"), (12, "SIGUSR2", "pass"), (13, "SIGPIPE", "pass"), (14, "SIGALRM", "pass"),
-    (15, "SIGTERM", "pass"), (17, "SIGCHLD", "pass"), (28, "SIGWINCH", "pass"), (29, "SIGIO", "pass"),
-];
+/// Stack pointers of threads blocked in a system call (`/proc/<pid>/task/*/syscall`).
+fn thread_stack_pointers(pid: u32) -> Vec<Addr> {
+    let Ok(dir) = std::fs::read_dir(format!("/proc/{pid}/task")) else { return Vec::new() };
+    dir.filter_map(|t| {
+        let txt = std::fs::read_to_string(t.ok()?.path().join("syscall")).ok()?;
+        // `nr arg1..arg6 sp pc`, or `running` / `-1 sp pc`.
+        let f: Vec<&str> = txt.split_whitespace().collect();
+        (f.len() >= 3).then(|| parse_addr(f[f.len() - 2]).ok()).flatten()
+    })
+    .collect()
+}
 
-/// Settings `signals` (signal number -> pass/ignore/break) over the defaults of [`SIGNALS`].
-// shortcut: Linux signal numbers only; Windows exception codes keep hh-debug's defaults.
-fn apply_signals(d: &Debugger, set: &std::collections::BTreeMap<String, String>) {
-    if cfg!(not(target_os = "linux")) {
-        return;
+impl App {
+    /// Signals the debugger knows: (code, name, default action, action the attached
+    /// debugger uses now or `None` when detached).
+    pub fn debug_signals(&self) -> R<Vec<SignalRow>> {
+        let live = self.with_dbg(|d, _| d.d.signal_actions().map_err(s)).unwrap_or_default();
+        Ok(hh_debug::signal_table()
+            .into_iter()
+            .map(|i| (i.code, i.name, action_str(i.default), live.iter().find(|l| l.0 == i.code).map(|l| action_str(l.1))))
+            .collect())
     }
-    for (code, _, dflt) in SIGNALS {
-        let a = set.get(&code.to_string()).map_or(dflt, String::as_str);
-        let a = match a {
+}
+
+/// (code, name, default action, current action when attached).
+pub type SignalRow = (u32, &'static str, &'static str, Option<&'static str>);
+
+fn action_str(a: SignalAction) -> &'static str {
+    match a {
+        SignalAction::Pass => "pass",
+        SignalAction::Ignore => "ignore",
+        SignalAction::Break => "break",
+    }
+}
+
+/// Settings `signals` (code -> pass/ignore/break) over the debugger's defaults: everything
+/// is reset to the defaults first, so a removed override takes effect.
+fn apply_signals(d: &Debugger, set: &std::collections::BTreeMap<String, String>) {
+    let _ = d.reset_signal_actions();
+    for (code, a) in set {
+        let Ok(code) = code.parse::<u32>() else { continue };
+        let a = match a.as_str() {
             "ignore" => SignalAction::Ignore,
             "break" => SignalAction::Break,
             _ => SignalAction::Pass,

@@ -102,7 +102,16 @@ export const api = {
   debugPause: () => call('debug_pause', {}),
   /** kind: into|over|out */
   debugStep: (tid, kind) => call('debug_step', { tid, kind }),
-  debugRunTo: (addr) => call('debug_run_to', { addr }),
+  /** tid: only that thread stops at addr (others pass it); null = any thread */
+  debugRunTo: (addr, tid = null) => call('debug_run_to', { addr, tid }),
+  /** options: {skip_hits, one_shot, max_hits} — changed in place, hits so far count */
+  debugSetOptions: (id, options) => call('debug_set_options', { id, options }),
+  /** req: {addr, len, kind: write|access, max_hits?} -> id (page-protection watch that records; refuses stack memory) */
+  debugWatchRange: (req) => call('debug_watch_range', { req }),
+  /** -> [{addr, module, symbol}] */
+  debugBacktrace: (tid, max = 64) => call('debug_backtrace', { tid, max }),
+  /** -> {lines: [{seq, text}], next}: exec, fork, breakpoints the debugger disabled, exit */
+  debugLog: (since) => call('debug_log', { since }),
   /** -> original bytes (hex) for write_bytes to restore */
   nopInstruction: (addr) => call('nop_instruction', { addr }),
 
@@ -116,7 +125,7 @@ export const api = {
   codeAdd: (addr, description) => call('code_add', { addr, description }),
   codeRemove: (index) => call('code_remove', { index }), codeNop: (index) => call('code_nop', { index }), codeRestore: (index, force = false) => call('code_restore', { index, force }),
   debugSetCondition: (id, condition) => call('debug_set_condition', { id, condition }),
-  /** -> [[number, name, defaultAction]] */
+  /** -> [[number, name, defaultAction, currentAction|null]] (current: from the attached debugger) */
   debugSignals: () => call('debug_signals', {}),
   /** key: base|offset|value -> {count, max_level, target} */
   ptrSort: (key, column, desc, vtype, fmt) => call('ptr_sort', { key, column, desc, vtype, fmt }),
@@ -180,6 +189,22 @@ export const api = {
   /** -> {pid, addr, speed, generation} or null when the process has no speedhack */
   speedGet: () => call('speed_get', {}),
   speedSet: (speed) => call('speed_set', { speed }),
+
+  // ---------- Lua forms, key state, selection, trainer ----------
+  /** -> {next, changes: [{seq, op, ...}], snapshot: {roots} | null} (snapshot when since is 0 or too far behind) */
+  uiPoll: (since) => call('ui_poll', { since }),
+  /** User event on a form control (OnClick, OnClose, OnDblClick, …) -> handler results */
+  uiEvent: (id, event, args = []) => call('ui_event', { id, event, args }),
+  /** The user changed a value (Text, Checked, ItemIndex, Position, …); not echoed back */
+  uiInput: (id, prop, value) => call('ui_input', { id, prop, value }),
+  /** Image file of a TImage -> data: URL */
+  uiImage: (path) => call('ui_image', { path }),
+  /** Keys held in the app window (CE virtual-key codes), for Lua isKeyPressed */
+  keyState: (keys) => call('key_state', { keys }),
+  /** The table selection, for Lua's SelectedRecords */
+  tableSelect: (ids) => call('table_select', { ids }),
+  /** req: {title, about, beep, show_keys, entries: [{id, label, keys}]} -> Lua trainer script */
+  trainerScript: (req) => call('trainer_script', { req }),
 };
 
 /** Ask for a file path: native dialog in the app, a text prompt in a browser (mock or bridge). */

@@ -688,6 +688,17 @@ function dbgTick() {
   const obj = P.obj;
   for (const b of D.bps) {
     if (!b.enabled) continue;
+    const o = b.options || {};
+    // Options like hh-debug: skip the first hits, switch off after one action or at max hits.
+    const done = (why) => { b.enabled = false; b.note = why; D.log.push({ seq: D.log.length + 1, text: `breakpoint ${b.id} disabled: ${why}` }); };
+    if (o.max_hits && b.hits >= o.max_hits) { done(`stopped after ${b.hits} hits`); continue; }
+    if (b.action === 'break' && o.skip_hits && b.cn < o.skip_hits && Date.now() - b.armed > 3000) { b.cn++; b.hits++; b.armed = Date.now(); continue; }
+    if (b.action === 'break' && o.one_shot && b.hits > (o.skip_hits || 0)) { done('one-shot: it ran once'); continue; }
+    if (b.range) {
+      const r = b.recs.get('w1') || { addr: CODE.w1[0], ip: CODE.w1[0] + 3, text: CODE.w1[2], bytes: CODE.w1[1], count: 0, address: b.addr + 0x10 };
+      r.count++; b.hits++; r.context = fakeCtx(CODE.w1[0], b.addr - 0x48); b.recs.set('w1', r);
+      continue;
+    }
     if (b.action === 'record') {
       const rec = (key, code, address) => {
         const [a, bytes, text] = CODE[code];
@@ -723,7 +734,7 @@ function brk(rip, reason) {
 }
 const BPK = { execute: 1, write: 1, access: 1 };
 const DBG = {
-  debug_attach() { need(); D ??= { state: 'running', tid: null, rip: null, reason: null, bps: [], next: 1, ctx: null, susp: new Set() }; return DBG.debug_status(); },
+  debug_attach() { need(); D ??= { state: 'running', tid: null, rip: null, reason: null, bps: [], next: 1, ctx: null, susp: new Set(), log: [] }; return DBG.debug_status(); },
   debug_detach() { need(); D = null; return null; },
   debug_status() {
     if (!P || !D) return { attached: false, state: 'detached', tid: null, reason: null, rip: null, exit_code: null };
@@ -738,13 +749,33 @@ const DBG = {
     let size = kind === 'execute' ? 1 : req.size || 4;
     const addr = parseAddr(req.addr);
     while (addr % size) size /= 2;
-    const b = { id: d.next++, addr, kind, size, method, action: req.action || 'break', ea: !!req.ea, enabled: true, hits: 0, recs: new Map(), trace: [], steps: req.steps || 1000, step_over_calls: !!req.step_over_calls, armed: Date.now(), cn: 0, condition: checkCond(req.condition) };
+    const b = { id: d.next++, addr, kind, size, len: size, method, action: req.action || 'break', ea: !!req.ea, enabled: true, hits: 0, recs: new Map(), trace: [], steps: req.steps || 1000, step_over_calls: !!req.step_over_calls, armed: Date.now(), cn: 0, condition: checkCond(req.condition),
+      options: { skip_hits: req.skip_hits || 0, one_shot: !!req.one_shot, max_hits: req.max_hits || null }, owner: 'user', note: null, dropped: 0 };
     d.bps.push(b);
     return b.id;
   },
   debug_remove_breakpoint({ id }) { const d = dneed(), i = d.bps.findIndex((b) => b.id === id); if (i < 0) err(`no breakpoint ${id}`); d.bps.splice(i, 1); return null; },
-  debug_set_enabled({ id, enabled }) { const b = dneed().bps.find((x) => x.id === id) || err(`no breakpoint ${id}`); b.enabled = enabled; if (!enabled) b.recs.clear(); b.armed = Date.now(); return null; },
-  debug_breakpoints: () => dneed().bps.map((b, i) => ({ id: b.id, addr: hx(b.addr), kind: b.kind, size: b.size, method: b.method, action: b.action, ea: b.ea, enabled: b.enabled, hits: b.hits, condition: b.condition || null, slot: b.method === 'hardware' && b.enabled ? i % 4 : null })),
+  // In place, like hh-debug: hits and records stay.
+  debug_set_enabled({ id, enabled }) { const b = dneed().bps.find((x) => x.id === id) || err(`no breakpoint ${id}`); b.enabled = enabled; if (enabled) b.note = null; b.armed = Date.now(); return null; },
+  debug_set_options({ id, options }) { const b = dneed().bps.find((x) => x.id === id) || err(`no breakpoint ${id}`); b.options = { skip_hits: options.skip_hits || 0, one_shot: !!options.one_shot, max_hits: options.max_hits || null }; return null; },
+  debug_watch_range({ req }) {
+    const d = dneed(), addr = parseAddr(req.addr), len = Number(req.len);
+    if (!(len >= 1)) err('the range is empty');
+    if (regionOf(addr)?.path === '[stack]') err(`${hx(addr)}..${hx(addr + len)} is on a thread's stack: a page watch there would fault on every call and local variable. Watch it with a hardware watchpoint (8 bytes or less) instead`);
+    const b = { id: d.next++, addr, kind: req.kind || 'write', size: Math.min(255, len), len, method: 'page', action: 'record', ea: false, enabled: true, hits: 0, recs: new Map(), trace: [], armed: Date.now(), cn: 0, condition: null,
+      options: { skip_hits: 0, one_shot: false, max_hits: req.max_hits || null }, owner: 'user', note: null, dropped: 0, range: true };
+    d.bps.push(b);
+    return b.id;
+  },
+  debug_backtrace({ tid, max = 64 }) {
+    const d = dneed();
+    if (d.state !== 'broken') err(`thread ${tid} is running`);
+    const exe = P.mods[0];
+    return [d.rip, CODE.w2[0] + 2, CODE.r1[0] + 7, exe.base + 0x1450].slice(0, max).map((a) => ({ addr: hx(a), module: modOf(a)?.name ?? null, symbol: symbolize(a) || null }));
+  },
+  debug_log({ since }) { const d = dneed(); return { lines: d.log.filter((l) => l.seq > since), next: d.log.length }; },
+  debug_breakpoints: () => dneed().bps.map((b, i) => ({ id: b.id, addr: hx(b.addr), kind: b.kind, size: b.size, len: b.len ?? b.size, method: b.method, action: b.action, ea: b.ea, enabled: b.enabled, hits: b.hits,
+    condition: b.condition || null, slot: b.method === 'hardware' && b.enabled ? i % 4 : null, options: b.options, records_dropped: b.dropped || 0, owner: b.owner || 'user', note: b.enabled ? null : b.note })),
   debug_records({ id }) {
     const b = dneed().bps.find((x) => x.id === id) || err(`no breakpoint ${id}`);
     return [...b.recs.values()].map((r) => ({ addr: hx(r.addr), ip: hx(r.ip), bytes: r.bytes.map((x) => x.toString(16).toUpperCase().padStart(2, '0')).join(' '), text: r.text, count: r.count, address: r.address != null ? hx(r.address) : null, context: r.context }));
@@ -783,7 +814,7 @@ const DBG = {
     brk(to, 'step');
     return null;
   },
-  debug_run_to({ addr }) { const d = dneed(); if (d.state !== 'broken') err('the process is not stopped'); brk(parseAddr(addr), 'step'); return null; },
+  debug_run_to({ addr, tid }) { const d = dneed(); void tid; if (d.state !== 'broken') err('the process is not stopped'); brk(parseAddr(addr), 'step'); return null; },
   nop_instruction({ addr }) {
     need();
     const a = parseAddr(addr), ins = decode(a) || err(`no valid instruction at ${addr}`), v = view(a, ins.len);
@@ -924,6 +955,69 @@ function liveSetValue(e, value) {
   if (e.frozen) fvals.set(e.id, value);
 }
 
+// ---------- Lua forms (mock): a small retained tree like hh-lua's, with JS handlers ----------
+const UI = { nodes: new Map(), changes: [], seq: 0, next: 1, handlers: new Map() };
+function uiChange(c) { UI.changes.push({ seq: ++UI.seq, ...c }); if (UI.changes.length > 5000) UI.changes.shift(); }
+function uiCreate(cls, parent, props, handlers = {}) {
+  const id = UI.next++;
+  const c = { id, class: cls, parent: parent ?? null, props: { Visible: true, Enabled: true, Left: 0, Top: 0, ...props }, events: Object.keys(handlers) };
+  UI.nodes.set(id, c);
+  UI.handlers.set(id, handlers);
+  uiChange({ op: 'create', control: JSON.parse(JSON.stringify(c)) });
+  return id;
+}
+function uiSet(id, prop, value, echo = true) {
+  const c = UI.nodes.get(id);
+  if (!c || c.props[prop] === value) return false;
+  c.props[prop] = value;
+  if (echo) uiChange({ op: 'update', id, prop, value });
+  return true;
+}
+function uiDestroy(id) {
+  if (!UI.nodes.has(id)) return;
+  for (const c of [...UI.nodes.values()]) if (c.parent === id) uiDestroy(c.id);
+  UI.nodes.delete(id); UI.handlers.delete(id);
+  uiChange({ op: 'destroy', id });
+}
+function uiSnapshot() {
+  const node = (c) => ({ ...c, children: [...UI.nodes.values()].filter((x) => x.parent === c.id).map(node) });
+  return { roots: [...UI.nodes.values()].filter((c) => c.parent == null).map(node) };
+}
+/** createForm() in the mock console: one form with every control kind HeapHook draws. */
+function demoForm(caption) {
+  const f = uiCreate('TCEForm', null, { Caption: caption || 'Demo form', Width: 360, Height: 300, Position: 4 }, { OnClose: () => { uiSet(f, 'Visible', false); } });
+  const mm = uiCreate('TMainMenu', f, {}), root = uiCreate('TMenuItem', mm, {});
+  const file = uiCreate('TMenuItem', root, { Caption: '&File' });
+  uiCreate('TMenuItem', file, { Caption: 'Say hello' }, { OnClick: () => luaLog('out', 'hello from the menu') });
+  uiCreate('TMenuItem', file, { Caption: '-' });
+  uiCreate('TMenuItem', file, { Caption: 'Close' }, { OnClick: () => uiSet(f, 'Visible', false) });
+  uiSet(f, 'Menu', mm);
+  uiCreate('TLabel', f, { Caption: 'Name', Left: 12, Top: 14 });
+  const ed = uiCreate('TEdit', f, { Left: 70, Top: 10, Width: 160, Height: 24, Text: 'Player' }, { OnChange: () => luaLog('out', 'name: ' + UI.nodes.get(ed).props.Text) });
+  const pb = uiCreate('TProgressBar', f, { Left: 12, Top: 46, Width: 218, Height: 8, Position: 40 });
+  uiCreate('TButton', f, { Caption: 'Step', Left: 240, Top: 10, Width: 100, Height: 26 }, { OnClick: () => uiSet(pb, 'Position', (UI.nodes.get(pb).props.Position + 10) % 110) });
+  uiCreate('TCheckBox', f, { Caption: 'God mode', Left: 12, Top: 64, Width: 150, Height: 20, Checked: false }, { OnClick: () => luaLog('out', 'god mode toggled') });
+  uiCreate('TRadioGroup', f, { Caption: 'Difficulty', Left: 12, Top: 92, Width: 160, Height: 96, Items: ['Easy', 'Normal', 'Hard'], ItemIndex: 1 }, { OnClick: () => luaLog('out', 'difficulty changed') });
+  uiCreate('TListBox', f, { Left: 184, Top: 64, Width: 156, Height: 84, Items: ['Sword', 'Shield', 'Potion', 'Bow'], ItemIndex: 0 });
+  uiCreate('TComboBox', f, { Left: 184, Top: 156, Width: 156, Height: 26, Items: ['Slot 1', 'Slot 2', 'Slot 3'], ItemIndex: 0 });
+  uiCreate('TTrackBar', f, { Left: 12, Top: 200, Width: 160, Height: 24, Min: 0, Max: 10, Position: 3 });
+  const gb = uiCreate('TGroupBox', f, { Caption: 'Notes', Left: 184, Top: 192, Width: 156, Height: 96 });
+  uiCreate('TMemo', gb, { Align: 5, Lines: ['Mock form', 'Edits go back to Lua'] });
+  return f;
+}
+/** The mock runs a generated trainer block by reading its item list. */
+function mockTrainer(src) {
+  const items = [...src.matchAll(/\{ id = (\d+), label = "((?:[^"\\]|\\.)*)", keys = \{ ([\d, ]*) \}/g)].map((m) => ({ id: +m[1], label: m[2], keys: m[3].split(',').map(Number).filter(Boolean) }));
+  const title = (src.match(/local title, about, beepOn, showKeys = "((?:[^"\\]|\\.)*)"/) || [])[1] || 'Trainer';
+  for (const c of [...UI.nodes.values()]) if (c.parent == null && c.props.trainer) uiDestroy(c.id);
+  const f = uiCreate('TCEForm', null, { Caption: title, Width: 320, Height: items.length * 26 + 22, trainer: true }, { OnClose: () => uiSet(f, 'Visible', false) });
+  items.forEach((it, i) => {
+    const e = liveFind(it.id);
+    const cb = uiCreate('TCheckBox', f, { Caption: it.label + (it.keys.length ? '   ' + it.keys.join('+') : ''), Left: 12, Top: 12 + i * 26, Width: 296, Height: 22, Checked: !!e?.frozen },
+      { OnClick: () => { const x = liveFind(it.id); if (x) { try { liveActivate(x, UI.nodes.get(cb).props.Checked); bump(); } catch (er) { luaLog('err', er); } } } });
+  });
+}
+
 const LOG = [];
 let logSeq = 0, luaBusy = false, luaStop = false, sound = 0, dlg = null, dlgSeq = 0;
 const luaHotkeys = new Map(); // createHotkey id -> keys
@@ -980,6 +1074,8 @@ async function mockLua(src, name) {
       const keys = m[1].split(',').map((k) => k.trim()).map((k) => vk[k] ?? (/^VK_F(\d+)$/.test(k) ? 111 + +k.slice(4) : /^VK_[A-Z0-9]$/.test(k) ? k.charCodeAt(3) : 0));
       luaHotkeys.set(luaHotkeys.size + 1, keys);
     } else if ((m = /^return (.+)$/.exec(l))) { result = val(m[1]); break; }
+    else if ((m = /(?:^|=\s*)createForm\((.*)\)/.exec(l))) demoForm(strArg(m[1] || ''));
+    else if (l === '-- BEGIN HEAPHOOK TRAINER') { mockTrainer(lines.slice(i).join('\n')); i = lines.findIndex((x, k) => k > i && x.trim() === '-- END HEAPHOOK TRAINER'); if (i < 0) break; }
     else if (/^speedhack_setSpeed\(/.test(l)) val(l);
     else luaLog('info', `mock backend: '${l}' is not simulated (the real backend runs full Lua)`);
   }
@@ -996,7 +1092,7 @@ const hkBindings = () => {
   return out;
 };
 const SETTINGS = { freeze_interval_ms: 100, live_update_ms: 300, fast_scan: true, scan_alignment: 4, scan_writable: 'yes', scan_executable: 'any',
-  scan_copy_on_write: 'no', scan_threads: 0, lua_budget_ms: 30000, table_script: 'ask', bp_method: 'software', hotkey_sound: false, theme: 'system', signals: {} };
+  scan_copy_on_write: 'no', scan_threads: 0, lua_budget_ms: 30000, lua_memory_mb: 1024, table_script: 'ask', bp_method: 'software', hotkey_sound: false, theme: 'system', signals: {} };
 function loadSettings() { try { return { ...SETTINGS, ...JSON.parse(localStorage.getItem('hh.mocksettings')) }; } catch { return { ...SETTINGS }; } }
 
 /** Seeded once so the table features can be tried without the real backend. */
@@ -1039,6 +1135,7 @@ const LIVE = {
   // The mock's scripts cannot fail to disable and run no Lua, so `force` and trust change nothing.
   table_trust() { return null; },
   table_open({ path }) {
+    for (const c of [...UI.nodes.values()]) if (c.parent == null) uiDestroy(c.id); // forms go with the table
     fs ??= loadFs();
     if (path === 'demo.json' && !fs[path]) fs[path] = DEMO;
     const t = fs[path] ?? err(/\.ct$/i.test(path) ? `file not found: ${path} (.CT parsing needs the real backend)` : `file not found: ${path}`);
@@ -1105,7 +1202,34 @@ const LIVE = {
     const keys = [...new Set(hkBindings().map((b) => b[0].join(',')))].map((s) => s.split(',').map(Number));
     const { resolve, ...d } = dlg || {};
     return { log: LOG.filter((l) => l.seq > since), next: logSeq, dialog: dlg ? d : null, table_version: T.version, hotkeys: keys, busy: luaBusy, sound,
-      process: P ? { pid: P.pid, name: P.name, is_64bit: true, alive: true } : null };
+      process: P ? { pid: P.pid, name: P.name, is_64bit: true, alive: true } : null, selection: { seq: 0, ids: [] }, ui_seq: UI.seq };
+  },
+  ui_poll({ since }) {
+    const behind = UI.changes.length && UI.changes[0].seq > since + 1;
+    if (!since || behind || since > UI.seq) return { next: UI.seq, changes: [], snapshot: uiSnapshot() };
+    return { next: UI.seq, changes: UI.changes.filter((c) => c.seq > since), snapshot: null };
+  },
+  ui_event({ id, event }) { const f = UI.handlers.get(id)?.[event]; if (f) f(); else if (event === 'OnClose') uiSet(id, 'Visible', false); return []; },
+  ui_input({ id, prop, value }) {
+    const c = UI.nodes.get(id);
+    if (!c) return null;
+    const key = prop === 'Text' && c.class === 'TMemo' ? 'Lines' : prop;
+    const v = key === 'Lines' && typeof value === 'string' ? value.split('\n') : value;
+    if (uiSet(id, key, v, false)) {
+      const hs = UI.handlers.get(id) || {};
+      hs.OnChange?.();
+      if (key === 'Checked' || (key === 'ItemIndex' && c.class === 'TRadioGroup')) hs.OnClick?.();
+    }
+    return null;
+  },
+  ui_image() { err('images need the real backend (it reads the file)'); },
+  key_state() { return null; },
+  table_select() { return null; },
+  trainer_script({ req }) {
+    if (!req.entries?.length) err('pick at least one table entry for the trainer');
+    const q = (x) => JSON.stringify(String(x));
+    const items = req.entries.map((it) => { const e = liveFind(it.id) || err(`no table entry ${it.id}`); return `    { id = ${it.id}, label = ${q(it.label || e.description)}, keys = { ${(it.keys || []).join(', ')} }, own = true },`; });
+    return `-- BEGIN HEAPHOOK TRAINER\n-- Generated by HeapHook's trainer generator (mock backend: the real one writes the full script).\ndo\n  local items = {\n${items.join('\n')}\n  }\n  local title, about, beepOn, showKeys = ${q(req.title || 'Trainer')}, ${q(req.about || '')}, ${!!req.beep}, ${!!req.show_keys}\nend\n-- END HEAPHOOK TRAINER\n`;
   },
   lua_dialog_reply({ id, value }) { if (dlg?.id === id) { dlg.resolve(value); dlg = null; } },
   settings_get: () => loadSettings(),
@@ -1580,8 +1704,10 @@ const TOOLS = {
   },
 
   debug_set_condition({ id, condition }) { if (typeof condition !== 'string') err('invalid args `condition` for command `debug_set_condition`: expected a string'); const b = dneed().bps.find((x) => x.id === id) || err(`no breakpoint ${id}`); b.condition = checkCond(condition); b.cn = 0; return null; },
-  debug_signals: () => [[2, 'SIGINT', 'pass'], [4, 'SIGILL', 'break'], [6, 'SIGABRT', 'pass'], [7, 'SIGBUS', 'break'], [8, 'SIGFPE', 'break'], [10, 'SIGUSR1', 'pass'], [11, 'SIGSEGV', 'break'],
-    [12, 'SIGUSR2', 'pass'], [13, 'SIGPIPE', 'pass'], [14, 'SIGALRM', 'pass'], [15, 'SIGTERM', 'pass'], [17, 'SIGCHLD', 'pass'], [28, 'SIGWINCH', 'pass'], [29, 'SIGIO', 'pass']],
+  // [code, name, default, current (attached debugger) | null], like hh-debug's signal_table().
+  debug_signals: () => [[1, 'SIGHUP', 'pass'], [2, 'SIGINT', 'pass'], [3, 'SIGQUIT', 'pass'], [4, 'SIGILL', 'break'], [5, 'SIGTRAP', 'break'], [6, 'SIGABRT', 'pass'], [7, 'SIGBUS', 'break'],
+    [8, 'SIGFPE', 'break'], [10, 'SIGUSR1', 'pass'], [11, 'SIGSEGV', 'break'], [12, 'SIGUSR2', 'pass'], [13, 'SIGPIPE', 'pass'], [14, 'SIGALRM', 'pass'], [15, 'SIGTERM', 'pass'],
+    [17, 'SIGCHLD', 'pass'], [28, 'SIGWINCH', 'pass'], [29, 'SIGIO', 'pass']].map(([c, n, a]) => [c, n, a, D ? loadSettings().signals?.[c] ?? a : null]),
 
   ptr_sort({ key, desc, vtype = '4bytes' }) {
     const ps = ptrNeed();

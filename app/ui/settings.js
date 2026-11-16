@@ -4,7 +4,7 @@ import { api } from './backend.js';
 import { $, attempt, toast, h } from './util.js';
 import { state, emit, setTick } from './core.js';
 
-const NUM = ['freeze_interval_ms', 'live_update_ms', 'scan_alignment', 'lua_budget_ms', 'scan_threads'];
+const NUM = ['freeze_interval_ms', 'live_update_ms', 'scan_alignment', 'lua_budget_ms', 'lua_memory_mb', 'scan_threads'];
 
 function apply(s) {
   state.settings = s;
@@ -18,21 +18,25 @@ export async function initSettings() {
   const s = await attempt(() => api.settingsGet());
   if (s) apply(s);
   const d = $('#dlg-settings'), f = d.querySelector('form');
-  // Debugger signals: what the debugger does when the process receives each one.
+  // Debugger signals: the debugger's own table (names and defaults), what it does with each.
   const sigs = (await api.debugSignals().catch(() => [])) || [];
   const sigSel = new Map();
   if (sigs.length) {
-    const grid = h('div', { style: 'display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:4px 12px' });
-    for (const [code, name] of sigs) {
-      const sel = h('select.compact', { 'aria-label': `${name} (${code})` }, ['pass', 'ignore', 'break'].map((a) => h('option', { value: a }, a[0].toUpperCase() + a.slice(1))));
+    const grid = h('div.sig-grid');
+    for (const [code, name, dflt] of sigs) {
+      const sel = h('select.compact', { 'aria-label': `${name} (${code})` }, ['pass', 'ignore', 'break'].map((a) => h('option', { value: a }, a[0].toUpperCase() + a.slice(1) + (a === dflt ? ' (default)' : ''))));
       sigSel.set(code, sel);
-      grid.append(h('label', { style: 'display:flex;align-items:center;justify-content:space-between;gap:8px' }, h('span.mono', null, `${name} `, h('span.muted', null, String(code))), sel));
+      sel.addEventListener('change', () => sel.classList.toggle('changed', sel.value !== dflt));
+      grid.append(h('label.sig-row', null, h('span.mono', null, `${name} `, h('span.muted', null, String(code))), sel));
     }
-    $('#st-path').before(h('fieldset.group', null, h('legend', null, 'Debugger signals'), grid));
+    const reset = h('button.btn.ghost', { type: 'button', title: 'Every signal back to the debugger\'s default action' }, 'Reset to defaults');
+    reset.addEventListener('click', () => { for (const [code, , dflt] of sigs) { const x = sigSel.get(code); x.value = dflt; x.classList.remove('changed'); } });
+    $('#st-path').before(h('fieldset.group', null, h('legend', null, 'Debugger signals'),
+      h('p.hint', null, 'Pass: the process gets it. Ignore: it is dropped. Break: the debugger stops and asks. Applies to an attached debugger at once.'), grid, reset));
   }
   function open() {
     const cur = state.settings;
-    for (const [code, , dflt] of sigs) sigSel.get(code).value = cur.signals?.[code] ?? dflt;
+    for (const [code, , dflt] of sigs) { const x = sigSel.get(code); x.value = cur.signals?.[code] ?? dflt; x.classList.toggle('changed', x.value !== dflt); }
     for (const el of f.elements) {
       if (!el.name || !(el.name in cur)) continue;
       if (el.type === 'checkbox') el.checked = !!cur[el.name]; else el.value = cur[el.name];

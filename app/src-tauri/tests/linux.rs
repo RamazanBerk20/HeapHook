@@ -442,7 +442,7 @@ fn breakpoints_stepping_registers_trace() {
     t.send("outer");
     assert_eq!(broken(&app).rip.as_deref(), Some(outer.as_str()));
     app.debug_remove_breakpoint(id).unwrap();
-    app.debug_run_to(&hex(outer_a + 6)).unwrap();
+    app.debug_run_to(&hex(outer_a + 6), None).unwrap();
     wait("run to", || Some(app.debug_status().unwrap()).filter(|s| s.state == "broken" && s.rip.as_deref() == Some(hex(outer_a + 6).as_str())));
     app.debug_continue(false).unwrap();
     assert_eq!(t.line(), "ok 4663 200");
@@ -636,7 +636,7 @@ fn hotkey_actions_at_the_command_layer() {
     let app = App::default();
     app.start_driver();
     app.open_process(t.child.id()).unwrap();
-    let hk = |action: &str, keys: Vec<u32>, value: Option<&str>| Hotkey { action: action.into(), keys, value: value.map(Into::into), description: None };
+    let hk = |action: &str, keys: Vec<u32>, value: Option<&str>| Hotkey { action: action.into(), keys, value: value.map(Into::into), description: None, id: None };
     let mut e = i32_entry(1, &t);
     e.hotkeys = vec![
         hk("Toggle Activation", vec![17, 112], None),
@@ -683,8 +683,8 @@ fn ct_round_trip_of_the_live_table() {
         vtype: hh_scan::VType::Byte,
         dropdown: Some(Dropdown { options: vec![item("0", "Easy"), item("1", "Hard")], read_only: true, description_only: false, display_value_as_item: true }),
         hotkeys: vec![
-            Hotkey { action: "Set Value".into(), keys: vec![17, 112], value: Some("1".into()), description: Some("hard".into()) },
-            Hotkey { action: "Toggle Activation".into(), keys: vec![18, 65], value: None, description: None },
+            Hotkey { action: "Set Value".into(), keys: vec![17, 112], value: Some("1".into()), description: Some("hard".into()), id: None },
+            Hotkey { action: "Toggle Activation".into(), keys: vec![18, 65], value: None, description: None, id: None },
         ],
         ..Entry::default()
     };
@@ -1110,4 +1110,377 @@ fn opening_a_table_or_closing_disables_active_scripts() {
     app.close_process().unwrap();
     assert_eq!(t.cmd("get")["i32"], 123456, "close_process left the script's patch in");
     assert!(log_text(&app).contains("still patched"), "{}", log_text(&app));
+}
+
+// ---------------------------------------------------------------- debugger adoption (1.0)
+
+fn bp_row(app: &App, id: u32) -> heaphook::debug::BpOut {
+    app.debug_breakpoints().unwrap().into_iter().find(|b| b.id == id).expect("breakpoint listed")
+}
+
+#[test]
+fn breakpoints_change_in_place_options_signals_backtrace() {
+    let mut t = Target::spawn_exe(exe("hh-debug", "hh-debug-target"));
+    let app = App::default();
+    app.open_process(t.child.id()).unwrap();
+    app.debug_attach().unwrap();
+    let (store, load, outer) = (t.addr("store"), t.addr("load"), t.addr("outer"));
+    let store_a = parse_addr(&store).unwrap();
+    let broken = |app: &App| wait("a break", || Some(app.debug_status().unwrap()).filter(|s| s.state == "broken"));
+
+    // Disable / enable / condition change in place: hits and records survive.
+    let id = app.debug_add_breakpoint(&bp(json!({"addr": store, "action": "record"}))).unwrap();
+    assert_eq!(t.cmd_line("store"), "ok 101 200");
+    assert_eq!(t.cmd_line("store"), "ok 102 200");
+    assert_eq!(bp_row(&app, id).hits, 2);
+    app.debug_set_enabled(id, false).unwrap();
+    assert_eq!(t.cmd_line("store"), "ok 103 200");
+    let b = bp_row(&app, id);
+    assert_eq!((b.enabled, b.hits, app.debug_records(id).unwrap()[0].count), (false, 2, 2));
+    app.debug_set_enabled(id, true).unwrap();
+    assert_eq!(t.cmd_line("store"), "ok 104 200");
+    assert_eq!(bp_row(&app, id).hits, 3, "hits kept across disable/enable");
+    app.debug_set_condition(id, "rsi == 0").unwrap();
+    assert_eq!(t.cmd_line("store"), "ok 105 200");
+    assert_eq!((bp_row(&app, id).hits, bp_row(&app, id).condition.as_deref()), (3, Some("rsi == 0")));
+    app.debug_set_condition(id, "").unwrap();
+    assert_eq!(t.cmd_line("store"), "ok 106 200");
+    assert_eq!(bp_row(&app, id).hits, 4, "condition cleared in place");
+    // The record list names the executing instruction (HitRecord.insn), no backwards decoding.
+    let r = &app.debug_records(id).unwrap()[0];
+    assert_eq!((r.addr.as_str(), r.text.as_str()), (store.as_str(), "mov [rdi],rsi"));
+    // Stop recording after N hits: the debugger disables it and says why.
+    app.debug_set_options(id, de(json!({"max_hits": 5}))).unwrap();
+    assert_eq!(t.cmd_line("store"), "ok 107 200");
+    assert_eq!(t.cmd_line("store"), "ok 108 200");
+    let b = wait("max hits disable", || Some(bp_row(&app, id)).filter(|b| b.note.is_some()));
+    assert_eq!((b.enabled, b.hits, b.options.max_hits), (false, 5, Some(5)));
+    assert!(b.note.as_deref().unwrap().contains("after 5 hits"), "{:?}", b.note);
+    app.debug_remove_breakpoint(id).unwrap();
+
+    // Break after N hits (`load` runs hh_load three times per command: load + the reply's two).
+    let id = app.debug_add_breakpoint(&bp(json!({"addr": outer, "skip_hits": 2}))).unwrap();
+    assert_eq!(t.cmd_line("outer"), "ok 109 200");
+    assert_eq!(t.cmd_line("outer"), "ok 110 200");
+    t.send("outer");
+    assert_eq!(broken(&app).reason.as_deref(), Some(format!("breakpoint {id}").as_str()));
+    assert_eq!(bp_row(&app, id).hits, 3);
+    app.debug_continue(false).unwrap();
+    assert_eq!(t.line(), "ok 111 200");
+    app.debug_remove_breakpoint(id).unwrap();
+    let _ = load;
+
+    // One-shot: breaks once, then the debugger disables it (log notice).
+    let id = app.debug_add_breakpoint(&bp(json!({"addr": outer, "one_shot": true}))).unwrap();
+    t.send("outer");
+    broken(&app);
+    app.debug_continue(false).unwrap();
+    assert_eq!(t.line(), "ok 112 200");
+    assert_eq!(t.cmd_line("outer"), "ok 113 200");
+    let b = wait("one-shot disable", || Some(bp_row(&app, id)).filter(|b| !b.enabled));
+    assert!(b.note.as_deref().is_some_and(|n| n.contains("one-shot")), "{:?}", b.note);
+    let log = app.debug_log(0).unwrap();
+    assert!(log.lines.iter().any(|l| l.text.contains(&format!("breakpoint {id} disabled: one-shot"))), "{:?}", log.lines);
+    assert!(app.debug_log(log.next).unwrap().lines.is_empty());
+    app.debug_remove_breakpoint(id).unwrap();
+
+    // Backtrace and run-to for one thread only.
+    let id = app.debug_add_breakpoint(&bp(json!({"addr": store}))).unwrap();
+    t.send("outer");
+    let st = broken(&app);
+    let tid = st.tid.unwrap();
+    let frames = app.debug_backtrace(tid, 16).unwrap();
+    assert_eq!(frames[0].addr, store);
+    assert_eq!(frames[0].module.as_deref(), Some("hh-debug-target"), "{frames:?}");
+    app.debug_remove_breakpoint(id).unwrap();
+    app.debug_run_to(&hex(store_a + 3), Some(tid)).unwrap();
+    let st = wait("run to (thread)", || Some(app.debug_status().unwrap()).filter(|s| s.state == "broken" && s.rip.as_deref() == Some(hex(store_a + 3).as_str())));
+    assert_eq!((st.tid, st.reason.as_deref()), (Some(tid), Some("step")));
+    app.debug_continue(false).unwrap();
+    assert_eq!(t.line(), "ok 114 200");
+
+    // Signals: the engine's table, an override from settings, and the reset to defaults.
+    let sigs = app.debug_signals().unwrap();
+    let usr1 = *sigs.iter().find(|s| s.1 == "SIGUSR1").expect("SIGUSR1 in the table");
+    assert_eq!((usr1.0, usr1.2, usr1.3), (10, "pass", Some("pass")));
+    let mut s = app.settings_get().unwrap();
+    s.signals.insert("10".into(), "break".into());
+    app.settings_set(s.clone()).unwrap();
+    assert_eq!(app.debug_signals().unwrap().iter().find(|x| x.0 == 10).unwrap().3, Some("break"));
+    t.send("raise 10");
+    assert_eq!(broken(&app).reason.as_deref(), Some("signal 10"));
+    app.debug_continue(true).unwrap();
+    assert_eq!(t.line(), "sig 1 0");
+    s.signals.clear();
+    app.settings_set(s).unwrap();
+    assert_eq!(app.debug_signals().unwrap().iter().find(|x| x.0 == 10).unwrap().3, Some("pass"), "reset to the default");
+    assert_eq!(t.cmd_line("raise 10"), "sig 2 0");
+    app.debug_detach().unwrap();
+}
+
+#[test]
+fn page_watch_records_the_writer_and_refuses_stacks() {
+    let mut t = Target::spawn_exe(exe("hh-debug", "hh-debug-target"));
+    let app = App::default();
+    app.open_process(t.child.id()).unwrap();
+    app.debug_attach().unwrap();
+    let (buf, store) = (parse_addr(&t.addr("buf")).unwrap(), t.addr("store"));
+    let range = |a: u64, len: u64| de::<heaphook::debug::RangeReq>(json!({"addr": hex(a), "len": len, "kind": "write"}));
+    let id = app.debug_watch_range(&range(buf + 0x100, 512)).unwrap();
+    let b = bp_row(&app, id);
+    assert_eq!((b.method, b.kind, b.len, b.action), ("page", "write", 512, "record"));
+    assert_eq!(t.cmd_line("bufw 264"), "buf 1");
+    // Outside the range (same page): not recorded.
+    assert_eq!(t.cmd_line("bufw 8"), "buf 1");
+    let recs = wait("a page-watch record", || Some(app.debug_records(id).unwrap()).filter(|r| !r.is_empty()));
+    assert_eq!(recs.len(), 1, "{recs:?}");
+    assert_eq!((recs[0].addr.as_str(), recs[0].text.as_str(), recs[0].address.clone()), (store.as_str(), "mov [rdi],rsi", Some(hex(buf + 264))));
+    app.debug_remove_breakpoint(id).unwrap();
+    // Stack memory is refused: the [stack] mapping and the region of a thread's stack pointer.
+    let stack = app.regions_info().unwrap().into_iter().find(|r| r.path.as_deref() == Some("[stack]")).expect("[stack] region");
+    let e = app.debug_watch_range(&range(stack.start + stack.size - 0x100, 16)).unwrap_err();
+    assert!(e.contains("stack"), "{e}");
+    assert!(app.debug_watch_range(&range(buf, 0)).is_err());
+    assert_eq!(t.cmd_line("bufw 264"), "buf 2");
+}
+
+#[test]
+fn lua_breakpoint_function_reads_and_changes_registers() {
+    let mut t = Target::spawn_exe(exe("hh-debug", "hh-debug-target"));
+    let app = App::default();
+    app.start_driver();
+    app.open_process(t.child.id()).unwrap();
+    let store = t.addr("store");
+    // CE: the function returns 1 to continue; register globals are read and written back.
+    app.lua_exec(&format!("debug_setBreakpoint({store}, function() seen = RSI; RSI = 500; return 1 end)")).unwrap();
+    let b = app.debug_breakpoints().unwrap();
+    assert_eq!((b.len(), b[0].owner, b[0].addr.as_str()), (1, "script", store.as_str()));
+    assert_eq!(t.cmd_line("store"), "ok 500 200", "{}", log_text(&app));
+    app.lua_exec("print('seen', seen, debug_isBroken())").unwrap();
+    assert!(log_text(&app).contains("out: seen 101 false"), "{}", log_text(&app));
+    // Not continued: the thread stays broken for the user, then continues from Lua.
+    app.lua_exec(&format!("debug_setBreakpoint({store}, function() EAX = 1 end)")).unwrap();
+    t.send("store");
+    let st = wait("left broken", || Some(app.debug_status().unwrap()).filter(|s| s.state == "broken"));
+    assert_eq!(st.rip.as_deref(), Some(store.as_str()));
+    app.lua_exec("assert(debug_isBroken()); debug_continueFromBreakpoint(co_run)").unwrap();
+    assert_eq!(t.line(), "ok 501 200");
+    app.lua_exec(&format!("debug_removeBreakpoint({store})")).unwrap();
+    assert!(app.debug_breakpoints().unwrap().is_empty());
+    assert_eq!(t.cmd_line("store"), "ok 502 200");
+}
+
+/// The control with `class` (and caption, when given) in a form snapshot.
+fn find_control(n: &[hh_lua::ControlNode], class: &str, caption: Option<&str>) -> Option<hh_lua::Control> {
+    n.iter().find_map(|c| {
+        let cap = c.control.props.get("Caption").and_then(|p| if let hh_lua::Prop::Str(s) = p { Some(s.as_str()) } else { None });
+        if c.control.class == class && (caption.is_none() || cap == caption) {
+            Some(c.control.clone())
+        } else {
+            find_control(&c.children, class, caption)
+        }
+    })
+}
+
+#[test]
+fn lua_form_button_toggles_an_entry_through_ui_commands() {
+    let t = Target::spawn();
+    let app = App::default();
+    app.open_process(t.child.id()).unwrap();
+    put(&app, vec![i32_entry(1, &t)]);
+    app.lua_exec(
+        "f = createForm()\nf.Caption = 'Tools'\nb = createButton(f)\nb.Caption = 'Toggle'\nb.OnClick = function() local r = getAddressList().getMemoryRecordByID(1); r.Active = not r.Active end\ne = createEdit(f)\ne.OnChange = function(s) print('typed ' .. s.Text) end",
+    )
+    .unwrap();
+    let p = app.ui_poll(0).unwrap();
+    let roots = p.snapshot.expect("first poll is a snapshot").roots;
+    let form = find_control(&roots, "TCEForm", Some("Tools")).expect("form");
+    let button = find_control(&roots, "TButton", Some("Toggle")).expect("button");
+    assert_eq!(button.parent, Some(form.id));
+    assert!(button.events.contains("OnClick"));
+    app.ui_event(button.id, "OnClick", vec![]).unwrap();
+    assert!(entry(&app, 1).frozen, "{}", log_text(&app));
+    app.ui_event(button.id, "OnClick", vec![]).unwrap();
+    assert!(!entry(&app, 1).frozen);
+    let edit = find_control(&roots, "TEdit", None).unwrap();
+    app.ui_input(edit.id, "Text", hh_lua::Prop::Str("hello".into())).unwrap();
+    assert!(log_text(&app).contains("out: typed hello"));
+    // Script changes arrive incrementally; user input is not echoed back.
+    let since = app.ui_poll(0).unwrap().next;
+    app.lua_exec("b.Caption = 'Toggle hp'").unwrap();
+    let p = app.ui_poll(since).unwrap();
+    assert!(p.snapshot.is_none());
+    let ch = serde_json::to_value(&p.changes).unwrap();
+    assert_eq!(ch[0]["op"], "update");
+    assert_eq!((ch[0]["id"].as_u64(), ch[0]["prop"].as_str(), ch[0]["value"].as_str()), (Some(button.id as u64), Some("Caption"), Some("Toggle hp")));
+    assert_eq!(app.lua_poll(0).unwrap().ui_seq, p.next);
+    // Closing (OnClose) hides by default; a table switch destroys the form.
+    app.ui_event(form.id, "OnClose", vec![]).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("t.json");
+    app.table_export(path.to_str().unwrap()).unwrap();
+    let since = app.ui_poll(0).unwrap().next;
+    app.table_open(path.to_str().unwrap(), false).unwrap();
+    let ch = serde_json::to_value(app.ui_poll(since).unwrap().changes).unwrap();
+    assert!(ch.as_array().unwrap().iter().any(|c| c["op"] == "destroy" && c["id"] == form.id), "{ch}");
+    assert!(app.ui_poll(0).unwrap().snapshot.unwrap().roots.is_empty());
+}
+
+#[test]
+fn generated_trainer_runs_and_its_hotkey_toggles_an_entry() {
+    let t = Target::spawn();
+    let app = App::default();
+    app.start_driver();
+    app.open_process(t.child.id()).unwrap();
+    put(&app, vec![i32_entry(1, &t)]);
+    let req: heaphook::trainer::TrainerReq = de(json!({"title": "HP trainer", "about": "Ctrl F7 toggles", "beep": true, "show_keys": true,
+        "entries": [{"id": 1, "label": "Freeze health", "keys": [17, 118]}]}));
+    let script = app.trainer_script(&req).unwrap();
+    assert!(script.starts_with(heaphook::trainer::BEGIN) && script.trim_end().ends_with(heaphook::trainer::END));
+    let st = app.table_get().unwrap();
+    app.table_put(Table { lua_script: script, ..st.table }, st.version).unwrap();
+    app.table_run_script().unwrap();
+    let roots = app.ui_poll(0).unwrap().snapshot.unwrap().roots;
+    assert!(find_control(&roots, "TCEForm", Some("HP trainer")).is_some(), "{}", log_text(&app));
+    let cb = find_control(&roots, "TCheckBox", None).expect("toggle");
+    assert!(app.lua_poll(0).unwrap().hotkeys.contains(&vec![17, 118]));
+    assert_eq!(app.hotkey_press(&[17, 118]).unwrap(), 1);
+    assert!(entry(&app, 1).frozen, "{}", log_text(&app));
+    // The check box follows (timer) and unchecking it deactivates the entry.
+    wait("box checked", || {
+        let r = app.ui_poll(0).unwrap().snapshot.unwrap().roots;
+        (find_control(&r, "TCheckBox", None)?.props.get("Checked") == Some(&hh_lua::Prop::Bool(true))).then_some(())
+    });
+    app.ui_input(cb.id, "Checked", hh_lua::Prop::Bool(false)).unwrap();
+    assert!(!entry(&app, 1).frozen, "{}", log_text(&app));
+    // Running it again replaces the form instead of stacking a second one.
+    app.table_run_script().unwrap();
+    let roots = app.ui_poll(0).unwrap().snapshot.unwrap().roots;
+    assert_eq!(roots.iter().filter(|r| r.control.class == "TCEForm").count(), 1);
+    assert_eq!(app.lua_poll(0).unwrap().hotkeys.iter().filter(|k| **k == vec![17, 118]).count(), 1);
+}
+
+#[test]
+fn group_activation_from_lua_runs_children_once_and_records_carry_fields() {
+    let mut t = Target::spawn();
+    let app = App::default();
+    app.start_driver();
+    app.open_process(t.child.id()).unwrap();
+    let child = Entry { id: 2, description: "kid".into(), script: Some("[ENABLE]\n{$lua}\nprint('kid on')\n{$asm}\n[DISABLE]\n{$lua}\nprint('kid off')\n{$asm}\n".into()), ..Entry::default() };
+    let mut value = i32_entry(3, &t);
+    value.dropdown = Some(Dropdown { options: vec![DropdownItem { value: "1".into(), text: "one".into() }], read_only: true, ..Dropdown::default() });
+    value.hotkeys = vec![Hotkey { action: "Set Value".into(), keys: vec![17, 119], value: Some("77".into()), description: None, id: None }];
+    let group = Entry {
+        id: 1,
+        description: "grp".into(),
+        options: vec!["moActivateChildrenAsWell".into(), "moDeactivateChildrenAsWell".into()],
+        children: vec![child, value],
+        ..Entry::default()
+    };
+    put(&app, vec![group]);
+    app.lua_exec("local g = getAddressList().getMemoryRecordByID(1)\nprint('hdr', g.IsGroupHeader, g.Type ~= 11, g.Options)\ng.Active = true").unwrap();
+    let log = log_text(&app);
+    assert_eq!(log.matches("out: kid on").count(), 1, "{log}");
+    assert!(log.contains("out: hdr true true [moActivateChildrenAsWell,moDeactivateChildrenAsWell]"), "{log}");
+    assert!(entry(&app, 2).frozen && entry(&app, 3).frozen);
+    app.table_set_active(&[1], false).unwrap();
+    assert_eq!(log_text(&app).matches("out: kid off").count(), 1);
+    app.table_set_active(&[1], true).unwrap();
+    assert_eq!(log_text(&app).matches("out: kid on").count(), 2, "{}", log_text(&app));
+    // Dropdown and hotkeys reach Lua; a hotkey made in Lua fires through the app's path with
+    // its OnHotkey callback.
+    app.lua_exec(
+        "local r = getAddressList().getMemoryRecordByID(3)\nprint('dd', r.DropDownList[0], r.DropDownReadOnly, r.HotkeyCount)\nlocal h = r.createHotkey({VK_CONTROL, VK_F10}, mrhSetValue, '1234')\nh.OnHotkey = function() print('hotkey cb') end",
+    )
+    .unwrap();
+    assert!(log_text(&app).contains("out: dd 1:one true 1"), "{}", log_text(&app));
+    let e = entry(&app, 3);
+    assert_eq!((e.hotkeys.len(), e.hotkeys[1].action.as_str(), e.hotkeys[1].keys.clone()), (2, "Set Value", vec![17, 121]));
+    assert!(app.lua_poll(0).unwrap().hotkeys.contains(&vec![17, 121]));
+    assert_eq!(app.hotkey_press(&[17, 121]).unwrap(), 1);
+    assert_eq!(t.cmd("get")["i32"], 1234);
+    assert!(log_text(&app).contains("out: hotkey cb"));
+}
+
+#[test]
+fn load_table_from_lua_clears_the_previous_tables_callbacks() {
+    let t = Target::spawn();
+    let app = App::default();
+    app.start_driver();
+    app.open_process(t.child.id()).unwrap();
+    put(&app, vec![i32_entry(1, &t)]);
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("next.json");
+    app.table_export(path.to_str().unwrap()).unwrap();
+    app.lua_exec("getAddressList().getMemoryRecordByID(1).OnActivate = function() print('old callback') end\nhk = createHotkey(function() end, VK_CONTROL, VK_F11)\nf = createForm()").unwrap();
+    assert!(app.lua_poll(0).unwrap().hotkeys.contains(&vec![17, 122]));
+    app.lua_exec(&format!("loadTable({:?})\nsaveTable({:?})", path.to_str().unwrap(), dir.path().join("saved.CT").to_str().unwrap())).unwrap();
+    assert!(dir.path().join("saved.CT").exists());
+    app.table_set_active(&[1], true).unwrap();
+    assert!(!log_text(&app).contains("out: old callback"), "{}", log_text(&app));
+    assert!(!app.lua_poll(0).unwrap().hotkeys.contains(&vec![17, 122]));
+    assert!(app.ui_poll(0).unwrap().snapshot.unwrap().roots.is_empty());
+    // Merge appends with new ids and keeps the current entries.
+    app.lua_exec(&format!("loadTable({:?}, true)", path.to_str().unwrap())).unwrap();
+    let st = app.table_get().unwrap().table;
+    assert_eq!(st.entries.iter().map(|e| e.id).collect::<Vec<_>>(), [1, 2]);
+    assert!(entry(&app, 1).frozen && !entry(&app, 2).frozen);
+}
+
+#[test]
+fn lua_host_extras_keys_selection_memscan_memory_limit_create_process() {
+    let t = Target::spawn();
+    let app = App::default();
+    app.open_process(t.child.id()).unwrap();
+    put(&app, vec![i32_entry(1, &t), i32_entry(2, &t)]);
+    app.key_state(&[17, 65]).unwrap();
+    app.lua_exec("print('keys', isKeyPressed(VK_CONTROL), isKeyPressed(VK_A), isKeyPressed(VK_B))").unwrap();
+    app.table_select(vec![1]).unwrap();
+    app.lua_exec("print('sel', getAddressList().SelCount, getAddressList().SelectedRecord.ID)").unwrap();
+    app.lua_exec("local al = getAddressList(); al.SelectedRecords = { al.getMemoryRecordByID(2) }").unwrap();
+    let sel = app.lua_poll(0).unwrap().selection;
+    assert_eq!((sel.seq, sel.ids), (1, vec![2]));
+    scan_exact_i32(&app, "123456");
+    app.lua_exec("print('memscan', getCurrentMemscan() ~= nil)").unwrap();
+    // Structures: the table's list is the one Lua sees.
+    app.lua_exec("local s = createStructure('fromLua'); s.addToGlobalStructureList(); print('structs', getStructureCount())").unwrap();
+    assert_eq!(app.struct_get().unwrap().iter().map(|s| s.name.as_str()).collect::<Vec<_>>(), ["fromLua"]);
+    let log = log_text(&app);
+    for want in ["out: keys true true false", "out: sel 1 1", "out: memscan true", "out: structs 1"] {
+        assert!(log.contains(want), "{want}\n{log}");
+    }
+    // The memory limit setting reaches the engine.
+    let mut s = app.settings_get().unwrap();
+    s.lua_memory_mb = 16;
+    app.settings_set(s.clone()).unwrap();
+    let e = app.lua_exec("local t = {} for i = 1, 1e7 do t[i] = string.rep('x', 64) .. i end").unwrap_err();
+    assert!(e.contains("not enough memory"), "{e}");
+    s.lua_memory_mb = 1024;
+    app.settings_set(s).unwrap();
+    app.lua_exec("local t = {} for i = 1, 2e5 do t[i] = string.rep('x', 64) .. i end").unwrap();
+    // createProcess goes through the app's create-process path and opens the new process.
+    app.lua_exec("pid = createProcess('/bin/sleep', '30')\nprint('pid', pid)").unwrap();
+    let opened = app.lua_poll(0).unwrap().process.unwrap();
+    assert!(log_text(&app).contains(&format!("out: pid {}", opened.info.pid)), "{}", log_text(&app));
+    assert_ne!(opened.info.pid, t.child.id());
+    app.close_process().unwrap();
+    let _ = Command::new("kill").arg("-9").arg(opened.info.pid.to_string()).status();
+}
+
+#[test]
+fn exec_and_fork_show_in_the_debugger_log_and_breakpoints() {
+    let mut t = Target::spawn_exe(exe("hh-debug", "hh-debug-target"));
+    let app = App::default();
+    app.open_process(t.child.id()).unwrap();
+    app.debug_attach().unwrap();
+    let id = app.debug_add_breakpoint(&bp(json!({"addr": t.addr("store"), "action": "record"}))).unwrap();
+    assert_eq!(t.cmd_line("fork"), "fork 42");
+    wait("fork notice", || app.debug_log(0).unwrap().lines.iter().any(|l| l.text.contains("forked")).then_some(()));
+    t.send("exec");
+    let info: Value = serde_json::from_str(&t.line()).unwrap();
+    assert!(info["store"].is_string());
+    let b = wait("disabled by exec", || Some(bp_row(&app, id)).filter(|b| !b.enabled));
+    assert!(b.note.as_deref().is_some_and(|n| n.contains("exec")), "{:?}", b.note);
+    assert!(app.debug_log(0).unwrap().lines.iter().any(|l| l.text.contains("ran exec")));
+    app.debug_detach().unwrap();
 }

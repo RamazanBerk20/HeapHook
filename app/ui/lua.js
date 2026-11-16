@@ -3,7 +3,7 @@
 import { api } from './backend.js';
 import { $, h, store, toast, modal, splitter } from './util.js';
 import { state, emit } from './core.js';
-import { comboOf } from './keys.js';
+import { comboOf, vkOf } from './keys.js';
 
 const POLL_MS = 250;
 const MAX_LINES = 2000;
@@ -126,6 +126,8 @@ export function initLua({ openTableScript }) {
       else if (!p.dialog && dialogEl) { dialogGone = true; dialogEl.close('cancel'); }
       emit('table:version', p.table_version);
       emit('backend:process', p.process);
+      emit('table:selection', p.selection);
+      emit('ui:seq', p.ui_seq);
       bound = new Set(p.hotkeys.map((k) => k.join(',')));
       if (busy !== p.busy) { busy = p.busy; sync(); }
       if (sound != null && p.sound > sound) beep();
@@ -136,6 +138,23 @@ export function initLua({ openTableScript }) {
   }
   setInterval(() => { if (!document.hidden) poll(); }, POLL_MS);
   poll();
+
+  // ---------- keys held in the window, for Lua isKeyPressed ----------
+  let held = new Set(), heldKey = '';
+  const sendHeld = () => {
+    const k = [...held].sort((a, b) => a - b).join(',');
+    if (k !== heldKey) { heldKey = k; api.keyState([...held]).catch(() => {}); }
+  };
+  const track = (e, down) => {
+    const v = vkOf(e.code);
+    if (v != null) down ? held.add(v) : held.delete(v);
+    // Modifier state from the event itself (a release outside the window is missed otherwise).
+    for (const [m, on_] of [[17, e.ctrlKey], [16, e.shiftKey], [18, e.altKey], [91, e.metaKey]]) on_ ? held.add(m) : held.delete(m);
+    sendHeld();
+  };
+  window.addEventListener('keydown', (e) => track(e, true), true);
+  window.addEventListener('keyup', (e) => track(e, false), true);
+  window.addEventListener('blur', () => { held.clear(); sendHeld(); });
 
   // ---------- in-app hotkeys (global ones are grabbed by the OS before this sees them) ----------
   const PRINTABLE = (k) => k === 32 || (k >= 48 && k <= 90) || (k >= 96 && k <= 111) || k >= 186;

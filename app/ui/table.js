@@ -161,6 +161,26 @@ export function initTable(root) {
     if (performance.now() - r.chgAt < 1000) row.querySelector('.c-val').classList.add('chg');
     return row;
   }
+  /** Lua's SelectedRecords reads the backend's copy of the selection. */
+  let selKey = '';
+  function syncSel() {
+    const k = [...sel].sort((a, b) => a - b).join(',');
+    if (k === selKey) return;
+    selKey = k;
+    api.tableSelect([...sel]).catch(() => {});
+  }
+  // A script set the selection (getAddressList().SelectedRecords = ...).
+  let luaSel = 0;
+  on('table:selection', (s) => {
+    if (!s || s.seq === luaSel) return;
+    const first = !luaSel && s.seq;
+    luaSel = s.seq;
+    if (first && !s.ids.length) return;
+    sel.clear(); s.ids.forEach((id) => sel.add(id));
+    selKey = [...sel].sort((a, b) => a - b).join(',');
+    if (s.ids.length) cursor = s.ids[0];
+    render();
+  });
   function render() {
     flatten();
     if (cursor != null && !flat.some((f) => f.e.id === cursor)) cursor = flat[0]?.e.id ?? null;
@@ -171,6 +191,7 @@ export function initTable(root) {
     $('#tb-lua').classList.toggle('has', !!meta.lua_script.trim());
     $('#tb-comments').classList.toggle('has', !!meta.comments.trim());
     resolveAll();
+    syncSel();
   }
   function rowOf(id) { return document.getElementById('te-' + id); }
   function scrollToCursor() { rowOf(cursor)?.scrollIntoView({ block: 'nearest' }); }
@@ -354,6 +375,16 @@ export function initTable(root) {
     emit(event, { addr: wire(a), vtype: e.vtype, len: e.len, utf16: e.utf16, description: e.description });
   }
 
+  /** Range watch prefilled with the entry's address and size. */
+  function watchRange() {
+    const e = cursor != null && byId(cursor);
+    const a = e && isValue(e) && R(e.id).addr;
+    if (a == null || a === false) { toast('Address not resolved'); return; }
+    const SZ = { byte: 1, binary: 1, '2bytes': 2, '4bytes': 4, '8bytes': 8, float: 4, double: 8 };
+    const len = e.vtype === 'string' ? (e.len || 16) * (e.utf16 ? 2 : 1) : e.vtype === 'aob' ? e.len || 8 : SZ[e.vtype] || 4;
+    emit('debug:watch-range', { addr: wire(a), len, kind: 'write' });
+  }
+
   // ---------- selection & keyboard ----------
   function select(id, { extend, toggle } = {}) {
     if (id == null) return;
@@ -371,6 +402,7 @@ export function initTable(root) {
     }
     grid.setAttribute('aria-activedescendant', 'te-' + cursor);
     scrollToCursor();
+    syncSel();
   }
   const cursorIdx = () => flat.findIndex((f) => f.e.id === cursor);
   function step(n, extend) {
@@ -478,6 +510,7 @@ export function initTable(root) {
       { label: 'Disassemble this memory region', kbd: 'Ctrl D', disabled: !addrE, run: () => browse('da') },
       { label: 'Find out what accesses this address', kbd: 'F5', disabled: !addrE, run: () => onAddr('debug:accesses') },
       { label: 'Find out what writes to this address', kbd: 'F6', disabled: !addrE, run: () => onAddr('debug:writes') },
+      { label: 'Watch this memory range for writes…', disabled: !addrE, run: () => watchRange() },
       { label: 'Pointer scan for this address…', disabled: !addrE, run: () => onAddr('ptr:scan') },
       { label: 'Open in structure dissector', disabled: !addrE || R(cur.id).addr == null, run: () => emit('struct:open', { addr: wire(R(cur.id).addr) }) },
       '-',
@@ -490,6 +523,7 @@ export function initTable(root) {
       { label: 'Delete', kbd: 'Del', disabled: !any, run: deleteSelected },
       '-',
       { label: 'Table Lua script…', run: editTableScript },
+      { label: 'Generate a trainer…', run: trainerDialog },
       { label: 'Table comments…', run: editComments },
     ], grid);
   }
@@ -772,7 +806,8 @@ export function initTable(root) {
       keyBtn.onblur = sync;
       const row = h('div.hk-row', null, act, keyBtn, val, desc,
         h('button.btn.icon', { type: 'button', 'aria-label': 'Remove hotkey', html: icon('x'), onclick: () => row.remove() }));
-      row.read = () => ({ action: act.value, keys, value: HK_VALUE.has(act.value) ? val.value.trim() : null, description: desc.value.trim() || null });
+      // The id stays: Lua's MemoryRecordHotkey objects find their hotkey by it.
+      row.read = () => ({ ...(hk.id != null ? { id: hk.id } : {}), action: act.value, keys, value: HK_VALUE.has(act.value) ? val.value.trim() : null, description: desc.value.trim() || null });
       rows.append(row);
       sync();
       return keyBtn;
@@ -839,6 +874,70 @@ export function initTable(root) {
     d.showModal();
   }
 
+  // ---------- trainer generator ----------
+  const TR_BEGIN = '-- BEGIN HEAPHOOK TRAINER', TR_END = '-- END HEAPHOOK TRAINER';
+  /** Pick entries and their hotkeys, a title and options; generates a Lua trainer into the table script. */
+  function trainerDialog() {
+    const cands = all().filter((e) => !isGroup(e) || e.children.length);
+    if (!cands.length) { toast('Add entries to the table first: the trainer toggles table entries'); return; }
+    const picked = new Set(selectedAll().map((e) => e.id));
+    const titleI = h('input', { type: 'text', value: tablePath.replace(/^.*[\\/]/, '').replace(/\.[^.]*$/, '') + ' trainer', autocomplete: 'off', 'aria-label': 'Title' });
+    const aboutI = h('input', { type: 'text', value: '', autocomplete: 'off', placeholder: 'optional, e.g. which game version it is for', 'aria-label': 'Text above the toggles' });
+    const beepI = h('input', { type: 'checkbox', checked: true }), keysI = h('input', { type: 'checkbox', checked: true });
+    const rows = cands.map((e) => {
+      const tog = e.hotkeys.find((k) => k.action.startsWith('Toggle Activation'));
+      let keys = tog ? [...tog.keys] : [];
+      const on_ = h('input', { type: 'checkbox', checked: picked.has(e.id), 'aria-label': `Include ${e.description}` });
+      const label = h('input', { type: 'text', value: e.description, autocomplete: 'off', 'aria-label': `Label for ${e.description}` });
+      const keyBtn = h('button.btn.hk-keys.mono', { type: 'button', 'aria-label': `Hotkey for ${e.description}; focus and press keys, Backspace clears` }, keys.length ? comboText(keys) : 'none');
+      keyBtn.onkeydown = (ev) => {
+        if (ev.key === 'Tab' && !ev.ctrlKey && !ev.altKey) return;
+        ev.preventDefault(); ev.stopPropagation();
+        if ((ev.key === 'Backspace' || ev.key === 'Delete') && !ev.ctrlKey && !ev.altKey && !ev.shiftKey) { keys = []; keyBtn.textContent = 'none'; return; }
+        const c = comboOf(ev);
+        if (c.some((k) => !MODS.has(k))) { keys = c; keyBtn.textContent = comboText(keys); on_.checked = true; } else keyBtn.textContent = comboText(c) + ' …';
+      };
+      keyBtn.onblur = () => { keyBtn.textContent = keys.length ? comboText(keys) : 'none'; };
+      const el = h('div.tr-row', null, on_, label, keyBtn, h('span.muted.tr-kind', null, isScript(e) ? 'script' : isGroup(e) ? 'group' : typeText(e)));
+      return { el, read: () => (on_.checked ? { id: e.id, label: label.value.trim(), keys } : null) };
+    });
+    const err = h('p.hint.mono', { role: 'alert' });
+    const form = h('form', { method: 'dialog' },
+      h('h2', null, 'Generate a trainer'),
+      h('p.hint', null, 'Builds a Lua form with one toggle per entry, plus its hotkey, into the table script. The trainer runs inside HeapHook when the table script runs; standalone .exe trainers are not built.'),
+      h('div.row2.row2-even', null, h('label.field', null, h('span', null, 'Title'), titleI), h('label.field', null, h('span', null, 'Text above the toggles'), aboutI)),
+      h('div.tr-head', { 'aria-hidden': 'true' }, h('span'), h('span', null, 'Label'), h('span', null, 'Hotkey'), h('span', null, 'Entry')),
+      h('div.tr-rows', { role: 'group', 'aria-label': 'Entries in the trainer' }, rows.map((r) => r.el)),
+      h('div.checks', null, h('label.check', null, beepI, ' Beep when a hotkey toggles'), h('label.check', null, keysI, ' Show hotkeys on the form')),
+      h('p.hint', null, 'A hotkey the entry already has (Toggle activation) is shown, not registered twice. Generating again replaces the earlier trainer block.'), err,
+      h('div.dlg-actions', null,
+        h('button.btn.primary', { value: 'run', type: 'submit' }, 'Generate and run ', h('kbd', null, 'Ctrl Enter')),
+        h('button.btn', { value: 'ok', type: 'submit' }, 'Generate'),
+        h('button.btn', { value: 'cancel', type: 'submit', formnovalidate: true }, 'Cancel ', h('kbd', null, 'Esc'))));
+    const d = h('dialog.dlg.dlg-wide', { 'aria-label': 'Generate a trainer' }, form);
+    d.onkeydown = (ev) => { if ((ev.ctrlKey || ev.metaKey) && ev.key === 'Enter' && !ev.target.classList.contains('hk-keys')) { ev.preventDefault(); form.requestSubmit(form.querySelector('[value=run]')); } };
+    form.addEventListener('submit', async (ev) => {
+      const how = ev.submitter?.value;
+      if (how === 'cancel') return;
+      ev.preventDefault();
+      err.textContent = '';
+      const entries = rows.map((r) => r.read()).filter(Boolean);
+      if (!entries.length) { err.textContent = 'Pick at least one entry'; return; }
+      let script;
+      try { script = await api.trainerScript({ title: titleI.value.trim(), about: aboutI.value.trim(), beep: beepI.checked, show_keys: keysI.checked, entries }); } catch (x) { err.textContent = String(x?.message || x); return; }
+      d.close();
+      const cur = meta.lua_script, i = cur.indexOf(TR_BEGIN), j = cur.indexOf(TR_END);
+      const next = i >= 0 && j > i ? cur.slice(0, i) + script.trimEnd() + cur.slice(j + TR_END.length) : (cur.trim() ? cur.trimEnd() + '\n\n' : '') + script;
+      await commit(() => { meta.lua_script = next; });
+      toast('Trainer written to the table script', 'info');
+      if (how === 'run') await runTableScript();
+    });
+    d.addEventListener('close', () => { d.remove(); grid.focus(); });
+    document.body.append(d);
+    d.showModal();
+    titleI.select();
+  }
+
   // ---------- save / load ----------
   const FILTERS = [['Cheat tables', ['CT', 'ct', 'json']], ['Cheat Engine table', ['CT', 'ct']], ['HeapHook table', ['json']], ['All files', ['*']]];
   async function save() {
@@ -896,6 +995,7 @@ export function initTable(root) {
   $('#tb-delete').addEventListener('click', deleteSelected);
   $('#tb-lua').addEventListener('click', editTableScript);
   $('#tb-comments').addEventListener('click', editComments);
+  $('#tb-trainer').addEventListener('click', trainerDialog);
   refetch();
 
   return { addDialog: () => entryDialog(), save, load, focus: () => grid.focus(), editTableScript };

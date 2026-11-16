@@ -71,16 +71,16 @@ decreased decreased_by changed unchanged same_as_first`, plus `not: bool` to inv
 | `pick_path` | `save, title, filters: [[name, [ext]]], default?` | path or `null` (native dialog) |
 | `debug_attach` / `debug_detach` | – | status / – (while attached all memory access goes through the debugger) |
 | `debug_status` | – | `{attached, state: detached/running/broken/suspended/exited, tid, reason, rip, exit_code}` |
-| `debug_add_breakpoint` | `req: {addr, kind: execute/write/access, size, method: software/hardware, action: break/record/trace, steps, step_over_calls, ea}` | `id` |
-| `debug_remove_breakpoint` / `debug_set_enabled` | `id` / `id, enabled` | – |
-| `debug_breakpoints` | – | `[{id, addr, kind, size, method, action, ea, enabled, hits, slot}]` |
-| `debug_records` / `debug_clear_records` | `id` | `[{addr, ip, bytes, text, count, address, context}]` / – (`addr` = accessing instruction) |
+| `debug_add_breakpoint` | `req: {addr, kind: execute/write/access, size, method: software/hardware, action: break/record/trace, steps, step_over_calls, ea, skip_hits, one_shot, max_hits}` | `id` (hh-debug's id; hit options: ignore the first `skip_hits` hits, switch off after acting once, switch off at `max_hits`) |
+| `debug_remove_breakpoint` / `debug_set_enabled` | `id` / `id, enabled` | – (enable/disable in place: hits, records and trace are kept) |
+| `debug_breakpoints` | – | `[{id, addr, kind, size, len, method: software/hardware/page, action, ea, enabled, hits, slot, condition, options: {skip_hits, one_shot, max_hits}, records_dropped, owner: user/script, note}]` (`note`: why the debugger switched it off: exec, one-shot, max hits, code written over it; `owner: script` = set from Lua) |
+| `debug_records` / `debug_clear_records` | `id` | `[{addr, ip, bytes, text, count, address, context}]` / – (`addr` = accessing instruction, from hh-debug's `HitRecord.insn`; `address` = accessed address for `ea` breakpoints and range watches) |
 | `debug_trace` | `id` | `[{addr, text, context}]` |
 | `debug_threads` / `debug_suspend_thread` | – / `tid, suspend` | `[{tid, suspended}]` / – |
 | `debug_context` | `tid` | registers, hex strings; `fpu: {fcw, fsw, mxcsr, st: [{hex, value}], xmm: [hex]}` |
 | `debug_set_register` | `tid, name, value` (hex; `rax`…`r15, rip, rflags, fs_base, gs_base`) | – |
 | `debug_stack` | `tid, count` | `[{addr, value, comment}]` |
-| `debug_continue` / `debug_pause` / `debug_step` / `debug_run_to` | `passSignal` / – / `tid, kind: into/over/out` / `addr` | – |
+| `debug_continue` / `debug_pause` / `debug_step` / `debug_run_to` | `passSignal` / – / `tid, kind: into/over/out` / `addr, tid?` | – (`run_to` with `tid`: only that thread stops at `addr`, others pass it) |
 | `nop_instruction` | `addr` | original bytes (hex) |
 | `ptr_scan` | `req: {target, opts: hh-ptr ScanOptions, base_start, base_end, alignment, writable_only, map_path, compare: [{path, target}]}` | `{count, max_level, target}` |
 | `ptr_rescan` | `req: {target, value, vtype, fmt, base_start, base_end, starts_with, ends_with, max_level, map_path}` | `{count, max_level, target}` |
@@ -102,9 +102,17 @@ decreased decreased_by changed unchanged same_as_first`, plus `not: bool` to inv
 | `hotkey_press` | `keys: [vk]` (CE virtual-key codes, any order) | number of hotkeys fired (table and `createHotkey`) |
 | `lua_exec` | `code` | – (echo, prints, results and errors with traceback go to the log) |
 | `lua_interrupt` | – | – (also answers an open script dialog with cancel) |
-| `lua_poll` | `since` | `{log: [{seq, kind: in/out/result/err/info, text}], next, dialog: {id, kind: message/dialog/input, title, text, dlg_type, buttons, initial} or null, table_version, hotkeys: [[vk]], busy, sound, process: {pid, name, is_64bit, alive} or null}` (`process`: the opened process; the UI closes it when `alive` turns false and picks it up after a reload) |
+| `lua_poll` | `since` | `{log: [{seq, kind: in/out/result/err/info, text}], next, dialog: {id, kind: message/dialog/input, title, text, dlg_type, buttons, initial} or null, table_version, hotkeys: [[vk]], busy, sound, process: {pid, name, is_64bit, alive} or null, selection: {seq, ids}, ui_seq}` (`process`: the opened process; the UI closes it when `alive` turns false and picks it up after a reload; `selection.seq` moves when a script sets `SelectedRecords`; `ui_seq` moves on every form change) |
+| `ui_poll` | `since` | `{next, changes: [{seq, op: create/update/event/reparent/destroy/call, …}], snapshot: {roots: [control with children]} or null}` (hh-lua `UiChange`s of the forms scripts build; a snapshot instead when `since` is 0 or older than the kept changes; the UI applies both idempotently) |
+| `ui_event` | `id, event, args?` | handler results (`OnClick`, `OnClose` (applies the close action), `OnDblClick`, `OnKeyPress`, …; no handler is not an error) |
+| `ui_input` | `id, prop, value` | – (the user changed `Text` / `Checked` / `ItemIndex` / `Position` / `Left` / `Top`; stored without echo, fires `OnChange` / `OnClick` like CE) |
+| `ui_image` | `path` | `data:` URL of a `TImage` picture file (png, jpg, gif, bmp, webp, svg; at most 8 MiB) |
+| `key_state` | `keys: [vk]` | – (keys held in the app window, for Lua `isKeyPressed`) |
+| `table_select` | `ids` | – (the UI's selection, for Lua `SelectedRecord(s)`) |
+| `trainer_script` | `req: {title, about, beep, show_keys, entries: [{id, label, keys: [vk]}]}` | Lua trainer block (`-- BEGIN HEAPHOOK TRAINER` … `-- END HEAPHOOK TRAINER`): a form with one toggle per entry and its hotkey (keys the entry already toggles with are shown, not registered twice); the UI puts it into the table script. Runs inside HeapHook; no standalone .exe |
+| Lua hosts | | `createProcess` uses `process_create` (and attaches with `debug`); `getCurrentMemscan` is the scanner of the main scan; `loadTable(f)` = `table_open` (Lua state of the old table cleared), `loadTable(f, true)` appends entries with new ids; `saveTable` = `table_export`; `debug_setBreakpoint` & co drive this debugger (breakpoint functions run on the driver thread, the register globals are written back, returning non-zero continues); group options are applied by hh-lua once; record hotkeys fire through `hotkey_press` -> `fire_record_hotkey` (OnHotkey / OnPostHotkey) |
 | `lua_dialog_reply` | `id, value` (`mb*` button for `dialog`, string for `input`, null = cancel) | – |
-| `settings_get` / `settings_set` | – / `settings` | `{freeze_interval_ms, live_update_ms, fast_scan, scan_alignment, scan_writable, scan_executable, scan_copy_on_write, lua_budget_ms, table_script: ask/never, bp_method, hotkey_sound, theme: system/light/dark, scan_threads, signals}` (stored in the platform config dir) |
+| `settings_get` / `settings_set` | – / `settings` | `{freeze_interval_ms, live_update_ms, fast_scan, scan_alignment, scan_writable, scan_executable, scan_copy_on_write, lua_budget_ms, lua_memory_mb (0 = unlimited), table_script: ask/never, bp_method, hotkey_sound, theme: system/light/dark, scan_threads, signals}` (stored in the platform config dir) |
 | `close_process` | – | – (detaches the debugger, stops scans/freezer, scripts marked off; patches stay) |
 | `process_create` | `req: {program, args (shell-like string), cwd, speedhack}` | `{pid, name, is_64bit}` (launched via hh-inject and opened) |
 | `speed_get` / `speed_set` | – / `speed` (0 < x <= 1000) | `{pid, addr, speed, generation}` or `null` / same (Lua `speedhack_setSpeed` uses it too) |
@@ -134,8 +142,12 @@ decreased decreased_by changed unchanged same_as_first`, plus `not: bool` to inv
 | `code_list` | – | `[{description, address, bytes, before, after, addr, state: original/nopped/changed/unreadable, current}]` (hh-tools CodeList over `table.codes`) |
 | `code_add` / `code_remove` / `code_nop` / `code_restore` | `addr, description` / `index` / `index` / `index, force` | index / – (NOP verifies the original bytes first) |
 | `debug_add_breakpoint` (condition) | `req.condition`: `rax==5 && rcx>0x100` (registers, numbers, `+ - * & \| ^`, comparisons, `! && \|\|`, parens) | rows of `debug_breakpoints` carry `condition` |
-| `debug_set_condition` | `id, condition` (empty clears) | – |
-| `debug_signals` | – | `[[signal, name, default action]]`; `settings.signals` maps signal -> pass/ignore/break |
+| `debug_set_condition` | `id, condition` (empty clears) | – (in place; hits kept) |
+| `debug_signals` | – | `[[signal, name, default action, current action or null]]` from hh-debug's `signal_table()` (`current`: the attached debugger's); `settings.signals` maps signal -> pass/ignore/break, codes left out use the default (applying resets every code first) |
+| `debug_set_options` | `id, options: {skip_hits, one_shot, max_hits}` | – (in place; hits so far count) |
+| `debug_watch_range` | `req: {addr, len, kind: write/access, max_hits?}` | `id` (page-protection watch that records, any length; refused inside a stack: the `[stack]` mapping or the region of a thread's stack pointer) |
+| `debug_backtrace` | `tid, max` | `[{addr, module, symbol}]` (frame-pointer walk of a stopped thread) |
+| `debug_log` | `since` | `{lines: [{seq, text}], next}` (exec, fork, breakpoints the debugger switched off, exit) |
 | `ptr_sort` | `key: base/offset/value, column, desc, vtype, fmt?` | `{count, max_level, target}`; `ptr_results`/`ptr_entry` follow the order |
 
 `scan_first.opts`: `{start, stop, writable, executable, copy_on_write` (each `yes`/`no`/`any`)`,
@@ -145,7 +157,7 @@ percent, pause_while_scanning}`.
 Cheat table entry: `{id, description, addr` (expression)`, offsets: [hex], vtype, len, utf16,
 signed, hex, frozen` (= active)`, freeze_mode, color, dropdown: {options: [{value, text}], read_only,
 description_only, display_value_as_item}, hotkeys: [{action` (CE name, e.g. `Toggle Activation`,
-`Set Value`, `Increase Value`)`, keys: [vk], value, description}], script` (auto-assembler text,
+`Set Value`, `Increase Value`)`, keys: [vk], value, description, id?}], script` (auto-assembler text,
 makes it a script entry)`, options: [CE group option names], ct_extra: [raw .CT XML], children: []}`.
 Table: `{entries, lua_script, comments, codes: [{description, address, bytes, before, after}],
 ct_extra: [raw .CT XML of unknown <CheatTable> children]}`.

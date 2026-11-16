@@ -135,6 +135,7 @@ export function initMemview() {
     contextMenu(x, y, [
       { label: 'Toggle breakpoint', kbd: 'F5', disabled: !a, run: () => emit('debug:toggle-bp', a) },
       { label: 'Run to cursor', kbd: 'F4', disabled: !a || state.dbg?.state !== 'broken', run: () => emit('debug:run-to', a) },
+      { label: 'Run to cursor, this thread only', kbd: 'Shift F4', disabled: !a || state.dbg?.state !== 'broken', run: () => emit('debug:run-to-thread', a) },
       { label: 'Find out what addresses this instruction accesses', disabled: !a || !/\[/.test(d?.text || ''), run: () => emit('debug:ea', { addr: a, text: d.text }) },
       { label: 'Break and trace…', disabled: !a, run: () => emit('debug:trace', { addr: a, text: d.text }) },
       { label: 'Set breakpoint…', disabled: !a, run: () => emit('debug:bp-dialog', a) },
@@ -169,7 +170,7 @@ export function initMemview() {
     else if (e.key === 'Enter') assembleLine();
     else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'g') gotoPrompt('da');
     else if (e.key === 'F5' && cur()) emit('debug:toggle-bp', cur());
-    else if (e.key === 'F4' && cur()) emit('debug:run-to', cur());
+    else if (e.key === 'F4' && cur()) emit(e.shiftKey ? 'debug:run-to-thread' : 'debug:run-to', cur());
     else if (e.key.toLowerCase() === 'x' && !e.ctrlKey && cur()) emit('code:xrefs', cur());
     else if (e.key === 'ContextMenu' || (e.shiftKey && e.key === 'F10')) {
       const r = (daPool[daSel] || da).getBoundingClientRect();
@@ -185,6 +186,10 @@ export function initMemview() {
 
   // ---------- hex ----------
   let hxTop = null, hxCur = null, bytes = [], chgUntil = [], lastTop = null, nib = null;
+  /** Selection anchor (Shift with arrows or click); the selection runs from it to the cursor. */
+  let hxAnchor = null;
+  const hxSel = () => (hxAnchor == null || hxCur == null || hxAnchor === hxCur ? null
+    : hxAnchor < hxCur ? [hxAnchor, hxCur + BigInt(unit()) - 1n] : [hxCur, hxAnchor + BigInt(unit()) - 1n]);
   const unit = () => TYPES[hxType.value];
   async function hxLoad() {
     if (hxTop == null) return;
@@ -229,7 +234,7 @@ export function initMemview() {
         hxPool.push(row); hx.append(row);
       }
     }
-    const now = performance.now(), curOff = hxCur != null ? Number(hxCur - hxTop) : -1;
+    const now = performance.now(), curOff = hxCur != null ? Number(hxCur - hxTop) : -1, sel = hxSel();
     hxPool.forEach((row, r) => {
       const base = r * 16, [a, bs, asc] = row.children;
       const t = fmtAddr(hxTop + BigInt(base));
@@ -240,8 +245,9 @@ export function initMemview() {
         let chg = false;
         for (let k = 0; k < u; k++) if (chgUntil[i + k] > now) chg = true;
         c.classList.toggle('chg', chg);
-        const isCur = curOff >= i && curOff < i + u;
+        const isCur = curOff >= i && curOff < i + u, at = hxTop + BigInt(i);
         c.classList.toggle('cursor', isCur);
+        c.classList.toggle('sel', !!sel && at >= sel[0] && at <= sel[1]);
         c.classList.toggle('pending', isCur && nib != null);
         if (isCur) { c.id = 'hx-cur'; } else if (c.id) c.removeAttribute('id');
       }
@@ -250,17 +256,19 @@ export function initMemview() {
       if (asc.textContent !== s) asc.textContent = s;
     });
     hx.setAttribute('aria-activedescendant', curOff >= 0 ? 'hx-cur' : '');
-    $('#hx-pos').textContent = hxCur != null ? fmtAddr(hxCur) : '';
+    $('#hx-pos').textContent = sel ? `${fmtAddr(sel[0])} · ${Number(sel[1] - sel[0] + 1n)} bytes` : hxCur != null ? fmtAddr(hxCur) : '';
   }
   const hxSchedule = rafThrottle(hxRender);
   function hxGoto(addr) {
+    hxAnchor = null;
     hxCur = big(addr);
     hxTop = hxCur & ~0xfn;
     nib = null;
     hxLoad();
   }
-  function hxMove(delta) {
+  function hxMove(delta, extend = false) {
     if (hxCur == null) return;
+    if (extend) hxAnchor ??= hxCur; else hxAnchor = null;
     const n = hxCur + BigInt(delta);
     hxCur = n < 0n ? 0n : n;
     nib = null;
@@ -281,10 +289,12 @@ export function initMemview() {
   }
   hx.addEventListener('keydown', async (e) => {
     const u = unit(), vis = visOf(hx);
-    if (e.key === 'ArrowRight') hxMove(u);
-    else if (e.key === 'ArrowLeft') hxMove(-u);
-    else if (e.key === 'ArrowDown') hxMove(16);
-    else if (e.key === 'ArrowUp') hxMove(-16);
+    const ext = e.shiftKey;
+    if (e.key === 'ArrowRight') hxMove(u, ext);
+    else if (e.key === 'ArrowLeft') hxMove(-u, ext);
+    else if (e.key === 'ArrowDown') hxMove(16, ext);
+    else if (e.key === 'ArrowUp') hxMove(-16, ext);
+    else if ((e.ctrlKey || e.metaKey) && e.shiftKey && e.key.toLowerCase() === 'r') watchSel();
     else if (e.key === 'PageDown') { hxTop += BigInt(vis * 16); hxMove(vis * 16); }
     else if (e.key === 'PageUp') { hxTop = hxTop > BigInt(vis * 16) ? hxTop - BigInt(vis * 16) : 0n; hxMove(-vis * 16); }
     else if (e.key === 'Enter') hxEditValue();
@@ -317,10 +327,17 @@ export function initMemview() {
     const c = e.target.closest('.hb');
     if (!c) return;
     const r = hxPool.indexOf(c.closest('.hx-row'));
+    if (e.shiftKey) hxAnchor ??= hxCur; else hxAnchor = null;
     hxCur = hxTop + BigInt(r * 16 + +c.dataset.o);
     nib = null;
     hxSchedule();
   });
+  /** Range watch over the selection (or the value under the cursor). */
+  function watchSel(kind = 'write') {
+    const sel = hxSel();
+    if (hxCur == null) return;
+    emit('debug:watch-range', sel ? { addr: wire(sel[0]), len: Number(sel[1] - sel[0] + 1n), kind } : { addr: wire(hxCur), len: unit() === 1 ? 4 : unit(), kind });
+  }
   hx.addEventListener('dblclick', (e) => { if (e.target.closest('.hb')) hxEditValue(); });
   const hxCurWire = () => (hxCur != null ? wire(hxCur) : null);
   const after = (p) => p.then((ok) => { if (ok) { lastTop = null; hxLoad(); } hx.focus(); });
@@ -338,6 +355,8 @@ export function initMemview() {
       { label: 'What references this address (code)', disabled: !a, run: () => emit('code:xrefs', a) },
       { label: 'Find out what accesses this address', disabled: !a, run: () => emit('debug:accesses', { addr: a, vtype: hxType.value === 'byte' ? '4bytes' : hxType.value }) },
       { label: 'Find out what writes to this address', disabled: !a, run: () => emit('debug:writes', { addr: a, vtype: hxType.value === 'byte' ? '4bytes' : hxType.value }) },
+      { label: hxSel() ? 'Watch the selected range for writes…' : 'Watch a range for writes…', kbd: 'Ctrl Shift R', disabled: !a, run: () => watchSel('write') },
+      { label: hxSel() ? 'Watch the selected range for accesses…' : 'Watch a range for accesses…', disabled: !a, run: () => watchSel('access') },
       '-',
       { label: 'Fill memory…', kbd: 'Ctrl Shift F', disabled: !state.proc, run: fill },
       { label: 'Copy memory…', kbd: 'Ctrl Shift C', disabled: !state.proc, run: copyMem },
@@ -349,7 +368,12 @@ export function initMemview() {
   hx.addEventListener('contextmenu', (e) => {
     e.preventDefault();
     const c = e.target.closest('.hb');
-    if (c) { const r = hxPool.indexOf(c.closest('.hx-row')); hxCur = hxTop + BigInt(r * 16 + +c.dataset.o); nib = null; hxSchedule(); }
+    if (c) {
+      const r = hxPool.indexOf(c.closest('.hx-row')), at = hxTop + BigInt(r * 16 + +c.dataset.o), sel = hxSel();
+      // Right-clicking inside the selection keeps it.
+      if (!sel || at < sel[0] || at > sel[1]) { hxAnchor = null; hxCur = at; }
+      nib = null; hxSchedule();
+    }
     hxMenu(e.clientX, e.clientY);
   });
   $('#hx-tools').addEventListener('click', () => { const r = $('#hx-tools').getBoundingClientRect(); hxMenu(r.left, r.bottom + 4); });

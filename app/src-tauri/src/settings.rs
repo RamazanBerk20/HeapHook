@@ -20,6 +20,8 @@ pub struct Settings {
     pub scan_threads: usize,
     /// Wall-clock limit for one Lua run (console, table script, timer tick); 0 = unlimited.
     pub lua_budget_ms: u64,
+    /// Most memory one Lua state may allocate, in MiB; 0 = unlimited.
+    pub lua_memory_mb: u64,
     /// What to do with a table's Lua script on load: `ask` or `never`.
     pub table_script: String,
     /// Method for new execute breakpoints: `software` or `hardware`.
@@ -44,6 +46,7 @@ impl Default for Settings {
             scan_copy_on_write: "no".into(),
             scan_threads: 0,
             lua_budget_ms: 30_000,
+            lua_memory_mb: 1024,
             table_script: "ask".into(),
             bp_method: "software".into(),
             hotkey_sound: false,
@@ -67,6 +70,7 @@ impl Settings {
         self.scan_alignment = self.scan_alignment.clamp(1, 64);
         self.scan_threads = self.scan_threads.min(256);
         self.lua_budget_ms = self.lua_budget_ms.min(3_600_000);
+        self.lua_memory_mb = self.lua_memory_mb.min(65_536);
         let tri = ["yes", "no", "any"];
         pick(&mut self.scan_writable, &tri, &d.scan_writable);
         pick(&mut self.scan_executable, &tri, &d.scan_executable);

@@ -1,19 +1,23 @@
 //! The app's Lua engine (hh-lua): one per app, bound to the current process through the
 //! session's `Switch` (so it follows debugger attach/detach), with the console log, the
-//! dialogs scripts open, `createHotkey` registrations, and the background driver that calls
-//! `tick()`, applies group cascades, re-syncs the freezer and keeps global hotkeys registered.
-use std::collections::{HashMap, VecDeque};
+//! dialogs scripts open, `createHotkey` registrations, the forms scripts build (`UiHost`,
+//! mirrored to the UI through `ui_poll`), the debugger behind `debug_*` (`DebugHost`), and
+//! the background driver that calls `tick()`, runs Lua breakpoint functions, re-syncs the
+//! freezer and keeps global hotkeys registered.
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::SeqCst};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::thread::ThreadId;
 use std::time::{Duration, Instant};
 
-use hh_core::Result as HResult;
-use hh_lua::{Engine, EngineOptions, Host};
+use hh_core::{Error as HError, Result as HResult};
+use hh_lua::{DebugHost, Engine, EngineOptions, Host, Prop, UiChange, UiHost, UiSnapshot};
+use hh_scan::Scanner;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::cheat::Live;
-use crate::commands::{App, R, lock};
+use crate::commands::{App, R, WeakApp, lock};
 
 const LOG_CAP: usize = 2000;
 const TICK: Duration = Duration::from_millis(20);
@@ -21,6 +25,10 @@ const TICK: Duration = Duration::from_millis(20);
 const FREEZE_RESYNC: Duration = Duration::from_secs(1);
 /// A combo firing twice within this window (global grab plus in-app key event) fires once.
 const HOTKEY_DEDUPE: Duration = Duration::from_millis(150);
+/// Form changes kept for `ui_poll`; a UI further behind gets a snapshot instead.
+const UI_CAP: usize = 20_000;
+/// Largest image file a form may show (`Picture.loadFromFile`).
+const MAX_IMAGE: u64 = 8 << 20;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct LogLine {
@@ -64,6 +72,34 @@ pub struct Console {
     pub(crate) hotkeys: Mutex<(HashMap<u32, Vec<u32>>, u64)>,
     /// The opened process's speedhack, when it was launched with one (`speedhack_setSpeed`).
     pub(crate) speedhack: Mutex<Option<Arc<hh_inject::Speedhack>>>,
+    /// The app, for hosts that call back into it (create process, tables, debugger).
+    pub(crate) app: OnceLock<WeakApp>,
+    /// Keys held down in the app window (`isKeyPressed`), CE virtual-key codes.
+    keys: Mutex<HashSet<u32>>,
+    /// Form changes with their sequence numbers, for `ui_poll`.
+    ui: Mutex<UiLog>,
+}
+
+#[derive(Default)]
+struct UiLog {
+    changes: VecDeque<(u64, UiChange)>,
+    seq: u64,
+}
+
+/// `ui_poll` answer: the changes after `since`, or the whole tree when the UI is too far
+/// behind (or asks with `since` 0).
+#[derive(Debug, Clone, Serialize)]
+pub struct UiPoll {
+    pub next: u64,
+    pub changes: Vec<UiSeqChange>,
+    pub snapshot: Option<UiSnapshot>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct UiSeqChange {
+    pub seq: u64,
+    #[serde(flatten)]
+    pub change: UiChange,
 }
 
 impl Console {
@@ -185,15 +221,136 @@ impl Host for Console {
             None => Err(hh_core::Error::Unsupported("speedhack: launch the process with \"Create process\" and the speedhack option")),
         }
     }
+    fn create_process(&self, path: &str, params: &str, debug: bool, _break_on_entry: bool) -> HResult<u32> {
+        let app = self.app()?;
+        let req = crate::inject::CreateReq { program: path.into(), args: params.into(), ..Default::default() };
+        let o = app.process_create(&req).map_err(HError::Other)?;
+        if debug {
+            app.debug_attach().map_err(HError::Other)?;
+        }
+        Ok(o.pid)
+    }
+    fn current_memscan(&self) -> Option<Arc<Scanner>> {
+        Some(self.app().ok()?.session().ok()?.scanner.clone())
+    }
+    fn load_table(&self, path: &str, merge: bool) -> HResult<()> {
+        let app = self.app()?;
+        if merge { app.table_merge(path) } else { app.table_open(path, false).map(|_| ()) }.map_err(HError::Other)
+    }
+    fn save_table(&self, path: &str, _protect: bool) -> HResult<()> {
+        self.app()?.table_export(path).map_err(HError::Other)
+    }
+    fn is_key_pressed(&self, vk: i64) -> bool {
+        let k = lock(&self.keys);
+        // CE: VK_SHIFT/CONTROL/MENU also match the left/right variants.
+        let alias = match vk {
+            160 | 161 => 16,
+            162 | 163 => 17,
+            164 | 165 => 18,
+            v => v,
+        };
+        k.contains(&(alias as u32))
+    }
 }
 
-/// The engine plus the lock that admits one caller at a time (hh-lua's budget guard counts
-/// nesting across threads, so concurrent entries would share one deadline).
+impl Console {
+    fn app(&self) -> HResult<App> {
+        self.app.get().and_then(App::upgrade).ok_or_else(|| HError::Other("HeapHook is shutting down".into()))
+    }
+}
+
+/// `debug_*` from Lua drive the app's debugger; breakpoints set this way are listed in
+/// the UI as script-owned.
+impl DebugHost for Console {
+    fn start(&self, _interface: i64) -> HResult<()> {
+        self.app()?.debug_attach().map(|_| ()).map_err(HError::Other)
+    }
+    fn is_debugging(&self) -> bool {
+        self.app().is_ok_and(|a| a.lua_debugging())
+    }
+    fn set_breakpoint(&self, bp: &hh_lua::BreakpointSpec) -> HResult<()> {
+        self.app()?.lua_set_breakpoint(bp).map(|_| ()).map_err(HError::Other)
+    }
+    fn remove_breakpoint(&self, address: hh_core::Addr) -> HResult<()> {
+        self.app()?.lua_remove_breakpoint(address).map_err(HError::Other)
+    }
+    fn continue_from_breakpoint(&self, tid: u32, mode: hh_lua::ContinueMode, ctx: Option<&hh_lua::RegContext>) -> HResult<()> {
+        self.app()?.lua_continue(tid, mode, ctx).map_err(HError::Other)
+    }
+    fn break_thread(&self, _tid: u32) -> HResult<()> {
+        self.app()?.debug_pause().map_err(HError::Other)
+    }
+}
+
+/// Forms built by scripts: every change is queued for the UI (`ui_poll`); never calls back
+/// into the engine.
+impl UiHost for Console {
+    fn changed(&self, change: &UiChange) {
+        let mut g = lock(&self.ui);
+        g.seq += 1;
+        let seq = g.seq;
+        g.changes.push_back((seq, change.clone()));
+        while g.changes.len() > UI_CAP {
+            g.changes.pop_front();
+        }
+    }
+}
+
+/// A lock one thread holds at a time and may take again (Lua calls hosts that call back
+/// into app commands that take it too: `loadTable`, `createProcess`, debugger functions).
+#[derive(Default)]
+pub(crate) struct ReLock {
+    m: Mutex<(Option<ThreadId>, usize)>,
+    cv: Condvar,
+}
+
+pub(crate) struct ReGuard<'a>(&'a ReLock);
+
+impl ReLock {
+    fn enter(&self) -> ReGuard<'_> {
+        let me = std::thread::current().id();
+        let mut g = lock(&self.m);
+        while g.0.is_some_and(|t| t != me) {
+            g = self.cv.wait(g).unwrap_or_else(|e| e.into_inner());
+        }
+        g.0 = Some(me);
+        g.1 += 1;
+        ReGuard(self)
+    }
+
+    /// `None` while another thread holds it.
+    fn try_enter(&self) -> Option<ReGuard<'_>> {
+        let me = std::thread::current().id();
+        let mut g = lock(&self.m);
+        if g.0.is_some_and(|t| t != me) {
+            return None;
+        }
+        g.0 = Some(me);
+        g.1 += 1;
+        Some(ReGuard(self))
+    }
+}
+
+impl Drop for ReGuard<'_> {
+    fn drop(&mut self) {
+        let mut g = lock(&self.0.m);
+        g.1 -= 1;
+        if g.1 == 0 {
+            g.0 = None;
+            self.0.cv.notify_one();
+        }
+    }
+}
+
+/// The engine plus the app's lock around it: one thread runs Lua and the table changes it
+/// makes at a time (hh-lua has its own gate; this one also covers the app-side steps).
 pub struct LuaCtx {
     pub(crate) engine: Engine,
-    run: Mutex<()>,
+    run: ReLock,
     pub(crate) console: Arc<Console>,
     busy: AtomicBool,
+    /// The script defines `debugger_onBreakpoint`: every breakpoint hit goes to Lua first.
+    pub(crate) onbp: AtomicBool,
 }
 
 impl LuaCtx {
@@ -203,11 +360,19 @@ impl LuaCtx {
         let console = Arc::new(Console::default());
         engine.set_host(console.clone());
         engine.set_table(live);
-        LuaCtx { engine, run: Mutex::new(()), console, busy: AtomicBool::new(false) }
+        engine.set_ui_host(console.clone());
+        engine.set_debug_host(console.clone());
+        LuaCtx { engine, run: ReLock::default(), console, busy: AtomicBool::new(false), onbp: AtomicBool::new(false) }
     }
 
-    pub(crate) fn enter(&self) -> MutexGuard<'_, ()> {
-        lock(&self.run)
+    pub(crate) fn enter(&self) -> ReGuard<'_> {
+        self.run.enter()
+    }
+
+    /// Re-reads whether `debugger_onBreakpoint` is defined; call with the lock held.
+    pub(crate) fn refresh_onbp(&self) {
+        let f = self.engine.lua().globals().raw_get::<mlua::Value>("debugger_onBreakpoint").is_ok_and(|v| v.is_function());
+        self.onbp.store(f, SeqCst);
     }
 }
 
@@ -226,6 +391,10 @@ pub struct LuaPoll {
     /// The opened process (`null` when none), so the UI notices an exit and can recover
     /// its state after a reload.
     pub process: Option<ProcessState>,
+    /// Table selection a script set (`SelectedRecords`); `seq` moves on each change.
+    pub selection: crate::cheat::Selection,
+    /// Sequence number of the last form change (call `ui_poll` when it moves).
+    pub ui_seq: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -275,8 +444,8 @@ impl App {
         l.busy.store(true, SeqCst);
         let r = l.engine.exec(code, name);
         l.busy.store(false, SeqCst);
+        l.refresh_onbp();
         drop(_g);
-        self.drain_cascades();
         match r {
             Ok(vals) => {
                 if !vals.is_empty() {
@@ -326,7 +495,72 @@ impl App {
             busy: self.x.lua.busy.load(SeqCst),
             sound: c.sound.load(SeqCst),
             process: self.session().ok().map(|s| ProcessState { info: s.info.clone(), alive: s.raw.is_alive() }),
+            selection: self.x.live.selection(),
+            ui_seq: lock(&c.ui).seq,
         })
+    }
+
+    // ---------------------------------------------------------------- forms
+
+    /// Form changes after `since` (`since` 0, or too far behind: the whole tree instead).
+    pub fn ui_poll(&self, since: u64) -> R<UiPoll> {
+        let g = lock(&self.x.lua.console.ui);
+        let next = g.seq;
+        let behind = g.changes.front().is_some_and(|f| f.0 > since + 1);
+        if since == 0 || behind || since > next {
+            drop(g);
+            // Changes made while the snapshot is taken are in it and also replayed: the UI
+            // applies them idempotently.
+            return Ok(UiPoll { next, changes: Vec::new(), snapshot: Some(self.x.lua.engine.ui_snapshot()) });
+        }
+        let changes = g.changes.iter().filter(|c| c.0 > since).map(|(seq, c)| UiSeqChange { seq: *seq, change: c.clone() }).collect();
+        Ok(UiPoll { next, changes, snapshot: None })
+    }
+
+    /// A user event on a form control (`OnClick`, `OnClose`, ...); returns the handler's results.
+    pub fn ui_event(&self, id: u32, event: &str, args: Vec<Prop>) -> R<Vec<Prop>> {
+        let _g = self.x.lua.enter();
+        let r = self.x.lua.engine.fire_event(id, event, &args).map_err(|e| e.to_string());
+        self.x.lua.refresh_onbp();
+        if let Err(e) = &r {
+            self.x.lua.console.push("err", e);
+        }
+        r
+    }
+
+    /// The user changed a control's value (`Text`, `Checked`, `ItemIndex`, `Position`).
+    pub fn ui_input(&self, id: u32, prop: &str, value: Prop) -> R<()> {
+        let _g = self.x.lua.enter();
+        let r = self.x.lua.engine.ui_input(id, prop, value).map_err(|e| e.to_string());
+        if let Err(e) = &r {
+            self.x.lua.console.push("err", e);
+        }
+        r
+    }
+
+    /// An image file a form shows (`TImage.Picture.loadFromFile`) as a `data:` URL.
+    pub fn ui_image(&self, path: &str) -> R<String> {
+        let mime = match std::path::Path::new(path).extension().and_then(|e| e.to_str()).map(str::to_ascii_lowercase).as_deref() {
+            Some("png") => "image/png",
+            Some("jpg" | "jpeg") => "image/jpeg",
+            Some("gif") => "image/gif",
+            Some("bmp") => "image/bmp",
+            Some("webp") => "image/webp",
+            Some("svg") => "image/svg+xml",
+            _ => return Err(format!("{path}: not an image HeapHook can show (png, jpg, gif, bmp, webp, svg)")),
+        };
+        let len = std::fs::metadata(path).map_err(|e| format!("{path}: {e}"))?.len();
+        if len > MAX_IMAGE {
+            return Err(format!("{path}: larger than {} MiB", MAX_IMAGE >> 20));
+        }
+        let b = std::fs::read(path).map_err(|e| format!("{path}: {e}"))?;
+        Ok(format!("data:{mime};base64,{}", base64(&b)))
+    }
+
+    /// Keys currently held in the app window (`isKeyPressed`).
+    pub fn key_state(&self, keys: &[u32]) -> R<()> {
+        *lock(&self.x.lua.console.keys) = keys.iter().copied().collect();
+        Ok(())
     }
 
     pub fn lua_dialog_reply(&self, r: DialogReply) -> R<()> {
@@ -372,12 +606,8 @@ impl App {
             let r = match t {
                 Target::Entry(id, i) => self.table_hotkey(*id, *i),
                 Target::Lua(id) => {
-                    let r = {
-                        let _g = self.x.lua.enter();
-                        self.x.lua.engine.fire_hotkey(*id).map_err(|e| e.to_string())
-                    };
-                    self.drain_cascades();
-                    r
+                    let _g = self.x.lua.enter();
+                    self.x.lua.engine.fire_hotkey(*id).map_err(|e| e.to_string())
                 }
             };
             if let Err(e) = r {
@@ -411,8 +641,8 @@ impl App {
 
     // ---------------------------------------------------------------- driver
 
-    /// Starts the background driver once: Lua timers/threads (`tick`), group cascades, the
-    /// frozen set, global hotkeys. It ends when the last `App` clone is dropped.
+    /// Starts the background driver once: Lua timers/threads (`tick`), Lua breakpoint
+    /// functions, the frozen set, global hotkeys. It ends when the last `App` clone is dropped.
     pub fn start_driver(&self) {
         if self.x.driver.swap(true, SeqCst) {
             return;
@@ -427,12 +657,13 @@ impl App {
                     let Some(app) = App::upgrade(&weak) else { break };
                     let l = &app.x.lua;
                     // Skip the tick while a console run holds the engine.
-                    if let Ok(_g) = l.run.try_lock()
-                        && let Err(e) = l.engine.tick()
-                    {
-                        l.console.push("err", &e.to_string());
+                    if let Some(_g) = l.run.try_enter() {
+                        if let Err(e) = l.engine.tick() {
+                            l.console.push("err", &e.to_string());
+                        }
+                        l.refresh_onbp();
                     }
-                    app.drain_cascades();
+                    app.dispatch_lua_break();
                     if app.x.live.take_dirty() || last_sync.elapsed() >= FREEZE_RESYNC {
                         app.sync_freeze();
                         last_sync = Instant::now();
@@ -443,5 +674,27 @@ impl App {
                 }
             })
             .expect("spawn driver thread");
+    }
+}
+
+/// Standard base64 with padding.
+fn base64(b: &[u8]) -> String {
+    const A: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(b.len().div_ceil(3) * 4);
+    for c in b.chunks(3) {
+        let n = (c[0] as u32) << 16 | (*c.get(1).unwrap_or(&0) as u32) << 8 | *c.get(2).unwrap_or(&0) as u32;
+        for i in 0..4 {
+            out.push(if i <= c.len() { A[(n >> (18 - 6 * i)) as usize & 63] as char } else { '=' });
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn base64_matches_rfc4648() {
+        let t = |s: &str| super::base64(s.as_bytes());
+        assert_eq!([t(""), t("f"), t("fo"), t("foo"), t("foob"), t("fooba"), t("foobar")], ["", "Zg==", "Zm8=", "Zm9v", "Zm9vYg==", "Zm9vYmE=", "Zm9vYmFy"]);
     }
 }

@@ -10,3 +10,4 @@ pub mod ptr;
 pub mod settings;
 pub mod table;
 pub mod tools;
+pub mod trainer;

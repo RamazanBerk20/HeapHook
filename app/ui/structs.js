@@ -311,7 +311,15 @@ export function initStructs({ showView }) {
       { label: 'Browse this address', kbd: 'Ctrl M', disabled: !v0, run: () => emit('mem:goto', { addr: v0.addr, pane: 'hex' }) },
       { label: 'Find out what accesses this address', disabled: !v0, run: () => emit('debug:accesses', { addr: v0.addr, vtype: r.vtype === 'pointer' ? '8bytes' : r.vtype }) },
       { label: 'Find out what writes to this address', disabled: !v0, run: () => emit('debug:writes', { addr: v0.addr, vtype: r.vtype === 'pointer' ? '8bytes' : r.vtype }) },
+      { label: 'Watch the whole structure for writes…', disabled: !columns().length, run: () => watchStruct() },
     ], list.el);
+  }
+  /** Range watch over the structure at the first address column (its full size). */
+  function watchStruct() {
+    const st = structs.find((x) => x.name === cur), c = columns()[0];
+    if (!st || !c) return;
+    const len = Math.max(1, ...st.elements.map((e) => Number(e.offset) + (Number(e.size) || 8)));
+    emit('debug:watch-range', { addr: c.addr, len, kind: 'write' });
   }
   function keys(e, i, r) {
     const k = e.key, ctrl = e.ctrlKey || e.metaKey;

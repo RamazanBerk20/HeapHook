@@ -12,8 +12,8 @@ use std::sync::Mutex;
 
 use hh_asm::AaState;
 use hh_core::{Addr, Error, Result as HResult};
-use hh_lua::{RecId, Record, TableHost};
-use hh_scan::{Fmt, FreezeMode, FrozenEntry, VType, ValueRef};
+use hh_lua::{RecId, Record, RecordHotkey, TableHost};
+use hh_scan::{Fmt, FreezeMode, FrozenEntry};
 use serde::Serialize;
 
 use crate::commands::{App, R, lock, parse_addr};
@@ -33,9 +33,6 @@ struct Inner {
     table: Table,
     version: u64,
     rt: HashMap<i64, Rt>,
-    /// (id, active) of records with children whose activation changed; the group options
-    /// decide what happens to the children (`App::drain_cascades`).
-    cascade: Vec<(i64, bool)>,
     freeze_dirty: bool,
     /// Earlier / undone tables of user edits (puts, structure and code-list changes).
     undo: Vec<Table>,
@@ -77,7 +74,37 @@ pub(crate) fn removed_active_scripts(old: &Table, new: &Table) -> Vec<i64> {
 }
 
 #[derive(Default)]
-pub struct Live(Mutex<Inner>);
+pub struct Live(Mutex<Inner>, Mutex<Selection>);
+
+/// The address list selection: the UI reports it (`table_select`); a script that sets it
+/// bumps `seq` so the UI follows.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct Selection {
+    pub seq: u64,
+    pub ids: Vec<i64>,
+}
+
+/// CE `mrh*` hotkey actions, in number order.
+const HK_ACTIONS: [&str; 8] = [
+    "Toggle Activation", "Toggle Activation Allow Increase", "Toggle Activation Allow Decrease", "Activate", "Deactivate", "Set Value",
+    "Increase Value", "Decrease Value",
+];
+
+/// Ids for an entry's hotkeys: each kept id when unique, the rest numbered after the largest.
+fn hotkey_ids(hks: &[table::Hotkey]) -> Vec<u32> {
+    let mut seen = HashSet::new();
+    let mut next = hks.iter().filter_map(|h| h.id).max().unwrap_or(0);
+    hks.iter()
+        .map(|h| match h.id.filter(|i| *i > 0 && seen.insert(*i)) {
+            Some(i) => i,
+            None => {
+                next += 1;
+                seen.insert(next);
+                next
+            }
+        })
+        .collect()
+}
 
 /// Consent for the Lua in a table's scripts (`{$lua}` blocks; the table script asks itself).
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
@@ -201,12 +228,27 @@ fn record(e: &Entry, parent: Option<i64>, rt: Option<&Rt>) -> Record {
     r.offsets = e.offsets.iter().map(|o| parse_off(o)).collect();
     r.vtype = e.vtype;
     r.fmt = fmt_of(e);
-    // shortcut: hh-lua activates a record either as a script or by reading its value; a group
-    // header is handed over as an empty script (enabling it runs nothing), so Lua sees Type 11
-    // for headers. Upgrade when hh-lua knows group records.
-    r.script = if is_group(e) { Some(String::new()) } else { e.script.clone() };
+    r.group_header = is_group(e);
+    r.script = e.script.clone();
     r.color = color_in(e.color.as_deref());
     r.active = e.frozen;
+    r.options = e.options.clone();
+    if let Some(d) = &e.dropdown {
+        r.dropdown = d.options.iter().map(|o| format!("{}:{}", o.value, o.text)).collect();
+        (r.dropdown_readonly, r.dropdown_description_only, r.dropdown_display_as_item) = (d.read_only, d.description_only, d.display_value_as_item);
+    }
+    r.hotkeys = e
+        .hotkeys
+        .iter()
+        .zip(hotkey_ids(&e.hotkeys))
+        .map(|(h, id)| RecordHotkey {
+            id,
+            keys: h.keys.iter().map(|&k| k as i64).collect(),
+            action: HK_ACTIONS.iter().position(|a| *a == h.action).unwrap_or(0) as i64,
+            value: h.value.clone().unwrap_or_default(),
+            description: h.description.clone().unwrap_or_default(),
+        })
+        .collect();
     if let Some(rt) = rt {
         r.aa_state = rt.aa_state.clone();
         r.frozen_value = rt.frozen_value.clone();
@@ -301,7 +343,6 @@ impl Live {
         }
         g.table = t;
         g.rt = rt;
-        g.cascade.clear();
         g.undo.clear();
         g.redo.clear();
         g.bump();
@@ -352,8 +393,13 @@ impl Live {
         }
     }
 
-    pub(crate) fn take_cascade(&self) -> Vec<(i64, bool)> {
-        std::mem::take(&mut lock(&self.0).cascade)
+    pub fn selection(&self) -> Selection {
+        lock(&self.1).clone()
+    }
+
+    /// The UI's selection (does not bump `seq`: the UI already shows it).
+    pub(crate) fn select(&self, ids: Vec<i64>) {
+        lock(&self.1).ids = ids;
     }
 
     pub(crate) fn take_dirty(&self) -> bool {
@@ -389,12 +435,49 @@ impl TableHost for Live {
             .map(|(e, p)| (record(e, p, None), p))
             .ok_or_else(|| Error::Other(format!("no record {id}")))?;
         let e = find_mut(&mut g.table.entries, id).expect("found above");
-        let group = is_group(e);
         e.description = rec.description.clone();
-        if !group {
-            e.addr = rec.address.clone();
+        if rec.group_header {
+            // A header has no address and no script (CE `IsGroupHeader`).
+            e.addr.clear();
+            e.script = None;
+        } else {
+            // A header turned into a value entry needs an address to stay one.
+            e.addr = if rec.address.trim().is_empty() && rec.script.is_none() { "0".into() } else { rec.address.clone() };
             e.script = rec.script.clone();
             e.vtype = rec.vtype;
+        }
+        if old.options != rec.options {
+            e.options = rec.options.clone();
+        }
+        if (&old.dropdown, old.dropdown_readonly, old.dropdown_description_only, old.dropdown_display_as_item)
+            != (&rec.dropdown, rec.dropdown_readonly, rec.dropdown_description_only, rec.dropdown_display_as_item)
+        {
+            e.dropdown = (!rec.dropdown.is_empty()).then(|| table::Dropdown {
+                options: rec
+                    .dropdown
+                    .iter()
+                    .map(|l| match l.split_once(':') {
+                        Some((v, t)) => table::DropdownItem { value: v.trim().into(), text: t.trim().into() },
+                        None => table::DropdownItem { value: l.trim().into(), text: String::new() },
+                    })
+                    .collect(),
+                read_only: rec.dropdown_readonly,
+                description_only: rec.dropdown_description_only,
+                display_value_as_item: rec.dropdown_display_as_item,
+            });
+        }
+        if old.hotkeys != rec.hotkeys {
+            e.hotkeys = rec
+                .hotkeys
+                .iter()
+                .map(|h| table::Hotkey {
+                    action: HK_ACTIONS.get(h.action.max(0) as usize).unwrap_or(&HK_ACTIONS[0]).to_string(),
+                    keys: h.keys.iter().map(|&k| k as u32).collect(),
+                    value: Some(h.value.clone()).filter(|v| !v.is_empty()),
+                    description: Some(h.description.clone()).filter(|d| !d.is_empty()),
+                    id: Some(h.id),
+                })
+                .collect();
         }
         if old.offsets != rec.offsets {
             e.offsets = rec.offsets.iter().map(|&o| fmt_off(o)).collect();
@@ -406,15 +489,10 @@ impl TableHost for Live {
         if old.color != rec.color {
             e.color = color_out(rec.color);
         }
-        let toggled = e.frozen != rec.active;
         e.frozen = rec.active;
-        let has_kids = !e.children.is_empty();
         let rt = g.rt.entry(id).or_default();
         rt.aa_state = rec.aa_state.clone();
         rt.frozen_value = rec.frozen_value.clone();
-        if toggled && has_kids {
-            g.cascade.push((id, rec.active));
-        }
         let new_parent = rec.parent.map(|p| p as i64);
         if new_parent != parent {
             let sub = find_mut(&mut g.table.entries, id).map_or(1, |e| height(std::slice::from_ref(e)));
@@ -458,6 +536,26 @@ impl TableHost for Live {
             g.bump();
         }
     }
+
+    fn selected(&self) -> Vec<RecId> {
+        let ids: HashSet<i64> = all(&lock(&self.0).table.entries).into_iter().map(|(e, _)| e.id).collect();
+        lock(&self.1).ids.iter().filter(|i| ids.contains(i)).map(|&i| i as RecId).collect()
+    }
+
+    fn set_selected(&self, ids: &[RecId]) {
+        let mut s = lock(&self.1);
+        s.ids = ids.iter().map(|&i| i as i64).collect();
+        s.seq += 1;
+    }
+
+    fn structures(&self) -> Option<Vec<hh_tools::structure::Structure>> {
+        Some(lock(&self.0).table.structures.clone())
+    }
+
+    fn set_structures(&self, s: Vec<hh_tools::structure::Structure>) -> bool {
+        Live::set_structures(self, s);
+        true
+    }
 }
 
 /// `[[addr]+o0]+o1`: the expression `resolve_address` understands.
@@ -465,36 +563,15 @@ pub fn expr_of(e: &Entry) -> String {
     e.offsets.iter().fold(e.addr.trim().to_string(), |x, o| format!("[{x}]+{}", o.trim()))
 }
 
-/// Adds `delta` to a displayed value (`hex` = both are hex); `None` when not numeric.
-fn add_value(vtype: VType, cur: &str, delta: &str, hex: bool, sign: i128) -> Option<String> {
-    if matches!(vtype, VType::Float | VType::Double) {
-        let v = cur.trim().parse::<f64>().ok()? + sign as f64 * delta.trim().parse::<f64>().ok()?;
-        return Some(v.to_string());
-    }
-    let int = |s: &str| {
-        let t = s.trim();
-        let (neg, b) = t.strip_prefix('-').map_or((false, t), |r| (true, r));
-        let b = b.trim_start_matches("0x").trim_start_matches("0X");
-        let v = if hex { i128::from_str_radix(b, 16).ok()? } else { b.parse::<i128>().ok()? };
-        Some(if neg { -v } else { v })
-    };
-    let width = match vtype {
-        VType::Byte => 8,
-        VType::Bytes2 => 16,
-        VType::Bytes4 => 32,
-        VType::Bytes8 => 64,
-        _ => return None,
-    };
-    let v = int(cur)? + sign * int(delta)?;
-    // Wrap like the game's integer would (CE does the same).
-    let mask = (1i128 << width) - 1;
-    let u = v & mask;
-    Some(if hex { format!("0x{u:X}") } else { u.to_string() })
-}
-
 impl App {
     pub fn table_get(&self) -> R<TableState> {
         Ok(self.x.live.state())
+    }
+
+    /// The UI's address list selection (what Lua's `SelectedRecords` sees).
+    pub fn table_select(&self, ids: Vec<i64>) -> R<()> {
+        self.x.live.select(ids);
+        Ok(())
     }
 
     /// A UI edit. Active script entries the edit removes are disabled first (their
@@ -542,6 +619,7 @@ the table was not opened: these active scripts could not be disabled (open anywa
         *lock(&self.x.trust) = Trust::Ask;
         let keep: Vec<i64> = failed.into_iter().map(|f| f.0).collect();
         let st = self.x.live.replace(t, &keep);
+        self.x.live.select(Vec::new());
         // Record callbacks, timers, hotkeys and forms of the previous table go with it.
         {
             let _g = self.x.lua.enter();
@@ -551,6 +629,26 @@ the table was not opened: these active scripts could not be disabled (open anywa
         }
         self.sync_freeze();
         Ok(st)
+    }
+
+    /// Lua `loadTable(file, true)`: appends the file's entries (new ids, inactive) and keeps
+    /// the current table, its scripts and their Lua state.
+    pub(crate) fn table_merge(&self, path: &str) -> R<()> {
+        let add = table::load(Path::new(path))?;
+        let cur = self.x.live.state();
+        let mut next = all(&cur.table.entries).iter().map(|(e, _)| e.id).max().unwrap_or(0);
+        let mut entries = add.entries;
+        for_each_mut(&mut entries, &mut |e| {
+            next += 1;
+            e.id = next;
+            e.frozen = false;
+        });
+        let mut t = cur.table;
+        t.entries.extend(entries);
+        if t.lua_script.trim().is_empty() {
+            t.lua_script = add.lua_script;
+        }
+        self.x.live.put(t, cur.version).map(|_| ())
     }
 
     /// Runs `[DISABLE]` of every active script while the process lives; (id, error) of
@@ -587,7 +685,6 @@ the table was not opened: these active scripts could not be disabled (open anywa
                     errs.push(e);
                 }
             }
-            errs.extend(self.cascade_locked());
         }
         if errs.is_empty() { Ok(()) } else { Err(errs.join("\n")) }
     }
@@ -619,53 +716,14 @@ the table was not opened: these active scripts could not be disabled (open anywa
         Ok(())
     }
 
-    /// Caller holds the Lua lock.
+    /// Caller holds the Lua lock. The engine applies the group options (children activated
+    /// or deactivated as well).
     fn activate_locked(&self, id: i64, active: bool) -> R<()> {
         let e = self.x.live.entry(id).ok_or_else(|| format!("no table entry {id}"))?;
-        // Group headers toggle without a process too (hh-lua needs one to "run" the header).
-        if is_group(&e) && self.session().is_err() {
-            let mut r = TableHost::get(&*self.x.live, id as RecId).ok_or("entry vanished")?;
-            r.active = active;
-            return TableHost::set(&*self.x.live, r).map_err(|e| e.to_string());
-        }
         self.x.lua.engine.set_active(id as RecId, active).map_err(|err| {
             let t = err.to_string();
             if t.starts_with(&e.description) { t } else { format!("{}: {t}", e.description) }
         })
-    }
-
-    /// Applies queued group options: moActivateChildrenAsWell / moDeactivateChildrenAsWell.
-    fn cascade_locked(&self) -> Vec<String> {
-        let mut errs = Vec::new();
-        loop {
-            let q = self.x.live.take_cascade();
-            if q.is_empty() {
-                return errs;
-            }
-            for (id, on) in q {
-                let Some(e) = self.x.live.entry(id) else { continue };
-                let opt = if on { "moActivateChildrenAsWell" } else { "moDeactivateChildrenAsWell" };
-                if !has_opt(&e, opt) {
-                    continue;
-                }
-                for c in e.children.iter().filter(|c| c.frozen != on) {
-                    if let Err(err) = self.activate_locked(c.id, on) {
-                        errs.push(err);
-                    }
-                }
-            }
-        }
-    }
-
-    /// Cascades queued by Lua (`memrec.Active = ...`) outside `table_set_active`.
-    pub(crate) fn drain_cascades(&self) {
-        let errs = {
-            let _g = self.x.lua.enter();
-            self.cascade_locked()
-        };
-        for e in errs {
-            self.x.lua.console.push("err", &e);
-        }
     }
 
     /// Writes `value` to each entry (groups with moRecursiveSetValue: to their value
@@ -700,35 +758,25 @@ the table was not opened: these active scripts could not be disabled (open anywa
         Ok(())
     }
 
-    fn read_entry(&self, e: &Entry) -> R<String> {
-        let a = self.entry_addr(e)?;
-        let r = ValueRef { addr: a, vtype: e.vtype, fmt: fmt_of(e) };
-        hh_scan::read_values(&*self.session()?.proc, &[r]).pop().flatten().ok_or_else(|| format!("cannot read {a:#x}"))
-    }
-
-    /// Runs hotkey `index` of entry `id` (CE actions).
+    /// Runs hotkey `index` of entry `id` through the engine: its CE action with the
+    /// record's OnHotkey / OnPostHotkey callbacks.
     pub fn table_hotkey(&self, id: i64, index: usize) -> R<()> {
         let e = self.x.live.entry(id).ok_or_else(|| format!("no table entry {id}"))?;
-        let hk = e.hotkeys.get(index).ok_or_else(|| format!("{}: no hotkey {index}", e.description))?.clone();
-        let val = hk.value.clone().unwrap_or_default();
-        match hk.action.as_str() {
-            "Toggle Activation" => self.table_set_active(&[id], !e.frozen),
-            "Toggle Activation Allow Increase" | "Toggle Activation Allow Decrease" => {
-                let m = if hk.action.ends_with("Increase") { FreezeMode::AllowIncrease } else { FreezeMode::AllowDecrease };
-                self.x.live.set_mode(id, m);
-                self.table_set_active(&[id], !e.frozen)
-            }
-            "Activate" => self.table_set_active(&[id], true),
-            "Deactivate" => self.table_set_active(&[id], false),
-            "Set Value" => self.table_set_value(&[id], &val),
-            "Increase Value" | "Decrease Value" => {
-                let sign = if hk.action.starts_with("Increase") { 1 } else { -1 };
-                let cur = self.read_entry(&e)?;
-                let next = add_value(e.vtype, &cur, &val, e.hex, sign).ok_or_else(|| format!("{}: {cur:?} {val:?} are not numbers", e.description))?;
-                self.table_set_value(&[id], &next)
-            }
-            a => Err(format!("{}: unknown hotkey action {a:?}", e.description)),
+        let hk = e.hotkeys.get(index).ok_or_else(|| format!("{}: no hotkey {index}", e.description))?;
+        if !HK_ACTIONS.contains(&hk.action.as_str()) {
+            return Err(format!("{}: unknown hotkey action {:?}", e.description, hk.action));
         }
+        if hk.action.starts_with("Toggle Activation Allow") {
+            let m = if hk.action.ends_with("Increase") { FreezeMode::AllowIncrease } else { FreezeMode::AllowDecrease };
+            self.x.live.set_mode(id, m);
+        }
+        let hid = hotkey_ids(&e.hotkeys)[index];
+        let r = {
+            let _g = self.x.lua.enter();
+            self.x.lua.engine.fire_record_hotkey(id as RecId, hid).map_err(|err| format!("{}: {err}", e.description))
+        };
+        self.sync_freeze();
+        r
     }
 
     /// Hands the active value entries to the freezer (addresses re-resolved).
@@ -755,12 +803,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn values_offsets_colors() {
-        assert_eq!(add_value(VType::Bytes4, "10", "5", false, 1).as_deref(), Some("15"));
-        assert_eq!(add_value(VType::Byte, "0", "1", false, -1).as_deref(), Some("255"));
-        assert_eq!(add_value(VType::Bytes2, "FF", "1", true, 1).as_deref(), Some("0x100"));
-        assert_eq!(add_value(VType::Float, "1.5", "0.25", false, 1).as_deref(), Some("1.75"));
-        assert_eq!(add_value(VType::String, "a", "1", false, 1), None);
+    fn hotkey_ids_stay_unique() {
+        let hk = |id| table::Hotkey { id, ..Default::default() };
+        assert_eq!(hotkey_ids(&[hk(None), hk(None)]), [1, 2]);
+        assert_eq!(hotkey_ids(&[hk(Some(5)), hk(None), hk(Some(5)), hk(Some(2))]), [5, 6, 7, 2]);
+    }
+
+    #[test]
+    fn offsets_colors() {
         assert_eq!((parse_off("1C"), parse_off("-8"), parse_off("0x10")), (0x1c, -8, 0x10));
         assert_eq!((fmt_off(0x1c), fmt_off(-8)), ("1C".to_string(), "-8".to_string()));
         assert_eq!(color_in(Some("#FF0000")), 0x0000FF);

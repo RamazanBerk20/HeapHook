@@ -1280,6 +1280,7 @@ dependencies = [
  "hh-scan",
  "hh-tools",
  "iced-x86",
+ "mlua",
  "roxmltree",
  "serde",
  "serde_json",

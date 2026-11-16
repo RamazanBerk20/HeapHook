@@ -12,6 +12,7 @@ import { initLua } from './lua.js';
 import { initSettings } from './settings.js';
 import { initStructs } from './structs.js';
 import { initDissect } from './dissect.js';
+import { initForms } from './forms.js';
 import { jobs } from './memtools.js';
 import { askPath } from './backend.js';
 
@@ -53,6 +54,7 @@ const lua = initLua({ openTableScript: () => table.editTableScript() });
 const structs = initStructs({ showView });
 const code = initDissect({ showView });
 const settings = await initSettings();
+const forms = initForms();
 
 // ---------- process picker ----------
 const dlgProc = $('#dlg-proc'), pSearch = $('#proc-search'), pList = $('#proc-list');
@@ -208,6 +210,7 @@ document.addEventListener('keydown', (e) => {
   else if (e.key === 'Escape' && jobs.running) jobs.cancel();
   else if (ctrl && k === ',') settings.open();
   else if (ctrl && e.shiftKey && k === 'd') dbg.toggleAttach();
+  else if (ctrl && e.shiftKey && k === 'l') forms.cycle();
   else if (e.key === 'F9' && !ctrl) e.shiftKey ? dbg.pause() : dbg.cont();
   else if (e.key === 'F7' && !ctrl) dbg.step('into');
   else if (e.key === 'F8' && !ctrl) dbg.step(e.shiftKey ? 'out' : 'over');

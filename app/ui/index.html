@@ -147,6 +147,7 @@
           <button id="tb-script" class="btn ghost" type="button" data-icon="code">Script</button>
           <button id="tb-group" class="btn ghost" type="button" data-icon="group">Group <kbd>Ctrl G</kbd></button>
           <button id="tb-lua" class="btn ghost" type="button" data-icon="terminal" title="The table's Lua script">Table script</button>
+          <button id="tb-trainer" class="btn ghost" type="button" data-icon="trainer" title="Generate a trainer (a Lua form with toggles and hotkeys) into the table script">Trainer</button>
           <button id="tb-comments" class="btn ghost icon" type="button" aria-label="Table comments" title="Table comments" data-icon="note"></button>
           <button id="tb-delete" class="btn ghost icon" type="button" aria-label="Delete selected (Del)" title="Delete selected (Del)" data-icon="trash"></button>
         </div>
@@ -175,6 +176,7 @@
             <button id="dc-over" class="btn ghost icon" type="button" aria-label="Step over (F8)" title="Step over (F8)" data-icon="stepOver"></button>
             <button id="dc-out" class="btn ghost icon" type="button" aria-label="Step out (Shift F8)" title="Step out (Shift F8)" data-icon="stepOut"></button>
             <button id="dc-runto" class="btn ghost icon" type="button" aria-label="Run to cursor (F4)" title="Run to cursor (F4)" data-icon="runTo"></button>
+            <button id="dc-runto-t" class="btn ghost icon" type="button" aria-label="Run to cursor, this thread only (Shift F4)" title="Run to cursor, this thread only: other threads pass the address (Shift F4)" data-icon="runToThread"></button>
           </span>
           <span class="toolbar">
             <button id="da-back" class="btn ghost icon" type="button" disabled aria-label="Back (Backspace)" title="Back (Backspace)" data-icon="back"></button>
@@ -213,6 +215,7 @@
           <button role="tab" type="button" aria-selected="false" aria-controls="mod-list" tabindex="-1">Modules <span id="mod-count" class="count mono"></span></button>
           <button role="tab" type="button" aria-selected="false" aria-controls="cpu-list" tabindex="-1" class="dbg-only" hidden>Registers</button>
           <button role="tab" type="button" aria-selected="false" aria-controls="stk-list" tabindex="-1" class="dbg-only" hidden>Stack</button>
+          <button role="tab" type="button" aria-selected="false" aria-controls="bt-list" tabindex="-1" class="dbg-only" hidden>Backtrace</button>
           <button role="tab" type="button" aria-selected="false" aria-controls="thr-list" tabindex="-1" class="dbg-only" hidden>Threads</button>
         </div>
       </div>
@@ -223,6 +226,7 @@
       <div id="mod-list" class="list" role="tabpanel" aria-label="Modules" hidden></div>
       <div id="cpu-list" class="list cpu" role="tabpanel" aria-label="Registers" hidden></div>
       <div id="stk-list" class="list" role="tabpanel" aria-label="Stack" hidden></div>
+      <div id="bt-list" class="list" role="tabpanel" aria-label="Backtrace" hidden></div>
       <div id="thr-list" class="list" role="tabpanel" aria-label="Threads" hidden></div>
     </aside>
   </section>
@@ -233,7 +237,9 @@
       <div class="panel-head">
         <h2 id="wl-title" class="sr-only">Watches</h2>
         <div id="wl-tabs" role="tablist" class="subtabs wl-tabs" aria-label="Watches"></div>
+        <span id="wl-dropped" class="badge yellow" role="status" hidden></span>
         <span class="toolbar">
+          <button title="Watch a memory range for writes or accesses (R)" id="wl-range" class="btn ghost" type="button" data-icon="memory"><span class="bl">Range</span> <kbd>R</kbd></button>
           <button title="Disassemble (Enter)" id="wl-show" class="btn ghost" type="button" data-icon="target"><span class="bl">Disassemble</span> <kbd>Enter</kbd></button>
           <button title="Replace with NOPs (N)" id="wl-nop" class="btn ghost" type="button" data-icon="nop"><span class="bl">Replace with NOPs</span> <kbd>N</kbd></button>
           <button title="Code list (L)" id="wl-code" class="btn ghost" type="button" data-icon="plus"><span class="bl">Code list</span> <kbd>L</kbd></button>
@@ -244,7 +250,7 @@
       </div>
       <div id="wl-head" class="vl-head cols-wl" role="presentation"><span>Count</span><span>Address</span><span>Instruction</span><span>Accessed</span></div>
       <div id="wl-list" class="wl-list" role="grid" aria-label="Watch records" tabindex="0"></div>
-      <p id="wl-empty" class="empty">No watches yet. On a cheat-table entry or scan result press <kbd>F6</kbd> (what writes) or <kbd>F5</kbd> (what accesses); in the disassembler use the context menu for instruction accesses and break-and-trace.</p>
+      <p id="wl-empty" class="empty">No watches yet. On a cheat-table entry or scan result press <kbd>F6</kbd> (what writes) or <kbd>F5</kbd> (what accesses); in the disassembler use the context menu for instruction accesses and break-and-trace. <kbd>R</kbd> watches a whole memory range.</p>
       <div id="wl-regs" class="regs-snap mono" aria-label="Registers at the selected record" role="group"></div>
     </section>
     <div id="div-dbg" class="divider dv-x" role="separator" aria-orientation="vertical" aria-label="Resize breakpoint panel" tabindex="0"></div>
@@ -262,6 +268,10 @@
           <span class="hints"><kbd>Space</kbd> NOP / restore · <kbd>Del</kbd> remove</span>
         </div>
         <div id="cl-list" class="list" role="listbox" aria-label="Code list" tabindex="0"></div>
+      </section>
+      <section id="dlog-pane" class="panel dlog-pane" aria-labelledby="dlog-title">
+        <div class="panel-head"><h2 id="dlog-title">Debugger log</h2></div>
+        <div id="dlog-list" class="dlog-list mono" role="log" aria-label="Debugger log" tabindex="0"></div>
       </section>
     </aside>
   </section>
@@ -675,8 +685,9 @@
     </fieldset>
     <fieldset class="group">
       <legend>Lua</legend>
-      <div class="row2 row2-even">
+      <div class="grid3">
         <div class="field"><label for="st-budget">Time limit per run (ms, 0 = none)</label><input id="st-budget" name="lua_budget_ms" class="mono" type="number" min="0"></div>
+        <div class="field"><label for="st-luamem">Memory limit (MiB, 0 = none)</label><input id="st-luamem" name="lua_memory_mb" class="mono" type="number" min="0" max="65536"></div>
         <div class="field"><label for="st-ts">Lua script in a loaded table</label>
           <select id="st-ts" name="table_script"><option value="ask">Always ask before running</option><option value="never">Never run</option></select></div>
       </div>
@@ -746,16 +757,20 @@
         <dd><kbd>Enter</kbd> Assemble line / edit value</dd>
         <dd><kbd>0-9 A-F</kbd> Type over bytes</dd>
         <dd><kbd>Shift F10</kbd> Tools: fill, copy, snapshots, pointers to here</dd>
+        <dd><kbd>Shift ←→↑↓</kbd> Select bytes (hex view) · <kbd>Ctrl Shift R</kbd> Watch the selection</dd>
         <dd><kbd>X</kbd> What references this (disassembler)</dd>
         <dt>Structures</dt>
         <dd><kbd>→ ←</kbd> Expand / collapse · <kbd>Enter</kbd> / <kbd>1-9</kbd> Edit value</dd>
         <dd><kbd>F2</kbd> Description · <kbd>T</kbd> Type · <kbd>S</kbd> Size · <kbd>Ins</kbd> <kbd>Del</kbd> Element</dd>
         <dd><kbd>A</kbd> Address column · <kbd>G</kbd> Dissect at · <kbd>Ctrl Enter</kbd> Add to table</dd>
         <dt>Debugger</dt>
-        <dd><kbd>F5</kbd> Toggle breakpoint · <kbd>F4</kbd> Run to cursor</dd>
+        <dd><kbd>F5</kbd> Toggle breakpoint · <kbd>F4</kbd> Run to cursor · <kbd>Shift F4</kbd> this thread only</dd>
         <dd><kbd>F9</kbd> Continue · <kbd>Shift F9</kbd> Break</dd>
         <dd><kbd>F7</kbd> Into · <kbd>F8</kbd> Over · <kbd>Shift F8</kbd> Out</dd>
-        <dd>Watch list: <kbd>Enter</kbd> disassemble · <kbd>N</kbd> NOP · <kbd>L</kbd> code list · <kbd>S</kbd> stop · <kbd>Del</kbd> close</dd>
+        <dd>Watch list: <kbd>Enter</kbd> disassemble · <kbd>N</kbd> NOP · <kbd>L</kbd> code list · <kbd>S</kbd> stop · <kbd>Del</kbd> close · <kbd>R</kbd> watch a range</dd>
+        <dd>Breakpoints: <kbd>E</kbd> condition and hit options · <kbd>H</kbd> int3 / debug register</dd>
+        <dt>Lua forms</dt>
+        <dd><kbd>Ctrl Shift L</kbd> focus the next form · <kbd>Esc</kbd> close it · <kbd>F10</kbd> its menu bar · <kbd>Alt ←→↑↓</kbd> move it</dd>
       </dl>
     </div>
     <div class="dlg-actions"><button class="btn primary" value="ok">Close <kbd>Esc</kbd></button></div>

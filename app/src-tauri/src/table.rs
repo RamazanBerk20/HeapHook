@@ -133,6 +133,9 @@ pub struct Hotkey {
     pub keys: Vec<u32>,
     pub value: Option<String>,
     pub description: Option<String>,
+    /// Stable id within the entry (Lua `MemoryRecordHotkey.ID`); assigned when missing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<u32>,
 }
 
 /// Deepest group nesting a table may have (every walk over the entry tree recurses).
@@ -355,6 +358,7 @@ fn entry(n: Node) -> Entry {
                     .unwrap_or_default(),
                 value: text(k, "Value"),
                 description: text(k, "Description").map(|d| unquote(&d)),
+                id: None,
             })
             .collect();
     }
@@ -508,7 +512,7 @@ fn write_entries(o: &mut String, list: &[Entry], d: usize) {
                 if let Some(d) = &h.description {
                     o.push_str(&format!("{p}      <Description>\"{}\"</Description>\n", esc(d)));
                 }
-                o.push_str(&format!("{p}      <ID>{i}</ID>\n{p}    </Hotkey>\n"));
+                o.push_str(&format!("{p}      <ID>{}</ID>\n{p}    </Hotkey>\n", h.id.unwrap_or(i as u32)));
             }
             o.push_str(&format!("{p}  </Hotkeys>\n"));
         }
@@ -655,7 +659,7 @@ if hp and 1 &lt; 2 then print("loaded") end
         assert_eq!(hp.offsets, ["10", "1C", "8"]);
         assert!(hp.signed && hp.vtype == VType::Bytes4);
         assert_eq!(hp.color.as_deref(), Some("#FF0000"));
-        assert_eq!(hp.hotkeys, [Hotkey { action: "Set Value".into(), keys: vec![17, 112], value: Some("999".into()), description: None }]);
+        assert_eq!(hp.hotkeys, [Hotkey { action: "Set Value".into(), keys: vec![17, 112], value: Some("999".into()), description: None, id: None }]);
         let s = &g.children[1];
         assert_eq!((s.description.as_str(), s.vtype, s.len, s.utf16), ("Name & title", VType::String, 24, true));
         let dd = &g.children[2];
