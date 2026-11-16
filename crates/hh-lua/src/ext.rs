@@ -71,6 +71,15 @@ fn read_chunks(st: &State, p: &dyn hh_core::Process, a: Addr, len: usize, mut f:
     Ok(())
 }
 
+/// Everything the extensions hold for scripts (a reset): buffers, pointer scans, structures,
+/// the dissection.
+pub(crate) fn release(st: &State) {
+    free_local_bufs(st);
+    crate::ptrscan::clear(st);
+    *st.ext.structs.lock().unwrap() = Default::default();
+    *st.ext.dissect.lock().unwrap() = None;
+}
+
 pub(crate) fn free_local_bufs(st: &State) {
     *st.ext.local_bufs.lock().unwrap() = LocalBufs::default();
 }
@@ -338,7 +347,8 @@ fn install_host(b: &B, h: &B) -> LR<()> {
             return Err(err("createProcess: OS access is disabled"));
         }
         let pid = st.host().create_process(&path, &params.unwrap_or_default(), debug.unwrap_or(false), brk.unwrap_or(false)).map_err(rt)?;
-        if let Ok(f) = lua.globals().get::<mlua::Function>("onOpenProcess") {
+        // raw: a trap on `_G` (`__index`) is not asked.
+        if let Ok(f) = lua.globals().raw_get::<mlua::Function>("onOpenProcess") {
             f.call::<()>(pid)?;
         }
         Ok(pid)

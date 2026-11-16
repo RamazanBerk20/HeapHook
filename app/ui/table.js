@@ -1201,7 +1201,8 @@ export function initTable(root) {
     (meta.symbols || []).forEach(addRow);
     const form = h('form', { method: 'dialog' },
       h('h2', null, 'Labels'),
-      h('p.hint', null, 'Names for addresses, saved with the table. Every address field and the disassembler understand them (game.exe+1A2B becomes player_hp).'),
+      h('p.hint', null, 'Names for addresses, saved with the table. Every address field and the disassembler understand them (game.exe+1A2B becomes player_hp). A label can never take the name of a loaded module: module names always win.'),
+      state.tableTrust === 'ask' || state.tableTrust === 'declined' ? h('p.hint.warn', { role: 'note' }, 'These labels came with a table you have not trusted: check what they point at before relying on them in your own scripts.') : null,
       h('div.lb-head', { 'aria-hidden': 'true' }, h('span', null, 'Name'), h('span', null, 'Address'), h('span', null, 'Now'), h('span')),
       rowsEl,
       h('button.btn.ghost', { type: 'button', onclick: () => addRow().focus() }, h('span', { html: icon('plus') }), 'Add label'),
@@ -1383,7 +1384,6 @@ export function initTable(root) {
   }
 
   // The code list is backend-owned (the debugger view shows it); meta.codes only rides along in puts.
-  on('table:script', ({ description, script }) => add([{ description, script }], { then: (e) => e && editScript(e.id) }));
   /** A backend-made entry (a template, an Auto Assemble window script): the backend inserts it with its origin. */
   async function insertMade(fn) {
     await chain;

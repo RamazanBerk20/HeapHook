@@ -30,9 +30,9 @@ pub(crate) fn value_text(lua: &Lua, v: &Value) -> String {
     match v {
         Value::String(s) => s.to_string_lossy(),
         Value::Error(e) => err_text(e),
+        // The engine's own `tostring` (captured at init; a script may replace the global).
         v => lua
-            .globals()
-            .get::<Function>("tostring")
+            .named_registry_value::<Function>("hh_tostring")
             .and_then(|f| f.call::<String>(v.clone()))
             .unwrap_or_default(),
     }
@@ -76,8 +76,19 @@ impl B<'_> {
         F: Fn(&Lua, &Arc<State>, A) -> LR<R> + Send + 'static,
     {
         let st = self.st.clone();
+        // The error path itself (messages, tracebacks) keeps working while a reset is pending.
+        let always = matches!(name, "traceback" | "errtext" | "aborted");
         self.names.borrow_mut().push(name.to_string());
-        self.t.set(name, self.lua.create_function(move |lua, a: A| f(lua, &st, a))?)
+        self.t.set(
+            name,
+            self.lua.create_function(move |lua, a: A| {
+                // A reset is pending: the state is being discarded, nothing more runs.
+                if !always && st.reset_pending.load(Ordering::SeqCst) {
+                    return Err(mlua::Error::runtime("the table's Lua was stopped"));
+                }
+                f(lua, &st, a)
+            })?,
+        )
     }
 }
 
@@ -206,7 +217,8 @@ fn install_process(b: &B) -> LR<()> {
         }
         let Ok(p) = hh_core::open(pid) else { return Ok(false) };
         set_process(lua, st, Some(p))?;
-        if let Ok(f) = lua.globals().get::<Function>("onOpenProcess") {
+        // raw: a trap on `_G` (`__index`) is not asked.
+        if let Ok(f) = lua.globals().raw_get::<Function>("onOpenProcess") {
             f.call::<()>(pid)?;
         }
         Ok(true)
@@ -265,6 +277,10 @@ fn install_process(b: &B) -> LR<()> {
     })?;
     b.f("registerSymbol", |_, st, (name, v, _nosave): (String, Value, Option<bool>)| {
         let a = addr(st, &v, false).map_err(rt)?;
+        let mods = st.proc().and_then(|p| p.modules().ok()).unwrap_or_default();
+        if hh_asm::names_module(&mods, &name) {
+            return Err(mlua::Error::runtime(format!("registerSymbol: {name} is the name of a loaded module")));
+        }
         st.syms.lock().unwrap().register(&name, a);
         Ok(())
     })?;
@@ -886,8 +902,9 @@ fn taint(st: &State, text: &str) {
 /// Capabilities of a script Lua hands to `autoAssemble`: the Lua is trusted (untrusted Lua
 /// never runs), but text it took from a record without capabilities keeps that record's
 /// origin. Provenance, not inspection: the text is compared with what Lua read from such
-/// records, never searched for directives. shortcut: text the trusted Lua rewrote (not
-/// just embedded) is not followed; full taint tracking would need tagged Lua strings.
+/// records, never searched for directives. The same check runs when Lua assigns a record's
+/// `Script` (that record becomes untrusted). shortcut: text the trusted Lua rewrote (not just
+/// embedded) is not followed; full taint tracking would need tagged Lua strings.
 fn text_caps(st: &State, text: &str) -> Caps {
     if st.tainted.lock().unwrap().iter().any(|t| text.contains(t.trim())) { Caps::None } else { Caps::Full }
 }
@@ -1223,7 +1240,13 @@ fn install_records(h: &B) -> LR<()> {
                     r.frozen_value = Some(s);
                 }
             }
-            "Script" => r.script = str_of(&v),
+            "Script" => {
+                r.script = str_of(&v);
+                // Taint follows the text into the record that will run it.
+                if r.script.as_deref().is_some_and(|x| text_caps(st, x) == Caps::None) && t.caps(id) == Caps::Full && !t.mark_untrusted(id) {
+                    return Err(mlua::Error::runtime("Script: this text came from a memory record that needs your consent; it cannot become another record's script"));
+                }
+            }
             // A preset name ('4 byte big endian') or a table of hh_scan::CustomType fields.
             "CustomTypeName" => {
                 r.custom = Some(custom_type(&v)?);
@@ -1420,8 +1443,13 @@ fn install_misc(b: &B, h: &B) -> LR<()> {
         st.host().error(&msg);
         Ok(())
     })?;
-    h.f("hotkey_register", |_, st, (id, keys): (u32, Vec<i64>)| st.host().register_hotkey(id, &keys).map_err(rt))?;
+    h.f("hotkey_register", |_, st, (id, keys): (u32, Vec<i64>)| {
+        st.host().register_hotkey(id, &keys).map_err(rt)?;
+        st.lua_hotkeys.lock().unwrap().insert(id);
+        Ok(())
+    })?;
     h.f("hotkey_unregister", |_, st, id: u32| {
+        st.lua_hotkeys.lock().unwrap().remove(&id);
         st.host().unregister_hotkey(id);
         Ok(())
     })?;
@@ -1438,6 +1466,8 @@ fn install_misc(b: &B, h: &B) -> LR<()> {
 }
 
 pub(crate) fn install(lua: &Lua, st: &Arc<State>, allow_os: bool) -> LR<Internals> {
+    // The engine's own references, captured before any script runs.
+    lua.set_named_registry_value("hh_tostring", lua.globals().get::<Function>("tostring")?)?;
     let b = B { lua, t: lua.globals(), st, names: Default::default() };
     let h = B { lua, t: lua.create_table()?, st, names: Default::default() };
     install_process(&b)?;

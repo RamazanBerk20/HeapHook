@@ -1065,6 +1065,11 @@ impl App {
 
     /// Auto Assembler template at `addr`: `code`, `aob` or `full` injection.
     pub fn aa_template(&self, addr: &str, kind: &str) -> R<String> {
+        self.aa_template_in(&*self.session()?, addr, kind)
+    }
+
+    /// [`App::aa_template`] for session `sess` (one snapshot for the text and its origin).
+    pub(crate) fn aa_template_in(&self, sess: &crate::commands::Session, addr: &str, kind: &str) -> R<String> {
         let k = match kind {
             "api" => hh_asm::Template::ApiHook,
             "code" => hh_asm::Template::CodeInjection,
@@ -1072,7 +1077,7 @@ impl App {
             "full" => hh_asm::Template::FullInjection,
             k => return Err(format!("unknown template {k:?}")),
         };
-        guard(hh_asm::injection_template(&*self.session()?.proc, parse_addr(addr)?, k))
+        guard(hh_asm::injection_template(&*sess.proc, parse_addr(addr)?, k))
     }
 
     // ------------------------------------------------------------------- code list

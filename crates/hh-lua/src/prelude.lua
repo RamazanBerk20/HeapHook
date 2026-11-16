@@ -32,6 +32,8 @@ do
   end
   coroutine.resume = function(co, ...) return rethrow(raw_resume(co, ...)) end
 end
+-- The engine's own references from here on (a script may replace the globals).
+local pcall, getmetatable, next = pcall, getmetatable, next
 
 -------------------------------------------------------------------- Rust errors -> strings
 -- Errors from Rust functions arrive as userdata; CE scripts expect strings (err:find, ..).
@@ -54,6 +56,11 @@ os.exit = function() error('os.exit is disabled in HeapHook', 2) end
 -- Text chunks only: Lua 5.3 does not verify bytecode, so a crafted binary chunk could
 -- corrupt HeapHook's memory.
 string.dump = nil
+-- The prelude's own copies of the libraries and base functions: a script that replaces
+-- `string.char` or `table.insert` (or `pcall`, `getmetatable`, `next`) does not change what
+-- the engine's helpers run. (Method calls on strings still go through the string metatable.)
+local function libcopy(t) local c = {} for k, v in pairs(t) do c[k] = v end return c end
+local string, table, math = libcopy(string), libcopy(table), libcopy(math)
 do
   local raw_load, raw_loadfile = load, loadfile
   -- (an explicit nil env differs from no env, so keep the arity)

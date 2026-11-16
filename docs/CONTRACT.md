@@ -291,8 +291,18 @@ Trust is decided by origin, never by content, and the engine fails closed.
   saying so) — on every route: click, hotkeys, group options, Lua `memrec.Active`, timers,
   forms, `autoAssemble` of text Lua read from such an entry (it reports `needs your consent`
   in its error), `aa_check` (an error containing `is not available to this script`).
-- **Withdrawing.** `table_trust(false)` after a yes, or Settings turning to "never", interrupts
-  the running script and drops the table's timers, threads, forms, `createHotkey` hotkeys,
-  record callbacks, registered Auto Assembler commands / prologues / lookup callbacks, Lua
-  breakpoints and pointer scans without running any of them once more.
+- **Withdrawing.** `table_trust(false)` after a yes, Settings turning to "never", and any
+  `table_open` (also `table_open_data`, Lua `loadTable(f)`) reset the Lua engine: the running
+  script is interrupted, the table's forms, `createHotkey` hotkeys, Lua breakpoints and pointer
+  scans are released, and a new interpreter replaces the old one (no global, metatable,
+  coroutine or callback of the old one survives; console globals are lost too, and the console
+  log says "Lua was reset"). A `loadTable(f)` from a script ends that script. A process change
+  does not reset Lua.
+- **Taint.** A script trusted Lua takes from an untrusted entry (`memrec.Script`) stays
+  untrusted: `autoAssemble` of text containing it runs without capabilities, and assigning it
+  to another record's `Script` makes that record untrusted (Foreign).
+- **Ids.** Entry ids in a loaded file that are not positive, unique and at most u32 are
+  renumbered after the valid ones.
+- **Symbols.** Labels, `registersymbol` and Lua `registerSymbol` may not take a loaded module's
+  name (or file name); module names win on lookup.
 

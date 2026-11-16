@@ -1451,7 +1451,12 @@ fn load_table_from_lua_clears_the_previous_tables_callbacks() {
     app.table_export(path.to_str().unwrap()).unwrap();
     app.lua_exec("getAddressList().getMemoryRecordByID(1).OnActivate = function() print('old callback') end\nhk = createHotkey(function() end, VK_CONTROL, VK_F11)\nf = createForm()").unwrap();
     assert!(app.lua_poll(0).unwrap().hotkeys.contains(&vec![17, 122]));
-    app.lua_exec(&format!("loadTable({:?})\nsaveTable({:?})", path.to_str().unwrap(), dir.path().join("saved.CT").to_str().unwrap())).unwrap();
+    // loadTable(f) replaces the table: Lua is reset, the rest of that script is refused.
+    let e = app.lua_exec(&format!("loadTable({:?})\nsaveTable({:?})", path.to_str().unwrap(), dir.path().join("saved.CT").to_str().unwrap())).unwrap_err();
+    assert!(e.contains("stopped"), "{e}");
+    assert!(!dir.path().join("saved.CT").exists());
+    assert!(log_text(&app).contains("Lua was reset"), "{}", log_text(&app));
+    app.lua_exec(&format!("saveTable({:?})", dir.path().join("saved.CT").to_str().unwrap())).unwrap();
     assert!(dir.path().join("saved.CT").exists());
     app.table_set_active(&[1], true).unwrap();
     assert!(!log_text(&app).contains("out: old callback"), "{}", log_text(&app));
@@ -3053,15 +3058,22 @@ impl Rng {
 #[derive(Clone, Copy, Debug)]
 enum FuzzOp {
     Open,
+    OpenData,
+    LuaLoadTable,
+    ForceOpen,
     Paste,
     Merge,
+    MergeWithScript,
     LuaMerge,
     AaAssign,
     TypedAssign,
+    Template,
     New,
     LuaCreate,
+    LuaSetDelete,
     PutEdits,
     Delete,
+    StructEdit,
     Undo,
     Redo,
     GrantEntries,
@@ -3069,18 +3081,30 @@ enum FuzzOp {
     Revoke,
     NeverOn,
     NeverOff,
+    SwitchProcess,
+    RunScript,
+    Callback,
+    Execute,
+    Console,
 }
-const FUZZ_OPS: [FuzzOp; 17] = [
+const FUZZ_OPS: [FuzzOp; 29] = [
     FuzzOp::Open,
+    FuzzOp::OpenData,
+    FuzzOp::LuaLoadTable,
+    FuzzOp::ForceOpen,
     FuzzOp::Paste,
     FuzzOp::Merge,
+    FuzzOp::MergeWithScript,
     FuzzOp::LuaMerge,
     FuzzOp::AaAssign,
     FuzzOp::TypedAssign,
+    FuzzOp::Template,
     FuzzOp::New,
     FuzzOp::LuaCreate,
+    FuzzOp::LuaSetDelete,
     FuzzOp::PutEdits,
     FuzzOp::Delete,
+    FuzzOp::StructEdit,
     FuzzOp::Undo,
     FuzzOp::Redo,
     FuzzOp::GrantEntries,
@@ -3088,6 +3112,11 @@ const FUZZ_OPS: [FuzzOp; 17] = [
     FuzzOp::Revoke,
     FuzzOp::NeverOn,
     FuzzOp::NeverOff,
+    FuzzOp::SwitchProcess,
+    FuzzOp::RunScript,
+    FuzzOp::Callback,
+    FuzzOp::Execute,
+    FuzzOp::Console,
 ];
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -3105,6 +3134,9 @@ struct Model {
     table_agreed: bool,
     never: bool,
     max_id: i64,
+    /// A table script ran with consent that is still in force (its globals may exist).
+    script_live: bool,
+    remote: bool,
 }
 
 impl Model {
@@ -3116,13 +3148,50 @@ impl Model {
             None => false,
         }
     }
+    fn opened(&mut self, ids: Vec<i64>) {
+        self.kind.clear();
+        self.agreed.clear();
+        self.table_agreed = false;
+        self.script_live = false;
+        self.max_id = 0;
+        for id in ids {
+            self.kind.insert(id, Kind2::Table);
+            self.max_id = self.max_id.max(id);
+        }
+    }
+    /// Consent for the table withdrawn (the app resets Lua when it was in force).
+    fn table_withdrawn(&mut self) {
+        if self.table_agreed {
+            self.script_live = false;
+        }
+        self.table_agreed = false;
+    }
 }
 
-fn fuzz_entries(r: &mut Rng, tag: &str) -> Vec<Entry> {
+/// The shared world of the fuzz runs: one target, one (hostile) remote server.
+struct FuzzEnv {
+    pid: u32,
+    store: String,
+    server: String,
+    dir: tempfile::TempDir,
+}
+
+/// Each entry's `{$lua}` writes its own id (`memrec.ID`) to the marker when it runs.
+fn fuzz_script(marker: &std::path::Path) -> String {
+    format!("[ENABLE]\n{{$lua}}\nlocal f = io.open({:?}, 'a') f:write(memrec.ID .. '\\n') f:close()\nreturn ''\n{{$asm}}\n[DISABLE]\n", marker.to_str().unwrap())
+}
+
+/// A table script that leaves a global behind: `tostring` writing `T` to the marker.
+fn fuzz_table_script(marker: &std::path::Path) -> String {
+    format!("local t, o = tostring, io.open\ntostring = function(...) local f = o({:?}, 'a') f:write('T\\n') f:close() return t(...) end", marker.to_str().unwrap())
+}
+
+fn fuzz_entries(r: &mut Rng, tag: &str, marker: &std::path::Path) -> Vec<Entry> {
+    let hk = |keys: Vec<u32>| Hotkey { action: "Activate".into(), keys, value: None, description: None, id: None };
     (0..1 + r.below(3))
         .map(|i| {
-            let kids = if r.below(3) == 0 { vec![Entry { description: format!("{tag}{i}k"), addr: "0x10".into(), ..Entry::default() }] } else { vec![] };
-            Entry { description: format!("{tag}{i}"), script: Some("[ENABLE]\n{$lua}\nreturn ''\n{$asm}\n[DISABLE]\n".into()), children: kids, ..Entry::default() }
+            let kids = if r.below(3) == 0 { vec![Entry { description: format!("{tag}{i}k"), script: Some(fuzz_script(marker)), ..Entry::default() }] } else { vec![] };
+            Entry { description: format!("{tag}{i}"), script: Some(fuzz_script(marker)), hotkeys: vec![hk(vec![17, 118])], children: kids, ..Entry::default() }
         })
         .collect()
 }
@@ -3133,58 +3202,93 @@ fn set_never(app: &App, on: bool) {
     app.settings_set(st).unwrap();
 }
 
+fn take_marks(marker: &std::path::Path) -> Vec<String> {
+    let m = marks(marker);
+    let _ = std::fs::remove_file(marker);
+    m.lines().map(str::to_string).collect()
+}
+
 /// Runs `ops` (each with its own random word); Err((step, why)) at the first broken invariant.
-fn fuzz_run(ops: &[(FuzzOp, u64)]) -> Result<(), (usize, String)> {
+fn fuzz_run(env: &FuzzEnv, ops: &[(FuzzOp, u64)]) -> Result<(), (usize, String)> {
     let app = App::default();
-    let dir = tempfile::tempdir().unwrap();
+    app.open_process(env.pid).unwrap();
+    let dir = tempfile::tempdir_in(env.dir.path()).unwrap();
+    let marker = dir.path().join("marker");
     let mut m = Model::default();
+    let (mut ran, mut ran_t) = (0usize, 0usize);
     for (step, &(op, word)) in ops.iter().enumerate() {
         let mut r = Rng(word | 1);
         let before = live_ids(&app);
-        let file = |r: &mut Rng, name: &str| {
+        let file = |r: &mut Rng, name: &str, script: bool| {
             let p = dir.path().join(format!("{name}{step}.json"));
-            heaphook::table::save(&p, &Table { entries: fuzz_entries(r, name), ..Table::default() }).unwrap();
+            let lua_script = if script { fuzz_table_script(&marker) } else { String::new() };
+            heaphook::table::save(&p, &Table { entries: fuzz_entries(r, name, &marker), lua_script, ..Table::default() }).unwrap();
             p
         };
         // The kind the ids this op mints get (None: it mints none).
         let mut mint: Option<Kind2> = None;
         match op {
-            FuzzOp::Open => {
-                let p = file(&mut r, "open");
-                app.table_open(p.to_str().unwrap(), false).unwrap();
-                m.kind.clear();
-                m.agreed.clear();
-                m.table_agreed = false;
-                m.max_id = 0;
-                for id in live_ids(&app) {
-                    m.kind.insert(id, Kind2::Table);
-                    m.max_id = m.max_id.max(id);
+            FuzzOp::Open | FuzzOp::OpenData | FuzzOp::LuaLoadTable => {
+                let with_script = r.below(2) == 0;
+                let p = file(&mut r, "open", with_script);
+                match op {
+                    FuzzOp::Open => drop(app.table_open(p.to_str().unwrap(), false)),
+                    FuzzOp::OpenData => drop(app.table_open_data("x.json", &std::fs::read_to_string(&p).unwrap(), false)),
+                    _ => drop(app.lua_exec(&format!("loadTable({:?})", p.to_str().unwrap()))),
                 }
+                m.opened(live_ids(&app));
+                continue;
+            }
+            FuzzOp::ForceOpen => {
+                // An own script whose [DISABLE] fails stays active: a forced open carries it.
+                let stuck = Entry { description: "stuck".into(), script: Some("[ENABLE]\n[DISABLE]\nassert(0,00)\n".into()), ..Entry::default() };
+                let id = app.table_new(vec![stuck], None, None).unwrap().ids[0];
+                app.table_set_active(&[id], true).unwrap();
+                let p = file(&mut r, "force", false);
+                app.table_open(p.to_str().unwrap(), true).unwrap();
+                m.opened(live_ids(&app));
+                let st = app.table_get().unwrap();
+                if let Some(g) = st.table.entries.iter().find(|e| e.description == "Still active from the previous table") {
+                    m.kind.insert(g.id, Kind2::Own);
+                    for c in &g.children {
+                        m.kind.insert(c.id, Kind2::Own);
+                    }
+                }
+                let _ = app.lua_exec("getAddressList().disableAllWithoutExecute()");
                 continue;
             }
             FuzzOp::Paste => {
                 let after = (!before.is_empty() && r.below(2) == 0).then(|| before[r.below(before.len())]);
-                let _ = app.table_paste(fuzz_entries(&mut r, "paste"), after, None);
+                let _ = app.table_paste(fuzz_entries(&mut r, "paste", &marker), after, None);
                 mint = Some(Kind2::Foreign);
             }
-            FuzzOp::Merge => {
-                let p = file(&mut r, "merge");
-                let _ = app.table_merge(p.to_str().unwrap());
-                mint = Some(Kind2::Foreign);
-            }
-            FuzzOp::LuaMerge => {
-                let p = file(&mut r, "lmerge");
-                let _ = app.lua_exec(&format!("loadTable({:?}, true)", p.to_str().unwrap()));
+            FuzzOp::Merge | FuzzOp::MergeWithScript | FuzzOp::LuaMerge => {
+                let script = matches!(op, FuzzOp::MergeWithScript);
+                let adopts = script && app.table_get().unwrap().table.lua_script.trim().is_empty();
+                let p = file(&mut r, "merge", script);
+                let ok = if matches!(op, FuzzOp::LuaMerge) { app.lua_exec(&format!("loadTable({:?}, true)", p.to_str().unwrap())).is_ok() } else { app.table_merge(p.to_str().unwrap()).is_ok() };
+                if ok && adopts {
+                    // The table asks again; its entries that could run keep running.
+                    if m.table_agreed && !m.never {
+                        for (id, k) in m.kind.iter_mut() {
+                            if *k == Kind2::Table {
+                                *k = Kind2::Foreign;
+                                m.agreed.insert(*id);
+                            }
+                        }
+                    }
+                    m.table_agreed = false;
+                }
                 mint = Some(Kind2::Foreign);
             }
             FuzzOp::AaAssign => {
                 let f = dir.path().join(format!("s{step}.cea"));
-                std::fs::write(&f, "[ENABLE]\n{$lua}\nreturn ''\n{$asm}\n[DISABLE]\n").unwrap();
+                std::fs::write(&f, fuzz_script(&marker)).unwrap();
                 let s = app.aa_session().unwrap();
                 app.aa_load_file(f.to_str().unwrap(), s).unwrap();
                 let agree = r.below(2) == 0 && app.aa_trust(s).is_ok();
                 let before_ids = live_ids(&app);
-                let _ = app.aa_assign(s, "[ENABLE]\n[DISABLE]\n", "assigned", None, None);
+                let _ = app.aa_assign(s, &fuzz_script(&marker), "assigned", None, None);
                 for id in live_ids(&app).into_iter().filter(|i| !before_ids.contains(i)) {
                     if agree {
                         m.agreed.insert(id);
@@ -3194,16 +3298,27 @@ fn fuzz_run(ops: &[(FuzzOp, u64)]) -> Result<(), (usize, String)> {
             }
             FuzzOp::TypedAssign => {
                 let s = app.aa_session().unwrap();
-                let _ = app.aa_assign(s, "[ENABLE]\n[DISABLE]\n", "typed", None, None);
+                let _ = app.aa_assign(s, &fuzz_script(&marker), "typed", None, None);
                 mint = Some(Kind2::Own);
             }
+            FuzzOp::Template => {
+                let _ = app.table_add_template(&env.store, "code", "tpl", None, None);
+                mint = Some(if m.remote { Kind2::Foreign } else { Kind2::Own });
+            }
             FuzzOp::New => {
-                let _ = app.table_new(fuzz_entries(&mut r, "new"), None, None);
+                let _ = app.table_new(fuzz_entries(&mut r, "new", &marker), None, None);
                 mint = Some(Kind2::Own);
             }
             FuzzOp::LuaCreate => {
                 let _ = app.lua_exec("getAddressList().createMemoryRecord().Description = 'lua'");
                 mint = Some(Kind2::Own);
+            }
+            FuzzOp::LuaSetDelete => {
+                if !before.is_empty() {
+                    let id = before[r.below(before.len())];
+                    let what = if r.below(2) == 0 { "Description = 'renamed by lua'" } else { "destroy()" };
+                    let _ = app.lua_exec(&format!("local r = getAddressList().getMemoryRecordByID({id}) if r then r.{what} end"));
+                }
             }
             FuzzOp::PutEdits | FuzzOp::Delete => {
                 let cur = app.table_get().unwrap();
@@ -3226,7 +3341,6 @@ fn fuzz_run(ops: &[(FuzzOp, u64)]) -> Result<(), (usize, String)> {
                             }
                         }
                         _ => {
-                            // regroup: move under another entry (or to the top)
                             let to = ids[r.below(ids.len())];
                             if let Some(e) = take_entry(&mut t.entries, id) {
                                 fn find(l: &mut [Entry], id: i64) -> Option<&mut Entry> {
@@ -3250,6 +3364,10 @@ fn fuzz_run(ops: &[(FuzzOp, u64)]) -> Result<(), (usize, String)> {
                 }
                 let _ = app.table_put(t, cur.version);
             }
+            FuzzOp::StructEdit => {
+                let s = hh_tools::structure::from_json(&format!(r#"[{{"name":"s{}","elements":[{{"offset":0,"vtype":"4bytes"}}]}}]"#, r.below(5))).unwrap();
+                let _ = app.struct_set(s);
+            }
             FuzzOp::Undo => {
                 let _ = app.table_history(false);
             }
@@ -3261,7 +3379,6 @@ fn fuzz_run(ops: &[(FuzzOp, u64)]) -> Result<(), (usize, String)> {
                 if !st.untrusted.is_empty() {
                     let pick = st.untrusted[r.below(st.untrusted.len())];
                     if app.table_trust_entries(&[pick]).is_ok() {
-                        // consent covers the subtree's foreign entries
                         fn sub(l: &[Entry], id: i64, out: &mut Vec<i64>, inside: bool) {
                             for e in l {
                                 let now = inside || e.id == id;
@@ -3290,17 +3407,85 @@ fn fuzz_run(ops: &[(FuzzOp, u64)]) -> Result<(), (usize, String)> {
             }
             FuzzOp::Revoke => {
                 app.table_trust(false).unwrap();
-                m.table_agreed = false;
+                m.table_withdrawn();
             }
             FuzzOp::NeverOn => {
                 set_never(&app, true);
                 m.never = true;
-                m.table_agreed = false;
+                m.table_withdrawn();
                 m.agreed.clear();
             }
             FuzzOp::NeverOff => {
                 set_never(&app, false);
                 m.never = false;
+            }
+            FuzzOp::SwitchProcess => {
+                // A process change keeps the table, its consent and its Lua.
+                if r.below(2) == 0 {
+                    app.remote_connect(&env.server, TOKEN, false).unwrap();
+                    app.remote_open(env.pid).unwrap();
+                    m.remote = true;
+                } else {
+                    app.open_process(env.pid).unwrap();
+                    m.remote = false;
+                }
+            }
+            FuzzOp::RunScript => {
+                let has = !app.table_get().unwrap().table.lua_script.trim().is_empty();
+                match app.table_run_script() {
+                    Ok(()) if has => {
+                        if !(m.table_agreed && !m.never) {
+                            return Err((step, "the table script ran without consent".into()));
+                        }
+                        m.script_live = true;
+                    }
+                    _ => {}
+                }
+            }
+            FuzzOp::Callback => {
+                if !before.is_empty() {
+                    let id = before[r.below(before.len())];
+                    // The user's own console code sets a callback on some entry: it runs only
+                    // for an entry with capabilities.
+                    let _ = app.lua_exec(&format!(
+                        "local r = getAddressList().getMemoryRecordByID({id}) if r then r.OnActivate = function() local f = io.open({:?}, 'a') f:write('cb{id}\\n') f:close() end end",
+                        marker.to_str().unwrap()
+                    ));
+                }
+            }
+            FuzzOp::Execute => {
+                if !before.is_empty() {
+                    let id = before[r.below(before.len())];
+                    let _ = take_marks(&marker);
+                    let _ = match r.below(4) {
+                        0 => app.table_set_active(&[id], true),
+                        1 => app.table_hotkey(id, 0),
+                        2 => app.hotkey_press(&[17, 118]).map(|_| ()),
+                        _ => app.lua_exec(&format!("local r = getAddressList().getMemoryRecordByID({id}) if r then r.Active = true end")),
+                    };
+                    for line in take_marks(&marker) {
+                        ran += 1;
+                        let ran = line.trim_start_matches("cb").parse::<i64>().unwrap_or(-1);
+                        if line == "T" {
+                            if !m.script_live {
+                                return Err((step, "the table script's global ran without consent in force".into()));
+                            }
+                        } else if !m.allowed(ran) {
+                            return Err((step, format!("entry {ran} ran ({line}) while the model does not allow it ({:?}, never {})", m.kind.get(&ran), m.never)));
+                        }
+                    }
+                    let _ = app.lua_exec("getAddressList().disableAllWithoutExecute()");
+                }
+            }
+            FuzzOp::Console => {
+                let _ = take_marks(&marker);
+                let _ = app.lua_exec("return tostring(1)");
+                if take_marks(&marker).iter().any(|l| l == "T") {
+                    ran_t += 1;
+                    if !m.script_live {
+                        return Err((step, "a withdrawn table script's tostring ran".into()));
+                    }
+                }
             }
         }
         // Ids: only inserting ops mint, always past every id issued before.
@@ -3330,40 +3515,182 @@ fn fuzz_run(ops: &[(FuzzOp, u64)]) -> Result<(), (usize, String)> {
     if std::env::var("HH_FUZZ_STATS").is_ok() {
         let ids = live_ids(&app);
         let full = ids.iter().filter(|&&i| app.table_caps(i) == hh_lua::Caps::Full).count();
-        eprintln!("end: {} live entries, {full} with capabilities, {} ids issued, never {}", ids.len(), m.kind.len(), m.never);
+        eprintln!("end: {} live entries, {full} with capabilities, {} ids issued, never {}; {ran} entry runs and {ran_t} table-global runs seen", ids.len(), m.kind.len(), m.never);
     }
     Ok(())
 }
 
-/// Seeded random sequences over every operation that touches entries or consent; after every
-/// step each live entry's capabilities match an independent model. On failure: the seed and a
-/// greedily shortened sequence.
+/// Seeded random sequences over every operation that touches entries, consent or Lua; after
+/// every step each live entry's capabilities match an independent model, and at intervals
+/// entries and the console actually run: a marker appears only when the model allows it. On
+/// failure: the seed and a greedily shortened sequence.
 #[test]
 fn trust_model_fuzz() {
+    let t = Target::spawn_exe(exe("hh-debug", "hh-debug-target"));
+    let server = hh_net::Server::bind("127.0.0.1:0", hh_net::ServerConfig::new(TOKEN), std::sync::Arc::new(HostileBackend)).unwrap().spawn().unwrap();
+    let env = FuzzEnv { pid: t.child.id(), store: t.addr("store"), server: server.addr().to_string(), dir: tempfile::tempdir().unwrap() };
     let seeds: Vec<u64> = match std::env::var("HH_FUZZ_SEED") {
         Ok(s) => vec![s.parse().unwrap()],
         Err(_) => vec![0x9e37_79b9, 1, 42, 0xdead_beef, 7_777_777],
     };
-    let steps: usize = std::env::var("HH_FUZZ_STEPS").ok().and_then(|s| s.parse().ok()).unwrap_or(600);
+    let steps: usize = std::env::var("HH_FUZZ_STEPS").ok().and_then(|s| s.parse().ok()).unwrap_or(1000);
+    // Running things and granting consent come up more often than the rest.
+    let mut pool: Vec<FuzzOp> = FUZZ_OPS.to_vec();
+    for (op, extra) in [(FuzzOp::Execute, 5), (FuzzOp::Console, 2), (FuzzOp::GrantTable, 2), (FuzzOp::GrantEntries, 3), (FuzzOp::RunScript, 2), (FuzzOp::NeverOff, 1)] {
+        pool.extend(std::iter::repeat_n(op, extra));
+    }
     let mut total = 0;
     for seed in seeds {
         let mut r = Rng(seed | 1);
-        let ops: Vec<(FuzzOp, u64)> = (0..steps).map(|_| (FUZZ_OPS[r.below(FUZZ_OPS.len())], r.next())).collect();
-        if let Err((at, why)) = fuzz_run(&ops) {
+        let ops: Vec<(FuzzOp, u64)> = (0..steps).map(|_| (pool[r.below(pool.len())], r.next())).collect();
+        if let Err((at, why)) = fuzz_run(&env, &ops) {
             let mut short: Vec<(FuzzOp, u64)> = ops[..=at].to_vec();
             let mut i = short.len();
             while i > 0 {
                 i -= 1;
                 let mut t = short.clone();
                 t.remove(i);
-                if fuzz_run(&t).is_err() {
+                if fuzz_run(&env, &t).is_err() {
                     short = t;
                 }
             }
-            let last = fuzz_run(&short).unwrap_err();
+            let last = fuzz_run(&env, &short).unwrap_err();
             panic!("seed {seed}: step {at}: {why}\nshortened to {} steps: {:?}\nfails with: {}", short.len(), short, last.1);
         }
         total += ops.len();
     }
+    drop(server);
     eprintln!("trust model fuzz: {total} steps");
+}
+
+// ---------- withdrawing consent leaves nothing of the table's Lua (a new interpreter) ----------
+
+/// What a once-trusted table script leaves behind to run later; each leaves its own trace.
+fn poison_payloads() -> Vec<(&'static str, &'static str)> {
+    vec![
+        ("replaced tostring", "local t = tostring tostring = function(...) mark('tostring') return t(...) end"),
+        ("string metatable __index", "getmetatable('').__index = function(s, k) mark('strmeta') return string[k] end"),
+        ("debugger_onBreakpoint", "function debugger_onBreakpoint() mark('onbp') return 1 end"),
+        ("onOpenProcess", "function onOpenProcess() mark('onopen') end"),
+        ("package.loaded poisoning", "package.loaded.string = setmetatable({}, { __index = function(_, k) mark('pkg') return string[k] end })"),
+        ("parked thread", "createThread(function() while true do mark('thread') sleep(20) end end)"),
+        ("_G traps", "setmetatable(_G, { __index = function(_, k) mark('index') end, __newindex = function(t, k, v) mark('newindex') rawset(t, k, v) end })"),
+        ("replaced print", "print = function(...) mark('print') end"),
+        ("replaced pcall", "pcall = function(...) mark('pcall') return true end"),
+    ]
+}
+
+#[test]
+fn withdrawn_table_lua_leaves_nothing_running() {
+    let mut t = Target::spawn_exe(exe("hh-debug", "hh-debug-target"));
+    let pid = t.child.id();
+    let store = t.addr("store");
+    let dir = tempfile::tempdir().unwrap();
+    let empty = dir.path().join("empty.json");
+    heaphook::table::save(&empty, &Table::default()).unwrap();
+    let mut cells = 0;
+    for how in ["decline", "never", "open another table"] {
+        for (name, payload) in poison_payloads() {
+            let app = App::default();
+            app.start_driver();
+            app.open_process(pid).unwrap();
+            let marker = dir.path().join(format!("m-{cells}"));
+            let m = format!("{:?}", marker.to_str().unwrap());
+            let script = format!(
+                "local io_open = io.open\nlocal function mark(w) local f = io_open({m}, 'a') f:write(w .. '\\n') f:close() end\n\
+                 tm = createTimer(nil) tm.Interval = 20 tm.OnTimer = function() mark('timer') end\n\
+                 fm = createForm() bt = createButton(fm) bt.OnClick = function() mark('form') end\n\
+                 createHotkey(function() mark('hotkey') end, VK_CONTROL, VK_F9)\n{payload}\n"
+            );
+            let file = dir.path().join(format!("t-{cells}.json"));
+            heaphook::table::save(&file, &Table { lua_script: script, ..Table::default() }).unwrap();
+            app.table_open(file.to_str().unwrap(), false).unwrap();
+            app.table_trust(true).unwrap();
+            app.table_run_script().unwrap();
+            wait("the table's timer runs", || marks(&marker).contains("timer").then_some(()));
+            let button = find_control(&app.ui_poll(0).unwrap().snapshot.unwrap().roots, "TButton", None).unwrap();
+            match how {
+                "decline" => app.table_trust(false).unwrap(),
+                "never" => set_never(&app, true),
+                _ => {
+                    app.table_open(empty.to_str().unwrap(), false).unwrap();
+                }
+            }
+            assert!(log_text(&app).contains("Lua was reset"), "{how}: no reset notice");
+            std::thread::sleep(Duration::from_millis(60)); // a timer tick in flight lands first
+            let _ = std::fs::remove_file(&marker);
+            let what = format!("{how} x {name}");
+            // console eval (traps, replaced functions, package.loaded)
+            app.lua_exec("x = 1 local _ = y return require('string').format('%d', 1 + 1), tostring(3), ('a'):upper()").unwrap();
+            app.lua_exec("print('hi') pcall(print, 'x')").unwrap();
+            // openProcess
+            app.lua_exec(&format!("openProcess({pid})")).unwrap();
+            // timer / thread ticks
+            std::thread::sleep(Duration::from_millis(150));
+            // form event, hotkey press
+            let _ = app.ui_event(button.id, "OnClick", vec![]);
+            assert!(app.ui_poll(0).unwrap().snapshot.unwrap().roots.is_empty(), "{what}: the form survived");
+            assert_eq!(app.hotkey_press(&[17, 120]).unwrap(), 0, "{what}: the hotkey survived");
+            // breakpoint hit: the user's own breakpoint; no Lua function may see it
+            app.debug_attach().unwrap();
+            app.debug_add_breakpoint(&bp(json!({"addr": store}))).unwrap();
+            t.send("store");
+            wait("broken at store", || (app.debug_status().unwrap().state == "broken").then_some(()));
+            app.debug_continue(false).unwrap();
+            assert!(t.line().starts_with("ok"));
+            app.debug_detach().unwrap();
+            assert_eq!(marks(&marker), "", "{what}: the withdrawn table's Lua ran\n{}", log_text(&app));
+            cells += 1;
+        }
+    }
+    eprintln!("withdrawal matrix: {cells} cells x 6 routes");
+}
+
+/// Trusted Lua copying an untrusted entry's script into another record: that record turns
+/// untrusted (it asks like a pasted entry) instead of running the text with full capabilities.
+#[test]
+fn script_copied_from_an_untrusted_entry_stays_untrusted() {
+    let t = Target::spawn();
+    let app = App::default();
+    app.open_process(t.child.id()).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let marker = dir.path().join("marker");
+    let script = format!("[ENABLE]\n{{$lua}}\nlocal f = io.open({:?}, 'a') f:write('ran\\n') f:close()\nreturn ''\n{{$asm}}\n[DISABLE]\n", marker.to_str().unwrap());
+    let u = app.table_paste(vec![Entry { description: "u".into(), script: Some(script), ..Entry::default() }], None, None).unwrap().ids[0];
+    app.lua_exec(&format!(
+        "local u = getAddressList().getMemoryRecordByID({u})\nm = getAddressList().createMemoryRecord()\nm.Type = vtAutoAssembler\nm.Script = '// copy\\n' .. u.Script\nm.Active = true\nmid = m.ID"
+    ))
+    .unwrap();
+    assert_eq!(marks(&marker), "", "{}", log_text(&app));
+    let st = app.table_get().unwrap();
+    assert_eq!(st.untrusted.len(), 2, "the copy is untrusted too: {:?}", st.untrusted);
+    let copy = *st.untrusted.iter().find(|&&i| i != u).unwrap();
+    assert!(app.table_set_active(&[copy], true).unwrap_err().starts_with(heaphook::cheat::NEEDS_ENTRY_CONSENT));
+    assert_eq!(marks(&marker), "");
+    app.table_trust_entries(&[copy]).unwrap();
+    app.table_set_active(&[copy], true).unwrap();
+    assert_eq!(marks(&marker), "ran\n");
+}
+
+/// Ids in memory are always positive, unique and at most u32: a file's valid ones are kept
+/// (its Lua may name them), the rest renumbered after them.
+#[test]
+fn loaded_ids_are_renumbered_when_invalid() {
+    let app = App::default();
+    let dir = tempfile::tempdir().unwrap();
+    let p = dir.path().join("ids.json");
+    let e = |id: i64| Entry { id, description: format!("e{id}"), addr: "0x10".into(), ..Entry::default() };
+    let t = Table { entries: vec![e(7), e(-3), e(0), e(7), Entry { children: vec![e(1 << 40)], ..e(9) }], ..Table::default() };
+    std::fs::write(&p, serde_json::to_string(&t).unwrap()).unwrap();
+    let st = app.table_open(p.to_str().unwrap(), false).unwrap();
+    let ids = live_ids(&app);
+    let mut uniq = ids.clone();
+    uniq.sort_unstable();
+    uniq.dedup();
+    assert_eq!(uniq.len(), ids.len(), "{ids:?}");
+    assert!(ids.iter().all(|&i| i > 0 && i <= u32::MAX as i64), "{ids:?}");
+    assert_eq!((st.table.entries[0].id, st.table.entries[4].id), (7, 9), "valid ids are kept");
+    // New ones come after all of them.
+    let n = app.table_new(vec![e(0)], None, None).unwrap().ids[0];
+    assert!(n > *ids.iter().max().unwrap());
 }

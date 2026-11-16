@@ -38,6 +38,17 @@ pub(crate) fn find_module<'m>(mods: &'m [Module], name: &str) -> Option<&'m Modu
     mods.iter().find(|m| m.name.eq_ignore_ascii_case(name))
 }
 
+/// Whether `name` is the name (or the file name) of one of `mods`: such a name may not be
+/// registered as a symbol or label.
+pub fn names_module(mods: &[Module], name: &str) -> bool {
+    let n = name.trim();
+    !n.is_empty()
+        && (n.eq_ignore_ascii_case("$process")
+            || mods.iter().any(|m| {
+                m.name.eq_ignore_ascii_case(n) || m.path.rsplit(['/', '\\']).next().is_some_and(|f| f.eq_ignore_ascii_case(n))
+            }))
+}
+
 /// `game.exe+1A2B` for an address inside a module, else `None`.
 pub fn module_offset(mods: &[Module], addr: Addr) -> Option<String> {
     mods.iter()
@@ -279,8 +290,10 @@ pub(crate) fn std_lookup(
     mods: &[Module],
     name: &str,
 ) -> Option<u64> {
-    syms.get(name)
-        .or_else(|| find_module(mods, name).map(|m| m.base))
+    // Module names win: a registered symbol or label can never redirect `module+offset`.
+    find_module(mods, name)
+        .map(|m| m.base)
+        .or_else(|| syms.get(name))
         .or_else(|| crate::symbols::lookup(p, mods, name))
 }
 

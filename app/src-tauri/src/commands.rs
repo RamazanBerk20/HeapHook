@@ -379,8 +379,8 @@ impl App {
         self.x.lua.engine.set_budget((s.lua_budget_ms > 0).then(|| Duration::from_millis(s.lua_budget_ms)));
         {
             let _g = self.x.lua.enter();
-            // mlua: 0 = no limit.
-            let _ = self.x.lua.engine.lua().set_memory_limit((s.lua_memory_mb as usize) << 20);
+            // 0 = no limit; kept for the states a reset builds.
+            let _ = self.x.lua.engine.set_memory_limit((s.lua_memory_mb > 0).then_some((s.lua_memory_mb as usize) << 20));
         }
         if let Ok(sess) = self.session() {
             sess.freezer.set_interval(Duration::from_millis(s.freeze_interval_ms));
@@ -903,7 +903,13 @@ impl App {
         }
         let mut names = Vec::new();
         // Later symbols may use earlier ones.
+        let mods = sess.proc.modules().unwrap_or_default();
         for u in syms {
+            // A label may not shadow a module (module names win anyway; say why it is unused).
+            if hh_asm::names_module(&mods, &u.name) {
+                self.x.lua.console.push("err", &format!("label {}: not used: it is the name of a loaded module", u.name));
+                continue;
+            }
             if let Ok(a) = hh_asm::resolve_address(&*sess.proc, &work, &u.address) {
                 work.register(&u.name, a);
                 names.push(u.name);

@@ -147,6 +147,12 @@ pub trait TableHost: Send + Sync {
     fn caps(&self, _id: RecId) -> Caps {
         Caps::None
     }
+    /// Trusted Lua is making record `id`'s script out of text it read from a record without
+    /// capabilities: make `id` untrusted too (return true; it then asks for consent like a
+    /// pasted entry), or refuse the assignment (false, the default).
+    fn mark_untrusted(&self, _id: RecId) -> bool {
+        false
+    }
 }
 
 /// In-memory [`TableHost`] for headless use and tests. Whoever fills it vouches for its
@@ -215,5 +221,9 @@ impl TableHost for MemTable {
     }
     fn caps(&self, id: RecId) -> Caps {
         if self.untrusted.lock().unwrap().contains(&id) { Caps::None } else { Caps::Full }
+    }
+    fn mark_untrusted(&self, id: RecId) -> bool {
+        self.set_caps(id, Caps::None);
+        true
     }
 }

@@ -219,6 +219,10 @@ Lua in a table can read, change and delete your files, start programs and use th
 - Settings > Lua > "Allow Lua scripts to access files and run programs": turn it off to stop that access. It applies after a restart. Scripts can still read and change the attached process.
 - An Auto Assembler script loaded from a file asks before its `{$lua}` or `loadbinary` runs. A script you type yourself runs without asking.
 
+- Withdrawing consent ("Do not trust" after a yes, or turning Settings to "Never run") and opening another table stop the table's Lua completely: HeapHook starts a new Lua interpreter, so its timers, forms, hotkeys, callbacks and anything else it defined are gone.
+- If trusted Lua copies the script of an entry that waits for consent into another entry, that entry waits for consent too. HeapHook follows the text only as long as the script copies or embeds it: text a script rewrites (for example with `gsub`) is no longer recognised, so trust scripts that edit other entries only as far as you trust the table.
+- A label or `registersymbol` can never take the name of a loaded module; module names always win. Labels that came with a table you have not trusted are marked in the Labels dialog.
+
 Open tables only from sources you trust.
 
 ## 6. The debugger
@@ -333,6 +337,8 @@ Ctrl B bookmarks an address, Ctrl Shift B lists bookmarks. In the disassembler, 
 The Lua view (Ctrl 5) runs Lua against the opened process. Ctrl Enter runs the text. Ctrl Up and Down walk through history. Esc interrupts a script. The table's Lua script is edited with the "Table script" button. Each run has a time limit (30 seconds by default) and a memory limit (1024 MiB), both in Settings.
 
 HeapHook implements part of Cheat Engine's Lua API. If a function you need is missing, check PARITY.md.
+
+When consent for a table's Lua is withdrawn, when Settings turn to "Never run", and when another table is opened (also by a script's `loadTable`), HeapHook discards the Lua interpreter and starts a new one. Globals you defined in the console are lost then too; the console says so ("Lua was reset"). A `loadTable(file)` call ends the script that made it. Changing the target process does not reset Lua.
 
 ### Table scripts and forms
 

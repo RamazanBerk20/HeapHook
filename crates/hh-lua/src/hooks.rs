@@ -70,7 +70,7 @@ pub(crate) fn symbol_lua(st: &State) -> Option<Lua> {
     if st.hooks.lock().unwrap().symbol == 0 {
         return None;
     }
-    st.weak.get()?.try_upgrade()
+    st.weak.read().unwrap().as_ref()?.try_upgrade()
 }
 
 fn symbol_lookup(lua: &Lua, st: &Arc<State>) -> SymbolLookup {

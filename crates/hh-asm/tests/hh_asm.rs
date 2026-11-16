@@ -3046,3 +3046,18 @@ fn aa_template_never_embeds_hostile_module_names() {
         }
     }
 }
+
+/// A symbol can never shadow a module: registering one by a module's name is refused, and
+/// module names win on lookup.
+#[test]
+fn symbols_never_shadow_modules() {
+    let p = game64();
+    let mut syms = SymbolTable::default();
+    let e = aa_execute(&p, &mut syms, "[ENABLE]\nalloc(m,8)\nregistersymbol(GAME.EXE)\n[DISABLE]\n", true, None, &mut AaHooks::default());
+    assert!(e.is_err());
+    let e = aa_check(&p, &syms, "[ENABLE]\nlabel(game.exe)\nregistersymbol(game.exe)\n[DISABLE]\n", &mut AaHooks::default()).unwrap();
+    assert!(e.message.contains("loaded module"), "{e:?}");
+    syms.register("game.exe", 0x1234);
+    assert_eq!(resolve_address(&p, &syms, "game.exe+10").unwrap(), GAME64 + 0x10);
+    assert!(names_module(&p.modules().unwrap(), "x/game.exe".rsplit('/').next().unwrap()));
+}

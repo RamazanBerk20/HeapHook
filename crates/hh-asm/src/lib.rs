@@ -25,7 +25,7 @@ pub use disasm::{
     disassemble_with, guess_value_type, previous_instruction,
 };
 pub use expr::{
-    Ctx, MAX_EXPR_DEPTH, SymbolLookup, SymbolTable, eval, module_offset, parse_num,
+    Ctx, MAX_EXPR_DEPTH, SymbolLookup, SymbolTable, eval, module_offset, names_module, parse_num,
     resolve_address, resolve_address_with,
 };
 pub use search::{

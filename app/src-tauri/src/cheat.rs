@@ -590,6 +590,26 @@ impl Live {
     /// The new table is untrusted; the carried scripts stay runnable (they were before).
     pub fn replace(&self, mut t: Table, keep: &[i64]) -> TableState {
         for_each_mut(&mut t.entries, &mut |e| e.frozen = false);
+        // Ids in memory are always positive, unique and at most u32: the file's valid ones are
+        // kept (its Lua script may name them), the rest renumbered after them.
+        let mut seen = HashSet::new();
+        for_each_mut(&mut t.entries, &mut |e| {
+            if e.id <= 0 || e.id > u32::MAX as i64 || !seen.insert(e.id) {
+                e.id = 0;
+            }
+        });
+        let (mut max, mut bad) = (seen.iter().copied().max().unwrap_or(0), 0i64);
+        for_each_mut(&mut t.entries, &mut |e| bad += (e.id == 0) as i64);
+        if max + bad + 1 > u32::MAX as i64 {
+            max = 0;
+            for_each_mut(&mut t.entries, &mut |e| e.id = 0);
+        }
+        for_each_mut(&mut t.entries, &mut |e| {
+            if e.id == 0 {
+                max += 1;
+                e.id = max;
+            }
+        });
         let mut g = lock(&self.0);
         let mut next = all(&t.entries).iter().map(|(e, _)| e.id).max().unwrap_or(0) + 1;
         let (mut rt, mut carried) = (HashMap::new(), Vec::new());
@@ -876,7 +896,11 @@ impl TableHost for Live {
 
     fn create(&self, parent: Option<RecId>) -> RecId {
         let mut g = lock(&self.0);
-        // Only trusted Lua runs, so what it creates is the user's own.
+        // Only trusted Lua runs, so what it creates is the user's own. No ids left: id 0
+        // names no record (every later use of it fails).
+        if g.next_id >= u32::MAX as i64 {
+            return 0;
+        }
         let id = g.issue(Origin::Own);
         let e = Entry { id, description: "No description".into(), addr: "0".into(), ..Entry::default() };
         // Past the depth limit the new record goes to the top level instead.
@@ -924,6 +948,14 @@ impl TableHost for Live {
 
     fn caps(&self, id: RecId) -> Caps {
         Live::caps(self, id as i64)
+    }
+
+    fn mark_untrusted(&self, id: RecId) -> bool {
+        let mut g = lock(&self.0);
+        g.origin.insert(id as i64, Origin::Foreign);
+        g.agreed.remove(&(id as i64));
+        g.bump();
+        true
     }
 }
 
@@ -988,13 +1020,8 @@ the table was not opened: these active scripts could not be disabled (open anywa
         let keep: Vec<i64> = failed.into_iter().map(|f| f.0).collect();
         let st = self.x.live.replace(t, &keep);
         self.x.live.select(Vec::new());
-        // Record callbacks, timers, hotkeys and forms of the previous table go with it.
-        {
-            let _g = self.x.lua.enter();
-            if let Err(e) = self.x.lua.engine.clear_table_state() {
-                self.x.lua.console.push("err", &format!("clearing the previous table's Lua state: {e}"));
-            }
-        }
+        // Nothing of the previous table's Lua may carry over: a new interpreter.
+        self.reset_lua("another table was opened");
         self.sync_freeze();
         Ok(st)
     }
@@ -1179,8 +1206,10 @@ the table was not opened: these active scripts could not be disabled (open anywa
     /// An injection template at `addr` as a new script entry after `after`. A template for
     /// a remote target embeds names the server reported: untrusted like a pasted entry.
     pub fn table_add_template(&self, addr: &str, kind: &str, description: &str, after: Option<i64>, base: Option<u64>) -> R<PasteOut> {
-        let script = self.aa_template(addr, kind)?;
-        let remote = self.session()?.info.remote.is_some();
+        // One session snapshot: the template's text and whether it is remote match.
+        let sess = self.session()?;
+        let script = self.aa_template_in(&sess, addr, kind)?;
+        let remote = sess.info.remote.is_some();
         let e = Entry { description: description.into(), script: Some(script), ..Entry::default() };
         let (version, ids) = self.x.live.insert(vec![e], after, base, if remote { Origin::Foreign } else { Origin::Own }, false)?;
         Ok(PasteOut { version, ids })
@@ -1211,17 +1240,25 @@ the table was not opened: these active scripts could not be disabled (open anywa
         Ok(())
     }
 
-    /// Consent was withdrawn: interrupt what runs, then drop timers, forms, hotkeys,
-    /// callbacks, registered AA hooks, Lua breakpoints and pointer scans without running any
-    /// of them once more.
+    /// Consent was withdrawn: a new interpreter (see [`App::reset_lua`]).
     pub(crate) fn stop_table_lua(&self) {
+        self.reset_lua("consent for the table's Lua was withdrawn");
+    }
+
+    /// Discards the Lua state (`Engine::reset`): what runs is interrupted, the table's timers,
+    /// forms, hotkeys, callbacks, AA hooks, Lua breakpoints and pointer scans are released, and
+    /// every global, including ones typed in the console, is gone. Called when consent is
+    /// withdrawn, Settings turn to "never", and another table replaces this one (open, drop,
+    /// Lua `loadTable(f)`). Not on a process change: the table and its consent stay the same.
+    pub(crate) fn reset_lua(&self, why: &str) {
         self.x.lua.engine.interrupt_handle().interrupt();
         self.x.lua.console.cancel();
         let _g = self.x.lua.enter();
-        if let Err(e) = self.x.lua.engine.stop_table_state() {
-            self.x.lua.console.push("err", &format!("stopping the table's Lua: {e}"));
+        if let Err(e) = self.x.lua.engine.reset() {
+            self.x.lua.console.push("err", &format!("resetting the Lua engine: {e}"));
         }
-        self.x.lua.console.push("info", "-- consent withdrawn: the table's Lua (timers, forms, hotkeys, callbacks) was stopped");
+        self.x.lua.refresh_onbp();
+        self.x.lua.console.push("info", &format!("-- Lua was reset ({why}): every timer, form, hotkey and callback of the table is gone, and so are globals defined in this console"));
     }
 
     /// Caller holds the Lua lock. The engine applies the group options (children activated

@@ -1137,11 +1137,14 @@ fn run(
                     need(1)?;
                     labels.extend(args.iter().map(|a| a.to_ascii_lowercase()));
                 }
-                "registersymbol" => to_register.extend(
-                    args.iter()
-                        .filter(|a| !a.is_empty())
-                        .map(|a| (ln, a.clone())),
-                ),
+                "registersymbol" => {
+                    // A symbol may not shadow a module (it would redirect other scripts'
+                    // `module+offset` writes).
+                    if let Some(a) = args.iter().find(|a| crate::expr::names_module(&r.mods, a)) {
+                        return err(ln, format!("registersymbol: {a} is the name of a loaded module"));
+                    }
+                    to_register.extend(args.iter().filter(|a| !a.is_empty()).map(|a| (ln, a.clone())))
+                }
                 "unregistersymbol" => {
                     to_unregister.extend(args.iter().filter(|a| !a.is_empty()).cloned())
                 }

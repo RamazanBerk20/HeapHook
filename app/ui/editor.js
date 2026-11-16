@@ -836,7 +836,10 @@ function buildAaWindow() {
     const p = await askPath({ save: false, title: 'Open Auto Assembler script', filters: [['Auto Assembler script', ['cea', 'aa', 'txt']], ['All files', ['*']]] });
     if (!p) return ta.focus();
     try {
-      const r = await api.aaLoadFile(p, await sess());
+      const s_ = await sess();
+      const r = await api.aaLoadFile(p, s_);
+      // "New" meanwhile started another (trusted) session: the file's text never goes there.
+      if (session !== s_) return;
       const text = typeof r === 'string' ? r : r?.script ?? '';
       const big = tooBig(text);
       if (big) { fail(big); ta.focus(); return; }

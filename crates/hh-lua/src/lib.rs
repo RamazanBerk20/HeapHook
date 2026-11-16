@@ -282,8 +282,15 @@ pub(crate) struct State {
     /// `autoAssemble` of text containing one runs without capabilities too.
     tainted: Mutex<std::collections::VecDeque<String>>,
     /// The engine's Lua state, for address resolution deep inside Rust helpers (weak: the
-    /// state owns closures holding this struct).
-    weak: OnceLock<mlua::WeakLua>,
+    /// state owns closures holding this struct). Replaced by [`Engine::reset`].
+    weak: RwLock<Option<mlua::WeakLua>>,
+    /// [`Engine::reset`] was asked for: every script is aborted and every host function
+    /// refused until the outermost entry performs it.
+    reset_pending: AtomicBool,
+    /// Ids of the `createHotkey` hotkeys registered with the host (released by a reset).
+    lua_hotkeys: Mutex<std::collections::HashSet<u32>>,
+    /// The Lua state's memory limit (a reset applies it to the new state).
+    memory_limit: Mutex<Option<usize>>,
     pub(crate) ui: ui::UiState,
     pub(crate) dbg: debug::DebugState,
     pub(crate) ext: ext::ExtState,
@@ -317,7 +324,9 @@ impl State {
     fn check(&self) -> mlua::Result<()> {
         let mut a = self.abort.lock().unwrap();
         if a.is_none() {
-            if self.interrupt.load(Ordering::SeqCst) {
+            if self.reset_pending.load(Ordering::SeqCst) {
+                *a = Some("the table's Lua was stopped".into());
+            } else if self.interrupt.load(Ordering::SeqCst) {
                 *a = Some("script interrupted".into());
             } else if self.deadline.lock().unwrap().is_some_and(|d| Instant::now() >= d) {
                 let b = self.budget.lock().unwrap().unwrap_or_default();
@@ -379,12 +388,39 @@ struct Internals {
     breakpoint: Function,
 }
 
-/// A Lua state with the Cheat Engine API. Cheap to clone (shared state).
+/// One Lua interpreter: the state and the prelude functions it handed back.
+#[derive(Clone)]
+struct Core {
+    lua: Lua,
+    i: Arc<Internals>,
+}
+
+/// A Lua state with the Cheat Engine API. Cheap to clone (shared state; every clone sees a
+/// [`Engine::reset`]).
 #[derive(Clone)]
 pub struct Engine {
-    lua: Lua,
+    core: Arc<Mutex<Core>>,
     st: Arc<State>,
-    i: Arc<Internals>,
+}
+
+/// A fresh interpreter for `st`: memory limit, instruction hook, the API and the prelude, the
+/// `process` global.
+fn build_core(st: &Arc<State>) -> Result<Core> {
+    let lua = Lua::new();
+    if let Some(m) = *st.memory_limit.lock().unwrap() {
+        lua.set_memory_limit(m).map_err(lua_err)?;
+    }
+    *st.weak.write().unwrap() = Some(lua.weak());
+    let hook_st = st.clone();
+    lua.set_global_hook(HookTriggers::new().every_nth_instruction(1000), move |_, _| hook_st.check().map(|_| VmState::Continue))
+        .map_err(lua_err)?;
+    let i = api::install(&lua, st, st.allow_os).map_err(lua_err)?;
+    let name = st.proc().and_then(|p| {
+        let pid = p.pid();
+        hh_core::list_processes().ok()?.into_iter().find(|i| i.pid == pid).map(|i| i.name)
+    });
+    lua.globals().set("process", name).map_err(lua_err)?;
+    Ok(Core { lua, i: Arc::new(i) })
 }
 
 fn lua_err(e: mlua::Error) -> Error {
@@ -396,10 +432,6 @@ fn lua_err(e: mlua::Error) -> Error {
 
 impl Engine {
     pub fn new(opts: EngineOptions) -> Result<Engine> {
-        let lua = Lua::new();
-        if let Some(m) = opts.memory_limit {
-            lua.set_memory_limit(m).map_err(lua_err)?;
-        }
         let st = Arc::new(State {
             proc: RwLock::new(None),
             local: OnceLock::new(),
@@ -422,33 +454,114 @@ impl Engine {
             in_symlookup: AtomicBool::new(false),
             denied: Mutex::new(Vec::new()),
             tainted: Mutex::new(Default::default()),
-            weak: OnceLock::new(),
+            weak: RwLock::new(None),
+            reset_pending: AtomicBool::new(false),
+            lua_hotkeys: Mutex::new(Default::default()),
+            memory_limit: Mutex::new(opts.memory_limit),
             ui: ui::UiState::default(),
             dbg: debug::DebugState::default(),
             ext: ext::ExtState::default(),
         });
-        let _ = st.weak.set(lua.weak());
-        let hook_st = st.clone();
-        lua.set_global_hook(HookTriggers::new().every_nth_instruction(1000), move |_, _| {
-            hook_st.check().map(|_| VmState::Continue)
-        })
-        .map_err(lua_err)?;
-        let i = api::install(&lua, &st, opts.allow_os).map_err(lua_err)?;
-        Ok(Engine {
-            lua,
-            st,
-            i: Arc::new(i),
-        })
+        let core = build_core(&st)?;
+        Ok(Engine { core: Arc::new(Mutex::new(core)), st })
     }
 
-    /// The underlying Lua state, for host-specific extensions.
-    pub fn lua(&self) -> &Lua {
-        &self.lua
+    fn core(&self) -> Core {
+        self.core.lock().unwrap().clone()
+    }
+
+    fn i(&self) -> Arc<Internals> {
+        self.core().i
+    }
+
+    /// The underlying Lua state, for host-specific extensions (a handle to the current one:
+    /// after [`Engine::reset`] it is a different state).
+    pub fn lua(&self) -> Lua {
+        self.core().lua
+    }
+
+    /// The Lua state's memory limit (`None` = unlimited); kept for the states a reset builds.
+    pub fn set_memory_limit(&self, limit: Option<usize>) -> Result<()> {
+        *self.st.memory_limit.lock().unwrap() = limit;
+        self.lua().set_memory_limit(limit.unwrap_or(0)).map(|_| ()).map_err(lua_err)
+    }
+
+    /// Discards the Lua state and builds a new one: consent for a table's Lua was withdrawn
+    /// (or another table replaces it), so nothing that table's code defined may survive —
+    /// globals, replaced library functions and metatables, `package.loaded`, coroutines,
+    /// upvalues, registry entries. First every external resource it held is released: forms
+    /// (the UI host hears they are gone), `createHotkey` hotkeys (unregistered with the host),
+    /// Lua breakpoints (removed through the debug host), pointer scans (cancelled, their files
+    /// deleted), memscans, HeapHook-side buffers, AA / symbol / structure registrations, taint
+    /// and refusal records. The old state is neutered before it is dropped, so finalizers
+    /// (`__gc`) it holds run no code. Hosts, process, budget, memory limit and the symbol
+    /// table (addresses, not code) stay.
+    ///
+    /// Any running script is interrupted. Called from inside the engine (a Lua callback on
+    /// this thread, e.g. `loadTable`), it is deferred: the running script is aborted, every
+    /// host function is refused, and the outermost entry performs the reset when it returns.
+    /// Another thread inside the engine is waited for (it is interrupted first).
+    pub fn reset(&self) -> Result<()> {
+        self.st.reset_pending.store(true, Ordering::SeqCst);
+        self.st.interrupt.store(true, Ordering::SeqCst);
+        if self.inside() {
+            return Ok(());
+        }
+        self.do_reset()
+    }
+
+    /// Whether this thread is inside the engine.
+    fn inside(&self) -> bool {
+        self.st.gate.lock().unwrap().owner == Some(std::thread::current().id())
+    }
+
+    fn do_reset(&self) -> Result<()> {
+        let _g = guard(&self.st);
+        if !self.st.reset_pending.load(Ordering::SeqCst) {
+            return Ok(()); // another thread did it meanwhile
+        }
+        let old = self.core();
+        // Every call and every instruction of the old state errors from now on (its `__gc`
+        // finalizers included, now and whenever the last handle goes).
+        let _ = old.lua.set_global_hook(HookTriggers { on_calls: true, every_nth_instruction: Some(1), ..Default::default() }, |_, _| {
+            Err(mlua::Error::runtime("this Lua state was discarded"))
+        });
+        let st = &self.st;
+        for id in std::mem::take(&mut *st.lua_hotkeys.lock().unwrap()) {
+            st.host().unregister_hotkey(id);
+        }
+        for id in st.ui.children(None) {
+            st.ui.destroy(id);
+        }
+        debug::clear(st);
+        *st.dbg.broken.lock().unwrap() = None;
+        ext::release(st);
+        st.scans.lock().unwrap().clear();
+        *st.hooks.lock().unwrap() = hooks::Regs::default();
+        st.in_symlookup.store(false, Ordering::SeqCst);
+        st.denied.lock().unwrap().clear();
+        st.tainted.lock().unwrap().clear();
+        st.allocs.lock().unwrap().clear();
+        *st.speed.lock().unwrap() = 1.0;
+        st.reset_pending.store(false, Ordering::SeqCst);
+        let core = build_core(st)?;
+        let old = std::mem::replace(&mut *self.core.lock().unwrap(), core);
+        drop(old);
+        *st.abort.lock().unwrap() = None;
+        Ok(())
+    }
+
+    /// Performs a pending reset when this thread is not inside the engine.
+    fn reset_if_pending(&self) -> Result<()> {
+        if self.st.reset_pending.load(Ordering::SeqCst) && !self.inside() {
+            self.do_reset()?;
+        }
+        Ok(())
     }
 
     /// Binds the engine to a process (or detaches with `None`); updates the `process` global.
     pub fn set_process(&self, p: Option<Arc<dyn Process>>) -> Result<()> {
-        api::set_process(&self.lua, &self.st, p).map_err(lua_err)
+        api::set_process(&self.lua(), &self.st, p).map_err(lua_err)
     }
 
     pub fn process(&self) -> Option<Arc<dyn Process>> {
@@ -491,32 +604,40 @@ impl Engine {
 
     /// Runs `f` as one guarded entry; an abort the script swallowed still fails the call.
     fn entry<T>(&self, f: impl FnOnce() -> Result<T>) -> Result<T> {
-        let _g = guard(&self.st);
-        let r = f();
-        match self.st.aborted() {
-            Some(m) if r.is_ok() => Err(Error::Other(m)),
-            _ => r,
-        }
+        self.reset_if_pending()?;
+        let r = {
+            let _g = guard(&self.st);
+            let r = f();
+            match self.st.aborted() {
+                Some(m) if r.is_ok() => Err(Error::Other(m)),
+                _ => r,
+            }
+        };
+        // A reset asked for from inside (e.g. `loadTable`) happens here, at the outermost exit.
+        self.reset_if_pending()?;
+        r
     }
 
     /// Runs a chunk (table script, console line). Returns its results converted with
     /// `tostring`. Errors carry the message, `name:line:` position and a traceback.
     pub fn exec(&self, src: &str, name: &str) -> Result<Vec<String>> {
         self.entry(|| {
-            let f = self.lua.load(src).set_name(format!("={name}")).set_mode(ChunkMode::Text).into_function().map_err(lua_err)?;
+            let lua = self.lua();
+            let f = lua.load(src).set_name(format!("={name}")).set_mode(ChunkMode::Text).into_function().map_err(lua_err)?;
             let r = self.call(f, MultiValue::new())?;
-            let tostring: Function = self.lua.globals().get("tostring").map_err(lua_err)?;
+            // The engine's own `tostring`, captured at init (a script may replace the global).
+            let tostring: Function = lua.named_registry_value("hh_tostring").map_err(lua_err)?;
             r.into_iter().map(|v| tostring.call::<String>(v).map_err(lua_err)).collect()
         })
     }
 
     /// Calls `f` under the traceback handler; Err holds the formatted Lua error.
     fn call(&self, f: Function, args: MultiValue) -> Result<MultiValue> {
-        let mut r = self.i.xcall.call::<MultiValue>((f, args)).map_err(lua_err)?;
+        let mut r = self.i().xcall.call::<MultiValue>((f, args)).map_err(lua_err)?;
         match r.pop_front() {
             Some(Value::Boolean(true)) => Ok(r),
             _ => {
-                let msg = r.pop_front().map(|v| api::value_text(&self.lua, &v)).unwrap_or_default();
+                let msg = r.pop_front().map(|v| api::value_text(&self.lua(), &v)).unwrap_or_default();
                 Err(Error::Other(msg))
             }
         }
@@ -527,7 +648,7 @@ impl Engine {
     /// into Err (the timers stay enabled, like in CE).
     pub fn tick(&self) -> Result<()> {
         self.entry(|| {
-            let errs: Vec<String> = self.i.tick.call(()).map_err(lua_err)?;
+            let errs: Vec<String> = self.i().tick.call(()).map_err(lua_err)?;
             if errs.is_empty() { Ok(()) } else { Err(Error::Other(errs.join("\n"))) }
         })
     }
@@ -538,20 +659,20 @@ impl Engine {
     /// deactivated as well).
     pub fn set_active(&self, id: RecId, active: bool) -> Result<()> {
         self.entry(|| {
-            let (ok, err): (bool, Option<String>) = self.i.setactive.call((id, active)).map_err(lua_err)?;
+            let (ok, err): (bool, Option<String>) = self.i().setactive.call((id, active)).map_err(lua_err)?;
             if ok { Ok(()) } else { Err(Error::Other(err.unwrap_or_else(|| "activation failed".into()))) }
         })
     }
 
     /// Runs the `createHotkey` function registered under `id`.
     pub fn fire_hotkey(&self, id: u32) -> Result<()> {
-        self.call_internal(&self.i.hotkey, id).map(|_| ())
+        self.call_internal(|i| &i.hotkey, id).map(|_| ())
     }
 
     /// Performs the action of hotkey `hotkey` of record `rec` (toggle, activate, set /
     /// increase / decrease value) with its OnHotkey / OnPostHotkey callbacks.
     pub fn fire_record_hotkey(&self, rec: RecId, hotkey: u32) -> Result<()> {
-        self.call_internal(&self.i.rechotkey, (rec, hotkey)).map(|_| ())
+        self.call_internal(|i| &i.rechotkey, (rec, hotkey)).map(|_| ())
     }
 
     /// Forgets everything the previous table's scripts left behind: memory record callbacks
@@ -563,7 +684,7 @@ impl Engine {
     /// Ownership is by time: everything created since the previous clear belongs to the
     /// current table, including objects created from the console.
     pub fn clear_table_state(&self) -> Result<()> {
-        self.call_internal(&self.i.clear, false).map(|_| ())
+        self.call_internal(|i| &i.clear, false).map(|_| ())
     }
 
     /// Like [`Engine::clear_table_state`], for consent the user withdrew: everything goes
@@ -571,7 +692,7 @@ impl Engine {
     /// running on another thread is interrupted first.
     pub fn stop_table_state(&self) -> Result<()> {
         self.st.interrupt.store(true, Ordering::SeqCst);
-        self.call_internal(&self.i.clear, true).map(|_| ())
+        self.call_internal(|i| &i.clear, true).map(|_| ())
     }
 
     /// Records refused since the last call because they lack the capabilities their script
@@ -587,13 +708,15 @@ impl Engine {
     /// first argument followed by `args`, and returns what it returned. `OnClose` also applies
     /// the close action (hide or free). A control without a handler is not an error.
     pub fn fire_event(&self, id: ControlId, event: &str, args: &[Prop]) -> Result<Vec<Prop>> {
+        self.reset_if_pending()?;
+        let lua = self.lua();
         let mut a = MultiValue::new();
         a.push_back(Value::Integer(id as i64));
-        a.push_back(event.into_lua(&self.lua).map_err(lua_err)?);
+        a.push_back(event.into_lua(&lua).map_err(lua_err)?);
         for p in args {
-            a.push_back(p.clone().into_lua(&self.lua).map_err(lua_err)?);
+            a.push_back(p.clone().into_lua(&lua).map_err(lua_err)?);
         }
-        let r = self.call_internal(&self.i.uievent, a)?;
+        let r = self.call_internal(|i| &i.uievent, a)?;
         Ok(r.iter().map(Prop::from_lua_value).collect())
     }
 
@@ -601,8 +724,9 @@ impl Engine {
     /// `Position`, ...): stores the value without echoing it back to the UI host and fires the
     /// control's `OnChange` (checkboxes also `OnClick`) when it changed.
     pub fn ui_input(&self, id: ControlId, prop: &str, value: Prop) -> Result<()> {
-        let v = value.into_lua(&self.lua).map_err(lua_err)?;
-        self.call_internal(&self.i.uiinput, (id, prop.to_string(), v)).map(|_| ())
+        self.reset_if_pending()?;
+        let v = value.into_lua(&self.lua()).map_err(lua_err)?;
+        self.call_internal(|i| &i.uiinput, (id, prop.to_string(), v)).map(|_| ())
     }
 
     /// The whole control tree (forms and their children), for a UI that attaches late.
@@ -621,15 +745,16 @@ impl Engine {
         self.entry(|| {
             *self.st.dbg.broken.lock().unwrap() = Some(ev.clone());
             *self.st.dbg.known.lock().unwrap() = Some(ev.context);
-            debug::write_context(&self.lua, &ev.context).map_err(lua_err)?;
-            let r = self.call(self.i.breakpoint.clone(), (ev.address as i64, ev.thread_id).into_lua_multi(&self.lua).map_err(lua_err)?);
+            let lua = self.lua();
+            debug::write_context(&lua, &ev.context).map_err(lua_err)?;
+            let r = self.call(self.i().breakpoint.clone(), (ev.address as i64, ev.thread_id).into_lua_multi(&lua).map_err(lua_err)?);
             let resume = match r.as_ref().ok().and_then(|v| v.front()) {
                 Some(Value::Boolean(b)) => *b,
                 Some(Value::Integer(i)) => *i != 0,
                 Some(Value::Number(n)) => *n != 0.0,
                 _ => false,
             };
-            let ctx = debug::read_context(&self.lua, &ev.context);
+            let ctx = debug::read_context(&lua, &ev.context);
             let changed = (ctx != ev.context).then_some(ctx);
             let mut b = self.st.dbg.broken.lock().unwrap();
             // The function may have continued (or re-broken) the thread itself.
@@ -651,10 +776,13 @@ impl Engine {
         *self.st.dbg.broken.lock().unwrap() = None;
     }
 
-    fn call_internal(&self, f: &Function, args: impl mlua::IntoLuaMulti) -> Result<MultiValue> {
+    /// Calls an internal prelude function of the CURRENT state (`which` picks it once a
+    /// pending reset is done).
+    fn call_internal(&self, which: impl FnOnce(&Internals) -> &Function, args: impl mlua::IntoLuaMulti) -> Result<MultiValue> {
         self.entry(|| {
-            let args = args.into_lua_multi(&self.lua).map_err(lua_err)?;
-            self.call(f.clone(), args)
+            let core = self.core();
+            let args = args.into_lua_multi(&core.lua).map_err(lua_err)?;
+            self.call(which(&core.i).clone(), args)
         })
     }
 
@@ -672,7 +800,7 @@ impl Engine {
     /// access is on (checking never reads the file). With [`Caps::None`] each of those is an
     /// error naming `hh_asm::NOT_AVAILABLE`.
     pub fn aa_hooks_check_only_with(&self, caps: Caps) -> AaHooks {
-        hooks::for_caps(&self.lua, &self.st, None, hooks::Mode::CheckNoLua, caps)
+        hooks::for_caps(&self.lua(), &self.st, None, hooks::Mode::CheckNoLua, caps)
     }
 
     /// Hooks for `hh_asm::aa_execute` / `aa_check` so `{$lua}` blocks and `luacall` run in
@@ -694,7 +822,7 @@ impl Engine {
     /// host knows the user typed or agreed to.
     pub fn aa_hooks_with(&self, memrec: Option<RecId>, syntax_check: bool, caps: Caps) -> AaHooks {
         let mode = if syntax_check { hooks::Mode::Check } else { hooks::Mode::Run };
-        hooks::for_caps(&self.lua, &self.st, memrec, mode, caps)
+        hooks::for_caps(&self.lua(), &self.st, memrec, mode, caps)
     }
 
     /// Whether `registerSymbolLookupCallback` functions are registered: a script run without
@@ -707,14 +835,14 @@ impl Engine {
     /// `hh_asm::DisasmOptions::address_name`); `None` while none is registered. Each call
     /// enters the engine (waits for a running script).
     pub fn address_name(&self) -> Option<AddressName> {
-        hooks::address_name(&self.lua, &self.st)
+        hooks::address_name(&self.lua(), &self.st)
     }
 
     /// The `registerSymbolLookupCallback` functions as a lookup for
     /// `hh_asm::resolve_address_with`; `None` while none is registered. Each call enters the
     /// engine.
     pub fn symbol_lookup(&self) -> Option<SymbolLookup> {
-        hooks::symbol_lookup_opt(&self.lua, &self.st)
+        hooks::symbol_lookup_opt(&self.lua(), &self.st)
     }
 
     /// `registerStructureDissectOverride`: the structure the first override that took care
@@ -722,12 +850,12 @@ impl Engine {
     /// `|a, s| engine.structure_override(a, s)`). An unnamed one is named by
     /// [`Engine::structure_name`], else `Structure_<addr>`. `None`: guess as usual.
     pub fn structure_override(&self, addr: Addr, size: usize) -> Option<hh_tools::structure::Structure> {
-        hooks::structure_override(&self.lua, &self.st, addr, size)
+        hooks::structure_override(&self.lua(), &self.st, addr, size)
     }
 
     /// `registerStructureNameLookup`: the name the first callback gives for a structure at
     /// `addr`, and the base address it suggests instead of `addr` (if any).
     pub fn structure_name(&self, addr: Addr) -> Option<(String, Option<Addr>)> {
-        hooks::structure_name(&self.lua, &self.st, addr)
+        hooks::structure_name(&self.lua(), &self.st, addr)
     }
 }
