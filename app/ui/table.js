@@ -233,8 +233,22 @@ export function initTable(root) {
     if (!targets.length) return;
     const on_ = !targets[0].frozen;
     await chain; // pending edits first
-    try { await api.tableSetActive(targets.map((t) => t.id), on_); } catch (err) { toast(err); }
+    try { await setActive(targets.map((t) => t.id), on_); } catch (err) { toast(err); }
     chain = chain.then(refetch);
+  }
+  /** Activation; a loaded table's {$lua} needs the user's yes once (the backend asks via the error). */
+  async function setActive(ids, on_) {
+    try { await api.tableSetActive(ids, on_); } catch (err) {
+      const m = String(err?.message || err);
+      if (!m.startsWith('needs consent:')) throw err;
+      const r = await modal({
+        title: 'Run Lua from this table?',
+        text: m.replace(/^needs consent:\s*/, '') + '. Allow it only if you trust where the table came from. The answer holds until another table is opened.',
+        buttons: [{ label: 'Allow Lua', value: 'allow' }, { label: 'Do not run', value: 'cancel', kbd: 'Esc', primary: true }],
+      });
+      await api.tableTrust(r.value === 'allow');
+      if (r.value === 'allow') await api.tableSetActive(ids, on_);
+    }
   }
   const edit = (ids, f) => commit(() => ids.forEach((id) => { const e = byId(id); if (e) f(e); }));
   function setMode(mode) { edit(selIds(), (e) => { e.freeze_mode = mode; }); }
@@ -630,7 +644,7 @@ export function initTable(root) {
       if (d.returnValue !== 'ok') return;
       const p = {
         description: f.elements.description.value, addr: f.elements.addr.value.trim(), offsets: offsets(),
-        vtype: f.elements.vtype.value, len: +f.elements.len.value || 0, utf16: f.elements.utf16.checked,
+        vtype: f.elements.vtype.value, len: ['string', 'aob'].includes(f.elements.vtype.value) ? +f.elements.len.value || 0 : 0, utf16: f.elements.utf16.checked,
         signed: f.elements.signed.checked, hex: f.elements.hex.checked,
       };
       if (!p.addr) { toast('Address is empty'); return; }
@@ -838,7 +852,14 @@ export function initTable(root) {
     const p = await askPath({ save: false, title: 'Open table', filters: FILTERS, dflt: tablePath });
     if (!p) return;
     await chain;
-    const st = await attempt(() => api.tableOpen(p));
+    let st;
+    try { st = await api.tableOpen(p); } catch (e) {
+      const m = String(e?.message || e);
+      if (!/could not be disabled/.test(m)) { toast(m); return; }
+      const r = await modal({ title: 'Scripts are still active', text: m, buttons: [{ label: 'Open anyway', value: 'force' }, { label: 'Cancel', value: 'cancel', kbd: 'Esc', primary: true }] });
+      if (r.value !== 'force') return;
+      st = await attempt(() => api.tableOpen(p, true));
+    }
     if (!st) return;
     rt.clear(); sel.clear(); collapsed.clear(); cursor = anchor = null; tablePath = p; store.set('tablePath', p);
     adopt(st);

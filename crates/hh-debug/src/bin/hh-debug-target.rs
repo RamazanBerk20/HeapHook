@@ -1,16 +1,29 @@
 //! hh-debug-target: test target for hh-debug's integration tests.
 //!
 //! On start it prints one JSON line with hex addresses:
-//! `{"pid":N,"store":"0x..","load":"0x..","outer":"0x..","value":"0x..","value2":"0x.."}`
+//! `{"pid":N,"store":"0x..","load":"0x..","outer":"0x..","value":"0x..","value2":"0x..",...}`
 //! - `store(p, v)`: `mov [rdi], rsi` (48 89 37, the first 3 bytes) then `ret`.
 //! - `load(p)`: `mov rax, [rdi]` (48 8b 07) then `ret`.
 //! - `outer(p, v)`: `nop; call store; nop; ret` (offsets 0, 1, 6, 7).
+//! - `hot(p)`: `lock inc qword [rdi]; ret` (the hot loop of `hot`).
+//! - `rec(n)`: `test rdi,rdi; jz +; dec rdi; call rec; nop; ret` (offsets 0, 3, 5, 8, 13, 14).
+//! - `rep(dst, n)`: `mov rcx, rsi; mov al, 0x41; rep stosb; ret` (offsets 0, 3, 5, 7).
+//! - `call(f)`: `call rdi; ret` (offsets 0, 2).
+//! - `buf`: a page-aligned 3-page buffer (zeroed); `execve`: libc's execve.
 //!
 //! `value` starts at 100 and `value2` at 200. Commands, one per line, each answered with
-//! `ok <value> <value2>`:
+//! `ok <value> <value2>` unless noted:
 //! `store` (value += 1 via store), `store2` (value2 += 1 via store), `load` (reads value
 //! via load), `outer` (value += 1 via outer), `spawn` (a new thread does value2 += 1 via
 //! store; joined), `dlopen <lib>` (Linux), `quit`. EOF also exits.
+//! Linux only:
+//! `hot <threads> <iters>` (each thread calls hot(&counter) iters times; `hot <counter>`),
+//! `rec <n>`, `rep <n>` (`rep <bytes set>`), `callsleep <ms>` (call(sleep), `ok`),
+//! `bufw <off>` / `bufr <off>` (store / load at buf+off),
+//! `fork` (child does store then _exit(42); `fork <status>`, negative = killed by signal),
+//! `spawntrue` (posix_spawn /bin/true; `spawn <status>`), `exec` (re-executes itself, which
+//! prints a new info line), `exitmain` (`ok`, then the main thread exits and a second thread
+//! keeps serving), `raise <sig>` (`sig <SIGUSR1 count> <SIGUSR2 count>`), `sigs` (same).
 use std::io::{BufRead, Write};
 
 #[cfg(target_arch = "x86_64")]
@@ -29,6 +42,29 @@ std::arch::global_asm!(
     "call hh_store",
     "nop",
     "ret",
+    ".globl hh_hot",
+    "hh_hot:",
+    "lock inc qword ptr [rdi]",
+    "ret",
+    ".globl hh_rec",
+    "hh_rec:",
+    "test rdi, rdi",
+    "jz 2f",
+    "dec rdi",
+    "call hh_rec",
+    "nop",
+    "2:",
+    "ret",
+    ".globl hh_rep",
+    "hh_rep:",
+    "mov rcx, rsi",
+    "mov al, 0x41",
+    "rep stosb",
+    "ret",
+    ".globl hh_call",
+    "hh_call:",
+    "call rdi",
+    "ret",
 );
 
 #[cfg(target_arch = "x86_64")]
@@ -36,61 +72,264 @@ unsafe extern "C" {
     fn hh_store(p: *mut u64, v: u64);
     fn hh_load(p: *const u64) -> u64;
     fn hh_outer(p: *mut u64, v: u64);
+    fn hh_hot(p: *mut u64);
+    fn hh_rec(n: u64);
+    fn hh_rep(dst: *mut u8, n: u64);
+    fn hh_call(f: extern "C" fn());
 }
 
 #[cfg(target_os = "linux")]
-unsafe extern "C" {
-    fn dlopen(name: *const std::ffi::c_char, flags: i32) -> *mut std::ffi::c_void;
+mod lx {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    pub static USR1: AtomicU64 = AtomicU64::new(0);
+    pub static USR2: AtomicU64 = AtomicU64::new(0);
+    pub static SLEEP_MS: AtomicU64 = AtomicU64::new(0);
+
+    extern "C" fn on_sig(s: libc::c_int) {
+        let c = if s == libc::SIGUSR1 { &USR1 } else { &USR2 };
+        c.fetch_add(1, Ordering::SeqCst);
+    }
+
+    pub fn install() {
+        unsafe {
+            libc::signal(libc::SIGUSR1, on_sig as *const () as libc::sighandler_t);
+            libc::signal(libc::SIGUSR2, on_sig as *const () as libc::sighandler_t);
+        }
+    }
+
+    pub extern "C" fn sleeper() {
+        std::thread::sleep(std::time::Duration::from_millis(
+            SLEEP_MS.load(Ordering::SeqCst),
+        ));
+    }
+
+    pub fn sigs() -> String {
+        format!(
+            "sig {} {}",
+            USR1.load(Ordering::SeqCst),
+            USR2.load(Ordering::SeqCst)
+        )
+    }
+
+    /// Exit status as a number, negative for "killed by signal".
+    pub fn status(st: libc::c_int) -> i32 {
+        if libc::WIFEXITED(st) {
+            libc::WEXITSTATUS(st)
+        } else {
+            -libc::WTERMSIG(st)
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct State {
+    v: usize,
+    v2: usize,
+    buf: usize,
+    counter: usize,
 }
 
 #[cfg(target_arch = "x86_64")]
 fn main() {
+    #[cfg(target_os = "linux")]
+    lx::install();
     let value: &'static mut u64 = Box::leak(Box::new(100));
     let value2: &'static mut u64 = Box::leak(Box::new(200));
-    let (v, v2) = (value as *mut u64 as usize, value2 as *mut u64 as usize);
+    let buf = Box::leak(vec![0u8; 4 * 4096].into_boxed_slice());
+    let buf = (buf.as_mut_ptr() as usize).next_multiple_of(4096);
+    let counter: &'static mut u64 = Box::leak(Box::new(0));
+    let st = State {
+        v: value as *mut u64 as usize,
+        v2: value2 as *mut u64 as usize,
+        buf,
+        counter: counter as *mut u64 as usize,
+    };
+    #[cfg(target_os = "linux")]
+    let execve = unsafe { libc::dlsym(libc::RTLD_DEFAULT, c"execve".as_ptr()) as usize };
+    #[cfg(not(target_os = "linux"))]
+    let execve = 0usize;
     let mut out = std::io::stdout().lock();
     writeln!(
         out,
-        r#"{{"pid":{},"store":"{:#x}","load":"{:#x}","outer":"{:#x}","value":"{v:#x}","value2":"{v2:#x}"}}"#,
+        r#"{{"pid":{},"store":"{:#x}","load":"{:#x}","outer":"{:#x}","hot":"{:#x}","rec":"{:#x}","rep":"{:#x}","call":"{:#x}","value":"{:#x}","value2":"{:#x}","buf":"{:#x}","counter":"{:#x}","execve":"{execve:#x}"}}"#,
         std::process::id(),
         hh_store as *const () as usize,
         hh_load as *const () as usize,
         hh_outer as *const () as usize,
+        hh_hot as *const () as usize,
+        hh_rec as *const () as usize,
+        hh_rep as *const () as usize,
+        hh_call as *const () as usize,
+        st.v,
+        st.v2,
+        st.buf,
+        st.counter,
     )
     .unwrap();
     out.flush().unwrap();
-    for line in std::io::stdin().lock().lines() {
-        let Ok(line) = line else { break };
-        let (p, p2) = (v as *mut u64, v2 as *mut u64);
-        unsafe {
-            match line.trim() {
-                "quit" => break,
-                "store" => hh_store(p, hh_load(p) + 1),
-                "store2" => hh_store(p2, hh_load(p2) + 1),
-                "load" => {
-                    hh_load(p);
-                }
-                "outer" => hh_outer(p, hh_load(p) + 1),
-                "spawn" => std::thread::spawn(move || {
+    drop(out);
+    serve(st);
+}
+
+/// The command loop; `exitmain` hands it to a second thread.
+#[cfg(target_arch = "x86_64")]
+fn serve(st: State) {
+    let mut line = String::new();
+    loop {
+        line.clear();
+        if std::io::stdin().lock().read_line(&mut line).unwrap_or(0) == 0 {
+            break;
+        }
+        let reply = command(&st, line.trim());
+        let Some(reply) = reply else { break };
+        let mut out = std::io::stdout().lock();
+        writeln!(out, "{reply}").unwrap();
+        out.flush().unwrap();
+    }
+    std::process::exit(0);
+}
+
+#[cfg(target_arch = "x86_64")]
+fn command(st: &State, line: &str) -> Option<String> {
+    let (p, p2) = (st.v as *mut u64, st.v2 as *mut u64);
+    let ok = || unsafe { format!("ok {} {}", hh_load(p), hh_load(p2)) };
+    let mut words = line.split_whitespace();
+    let cmd = words.next().unwrap_or("");
+    #[cfg_attr(not(target_os = "linux"), allow(unused))]
+    let mut num = || -> u64 { words.next().and_then(|w| w.parse().ok()).unwrap_or(0) };
+    unsafe {
+        match cmd {
+            "quit" => return None,
+            "store" => hh_store(p, hh_load(p) + 1),
+            "store2" => hh_store(p2, hh_load(p2) + 1),
+            "load" => {
+                hh_load(p);
+            }
+            "outer" => hh_outer(p, hh_load(p) + 1),
+            "spawn" => {
+                let v2 = st.v2;
+                std::thread::spawn(move || {
                     let p2 = v2 as *mut u64;
                     hh_store(p2, hh_load(p2) + 1)
                 })
                 .join()
-                .unwrap(),
-                #[cfg(target_os = "linux")]
-                l if l.starts_with("dlopen ") => {
-                    let name = std::ffi::CString::new(&l[7..]).unwrap();
-                    dlopen(name.as_ptr(), 2); // RTLD_NOW
-                }
-                _ => {
-                    writeln!(out, "error").unwrap();
-                    out.flush().unwrap();
-                    continue;
-                }
+                .unwrap()
             }
-            writeln!(out, "ok {} {}", hh_load(p), hh_load(p2)).unwrap();
+            #[cfg(target_os = "linux")]
+            "dlopen" => {
+                let name = std::ffi::CString::new(line[7..].trim()).unwrap();
+                libc::dlopen(name.as_ptr(), libc::RTLD_NOW);
+            }
+            #[cfg(target_os = "linux")]
+            _ => return Some(linux_command(st, cmd, &mut num)),
+            #[cfg(not(target_os = "linux"))]
+            _ => return Some("error".into()),
         }
-        out.flush().unwrap();
+    }
+    Some(ok())
+}
+
+#[cfg(target_os = "linux")]
+fn linux_command(st: &State, cmd: &str, num: &mut dyn FnMut() -> u64) -> String {
+    use std::sync::atomic::Ordering;
+    let p = st.v as *mut u64;
+    unsafe {
+        match cmd {
+            "hot" => {
+                let (threads, iters) = (num(), num());
+                let c = st.counter;
+                let hs: Vec<_> = (0..threads)
+                    .map(|_| {
+                        std::thread::spawn(move || {
+                            for _ in 0..iters {
+                                hh_hot(c as *mut u64);
+                            }
+                        })
+                    })
+                    .collect();
+                for h in hs {
+                    h.join().unwrap();
+                }
+                format!("hot {}", hh_load(c as *const u64))
+            }
+            "rec" => {
+                hh_rec(num());
+                "ok".into()
+            }
+            "rep" => {
+                let n = num().min(4096);
+                let mut v = vec![0u8; 4096];
+                hh_rep(v.as_mut_ptr(), n);
+                format!("rep {}", v.iter().filter(|&&b| b == 0x41).count())
+            }
+            "callsleep" => {
+                lx::SLEEP_MS.store(num(), Ordering::SeqCst);
+                hh_call(lx::sleeper);
+                "ok".into()
+            }
+            "bufw" => {
+                let a = (st.buf + num() as usize) as *mut u64;
+                hh_store(a, hh_load(a) + 1);
+                format!("buf {}", hh_load(a))
+            }
+            "bufr" => format!("buf {}", hh_load((st.buf + num() as usize) as *const u64)),
+            "fork" => match libc::fork() {
+                0 => {
+                    hh_store(p, 5);
+                    libc::_exit(42);
+                }
+                -1 => "fork failed".into(),
+                child => {
+                    let mut s = 0;
+                    libc::waitpid(child, &mut s, 0);
+                    format!("fork {}", lx::status(s))
+                }
+            },
+            "spawntrue" => {
+                let mut pid = 0;
+                let path = c"/bin/true";
+                let argv = [path.as_ptr() as *mut libc::c_char, std::ptr::null_mut()];
+                let envp = [std::ptr::null_mut()];
+                let r = libc::posix_spawn(
+                    &mut pid,
+                    path.as_ptr(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    argv.as_ptr(),
+                    envp.as_ptr(),
+                );
+                if r != 0 {
+                    return format!("spawn failed {r}");
+                }
+                let mut s = 0;
+                libc::waitpid(pid, &mut s, 0);
+                format!("spawn {}", lx::status(s))
+            }
+            "exec" => {
+                let exe =
+                    std::ffi::CString::new(std::env::current_exe().unwrap().to_str().unwrap())
+                        .unwrap();
+                let argv = [exe.as_ptr(), std::ptr::null()];
+                libc::execv(exe.as_ptr(), argv.as_ptr());
+                "exec failed".into()
+            }
+            "exitmain" => {
+                let st2 = *st;
+                let mut out = std::io::stdout().lock();
+                writeln!(out, "ok").unwrap();
+                out.flush().unwrap();
+                drop(out);
+                std::thread::spawn(move || serve(st2));
+                libc::syscall(libc::SYS_exit, 0);
+                unreachable!()
+            }
+            "raise" => {
+                libc::raise(num() as i32);
+                lx::sigs()
+            }
+            "sigs" => lx::sigs(),
+            _ => "error".into(),
+        }
     }
 }
 

@@ -22,6 +22,14 @@ pub struct Symbol {
 
 /// Largest single read a header may ask for; corrupt counts fail instead of allocating.
 const MAX_READ: usize = 64 << 20;
+/// Longest symbol name kept (long C++ manglings are a few KB); longer names are skipped.
+const MAX_NAME: usize = 4096;
+/// Most symbols one module may have (big browsers have ~1M); more is a hostile image.
+pub const MAX_SYMBOLS_PER_MODULE: usize = 4_000_000;
+/// Most bytes parsing one module may read from its file or memory, across all tables.
+const MAX_BYTES_PER_MODULE: u64 = 512 << 20;
+/// Largest module file opened at all.
+pub const MAX_MODULE_FILE: u64 = 16 << 30;
 
 /// Random access by offset (file) or virtual address (memory). May return fewer bytes.
 type Src<'a> = &'a dyn Fn(u64, usize) -> Option<Vec<u8>>;
@@ -62,9 +70,11 @@ fn word(b: &[u8], o: usize, is64: bool) -> Option<u64> {
         u32_at(b, o).map(u64::from)
     }
 }
+/// NUL-terminated name at the start of `b`; `None` if empty or longer than `MAX_NAME`.
 fn cstr(b: &[u8]) -> Option<String> {
+    let b = &b[..b.len().min(MAX_NAME + 1)];
     let n = b.iter().position(|&c| c == 0).unwrap_or(b.len());
-    (n > 0).then(|| String::from_utf8_lossy(&b[..n]).into_owned())
+    (n > 0 && n <= MAX_NAME).then(|| String::from_utf8_lossy(&b[..n]).into_owned())
 }
 fn sz(v: u64) -> Result<usize> {
     usize::try_from(v)
@@ -157,9 +167,12 @@ fn elf_header(src: Src, base: Addr) -> Result<Elf> {
 }
 
 /// Decodes a symbol array. Keeps defined functions / objects / untyped labels.
-fn elf_syms(elf: &Elf, syms: &[u8], strtab: &[u8], out: &mut Vec<(Symbol, bool)>) {
+fn elf_syms(elf: &Elf, syms: &[u8], strtab: &[u8], out: &mut Vec<(Symbol, bool)>) -> Result<()> {
     let ent = if elf.is64 { 24 } else { 16 };
     for s in syms.chunks_exact(ent) {
+        if out.len() >= MAX_SYMBOLS_PER_MODULE {
+            return Err(bad("more than MAX_SYMBOLS_PER_MODULE symbols"));
+        }
         let name = u32_at(s, 0).unwrap_or(0) as usize;
         let (info, shndx, value, size) = if elf.is64 {
             (s[4], u16_at(s, 6), u64_at(s, 8), u64_at(s, 16))
@@ -190,6 +203,7 @@ fn elf_syms(elf: &Elf, syms: &[u8], strtab: &[u8], out: &mut Vec<(Symbol, bool)>
             info >> 4 != 0,
         ));
     }
+    Ok(())
 }
 
 /// `.dynsym` then `.symtab` from the section headers of a file.
@@ -220,6 +234,8 @@ fn elf_sections(elf: &Elf, src: Src) -> Result<Vec<(Symbol, bool)>> {
             )
         })
     };
+    // Hostile files repeat one table under many headers: parse each (table, strings) once.
+    let mut seen = std::collections::HashSet::new();
     for want in [11u32, 2] {
         // SHT_DYNSYM, SHT_SYMTAB
         for i in 0..elf.shnum {
@@ -230,9 +246,12 @@ fn elf_sections(elf: &Elf, src: Src) -> Result<Vec<(Symbol, bool)>> {
                 continue;
             }
             let (_, soff, ssize, _) = sec(link).ok_or_else(|| bad("string table"))?;
+            if !seen.insert((off, size, soff, ssize)) {
+                continue;
+            }
             let syms = read(src, off, sz(size)?)?;
             let strs = read(src, soff, sz(ssize)?)?;
-            elf_syms(elf, &syms, &strs, &mut out);
+            elf_syms(elf, &syms, &strs, &mut out)?;
         }
     }
     Ok(out)
@@ -271,7 +290,7 @@ fn elf_dynamic(elf: &Elf, read_va: Src, fix: &dyn Fn(u64) -> u64) -> Result<Vec<
         let buckets_va = gh
             .wrapping_add(16)
             .wrapping_add(bloom.wrapping_mul(w as u64));
-        let buckets = read(read_va, buckets_va, sz(nb * 4)?)?;
+        let buckets = read(read_va, buckets_va, sz(nb.saturating_mul(4))?)?;
         let max = buckets
             .chunks_exact(4)
             .filter_map(|b| u32_at(b, 0))
@@ -280,10 +299,10 @@ fn elf_dynamic(elf: &Elf, read_va: Src, fix: &dyn Fn(u64) -> u64) -> Result<Vec<
         if max < symoff {
             symoff
         } else {
-            let chain = buckets_va.wrapping_add(nb * 4);
+            let chain = buckets_va.wrapping_add(nb.wrapping_mul(4));
             let mut i = max;
             loop {
-                let v = read(read_va, chain.wrapping_add((i - symoff) * 4), 4)?;
+                let v = read(read_va, chain.wrapping_add((i - symoff).wrapping_mul(4)), 4)?;
                 i += 1;
                 if u32_at(&v, 0).unwrap_or(1) & 1 == 1 || i - max > 1 << 20 {
                     break i;
@@ -295,7 +314,7 @@ fn elf_dynamic(elf: &Elf, read_va: Src, fix: &dyn Fn(u64) -> u64) -> Result<Vec<
     let syms = read(read_va, symtab, sz(count.saturating_mul(ent))?)?;
     let strs = read(read_va, strtab, sz(strsz)?)?;
     let mut out = Vec::new();
-    elf_syms(elf, &syms, &strs, &mut out);
+    elf_syms(elf, &syms, &strs, &mut out)?;
     Ok(out)
 }
 
@@ -311,7 +330,7 @@ fn elf_file(src: Src, base: Addr) -> Result<Vec<(Symbol, bool)>> {
             .loads
             .iter()
             .find(|(_, lva, fsz)| va >= *lva && va - lva < *fsz)?;
-        src(off + (va - lva), len)
+        src(off.checked_add(va - lva)?, len)
     };
     elf_dynamic(&elf, &read_va, &|v| v)
 }
@@ -328,12 +347,13 @@ fn pe(src: Src, mapped: bool, base: Addr) -> Result<Vec<(Symbol, bool)>> {
     }
     let nt = u32_at(&dos, 0x3C).ok_or_else(e)? as u64;
     let coff = read(src, nt, 24)?;
+    let opt_at = nt.checked_add(24).ok_or_else(e)?;
     if &coff[..4] != b"PE\0\0" {
         return Err(bad("PE signature"));
     }
     let nsec = u16_at(&coff, 6).ok_or_else(e)? as usize;
     let optsz = u16_at(&coff, 20).ok_or_else(e)? as usize;
-    let opt = read(src, nt + 24, optsz)?;
+    let opt = read(src, opt_at, optsz)?;
     let (ndirs, dirs) = match u16_at(&opt, 0) {
         Some(0x10b) => (92, 96),
         Some(0x20b) => (108, 112),
@@ -349,7 +369,7 @@ fn pe(src: Src, mapped: bool, base: Addr) -> Result<Vec<(Symbol, bool)>> {
     if exp == 0 {
         return Ok(Vec::new());
     }
-    let secs = read(src, nt + 24 + optsz as u64, nsec * 40)?;
+    let secs = read(src, opt_at + optsz as u64, nsec * 40)?;
     let to_off = |rva: u64| -> Option<u64> {
         if mapped {
             return Some(rva);
@@ -364,7 +384,7 @@ fn pe(src: Src, mapped: bool, base: Addr) -> Result<Vec<(Symbol, bool)>> {
             );
             first = first.min(va);
             if rva >= va && rva - va < vsz.max(raw) {
-                return Some(ptr + (rva - va));
+                return ptr.checked_add(rva - va);
             }
         }
         (rva < first).then_some(rva)
@@ -388,7 +408,11 @@ fn pe(src: Src, mapped: bool, base: Addr) -> Result<Vec<(Symbol, bool)>> {
     // Names normally live inside the export directory: read it once.
     let blob = rd(exp, sz(exp_size)?).unwrap_or_default();
     let mut out = Vec::new();
-    for i in 0..nnames {
+    // `names` holds at most MAX_READ / 4 entries, so the loop is bounded by what was read.
+    for i in 0..nnames.min(names.len() / 4) {
+        if out.len() >= MAX_SYMBOLS_PER_MODULE {
+            return Err(bad("more than MAX_SYMBOLS_PER_MODULE exports"));
+        }
         let (Some(nrva), Some(ord)) = (u32_at(&names, i * 4), u16_at(&ords, i * 2)) else {
             continue;
         };
@@ -422,6 +446,54 @@ fn pe(src: Src, mapped: bool, base: Addr) -> Result<Vec<(Symbol, bool)>> {
 
 // ---------------------------------------------------------------------------- dispatch
 
+/// `src` that stops answering once `MAX_BYTES_PER_MODULE` bytes have been read through it.
+fn budgeted<'a>(src: Src<'a>) -> impl Fn(u64, usize) -> Option<Vec<u8>> + 'a {
+    let used = std::cell::Cell::new(0u64);
+    move |o, len| {
+        let total = used.get().saturating_add(len as u64);
+        if total > MAX_BYTES_PER_MODULE {
+            return None;
+        }
+        used.set(total);
+        src(o, len)
+    }
+}
+
+/// Opens a module file named by the target (its memory map, a module list) for ranged
+/// reads. Only regular files up to `MAX_MODULE_FILE` are accepted, opened non-blocking so a
+/// FIFO or device planted at that path can never hang the caller, and at most
+/// `MAX_BYTES_PER_MODULE` bytes are read through the returned reader in total.
+pub fn module_file_reader(path: &str) -> Result<impl Fn(u64, usize) -> Option<Vec<u8>> + use<>> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.read(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::custom_flags(&mut opts, libc::O_NONBLOCK);
+    let f = opts.open(path)?;
+    let meta = f.metadata()?;
+    if !meta.is_file() {
+        return Err(Error::Other(format!("{path}: not a regular file")));
+    }
+    if meta.len() > MAX_MODULE_FILE {
+        return Err(Error::Other(format!(
+            "{path}: larger than {MAX_MODULE_FILE} bytes"
+        )));
+    }
+    let f = std::cell::RefCell::new(f);
+    let used = std::cell::Cell::new(0u64);
+    Ok(move |o: u64, len: usize| {
+        let total = used.get().saturating_add(len as u64);
+        if total > MAX_BYTES_PER_MODULE {
+            return None;
+        }
+        used.set(total);
+        let mut f = f.borrow_mut();
+        f.seek(SeekFrom::Start(o)).ok()?;
+        let mut b = Vec::new();
+        f.by_ref().take(len as u64).read_to_end(&mut b).ok()?;
+        Some(b)
+    })
+}
+
 fn parse_file(src: Src, base: Addr) -> Result<Vec<(Symbol, bool)>> {
     match src(0, 4).as_deref() {
         Some(b"\x7fELF") => elf_file(src, base),
@@ -437,6 +509,7 @@ fn parse_mem(p: &dyn Process, m: &Module) -> Result<Vec<(Symbol, bool)>> {
         b.truncate(n);
         Some(b)
     };
+    let at = budgeted(&at);
     let by_off = |o: u64, len: usize| at(m.base.wrapping_add(o), len);
     match by_off(0, 4).as_deref() {
         Some(b"\x7fELF") => {
@@ -446,7 +519,7 @@ fn parse_mem(p: &dyn Process, m: &Module) -> Result<Vec<(Symbol, bool)>> {
             // The loader usually relocates dynamic-section pointers in place.
             let fix = |v: u64| {
                 if bias != 0 && v >= m.base && v - m.base < m.size {
-                    v - bias
+                    v.wrapping_sub(bias)
                 } else {
                     v
                 }
@@ -465,6 +538,7 @@ pub fn parse_symbols(file: &[u8], base: Addr) -> Result<Vec<Symbol>> {
         file.get(o..o.saturating_add(len).min(file.len()))
             .map(<[u8]>::to_vec)
     };
+    let src = budgeted(&src);
     Ok(parse_file(&src, base)?.into_iter().map(|s| s.0).collect())
 }
 
@@ -533,16 +607,8 @@ fn load(p: &dyn Process, m: &Module) -> Result<Vec<(Symbol, bool)>> {
         paths.insert(0, format!("/proc/{}/root{}", p.pid(), m.path));
     }
     for path in paths {
-        let Ok(f) = std::fs::File::open(&path) else {
+        let Ok(src) = module_file_reader(&path) else {
             continue;
-        };
-        let f = std::cell::RefCell::new(f);
-        let src = |o: u64, len: usize| {
-            let mut f = f.borrow_mut();
-            f.seek(SeekFrom::Start(o)).ok()?;
-            let mut b = Vec::new();
-            f.by_ref().take(len as u64).read_to_end(&mut b).ok()?;
-            Some(b)
         };
         if let Ok(s) = parse_file(&src, m.base) {
             return Ok(s);

@@ -67,6 +67,9 @@ impl Process for TestProc {
     fn modules(&self) -> Result<Vec<Module>> {
         Ok(self.mods.clone())
     }
+    fn threads(&self) -> Result<Vec<u32>> {
+        Ok(vec![1, 0x2A])
+    }
     fn alloc(&self, size: u64, _prot: Prot, near: Option<Addr>) -> Result<Addr> {
         let mut n = self.next.lock().unwrap();
         let base = near.map_or(0x5000_0000, |a| (a & !0xFFFF) + 0x10_0000);

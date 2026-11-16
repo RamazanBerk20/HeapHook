@@ -5,6 +5,7 @@ use std::sync::Mutex;
 use hh_asm::AaState;
 use hh_core::{Error, Result};
 use hh_scan::{Fmt, VType};
+use hh_tools::structure::Structure;
 
 pub type RecId = u32;
 
@@ -32,6 +33,37 @@ pub struct Record {
     pub frozen_value: Option<String>,
     /// What the last enable of `script` did; needed to disable it.
     pub aa_state: Option<AaState>,
+    /// CE `IsGroupHeader`: activating it runs nothing and reads nothing (children follow the
+    /// group options).
+    pub group_header: bool,
+    /// CE memory record options (`moHideChildren`, `moActivateChildrenAsWell`,
+    /// `moDeactivateChildrenAsWell`, `moRecursiveSetValue`, `moAllowManualCollapseAndExpand`,
+    /// `moManualExpandCollapse`, `moAlwaysHideChildren`). The engine applies the activation
+    /// cascade and recursive set value itself.
+    pub options: Vec<String>,
+    pub collapsed: bool,
+    /// CE `DropDownList` lines, `value:description`.
+    pub dropdown: Vec<String>,
+    pub dropdown_readonly: bool,
+    pub dropdown_description_only: bool,
+    pub dropdown_display_as_item: bool,
+    /// Hotkeys of this record. The host owns triggering them: when one is pressed it calls
+    /// [`crate::Engine::fire_record_hotkey`].
+    pub hotkeys: Vec<RecordHotkey>,
+}
+
+/// A memory record hotkey (CE `MemoryRecordHotkey`).
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct RecordHotkey {
+    /// Unique within its record.
+    pub id: u32,
+    /// CE virtual-key codes.
+    pub keys: Vec<i64>,
+    /// CE `mrh*`: 0 toggle, 1 toggle (allow increase), 2 toggle (allow decrease), 3 activate,
+    /// 4 deactivate, 5 set value, 6 increase value, 7 decrease value.
+    pub action: i64,
+    pub value: String,
+    pub description: String,
 }
 
 impl Record {
@@ -49,6 +81,14 @@ impl Record {
             active: false,
             frozen_value: None,
             aa_state: None,
+            group_header: false,
+            options: Vec::new(),
+            collapsed: false,
+            dropdown: Vec::new(),
+            dropdown_readonly: false,
+            dropdown_description_only: false,
+            dropdown_display_as_item: false,
+            hotkeys: Vec::new(),
         }
     }
 }
@@ -64,12 +104,29 @@ pub trait TableHost: Send + Sync {
     fn create(&self, parent: Option<RecId>) -> RecId;
     /// Removes the record and its children.
     fn delete(&self, id: RecId);
+    /// Selected records (address list selection). Default: none.
+    fn selected(&self) -> Vec<RecId> {
+        Vec::new()
+    }
+    /// Changes the selection. Default: ignored.
+    fn set_selected(&self, _ids: &[RecId]) {}
+    /// The global structure list (CE `getStructureCount`/`getStructure`), when the host owns
+    /// one. Default `None`: the engine keeps its own list.
+    fn structures(&self) -> Option<Vec<Structure>> {
+        None
+    }
+    /// Replaces the host's structure list; return false if the host has none (the engine
+    /// then keeps it). Default false.
+    fn set_structures(&self, _s: Vec<Structure>) -> bool {
+        false
+    }
 }
 
 /// In-memory [`TableHost`] for headless use and tests.
 #[derive(Default)]
 pub struct MemTable {
     inner: Mutex<(Vec<Record>, RecId)>,
+    selection: Mutex<Vec<RecId>>,
 }
 
 impl MemTable {
@@ -115,5 +172,12 @@ impl TableHost for MemTable {
             g.0.retain(|r| r.id != p);
             gone.extend(g.0.iter().filter(|r| r.parent == Some(p)).map(|r| r.id));
         }
+    }
+    fn selected(&self) -> Vec<RecId> {
+        let ids = self.ids();
+        self.selection.lock().unwrap().iter().copied().filter(|i| ids.contains(i)).collect()
+    }
+    fn set_selected(&self, ids: &[RecId]) {
+        *self.selection.lock().unwrap() = ids.to_vec();
     }
 }

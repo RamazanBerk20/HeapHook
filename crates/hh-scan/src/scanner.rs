@@ -95,6 +95,7 @@ pub struct Scanner {
     busy: Mutex<()>,
     prog: Progress,
     mem_limit: AtomicU64,
+    spill_dir: Mutex<Option<std::path::PathBuf>>,
 }
 
 struct Running<'a>(&'a Progress);
@@ -112,8 +113,20 @@ impl Drop for Suspended<'_> {
     }
 }
 
+/// True if the target is already stopped (Linux: state `T`/`t` in `/proc/<pid>/stat`), so a
+/// "pause while scanning" must neither suspend nor resume it. Elsewhere: unknown, false.
+fn already_stopped(p: &dyn Process) -> bool {
+    #[cfg(target_os = "linux")]
+    if let Ok(s) = std::fs::read_to_string(format!("/proc/{}/stat", p.pid())) {
+        // The state follows the parenthesised command name, which may itself contain ')'.
+        return s.rsplit_once(')').and_then(|(_, r)| r.trim_start().chars().next()).is_some_and(|c| matches!(c, 'T' | 't'));
+    }
+    let _ = p;
+    false
+}
+
 fn suspend(p: &dyn Process, on: bool) -> Result<Option<Suspended<'_>>> {
-    if !on {
+    if !on || already_stopped(p) {
         return Ok(None);
     }
     match p.suspend() {
@@ -155,7 +168,8 @@ impl ReadBuf {
                 }
                 _ => {
                     let a = addr + pos as u64;
-                    pos = (((a / PAGE) + 1) * PAGE - addr) as usize;
+                    // Skip to the next page; the last page of the address space ends the read.
+                    pos = ((a / PAGE + 1).checked_mul(PAGE)).map_or(len, |n| (n - addr) as usize);
                 }
             }
         }
@@ -212,12 +226,22 @@ impl Scanner {
             busy: Mutex::default(),
             prog: Progress::default(),
             mem_limit: AtomicU64::new(DEFAULT_MEM_LIMIT),
+            spill_dir: Mutex::new(None),
         }
     }
 
     /// RAM a result set may use before chunks spill to a temp file.
     pub fn set_memory_limit(&self, bytes: u64) {
         self.mem_limit.store(bytes, Relaxed);
+    }
+
+    /// Directory for spill files (`None` = `$HEAPHOOK_TMPDIR`, else a disk-backed temp dir).
+    pub fn set_spill_dir(&self, dir: Option<std::path::PathBuf>) {
+        *self.spill_dir.lock().unwrap_or_else(|e| e.into_inner()) = dir;
+    }
+
+    fn spill(&self) -> Spill {
+        Spill::new(self.mem_limit.load(Relaxed)).in_dir(self.spill_dir.lock().unwrap_or_else(|e| e.into_inner()).clone())
     }
 
     pub fn progress(&self) -> ScanProgress {
@@ -360,7 +384,7 @@ impl Scanner {
         let _s = suspend(&*self.proc, req.opts.pause_while_scanning)?;
         let units = self.units(&kind)?;
         self.prog.total.store(units.iter().map(|u| u.end - u.start).sum(), Relaxed);
-        let spill = Spill::new(self.mem_limit.load(Relaxed));
+        let spill = self.spill();
         let chunks: Vec<Vec<Chunk>> = Self::par(kind.opts.threads, || {
             units.par_iter().map(|u| self.first_unit(&kind, &plan, u, &spill)).collect::<Result<_>>()
         })??;
@@ -407,7 +431,7 @@ impl Scanner {
         let keep = plan.keeps_prev && matches!(src, Src::Prev);
         self.prog.total.store(cur.count, Relaxed);
         let _s = suspend(&*self.proc, kind.opts.pause_while_scanning)?;
-        let spill = Spill::new(self.mem_limit.load(Relaxed));
+        let spill = self.spill();
         let chunks: Vec<Option<Chunk>> = Self::par(kind.opts.threads, || {
             cur.chunks
                 .par_iter()

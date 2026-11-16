@@ -141,7 +141,8 @@ export function initPtrscan({ showView }) {
   }
 
   async function addEntry() {
-    if (cursor < 0) return;
+    // The list is focused before a scan's rows arrive, so there may be no cursor yet.
+    if (cursor < 0) { if (!count()) return; moveTo(first); }
     const d = rows[cursor - rowsAt];
     const e = await attempt(() => api.ptrEntry(cursor, vt.value, d ? `Pointer ${d.text}` : 'Pointer path'));
     if (!e) return;

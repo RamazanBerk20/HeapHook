@@ -131,6 +131,23 @@ fn live_target_from_lua() {
 
         mem = allocateMemory(4096)
         assert(mem and writeInteger(mem, 31337) and readInteger(mem) == 31337)
+
+        -- threads, copies and symbols in a real process
+        local tl = getThreadlist()
+        assert(tl.Count >= 2, 'main + idle thread, got ' .. tl.Count)
+        assert(tonumber(tl[0], 16) == PID, 'first thread is the main one')
+        assert(copyMemory(STR, 20, mem + 64) == mem + 64 and readString(mem + 64, 20) == 'HeapHook test string')
+        assert(compareMemory(STR, mem + 64, 20))
+        local mine = copyMemory(STR, 20, nil, 1)
+        assert(readStringLocal(mine, 20) == 'HeapHook test string')
+        assert(compareMemory(STR, mine, 20, 1))
+        local si = getSymbolInfo('malloc')
+        assert(si and si.address ~= 0 and si.modulename:find('libc'), 'malloc found in libc')
+        assert(inModule(si.address) and getModuleSize(si.modulename) > 0)
+        assert(enumExports(si.modulename).malloc == si.address)
+        assert(getAddress('libc.malloc') == si.address)
+        local regions = enumMemoryRegions()
+        assert(#regions > 5 and getMemoryProtection(I32).W)
     "#,
     );
     let r = t.cmd("inc");

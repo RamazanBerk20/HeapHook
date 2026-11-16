@@ -380,7 +380,8 @@ export function initStructs({ showView }) {
   $('#st-spider-close').addEventListener('click', () => { spHost.hidden = true; list?.focus(); });
   on('struct:open', ({ addr, expr }) => openAt(addr, expr));
   on('process:opened', () => { groups = [[]]; expanded.clear(); rows = []; hits = []; loadStructs().then(render); });
-  on('table:version', () => { if (!view.hidden) loadStructs(); });
+  let structVer = null;
+  on('table:version', (v) => { if (!view.hidden && v !== structVer) { structVer = v; loadStructs(); } });
   addTicker(() => (!view.hidden && !editing && state.proc && columns().length ? evalTree() : null));
   view.addEventListener('keydown', (e) => {
     if (e.target.closest('input,select,textarea')) return;

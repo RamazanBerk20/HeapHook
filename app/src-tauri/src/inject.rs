@@ -57,16 +57,28 @@ impl App {
         let l = hh_inject::launch(&o).map_err(s)?;
         let pid = l.pid;
         self.keep_child(l.child);
-        let info = self.open_process(pid)?;
+        let info = match self.open_process(pid) {
+            Ok(i) => i,
+            Err(e) => {
+                self.kill_child(pid);
+                return Err(e);
+            }
+        };
         if req.speedhack {
             // The control block appears once the loader has run the library's initializer.
             let t0 = Instant::now();
             loop {
-                if self.speed_find()?.is_some() {
-                    break;
-                }
-                if t0.elapsed() > Duration::from_secs(2) {
-                    return Err(format!("{} started (pid {pid}) but the speedhack library did not load (static or setuid binary?)", info.name));
+                let err = match self.speed_find() {
+                    Ok(Some(_)) => break,
+                    Ok(None) if t0.elapsed() <= Duration::from_secs(2) => None,
+                    Ok(None) => Some(format!("{} (pid {pid}) was stopped: the speedhack library did not load (static or setuid binary?)", info.name)),
+                    Err(e) => Some(e),
+                };
+                if let Some(e) = err {
+                    // Do not leave a half-started process open that the UI does not show.
+                    let _ = self.close_process();
+                    self.kill_child(pid);
+                    return Err(e);
                 }
                 std::thread::sleep(Duration::from_millis(25));
             }
@@ -79,6 +91,15 @@ impl App {
         let mut g = lock(&self.x.children);
         g.retain_mut(|c| !matches!(c.try_wait(), Ok(Some(_))));
         g.push(c);
+    }
+
+    fn kill_child(&self, pid: u32) {
+        let mut g = lock(&self.x.children);
+        if let Some(i) = g.iter().position(|c| c.id() == pid) {
+            let mut c = g.remove(i);
+            let _ = c.kill();
+            let _ = c.wait();
+        }
     }
 
     /// Looks the control block up in the opened process (cached in the console slot).

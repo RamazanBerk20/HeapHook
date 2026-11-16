@@ -193,3 +193,60 @@ fn json_ct_and_entries() {
     let json = serde_json::to_value(&e[0]).unwrap();
     assert_eq!(json["vtype"], "4bytes");
 }
+
+// ---------------------------------------------------------------- hostile input (release audit)
+
+fn nested(name: &str, child: &str, fanout: usize) -> Structure {
+    let mut elements: Vec<Element> = (0..fanout)
+        .map(|i| Element { child: Some(child.into()), ..Element::new(i as u64 * 8, ElemType::Struct) })
+        .collect();
+    elements.push(Element::new(fanout as u64 * 8, ElemType::Bytes4));
+    Structure { name: name.into(), elements }
+}
+
+#[test]
+fn long_nesting_chains_do_not_overflow_the_stack() {
+    let p = planted();
+    let mut v: Vec<Structure> = (0..30_000).map(|i| nested(&format!("s{i}"), &format!("s{}", i + 1), 1)).collect();
+    v.push(Structure { name: "s30000".into(), elements: vec![Element::new(0, ElemType::Byte)] });
+    let t = std::time::Instant::now();
+    assert!(struct_size(&v, "s0", 8).unwrap() > 0);
+    assert!(evaluate(&p, &v, "s0", 0x10000).is_ok());
+    assert!(to_entries(&v, "s0", "x", &[], 8, None, 1).is_ok());
+    assert!(t.elapsed().as_secs() < 10, "{:?}", t.elapsed());
+    // A cycle within the evaluated depth is still refused.
+    let cyc = vec![nested("a", "b", 1), nested("b", "a", 1)];
+    assert!(struct_size(&cyc, "a", 8).is_err());
+}
+
+#[test]
+fn exponential_nesting_is_cached_and_capped() {
+    let p = planted();
+    // 16 levels, each embedding the next 20 times: 20^16 fields if expanded.
+    let mut v: Vec<Structure> = (0..16).map(|i| nested(&format!("l{i}"), &format!("l{}", i + 1), 20)).collect();
+    v.push(Structure { name: "l16".into(), elements: vec![Element::new(0, ElemType::Byte)] });
+    let t = std::time::Instant::now();
+    assert!(struct_size(&v, "l0", 8).is_ok());
+    let e = evaluate(&p, &v, "l0", 0x10000).unwrap_err().to_string();
+    assert!(e.contains("fields"), "{e}");
+    assert!(to_entries(&v, "l0", "x", &[], 8, None, 1).is_err());
+    let _ = to_ct_xml(&v, 8);
+    assert!(t.elapsed().as_secs() < 10, "{:?}", t.elapsed());
+}
+
+#[test]
+fn deeply_nested_ct_structures_parse_in_linear_time() {
+    let n = 20_000;
+    let mut x = String::from("<Structures>");
+    for i in 0..n {
+        x += &format!("<Structure Name=\"s{i}\"><Elements><Element Offset=\"0\" Vartype=\"Byte\"/></Elements>");
+    }
+    x += &"</Structure>".repeat(n);
+    x += "</Structures>";
+    let t = std::time::Instant::now();
+    if let Ok(v) = from_ct_xml(&x) {
+        assert_eq!(v.len(), n);
+        assert!(v.iter().all(|s| s.elements.len() == 1));
+    }
+    assert!(t.elapsed().as_secs() < 10, "{:?}", t.elapsed());
+}

@@ -1,5 +1,5 @@
 // Entry point: wires panels, process picker, view switching, global shortcuts, splitters.
-import { api, isMock } from './backend.js';
+import { api, isMock, isBridge } from './backend.js';
 import { $, $$, h, icon, splitter, toast, closeMenu, attempt } from './util.js';
 import { state, emit, on } from './core.js';
 import { initResults } from './results.js';
@@ -19,6 +19,7 @@ import { askPath } from './backend.js';
 for (const el of $$('[data-icon]')) el.insertAdjacentHTML('afterbegin', icon(el.dataset.icon));
 $('#ed-vtype').append(...VTYPES.map(([v, l]) => h('option', { value: v }, l)));
 if (isMock) $('#mock-badge').hidden = false;
+if (isBridge) Object.assign($('#mock-badge'), { hidden: false, textContent: 'dev bridge', title: 'Real backend over the development HTTP bridge: no native dialogs or global hotkeys' });
 
 const results = initResults($('#results'));
 const scan = initScan(results);
@@ -89,10 +90,14 @@ function opened(info) {
   refreshSpeed();
   scan.focusValue();
 }
-async function closeProcess() {
-  if (!state.proc) return;
+let closing = false;
+async function closeProcess(why = 'Process closed; the debugger is detached') {
+  if (!state.proc || closing) return;
   dlgProc.close();
-  if (!(await attempt(async () => { await api.closeProcess(); return true; }))) return;
+  closing = true;
+  const ok = await attempt(async () => { await api.closeProcess(); return true; });
+  closing = false;
+  if (!ok) return;
   state.proc = null;
   $('#proc-label').textContent = 'No process';
   $('#proc-meta').textContent = '';
@@ -100,8 +105,15 @@ async function closeProcess() {
   document.title = 'HeapHook';
   emit('process:closed');
   refreshSpeed();
-  toast('Process closed; the debugger is detached', 'info');
+  toast(why, 'info');
 }
+// The Lua poll reports the backend's process: pick it up after a reload, close it when it exits.
+let firstPoll = true;
+on('backend:process', (p) => {
+  if (firstPoll && p?.alive && !state.proc) opened(p);
+  firstPoll = false;
+  if (p && !p.alive && state.proc?.pid === p.pid) closeProcess(`${p.name} (pid ${p.pid}) exited; closed it`);
+});
 async function createProcess() {
   dlgProc.close();
   const d = $('#dlg-create'), f = d.querySelector('form');
@@ -120,7 +132,7 @@ $('#cr-browse').addEventListener('click', async () => {
   if (p) $('#cr-prog').value = p;
 });
 $('#proc-create').addEventListener('click', createProcess);
-$('#proc-close').addEventListener('click', closeProcess);
+$('#proc-close').addEventListener('click', () => closeProcess());
 
 // ---------- speedhack ----------
 let speed = null;
@@ -180,7 +192,7 @@ $('#settings-btn').addEventListener('click', () => settings.open());
 document.addEventListener('keydown', (e) => {
   if (document.querySelector('dialog[open]')) return;
   const k = e.key.toLowerCase(), ctrl = e.ctrlKey || e.metaKey;
-  const inField = e.target.matches('input, select, textarea');
+  const inField = !!e.target.matches?.('input, select, textarea');
   if (ctrl && k === 'p') openPicker();
   else if (ctrl && k === '1') showView('scan');
   else if (ctrl && k === '2') showView('mem');

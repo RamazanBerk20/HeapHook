@@ -135,13 +135,44 @@ pub struct Hotkey {
     pub description: Option<String>,
 }
 
-pub fn load(path: &Path) -> Result<Table, String> {
-    let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
-    if is_ct(path) {
-        return from_ct(&text);
+/// Deepest group nesting a table may have (every walk over the entry tree recurses).
+pub const MAX_DEPTH: usize = 64;
+/// Most entries a table may have.
+pub const MAX_ENTRIES: usize = 200_000;
+/// Largest table file read.
+pub const MAX_FILE: u64 = 64 << 20;
+
+/// Refuses trees deeper than [`MAX_DEPTH`] or larger than [`MAX_ENTRIES`] (iterative, so it
+/// is safe on any input).
+pub fn check_limits(entries: &[Entry]) -> Result<(), String> {
+    let (mut stack, mut n) = (vec![(entries, 1usize)], 0usize);
+    while let Some((list, d)) = stack.pop() {
+        if !list.is_empty() && d > MAX_DEPTH {
+            return Err(format!("the table nests groups more than {MAX_DEPTH} levels deep"));
+        }
+        n += list.len();
+        if n > MAX_ENTRIES {
+            return Err(format!("the table has more than {MAX_ENTRIES} entries"));
+        }
+        stack.extend(list.iter().map(|e| (&e.children[..], d + 1)));
     }
-    // A bare entry array is accepted too.
-    serde_json::from_str::<TableIn>(&text).map(Table::from).map_err(|e| format!("{}: {e}", path.display()))
+    Ok(())
+}
+
+pub fn load(path: &Path) -> Result<Table, String> {
+    let size = std::fs::metadata(path).map_err(|e| format!("{}: {e}", path.display()))?.len();
+    if size > MAX_FILE {
+        return Err(format!("{}: {} MiB is too big for a table (limit {} MiB)", path.display(), size >> 20, MAX_FILE >> 20));
+    }
+    let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let t = if is_ct(path) {
+        from_ct(&text)?
+    } else {
+        // A bare entry array is accepted too. serde_json's recursion limit keeps this shallow.
+        serde_json::from_str::<TableIn>(&text).map(Table::from).map_err(|e| format!("{}: {e}", path.display()))?
+    };
+    check_limits(&t.entries).map_err(|e| format!("{}: {e}", path.display()))?;
+    Ok(t)
 }
 
 pub fn save(path: &Path, t: &Table) -> Result<(), String> {
@@ -168,6 +199,17 @@ pub fn from_ct(xml: &str) -> Result<Table, String> {
         return Err("not a Cheat Engine table (no <CheatTable>)".into());
     }
     let known = ["CheatEntries", "LuaScript", "Comments", "CheatCodes", "Structures"];
+    // Bound the recursive conversion below before it starts.
+    let mut n = 0usize;
+    for e in root.descendants().filter(|c| c.has_tag_name("CheatEntry")) {
+        n += 1;
+        if n > MAX_ENTRIES {
+            return Err(format!("the table has more than {MAX_ENTRIES} entries"));
+        }
+        if e.ancestors().filter(|a| a.has_tag_name("CheatEntry")).take(MAX_DEPTH + 1).count() >= MAX_DEPTH {
+            return Err(format!("the table nests groups more than {MAX_DEPTH} levels deep"));
+        }
+    }
     let structures = match child(root, "Structures") {
         Some(n) => hh_tools::structure::from_ct_xml(&xml.trim_start_matches('\u{feff}')[n.range()]).map_err(|e| e.to_string())?,
         None => Vec::new(),
@@ -646,8 +688,8 @@ if hp and 1 &lt; 2 then print("loaded") end
 
     #[test]
     fn json_and_ct_files() {
-        let dir = std::env::temp_dir().join(format!("hh-table-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
         let t = from_ct(CT).unwrap();
         for name in ["t.json", "t.CT"] {
             let p = dir.join(name);
@@ -660,6 +702,5 @@ if hp and 1 &lt; 2 then print("loaded") end
         let u = load(&dir.join("ui.json")).unwrap();
         assert_eq!((u.entries[0].vtype, u.entries[0].addr.as_str()), (VType::Float, "0x10"));
         assert!(from_ct("<foo/>").is_err());
-        std::fs::remove_dir_all(dir).unwrap();
     }
 }

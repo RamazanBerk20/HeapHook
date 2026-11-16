@@ -11,6 +11,8 @@ use hh_net::server::{Req, decode_request};
 use hh_net::{Backend, Server, ServerConfig, ServerHandle, connect};
 
 const BASE: Addr = 0x10000;
+/// An alloc of this size panics inside the backend.
+const PANIC_SIZE: u64 = 0xDEAD;
 /// Reads at ERR + k fail with error variant k.
 const ERR: Addr = 0xE000_0000;
 
@@ -34,6 +36,7 @@ struct TestProc {
     mock: MockProcess,
     delay_ms: AtomicU64,
     suspends: AtomicU32,
+    resumes: AtomicU32,
 }
 
 impl Memory for TestProc {
@@ -75,6 +78,7 @@ impl Process for TestProc {
         Ok(vec![42, 43])
     }
     fn alloc(&self, size: u64, _prot: Prot, near: Option<Addr>) -> Result<Addr> {
+        assert!(size != PANIC_SIZE, "backend bug");
         Ok(near.unwrap_or(0x5000_0000) + size)
     }
     fn free(&self, _addr: Addr, _size: u64) -> Result<()> {
@@ -88,6 +92,7 @@ impl Process for TestProc {
         Ok(())
     }
     fn resume(&self) -> Result<()> {
+        self.resumes.fetch_add(1, Relaxed);
         Ok(())
     }
 }
@@ -113,7 +118,7 @@ const TOKEN: &str = "s3cret-token";
 
 fn start_with(mem: usize, f: impl FnOnce(&mut ServerConfig)) -> (ServerHandle, Arc<TestProc>) {
     let data: Vec<u8> = (0..mem).map(|i| (i * 7 + i / 4096) as u8).collect();
-    let p = Arc::new(TestProc { mock: MockProcess::new(BASE, data), delay_ms: AtomicU64::new(0), suspends: AtomicU32::new(0) });
+    let p = Arc::new(TestProc { mock: MockProcess::new(BASE, data), delay_ms: AtomicU64::new(0), suspends: AtomicU32::new(0), resumes: AtomicU32::new(0) });
     let mut cfg = ServerConfig::new(TOKEN);
     cfg.auth_delay = Duration::from_millis(100);
     f(&mut cfg);
@@ -370,7 +375,7 @@ fn wrong_token_rejected() {
 
 #[test]
 fn empty_server_token_refused() {
-    assert!(Server::bind("127.0.0.1:0", ServerConfig::new(""), Arc::new(TestBackend(Arc::new(TestProc { mock: MockProcess::new(0, vec![]), delay_ms: AtomicU64::new(0), suspends: AtomicU32::new(0) })))).is_err());
+    assert!(Server::bind("127.0.0.1:0", ServerConfig::new(""), Arc::new(TestBackend(Arc::new(TestProc { mock: MockProcess::new(0, vec![]), delay_ms: AtomicU64::new(0), suspends: AtomicU32::new(0), resumes: AtomicU32::new(0) })))).is_err());
 }
 
 #[test]
@@ -566,7 +571,8 @@ fn connection_limit() {
     let (h, _) = start_with(4096, |c| c.max_connections = 2);
     let a = connect(h.addr(), TOKEN).unwrap();
     let b = connect(h.addr(), TOKEN).unwrap();
-    assert!(connect(h.addr(), TOKEN).is_err());
+    let e = connect(h.addr(), TOKEN).err().unwrap();
+    assert!(e.to_string().contains("connection limit (2) reached"), "{e}");
     drop((a, b));
     // Slots free up once the server notices the disconnects.
     let t = Instant::now();
@@ -599,6 +605,153 @@ fn oversized_requests_get_errors_not_crashes() {
     s.write_all(&proto::frame(3, op::REGIONS, |e| e.u32(999))).unwrap();
     let f = proto::read_frame(&mut s, 1 << 20).unwrap();
     assert_eq!((f.id, f.op), (3, proto::STATUS_ERR));
+}
+
+// ------------------------------------------------------------------ release audit regressions
+
+/// Waits up to 5 s for `f`.
+fn eventually(what: &str, f: impl Fn() -> bool) {
+    let t = Instant::now();
+    while !f() {
+        assert!(t.elapsed() < Duration::from_secs(5), "timed out waiting for {what}");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[test]
+fn idle_unauthenticated_connections_cannot_lock_out_clients() {
+    let (h, _) = start_with(4096, |c| {
+        c.max_connections = 2;
+        c.max_pending = 4;
+        c.handshake_timeout = Duration::from_secs(60);
+    });
+    // Far more idle sockets than either budget: the oldest pending ones get dropped.
+    let idle: Vec<TcpStream> = (0..40).map(|_| raw(&h)).collect();
+    let a = connect(h.addr(), TOKEN).unwrap();
+    let b = connect(h.addr(), TOKEN).unwrap();
+    assert_eq!(a.list_processes().unwrap().len(), 2);
+    assert_eq!(b.list_processes().unwrap().len(), 2);
+    drop(idle);
+}
+
+#[test]
+fn trickling_handshake_gets_one_deadline() {
+    let (h, _) = start_with(4096, |c| c.handshake_timeout = Duration::from_millis(400));
+    let mut s = raw(&h);
+    let mut r = s.try_clone().unwrap();
+    let t = Instant::now();
+    let reader = std::thread::spawn(move || {
+        let mut b = [0u8; 64];
+        // Returns when the server closes (EOF or reset), not on our 5 s read timeout.
+        while let Ok(n) = r.read(&mut b) {
+            if n == 0 {
+                break;
+            }
+        }
+        t.elapsed()
+    });
+    let hello = proto::frame(0, op::HELLO, |e| {
+        e.0.extend_from_slice(proto::MAGIC);
+        e.u16(proto::VERSION);
+        e.0.extend_from_slice(&[7; 32]);
+    });
+    // One byte every 50 ms: every single read is fast, the whole frame takes 2.4 s.
+    for b in hello {
+        if reader.is_finished() || s.write_all(&[b]).is_err() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let closed_after = reader.join().unwrap();
+    assert!(closed_after < Duration::from_millis(1500), "{closed_after:?}");
+}
+
+#[test]
+fn disconnect_close_and_shutdown_resume_suspended_targets() {
+    let (h, tp) = start();
+    let resumes = || tp.resumes.load(Relaxed);
+    // Disconnect with two outstanding suspends (three suspends, one resume).
+    let c = connect(h.addr(), TOKEN).unwrap();
+    let p = c.open(42).unwrap();
+    for _ in 0..3 {
+        p.suspend().unwrap();
+    }
+    p.resume().unwrap();
+    assert_eq!(resumes(), 1);
+    drop((p, c));
+    eventually("resume after disconnect", || resumes() == 3);
+    // CLOSE of the handle.
+    let c = connect(h.addr(), TOKEN).unwrap();
+    let p = c.open(42).unwrap();
+    p.suspend().unwrap();
+    drop(p);
+    eventually("resume after close", || resumes() == 4);
+    // Server shutdown: done by the time shutdown returns.
+    let p = c.open(42).unwrap();
+    p.suspend().unwrap();
+    h.shutdown();
+    assert_eq!(resumes(), 5);
+}
+
+#[test]
+fn backend_panic_is_an_error_and_frees_the_slot() {
+    let (h, _) = start_with(4096, |c| {
+        c.max_connections = 1;
+        c.workers = 2;
+    });
+    let c = connect(h.addr(), TOKEN).unwrap();
+    let p = c.open(42).unwrap();
+    for _ in 0..5 {
+        let e = p.alloc(PANIC_SIZE, Prot::default(), None).unwrap_err();
+        assert!(e.to_string().contains("internal error"), "{e}");
+    }
+    assert_eq!(p.threads().unwrap(), [42, 43]);
+    drop((p, c));
+    eventually("slot freed", || connect(h.addr(), TOKEN).is_ok());
+}
+
+#[test]
+fn server_wide_handle_cap() {
+    let (h, _) = start_with(4096, |c| c.max_total_handles = 3);
+    let a = connect(h.addr(), TOKEN).unwrap();
+    let b = connect(h.addr(), TOKEN).unwrap();
+    let a1 = a.open(42).unwrap();
+    let _a2 = a.open(42).unwrap();
+    let _b1 = b.open(42).unwrap();
+    let e = b.open(42).err().unwrap();
+    assert!(e.to_string().contains("on this server"), "{e}");
+    // A failed backend open does not use up the budget.
+    drop(a1);
+    eventually("handle freed", || b.open(42).is_ok());
+    assert!(b.open(1).is_err());
+}
+
+#[test]
+fn failed_auth_is_rate_limited_server_wide() {
+    let (h, _) = start(); // auth_delay 100 ms
+    let t = Instant::now();
+    std::thread::scope(|s| {
+        for _ in 0..6 {
+            s.spawn(|| assert!(matches!(connect(h.addr(), "wrong-token-guess").err().unwrap(), Error::Permission(_))));
+        }
+    });
+    // Per-connection delays would let all six finish after ~100 ms.
+    assert!(t.elapsed() >= Duration::from_millis(550), "{:?}", t.elapsed());
+    still_serves(&h);
+}
+
+#[test]
+fn hh_server_refuses_short_tokens() {
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_hh-server"))
+        .args(["--listen", "127.0.0.1:0", "--token", "short-token"])
+        .env_remove("HH_SERVER_TOKEN")
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("at least 16 characters"), "{err}");
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_hh-server")).args(["--listen", "127.0.0.1:0"]).env("HH_SERVER_TOKEN", "123456789012345").output().unwrap();
+    assert!(!out.status.success());
 }
 
 // ------------------------------------------------------------------ benchmark

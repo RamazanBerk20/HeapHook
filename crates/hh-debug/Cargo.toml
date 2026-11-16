@@ -1,10 +1,12 @@
 [package]
 name = "hh-debug"
 version.workspace = true
+license.workspace = true
 edition.workspace = true
 
 [dependencies]
 hh-core.workspace = true
+hh-asm.workspace = true
 serde.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]

@@ -1,6 +1,7 @@
 [package]
 name = "hh-speedhack"
-version = "0.1.0"
+version = "1.0.0-rc.1"
+license = "Apache-2.0"
 edition = "2024"
 description = "HeapHook speedhack payload, injected into the target process"
 

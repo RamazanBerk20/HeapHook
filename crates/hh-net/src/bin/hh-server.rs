@@ -9,13 +9,17 @@ const USAGE: &str = "usage: hh-server [--listen ADDR:PORT] [--allow-remote] [--t
 
   --listen ADDR:PORT  address to listen on (default 127.0.0.1:52736)
   --allow-remote      required to listen on anything but a loopback address
-  --token TOKEN       shared secret (default: $HH_SERVER_TOKEN, else a random one is printed).
-                      Prefer the environment variable: command lines are visible to other users.
+  --token TOKEN       shared secret, at least 16 characters (default: $HH_SERVER_TOKEN, else a
+                      random one is printed). Prefer the environment variable: command lines
+                      are visible to other users.
   --read-only         reject write, alloc, free, protect, suspend and resume
 
 The server exposes the memory of every process this user can access. Authentication is
 challenge-response (the token is never sent) but traffic is NOT encrypted: use it on a
 trusted network or through an SSH tunnel (ssh -L 52736:127.0.0.1:52736 host).";
+
+/// Shortest user-supplied token; a weak one is the only real way past the authentication.
+const MIN_TOKEN: usize = 16;
 
 fn main() -> ExitCode {
     match run() {
@@ -48,6 +52,15 @@ fn run() -> Result<(), String> {
     let addrs: Vec<SocketAddr> = listen.to_socket_addrs().map_err(|e| format!("{listen}: {e}"))?.collect();
     if !allow_remote && addrs.iter().any(|a| !a.ip().is_loopback()) {
         return Err(format!("{listen} is not a loopback address; pass --allow-remote to expose process memory on the network"));
+    }
+    if let Some(t) = &token
+        && t.chars().count() < MIN_TOKEN
+    {
+        return Err(format!(
+            "the token must be at least {MIN_TOKEN} characters long (got {}); omit --token and \
+             $HH_SERVER_TOKEN to have a random one generated",
+            t.chars().count()
+        ));
     }
     let generated = token.is_none();
     let token = match token {

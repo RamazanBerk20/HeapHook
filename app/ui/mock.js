@@ -1036,6 +1036,8 @@ const LIVE = {
     liveFreeze();
     return T.version;
   },
+  // The mock's scripts cannot fail to disable and run no Lua, so `force` and trust change nothing.
+  table_trust() { return null; },
   table_open({ path }) {
     fs ??= loadFs();
     if (path === 'demo.json' && !fs[path]) fs[path] = DEMO;
@@ -1102,7 +1104,8 @@ const LIVE = {
   lua_poll({ since }) {
     const keys = [...new Set(hkBindings().map((b) => b[0].join(',')))].map((s) => s.split(',').map(Number));
     const { resolve, ...d } = dlg || {};
-    return { log: LOG.filter((l) => l.seq > since), next: logSeq, dialog: dlg ? d : null, table_version: T.version, hotkeys: keys, busy: luaBusy, sound };
+    return { log: LOG.filter((l) => l.seq > since), next: logSeq, dialog: dlg ? d : null, table_version: T.version, hotkeys: keys, busy: luaBusy, sound,
+      process: P ? { pid: P.pid, name: P.name, is_64bit: true, alive: true } : null };
   },
   lua_dialog_reply({ id, value }) { if (dlg?.id === id) { dlg.resolve(value); dlg = null; } },
   settings_get: () => loadSettings(),
@@ -1576,7 +1579,7 @@ const TOOLS = {
     return null;
   },
 
-  debug_set_condition({ id, condition }) { const b = dneed().bps.find((x) => x.id === id) || err(`no breakpoint ${id}`); b.condition = checkCond(condition); b.cn = 0; return null; },
+  debug_set_condition({ id, condition }) { if (typeof condition !== 'string') err('invalid args `condition` for command `debug_set_condition`: expected a string'); const b = dneed().bps.find((x) => x.id === id) || err(`no breakpoint ${id}`); b.condition = checkCond(condition); b.cn = 0; return null; },
   debug_signals: () => [[2, 'SIGINT', 'pass'], [4, 'SIGILL', 'break'], [6, 'SIGABRT', 'pass'], [7, 'SIGBUS', 'break'], [8, 'SIGFPE', 'break'], [10, 'SIGUSR1', 'pass'], [11, 'SIGSEGV', 'break'],
     [12, 'SIGUSR2', 'pass'], [13, 'SIGPIPE', 'pass'], [14, 'SIGALRM', 'pass'], [15, 'SIGTERM', 'pass'], [17, 'SIGCHLD', 'pass'], [28, 'SIGWINCH', 'pass'], [29, 'SIGIO', 'pass']],
 

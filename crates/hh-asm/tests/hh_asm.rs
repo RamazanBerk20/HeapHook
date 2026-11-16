@@ -1900,3 +1900,280 @@ fn aa_lua_block_reaches_hook_verbatim() {
     assert_eq!(st.allocs.len(), 1);
     aa_execute(&p, &mut syms, &ok, false, Some(&st), &mut hooks).unwrap();
 }
+
+// ---------------------------------------------------------------- hostile input (release audit)
+
+fn check_msg(p: &TestProc, script: &str, hooks: &mut AaHooks) -> String {
+    aa_check(p, &SymbolTable::default(), script, hooks)
+        .map(|e| e.message)
+        .unwrap_or_default()
+}
+
+#[test]
+fn deep_expressions_error_instead_of_overflowing_the_stack() {
+    let p = game64();
+    let syms = SymbolTable::default();
+    let deep = format!("dd {}1{}", "(".repeat(10_000), ")".repeat(10_000));
+    assert!(assemble_line(&deep, 0x1000, 64, &no_syms).is_err());
+    let unary = format!("{}1", "-".repeat(100_000));
+    assert!(resolve_address(&p, &syms, &unary).is_err());
+    let ptrs = format!("{}1000{}", "[".repeat(10_000), "]".repeat(10_000));
+    assert!(resolve_address(&p, &syms, &ptrs).is_err());
+    // Reasonable nesting still works.
+    let ok = format!("{}1{}", "(".repeat(200), ")".repeat(200));
+    assert_eq!(resolve_address(&p, &syms, &ok).unwrap(), 1);
+    assert_eq!(resolve_address(&p, &syms, "--1").unwrap(), 1);
+}
+
+#[test]
+fn chained_defines_are_capped_and_fast() {
+    let p = game64();
+    let mut s = String::from("define(a0,x)\n");
+    for i in 1..40 {
+        s += &format!("define(a{i},a{} a{})\n", i - 1, i - 1);
+    }
+    s += "[ENABLE]\n[DISABLE]\n";
+    let t = std::time::Instant::now();
+    let m = check_msg(&p, &s, &mut AaHooks::default());
+    assert!(m.contains("expands to more than"), "{m}");
+    assert!(t.elapsed().as_secs() < 10, "{:?}", t.elapsed());
+    // A long line with many replacements stays linear.
+    let line = "v ".repeat(200_000);
+    let s = format!("define(v,1)\n[ENABLE]\nalloc(m,10)\nm:\ndb {line}\n[DISABLE]\n");
+    let t = std::time::Instant::now();
+    assert_eq!(check_msg(&p, &s, &mut AaHooks::default()), "");
+    assert!(t.elapsed().as_secs() < 10, "{:?}", t.elapsed());
+    // Whole-word replacement only.
+    let s = "define(a,90)\n[ENABLE]\nalloc(m,10)\nm:\ndb a\nlabel(aa)\naa:\n[DISABLE]\n";
+    assert_eq!(check_msg(&p, s, &mut AaHooks::default()), "");
+}
+
+#[test]
+fn lua_blocks_cannot_expand_forever() {
+    let p = game64();
+    let mut hooks = AaHooks {
+        lua: Some(Box::new(|_| Ok("{$lua:0}\n{$lua:0}\n".into()))),
+        ..Default::default()
+    };
+    let m = check_msg(
+        &p,
+        "[ENABLE]\n{$lua}\nreturn ''\n{$asm}\n[DISABLE]\n",
+        &mut hooks,
+    );
+    assert!(m.contains("{$lua} blocks"), "{m}");
+}
+
+#[test]
+fn includes_are_capped() {
+    let p = game64();
+    let mut hooks = AaHooks {
+        include: Some(Box::new(|_| {
+            Ok("include(x)\ninclude(x)\ninclude(x)\n".into())
+        })),
+        ..Default::default()
+    };
+    let m = check_msg(&p, "[ENABLE]\ninclude(x)\n[DISABLE]\n", &mut hooks);
+    assert!(m.contains("include"), "{m}");
+}
+
+#[test]
+fn aobscan_skips_ahead_caps_and_cancels() {
+    let p = TestProc::new(8);
+    p.map(0x1000_0000, vec![0u8; 16 << 20]);
+    let pat = format!("{}01", "?? ".repeat(1000));
+    let t = std::time::Instant::now();
+    assert!(aob_scan(&p, 0, u64::MAX, &pat, 1).unwrap().is_empty());
+    assert!(t.elapsed().as_secs() < 10, "{:?}", t.elapsed());
+    p.map(0x2000_0000, hex("90 90 01 02 90 01 02 03"));
+    assert_eq!(
+        aob_scan(&p, 0, u64::MAX, "01 02 ?? 01", 10).unwrap(),
+        vec![0x2000_0002]
+    );
+    assert_eq!(
+        aob_scan(&p, 0, u64::MAX, "?? 02", 10).unwrap(),
+        vec![0x2000_0002, 0x2000_0005]
+    );
+    assert!(aob_scan(&p, 0, u64::MAX, &"?? ".repeat(1025), 1).is_err());
+    let stop = std::sync::atomic::AtomicBool::new(true);
+    assert!(aob_scan_cancellable(&p, 0, u64::MAX, "01 02", 1, &stop).is_err());
+}
+
+#[test]
+fn struct_offset_overflow_is_an_error() {
+    let p = game64();
+    let s = "[ENABLE]\nstruct s\na: resq FFFFFFFFFFFFFFFF\nb: resb 1\nc: resb 1\nends\n[DISABLE]\n";
+    let m = check_msg(&p, s, &mut AaHooks::default());
+    assert!(m.contains("larger than"), "{m}");
+}
+
+#[test]
+fn readmem_and_assembled_size_are_capped() {
+    let p = game64();
+    p.map(0x3000_0000, vec![0x11u8; 2 << 20]);
+    // One read larger than the old silent 1 MiB truncation is copied whole.
+    let s = "[ENABLE]\nalloc(m,3000000)\nm:\nreadmem(30000000,2000000)\nlabel(e)\ne:\nregistersymbol(e)\n[DISABLE]\n";
+    let mut syms = SymbolTable::default();
+    let st = aa_execute(&p, &mut syms, s, true, None, &mut AaHooks::default()).unwrap();
+    assert_eq!(st.registered[0].1 - st.allocs[0].addr, 2_000_000);
+    let reads = "readmem(30000000,1000000)\n".repeat(17);
+    let s = format!("[ENABLE]\nalloc(m,10)\nm:\n{reads}[DISABLE]\n");
+    let m = check_msg(&p, &s, &mut AaHooks::default());
+    assert!(m.contains("readmem"), "{m}");
+    let nops = "nop FFFF\n".repeat(1100);
+    let s = format!("[ENABLE]\nalloc(m,10)\nm:\n{nops}[DISABLE]\n");
+    let m = check_msg(&p, &s, &mut AaHooks::default());
+    assert!(m.contains("assembles to more than"), "{m}");
+}
+
+/// ELF64 with `n_dup` copies of one `.symtab` header over `n` symbols named from `strtab`.
+fn elf_with_symtab(strtab: &[u8], name_off: u64, n: usize, n_dup: usize) -> Vec<u8> {
+    let mut b = build_elf(true, false, true);
+    let str_at = b.len();
+    b.extend_from_slice(strtab);
+    let sym_at = b.len();
+    for _ in 0..n {
+        let e = b.len();
+        b.resize(e + 24, 0);
+        put(&mut b, e, name_off, 4);
+        b[e + 4] = 0x12;
+        put(&mut b, e + 6, 5, 2);
+        put(&mut b, e + 8, 0x1100, 8);
+        put(&mut b, e + 16, 0, 8);
+    }
+    let sh_at = b.len();
+    let sec = |b: &mut Vec<u8>, typ: u64, off: usize, size: usize, link: u64| {
+        let s = b.len();
+        put(b, s + 4, typ, 4);
+        put(b, s + 24, off as u64, 8);
+        put(b, s + 32, size as u64, 8);
+        put(b, s + 40, link, 4);
+        put(b, s + 56, 0, 8);
+    };
+    sec(&mut b, 0, 0, 0, 0);
+    sec(&mut b, 3, str_at, strtab.len(), 0);
+    for _ in 0..n_dup {
+        sec(&mut b, 2, sym_at, n * 24, 1);
+    }
+    put(&mut b, 40, sh_at as u64, 8);
+    put(&mut b, 60, 2 + n_dup as u64, 2);
+    b
+}
+
+#[test]
+fn hostile_elf_symbol_tables_are_bounded() {
+    // 5000 headers naming one table: parsed once.
+    let img = elf_with_symtab(b"\0f\0", 1, 1000, 5000);
+    let t = std::time::Instant::now();
+    let syms = parse_symbols(&img, 0).unwrap();
+    assert_eq!(syms.len(), 1000);
+    assert!(t.elapsed().as_secs() < 10, "{:?}", t.elapsed());
+    // Names without a terminator within the cap are skipped, not copied per symbol.
+    let img = elf_with_symtab(&vec![b'A'; 1 << 20], 0, 1000, 5000);
+    let syms = parse_symbols(&img, 0).unwrap_or_default();
+    assert!(syms.iter().all(|s| s.name.len() <= 4096));
+    assert!(syms.len() < 10, "{}", syms.len());
+}
+
+#[test]
+fn hostile_elf_program_headers_do_not_overflow() {
+    // PT_LOAD at a file offset near u64::MAX: the stripped-file fallback maps through it.
+    let mut b = build_elf(true, false, false);
+    put(&mut b, 64 + 8, u64::MAX - 0x10, 8);
+    let _ = parse_symbols(&b, 0x1000);
+    // Load address above the module base: the bias wraps, dynamic pointers must not underflow.
+    let mut b = build_elf(true, false, false);
+    put(&mut b, 64 + 16, 0xFFFF_0000_0000_0000, 8);
+    let base = 0x3000_0000_0000;
+    let dynamic = 0x700;
+    for i in 1..4 {
+        let v = u64::from_le_bytes(
+            b[dynamic + i * 16 + 8..dynamic + i * 16 + 16]
+                .try_into()
+                .unwrap(),
+        );
+        put(&mut b, dynamic + i * 16 + 8, base + v, 8);
+    }
+    let p = TestProc::new(8).module("wrap.so", base, b);
+    let _ = module_symbols(&p, &p.mods[0]);
+}
+
+#[test]
+fn hostile_pe_export_counts_are_bounded() {
+    let mut b = build_pe(true, true);
+    // 0xFFFFFFFF names: the loop is bounded by what the name array read returned.
+    put(&mut b, 0x400 + 24, 0xFFFF_FFFF, 4);
+    let _ = parse_symbols(&b, 0);
+    // e_lfanew near u32::MAX.
+    let mut b = build_pe(true, true);
+    put(&mut b, 0x3C, 0xFFFF_FFF0, 4);
+    assert!(parse_symbols(&b, 0).is_err());
+}
+
+#[cfg(unix)]
+#[test]
+fn module_files_must_be_regular() {
+    let dir = std::env::temp_dir().join(format!("hh-asm-fifo-{}", std::process::id()));
+    let _ = std::fs::remove_file(&dir);
+    let ok = std::process::Command::new("mkfifo")
+        .arg(&dir)
+        .status()
+        .is_ok_and(|s| s.success());
+    if ok {
+        // Opening a FIFO without O_NONBLOCK would block forever (no writer).
+        assert!(module_file_reader(dir.to_str().unwrap()).is_err());
+        let p = TestProc::new(8).module("fifo.so", 0x7000_0000, build_elf(true, false, false));
+        let mut m = p.mods[0].clone();
+        m.path = dir.to_str().unwrap().into();
+        assert!(!module_symbols(&p, &m).is_empty());
+        let _ = std::fs::remove_file(&dir);
+    }
+    assert!(module_file_reader("/").is_err());
+    let exe = std::env::current_exe().unwrap();
+    let rd = module_file_reader(exe.to_str().unwrap()).unwrap();
+    assert_eq!(rd(0, 4).unwrap(), b"\x7fELF");
+}
+
+#[test]
+fn garbage_scripts_never_panic_or_hang() {
+    let p = game64();
+    let syms = SymbolTable::default();
+    let frags = [
+        "define(a,a a)",
+        "define(b,(((",
+        "readmem(game.exe,FFFFFFFFFFFFFFFF)",
+        "readmem(FFFFFFFFFFFFFFFF,10)",
+        "struct s",
+        "x: resq FFFFFFFFFFFFFFFF",
+        "ends",
+        "aobscan(q,?? ?? 01)",
+        "aobscanregion(q,FFFFFFFFFFFFFFF0,FFFFFFFFFFFFFFFF,01)",
+        "alloc(m,FFFFFFFFFFFFFFFF)",
+        "m:",
+        "FFFFFFFFFFFFFFFF:",
+        "nop FFFF",
+        "db a b a b",
+        "dd [[[[game.exe]]]]",
+        "fullaccess(FFFFFFFFFFFFFFFF,FFFFFFFFFFFFFFFF)",
+        "assert(FFFFFFFFFFFFFFFF,01)",
+        "{$try}",
+        "{$except}",
+        "@@:",
+        "jmp @f",
+        "reassemble(FFFFFFFFFFFFFFFF)",
+    ];
+    let mut seed = 11u64;
+    let mut next = || {
+        seed = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        (seed >> 33) as usize
+    };
+    let t = std::time::Instant::now();
+    for _ in 0..2_000 {
+        let n = 1 + next() % 12;
+        let body: Vec<&str> = (0..n).map(|_| frags[next() % frags.len()]).collect();
+        let s = format!("[ENABLE]\n{}\n[DISABLE]\n", body.join("\n"));
+        let _ = aa_check(&p, &syms, &s, &mut AaHooks::default());
+    }
+    assert!(t.elapsed().as_secs() < 60, "{:?}", t.elapsed());
+}

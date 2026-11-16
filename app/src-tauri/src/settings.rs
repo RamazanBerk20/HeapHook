@@ -100,13 +100,12 @@ mod tests {
     fn normalize_and_round_trip() {
         let s = Settings { freeze_interval_ms: 0, theme: "neon".into(), table_script: "always".into(), ..Settings::default() }.normalized();
         assert_eq!((s.freeze_interval_ms, s.theme.as_str(), s.table_script.as_str()), (1, "system", "ask"));
-        let dir = std::env::temp_dir().join(format!("hh-settings-{}", std::process::id()));
-        let p = dir.join("sub/settings.json");
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("sub/settings.json");
         let s = Settings { lua_budget_ms: 0, theme: "dark".into(), ..Settings::default() };
         s.save(&p).unwrap();
         assert_eq!(Settings::load(&p), s);
         std::fs::write(&p, "{ not json").unwrap();
         assert_eq!(Settings::load(&p), Settings::default());
-        std::fs::remove_dir_all(dir).unwrap();
     }
 }

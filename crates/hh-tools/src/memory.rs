@@ -279,6 +279,9 @@ pub fn load_snapshot(path: &Path) -> Result<Snapshot> {
         if len > left {
             return Err(Error::Parse("memory file truncated".into()));
         }
+        if addr.checked_add(len).is_none() {
+            return Err(Error::Parse(format!("memory file block at {addr:#x} wraps the address space")));
+        }
         let mut data = vec![0u8; check_len(len)?];
         r.read_exact(&mut data)?;
         left -= len;
@@ -325,12 +328,17 @@ pub fn load_memory(p: &dyn Process, path: &Path, relocate_to: Option<Addr>) -> R
 
 // ---------------------------------------------------------------------------- fill / copy
 
+fn end_of(addr: Addr, len: u64) -> Result<Addr> {
+    addr.checked_add(len).ok_or_else(|| Error::Other(format!("range {addr:#x}+{len:#x} wraps the address space")))
+}
+
 /// Fills `[addr, addr+len)` with `pattern` repeated.
 pub fn fill(p: &dyn Process, addr: Addr, len: u64, pattern: &[u8]) -> Result<()> {
     if pattern.is_empty() {
         return Err(Error::Other("empty fill pattern".into()));
     }
     check_len(len)?;
+    end_of(addr, len)?;
     let chunk = (1u64 << 20).min(len) as usize;
     // A whole number of patterns per chunk keeps the phase across chunks.
     let chunk = (chunk / pattern.len()).max(1) * pattern.len();
@@ -347,6 +355,8 @@ pub fn fill(p: &dyn Process, addr: Addr, len: u64, pattern: &[u8]) -> Result<()>
 /// Copies `len` bytes from `src` to `dst` (overlapping ranges are handled like memmove).
 pub fn copy(p: &dyn Process, src: Addr, dst: Addr, len: u64) -> Result<()> {
     check_len(len)?;
+    end_of(src, len)?;
+    end_of(dst, len)?;
     const C: u64 = 1 << 20;
     let mut buf = vec![0u8; C.min(len) as usize];
     let n_chunks = len.div_ceil(C.max(1));
@@ -495,7 +505,7 @@ pub fn find_pointers(p: &dyn Process, q: &PointerQuery, progress: &Progress) -> 
     let ps = p.pointer_size();
     let mods = p.modules().unwrap_or_default();
     let in_mod = |a: Addr| mods.iter().any(|m| a >= m.base && a - m.base < m.size);
-    let chunks: Vec<(Addr, u64)> = p
+    let mut chunks: Vec<(Addr, u64)> = p
         .regions()?
         .into_iter()
         .filter(|r| r.prot.r && (r.prot.w || !q.writable_only))
@@ -510,30 +520,40 @@ pub fn find_pointers(p: &dyn Process, q: &PointerQuery, progress: &Progress) -> 
         .collect();
     progress.start(chunks.iter().map(|c| c.1).sum());
     let lo = q.target.saturating_sub(q.max_offset);
-    let mut hits: Vec<PointerHit> = chunks
-        .par_iter()
-        .map(|&(s, n)| {
-            progress.check()?;
-            let b = crate::read_some(p, s, n as usize);
-            let mut out = Vec::new();
-            let skew = ((ps as u64 - s % ps as u64) % ps as u64) as usize;
-            for (i, w) in b.get(skew..).unwrap_or_default().chunks_exact(ps).enumerate() {
-                let mut v = [0u8; 8];
-                v[..ps].copy_from_slice(w);
-                let v = u64::from_le_bytes(v);
-                if v != 0 && v >= lo && v <= q.target {
-                    let addr = s + (skew + i * ps) as u64;
-                    out.push(PointerHit { addr, value: v, offset: q.target - v, module: None });
+    // Batches in address order, so scanning stops as soon as the lowest `max_results` hits
+    // are known instead of collecting every hit first.
+    chunks.sort_unstable();
+    let mut hits: Vec<PointerHit> = Vec::new();
+    for batch in chunks.chunks(rayon::current_num_threads().max(1) * 4) {
+        if hits.len() >= q.max_results {
+            break;
+        }
+        let found: Vec<Vec<PointerHit>> = batch
+            .par_iter()
+            .map(|&(s, n)| {
+                progress.check()?;
+                let b = crate::read_some(p, s, n as usize);
+                let mut out = Vec::new();
+                let skew = ((ps as u64 - s % ps as u64) % ps as u64) as usize;
+                for (i, w) in b.get(skew..).unwrap_or_default().chunks_exact(ps).enumerate() {
+                    let mut v = [0u8; 8];
+                    v[..ps].copy_from_slice(w);
+                    let v = u64::from_le_bytes(v);
+                    if v != 0 && v >= lo && v <= q.target {
+                        let addr = s + (skew + i * ps) as u64;
+                        out.push(PointerHit { addr, value: v, offset: q.target - v, module: None });
+                        if out.len() >= q.max_results {
+                            break;
+                        }
+                    }
                 }
-            }
-            progress.add(n);
-            progress.add_found(out.len() as u64);
-            Ok(out)
-        })
-        .collect::<Result<Vec<_>>>()?
-        .into_iter()
-        .flatten()
-        .collect();
+                progress.add(n);
+                progress.add_found(out.len() as u64);
+                Ok(out)
+            })
+            .collect::<Result<_>>()?;
+        hits.extend(found.into_iter().flatten());
+    }
     hits.sort_by_key(|h| h.addr);
     hits.truncate(q.max_results);
     for h in &mut hits {

@@ -15,7 +15,7 @@ pub use freeze::FrozenEntryEx;
 pub use plan::{FirstScan, NextScan, NextScanEx, Priority, ScanOptions, ScanType, Tri};
 pub use scanner::{ResultRow, ScanCount, ScanProgress, Scanner};
 pub use value::{
-    CustomType, Fmt, Rounding, VType, ValueRef, ValueRefEx, format_value, parse_value, read_values, read_values_ex, value_size,
+    CustomType, Fmt, MAX_VALUE_LEN, Rounding, VType, ValueRef, ValueRefEx, format_value, parse_value, read_values, read_values_ex, value_size,
     write_custom, write_value,
 };
 

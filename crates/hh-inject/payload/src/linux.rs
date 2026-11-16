@@ -1,19 +1,16 @@
-//! Linux hooks. Two ways in:
-//! - `LD_PRELOAD`: the exported functions below interpose libc's by symbol name.
-//! - Runtime injection: `hh_speedhack_hook` (called by the host after `dlopen`) rewrites the
-//!   GOT slots (`JUMP_SLOT` / `GLOB_DAT` relocations) naming these functions in every module
-//!   loaded at that moment. Slots are pointer-sized aligned stores, so this is safe while
-//!   other threads run. It misses modules loaded later, pointers fetched earlier with
-//!   `dlsym`, libc-internal calls, static binaries, raw syscalls / vDSO calls and `rdtsc`.
+//! Linux hooks: loaded through `LD_PRELOAD`, the exported functions below interpose libc's
+//! by symbol name.
 //!
 //! Real time comes straight from the vDSO (or the raw syscall), real sleeps and waits are raw
 //! syscalls, so a hook never re-enters another hook.
 // Casts between libc time types are kept for portability to targets where they differ.
 #![allow(clippy::unnecessary_cast)]
+#[cfg(not(target_arch = "x86_64"))]
+compile_error!("the speedhack payload supports x86-64 only (the vDSO lookup reads Elf64 structures)");
 use std::ffi::CStr;
 use std::ptr::null_mut;
-use std::sync::atomic::Ordering::{Acquire, Relaxed, Release};
-use std::sync::atomic::{AtomicU32, AtomicUsize};
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering::{Relaxed, Release};
 
 use libc::{c_int, c_long, c_uint, c_void, clockid_t, time_t, timespec, timeval};
 
@@ -60,7 +57,7 @@ fn real(id: clockid_t) -> i64 {
             libc::syscall(libc::SYS_clock_gettime, id, &mut ts);
         }
     }
-    ts.tv_sec as i64 * NS + ts.tv_nsec as i64
+    (ts.tv_sec as i64).saturating_mul(NS).saturating_add(ts.tv_nsec as i64)
 }
 
 fn ts(ns: i64) -> timespec {
@@ -197,7 +194,7 @@ pub unsafe extern "C" fn nanosleep(req: *const timespec, rem: *mut timespec) -> 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn usleep(us: libc::useconds_t) -> c_int {
     let _g = InFlight::enter();
-    match virtual_sleep(1, &CLOCKS[1], us as i64 * 1000, false) {
+    match virtual_sleep(1, &CLOCKS[1], (us as i64).saturating_mul(1000), false) {
         None => 0,
         Some(_) => {
             set_errno(libc::EINTR);
@@ -209,10 +206,10 @@ pub unsafe extern "C" fn usleep(us: libc::useconds_t) -> c_int {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn sleep(s: c_uint) -> c_uint {
     let _g = InFlight::enter();
-    match virtual_sleep(1, &CLOCKS[1], s as i64 * NS, false) {
+    match virtual_sleep(1, &CLOCKS[1], (s as i64).saturating_mul(NS), false) {
         None => 0,
         // Like glibc: whole seconds left, rounded.
-        Some(left) => ((left + NS / 2) / NS) as c_uint,
+        Some(left) => (left.saturating_add(NS / 2) / NS) as c_uint,
     }
 }
 
@@ -243,6 +240,11 @@ fn scale_ms(ms: c_int) -> c_int {
     (ms as f64 / speed()).ceil().clamp(1.0, c_int::MAX as f64) as c_int
 }
 
+/// A timeval in µs, saturating (a timeout of years must not overflow).
+fn usecs(t: &timeval) -> i64 {
+    (t.tv_sec as i64).saturating_mul(1_000_000).saturating_add(t.tv_usec as i64)
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn select(
     n: c_int,
@@ -256,7 +258,8 @@ pub unsafe extern "C" fn select(
         return unsafe { libc::syscall(libc::SYS_select, n, r, w, e, tv) as c_int };
     };
     let s = speed();
-    let virt = t.tv_sec as i64 * 1_000_000 + t.tv_usec as i64;
+    let virt = usecs(t);
+    // Float-to-int casts saturate, so a huge timeout stays huge instead of overflowing.
     let real = (virt as f64 / s).ceil() as i64;
     let mut rt = timeval {
         tv_sec: (real / 1_000_000) as time_t,
@@ -268,7 +271,7 @@ pub unsafe extern "C" fn select(
     let ret = unsafe { libc::syscall(libc::SYS_select, n, r, w, e, &mut rt) as c_int };
     if virt > 0 {
         // Linux reports the time left; hand it back in virtual time.
-        let left = ((rt.tv_sec as i64 * 1_000_000 + rt.tv_usec as i64) as f64 * s) as i64;
+        let left = (usecs(&rt) as f64 * s) as i64;
         let left = left.min(virt);
         *t = timeval {
             tv_sec: (left / 1_000_000) as time_t,
@@ -276,209 +279,6 @@ pub unsafe extern "C" fn select(
         };
     }
     ret
-}
-
-// ---- runtime hooking: GOT slots -------------------------------------------------------
-
-fn hooks() -> [(&'static CStr, usize); 11] {
-    [
-        (c"clock_gettime", clock_gettime as *const () as usize),
-        (c"gettimeofday", gettimeofday as *const () as usize),
-        (c"time", time as *const () as usize),
-        (c"clock_nanosleep", clock_nanosleep as *const () as usize),
-        (c"nanosleep", nanosleep as *const () as usize),
-        (c"usleep", usleep as *const () as usize),
-        (c"sleep", sleep as *const () as usize),
-        (c"poll", poll as *const () as usize),
-        (c"epoll_wait", epoll_wait as *const () as usize),
-        (c"select", select as *const () as usize),
-        // `__clock_gettime` is what some older binaries import.
-        (c"__clock_gettime", clock_gettime as *const () as usize),
-    ]
-}
-
-/// Patched slots: (slot address | 1 if it sits in RELRO, original value).
-const MAX_SLOTS: usize = 1024;
-static SAVED: [[AtomicUsize; 2]; MAX_SLOTS] = [const { [AtomicUsize::new(0), AtomicUsize::new(0)] }; MAX_SLOTS];
-static SAVED_N: AtomicUsize = AtomicUsize::new(0);
-/// Serializes hook/unhook calls (the host issues them one at a time anyway).
-static INSTALLING: AtomicU32 = AtomicU32::new(0);
-
-fn page() -> usize {
-    match unsafe { libc::sysconf(libc::_SC_PAGESIZE) } {
-        n if n > 0 => n as usize,
-        _ => 4096,
-    }
-}
-
-/// Writes `val` into the pointer slot `slot`; RELRO slots are made writable for the store.
-unsafe fn store_slot(slot: usize, val: usize, relro: bool) -> bool {
-    let pg = slot & !(page() - 1);
-    unsafe {
-        if relro
-            && libc::mprotect(
-                pg as *mut c_void,
-                page(),
-                libc::PROT_READ | libc::PROT_WRITE,
-            ) != 0
-        {
-            return false;
-        }
-        AtomicUsize::from_ptr(slot as *mut usize).store(val, Release);
-        if relro {
-            libc::mprotect(pg as *mut c_void, page(), libc::PROT_READ);
-        }
-    }
-    true
-}
-
-#[repr(C)]
-struct Dyn {
-    tag: i64,
-    val: u64,
-}
-
-#[repr(C)]
-struct Rela {
-    offset: u64,
-    info: u64,
-    addend: i64,
-}
-
-const DT_PLTRELSZ: i64 = 2;
-const DT_STRTAB: i64 = 5;
-const DT_SYMTAB: i64 = 6;
-const DT_RELA: i64 = 7;
-const DT_RELASZ: i64 = 8;
-const DT_JMPREL: i64 = 23;
-const R_X86_64_GLOB_DAT: u64 = 6;
-const R_X86_64_JUMP_SLOT: u64 = 7;
-
-unsafe extern "C" fn patch_module(
-    info: *mut libc::dl_phdr_info,
-    _size: libc::size_t,
-    _data: *mut c_void,
-) -> c_int {
-    let info = unsafe { &*info };
-    let base = info.dlpi_addr as usize;
-    let phdrs = unsafe { std::slice::from_raw_parts(info.dlpi_phdr, info.dlpi_phnum as usize) };
-    let own = std::ptr::addr_of!(HH_SPEEDHACK) as usize;
-    if phdrs.iter().any(|p| {
-        p.p_type == libc::PT_LOAD
-            && (base + p.p_vaddr as usize..base + (p.p_vaddr + p.p_memsz) as usize).contains(&own)
-    }) {
-        return 0; // never hook ourselves
-    }
-    // The range ld.so made read-only after relocation (both ends rounded down to pages).
-    let relro = phdrs
-        .iter()
-        .find(|p| p.p_type == libc::PT_GNU_RELRO)
-        .map(|p| {
-            let (s, e) = (base + p.p_vaddr as usize, base + (p.p_vaddr + p.p_memsz) as usize);
-            (s & !(page() - 1))..(e & !(page() - 1))
-        })
-        .unwrap_or(0..0);
-    let Some(dynamic) = phdrs.iter().find(|p| p.p_type == libc::PT_DYNAMIC) else {
-        return 0;
-    };
-    // glibc relocates these pointers in place; the vDSO's are still offsets.
-    let fix = |p: u64| {
-        if (p as usize) < base {
-            p as usize + base
-        } else {
-            p as usize
-        }
-    };
-    let (mut symtab, mut strtab) = (0, 0);
-    let mut tables = [(0usize, 0usize); 2];
-    let mut d = (base + dynamic.p_vaddr as usize) as *const Dyn;
-    unsafe {
-        while (*d).tag != 0 {
-            let v = (*d).val;
-            match (*d).tag {
-                DT_SYMTAB => symtab = fix(v),
-                DT_STRTAB => strtab = fix(v),
-                DT_RELA => tables[0].0 = fix(v),
-                DT_RELASZ => tables[0].1 = v as usize,
-                DT_JMPREL => tables[1].0 = fix(v),
-                DT_PLTRELSZ => tables[1].1 = v as usize,
-                _ => {}
-            }
-            d = d.add(1);
-        }
-    }
-    if symtab == 0 || strtab == 0 {
-        return 0;
-    }
-    let hooks = hooks();
-    for (rel, size) in tables {
-        if rel == 0 {
-            continue;
-        }
-        let rels =
-            unsafe { std::slice::from_raw_parts(rel as *const Rela, size / size_of::<Rela>()) };
-        for r in rels {
-            let (ty, sym) = (r.info & 0xffff_ffff, (r.info >> 32) as usize);
-            if (ty != R_X86_64_JUMP_SLOT && ty != R_X86_64_GLOB_DAT) || sym == 0 {
-                continue;
-            }
-            let s = unsafe { &*(symtab as *const libc::Elf64_Sym).add(sym) };
-            let name = unsafe { CStr::from_ptr((strtab + s.st_name as usize) as *const _) };
-            let Some(&(_, hook)) = hooks.iter().find(|(n, _)| *n == name) else {
-                continue;
-            };
-            let slot = base + r.offset as usize;
-            let cur = unsafe { AtomicUsize::from_ptr(slot as *mut usize).load(Acquire) };
-            let n = SAVED_N.load(Relaxed);
-            if cur == hook || n == MAX_SLOTS {
-                continue;
-            }
-            let in_relro = relro.contains(&slot);
-            SAVED[n][0].store(slot | in_relro as usize, Relaxed);
-            SAVED[n][1].store(cur, Relaxed);
-            if unsafe { store_slot(slot, hook, in_relro) } {
-                SAVED_N.store(n + 1, Relaxed);
-            }
-        }
-    }
-    0
-}
-
-/// Points every GOT slot naming a hooked function at the hook. Returns the number of
-/// slots hooked so far. Called by the host (remote call) after injecting the library.
-#[unsafe(no_mangle)]
-pub extern "C" fn hh_speedhack_hook() -> c_int {
-    init();
-    if INSTALLING.swap(1, Acquire) != 0 {
-        return -1;
-    }
-    unsafe { libc::dl_iterate_phdr(Some(patch_module), null_mut()) };
-    let n = SAVED_N.load(Relaxed);
-    HH_SPEEDHACK.hooks.store(n as u32, Relaxed);
-    INSTALLING.store(0, Release);
-    n as c_int
-}
-
-/// Puts back every slot this library patched (unless someone re-patched it since).
-/// Returns how many threads are still inside a hook; unload only once that reaches 0.
-#[unsafe(no_mangle)]
-pub extern "C" fn hh_speedhack_unhook() -> i64 {
-    if INSTALLING.swap(1, Acquire) != 0 {
-        return -1;
-    }
-    let hooks = hooks();
-    for e in SAVED[..SAVED_N.load(Relaxed)].iter().rev() {
-        let (tagged, orig) = (e[0].load(Relaxed), e[1].load(Relaxed));
-        let slot = tagged & !1;
-        let cur = unsafe { AtomicUsize::from_ptr(slot as *mut usize).load(Acquire) };
-        if hooks.iter().any(|&(_, h)| h == cur) {
-            unsafe { store_slot(slot, orig, tagged & 1 != 0) };
-        }
-    }
-    SAVED_N.store(0, Relaxed);
-    HH_SPEEDHACK.hooks.store(0, Relaxed);
-    INSTALLING.store(0, Release);
-    HH_SPEEDHACK.inflight.load(Acquire)
 }
 
 // ---- initializer ----------------------------------------------------------------------
@@ -532,3 +332,17 @@ extern "C" fn init() {
 #[used]
 #[unsafe(link_section = ".init_array")]
 static INIT: extern "C" fn() = init;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn time_conversions_saturate() {
+        let huge = timeval { tv_sec: time_t::MAX, tv_usec: 999_999 };
+        assert_eq!(usecs(&huge), i64::MAX);
+        assert_eq!(usecs(&timeval { tv_sec: 2, tv_usec: 5 }), 2_000_005);
+        let t = timespec { tv_sec: time_t::MAX, tv_nsec: 0 };
+        assert_eq!(ns(&t), Some(i64::MAX));
+    }
+}

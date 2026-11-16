@@ -5,7 +5,8 @@
 //!
 //! Structures refer to each other by name (`Element.child`), like Cheat Engine's global
 //! structure list, so a set of definitions is a plain `Vec<Structure>`.
-use std::collections::HashSet;
+use std::cell::{Cell, RefCell};
+use std::collections::{HashMap, HashSet};
 
 use hh_core::{Addr, Error, Process, Result};
 use hh_scan::{Fmt, VType, format_value};
@@ -129,56 +130,96 @@ fn lookup<'a>(structs: &'a [Structure], name: &str) -> Result<&'a Structure> {
         .ok_or_else(|| Error::Other(format!("no structure named {name:?}")))
 }
 
-/// Looks up a structure for evaluation, refusing ones that embed themselves (directly or
-/// through other inline structures), which would have no finite size.
-fn find<'a>(structs: &'a [Structure], name: &str) -> Result<&'a Structure> {
-    fn visit<'a>(structs: &'a [Structure], name: &'a str, stack: &mut Vec<&'a str>) -> Result<()> {
-        if stack.contains(&name) {
-            return Err(Error::Other(format!("structure {name:?} embeds itself")));
+const MAX_NEST: usize = 16;
+/// Most fields one `evaluate` / `to_entries` call produces; nested structures repeat their
+/// fields per reference, so a small hostile definition could otherwise expand exponentially.
+pub const MAX_FIELDS: usize = 100_000;
+
+/// One call's view of a definition set: name index, cached sizes and the field budget.
+struct Defs<'a> {
+    by_name: HashMap<&'a str, &'a Structure>,
+    sizes: RefCell<HashMap<(&'a str, usize), usize>>,
+    fields: Cell<usize>,
+}
+
+impl<'a> Defs<'a> {
+    fn new(structs: &'a [Structure]) -> Self {
+        let mut by_name = HashMap::new();
+        for s in structs {
+            // First definition wins, as with a linear search.
+            by_name.entry(s.name.as_str()).or_insert(s);
         }
-        let Ok(s) = lookup(structs, name) else { return Ok(()) };
-        stack.push(name);
-        for e in s.elements.iter().filter(|e| e.vtype == ElemType::Struct) {
-            if let Some(c) = &e.child {
-                visit(structs, c, stack)?;
-            }
+        Defs { by_name, sizes: RefCell::default(), fields: Cell::new(0) }
+    }
+    fn get(&self, name: &str) -> Option<&'a Structure> {
+        self.by_name.get(name).copied()
+    }
+    /// Counts one produced field against [`MAX_FIELDS`].
+    fn field(&self) -> Result<()> {
+        self.fields.set(self.fields.get() + 1);
+        if self.fields.get() > MAX_FIELDS {
+            return Err(Error::Other(format!("structure expands to more than {MAX_FIELDS} fields")));
         }
-        stack.pop();
         Ok(())
     }
-    let s = lookup(structs, name)?;
-    visit(structs, name, &mut Vec::new())?;
-    Ok(s)
-}
 
-const MAX_NEST: usize = 16;
-
-/// Byte size of an element; nested structures use the child's size.
-fn elem_size(structs: &[Structure], e: &Element, ptr: usize, depth: usize) -> usize {
-    if e.vtype == ElemType::Struct && e.size == 0 {
-        return e
-            .child
-            .as_deref()
-            .and_then(|c| lookup(structs, c).ok())
-            .map_or(0, |s| struct_size_at(structs, s, ptr, depth + 1));
+    /// Looks up a structure for evaluation, refusing ones that embed themselves (directly or
+    /// through other inline structures), which would have no finite size. Only the
+    /// `MAX_NEST` levels that evaluation reaches are checked; each name is explored once.
+    fn find(&self, name: &str) -> Result<&'a Structure> {
+        fn visit<'a>(d: &Defs<'a>, name: &'a str, stack: &mut Vec<&'a str>, done: &mut HashSet<&'a str>) -> Result<()> {
+            if stack.contains(&name) {
+                return Err(Error::Other(format!("structure {name:?} embeds itself")));
+            }
+            if stack.len() > MAX_NEST || done.contains(name) {
+                return Ok(());
+            }
+            let Some(s) = d.get(name) else { return Ok(()) };
+            stack.push(&s.name);
+            for e in s.elements.iter().filter(|e| e.vtype == ElemType::Struct) {
+                if let Some(c) = &e.child {
+                    visit(d, c, stack, done)?;
+                }
+            }
+            stack.pop();
+            done.insert(&s.name);
+            Ok(())
+        }
+        let s = self.get(name).ok_or_else(|| Error::Other(format!("no structure named {name:?}")))?;
+        visit(self, &s.name, &mut Vec::new(), &mut HashSet::new())?;
+        Ok(s)
     }
-    e.fixed_size(ptr)
-}
 
-fn struct_size_at(structs: &[Structure], s: &Structure, ptr: usize, depth: usize) -> usize {
-    if depth > MAX_NEST {
-        return 0;
+    /// Byte size of an element; nested structures use the child's size.
+    fn elem_size(&self, e: &Element, ptr: usize, depth: usize) -> usize {
+        if e.vtype == ElemType::Struct && e.size == 0 {
+            return e.child.as_deref().and_then(|c| self.get(c)).map_or(0, |s| self.struct_size_at(s, ptr, depth + 1));
+        }
+        e.fixed_size(ptr)
     }
-    s.elements
-        .iter()
-        .map(|e| (e.offset as usize).saturating_add(elem_size(structs, e, ptr, depth)))
-        .max()
-        .unwrap_or(0)
+
+    fn struct_size_at(&self, s: &'a Structure, ptr: usize, depth: usize) -> usize {
+        if depth > MAX_NEST {
+            return 0;
+        }
+        if let Some(&n) = self.sizes.borrow().get(&(s.name.as_str(), depth)) {
+            return n;
+        }
+        let n = s
+            .elements
+            .iter()
+            .map(|e| (e.offset as usize).saturating_add(self.elem_size(e, ptr, depth)))
+            .max()
+            .unwrap_or(0);
+        self.sizes.borrow_mut().insert((s.name.as_str(), depth), n);
+        n
+    }
 }
 
 /// Size of a structure: the end of its last element.
 pub fn struct_size(structs: &[Structure], name: &str, ptr_size: usize) -> Result<usize> {
-    Ok(struct_size_at(structs, find(structs, name)?, ptr_size, 0))
+    let d = Defs::new(structs);
+    Ok(d.struct_size_at(d.find(name)?, ptr_size, 0))
 }
 
 // ------------------------------------------------------------------------------ evaluate
@@ -213,17 +254,18 @@ pub fn evaluate(
     name: &str,
     base: Addr,
 ) -> Result<Vec<FieldValue>> {
-    let s = find(structs, name)?;
+    let d = Defs::new(structs);
+    let s = d.find(name)?;
     let ptr = p.pointer_size();
-    let len = check_len(struct_size_at(structs, s, ptr, 0) as u64)?;
+    let len = check_len(d.struct_size_at(s, ptr, 0) as u64)?;
     let buf = read_some(p, base, len);
     let readable = Readable::of(p)?;
-    Ok(eval_in(structs, s, base, 0, &buf, ptr, &readable, 0))
+    eval_in(&d, s, base, 0, &buf, ptr, &readable, 0)
 }
 
 #[allow(clippy::too_many_arguments)]
 fn eval_in(
-    structs: &[Structure],
+    d: &Defs,
     s: &Structure,
     base: Addr,
     rel: u64,
@@ -231,12 +273,13 @@ fn eval_in(
     ptr: usize,
     readable: &Readable,
     depth: usize,
-) -> Vec<FieldValue> {
+) -> Result<Vec<FieldValue>> {
     s.elements
         .iter()
         .enumerate()
         .map(|(index, e)| {
-            let size = elem_size(structs, e, ptr, depth);
+            d.field()?;
+            let size = d.elem_size(e, ptr, depth);
             let off = rel.wrapping_add(e.offset);
             let raw = buf.get(off as usize..(off as usize).saturating_add(size));
             let mut fv = FieldValue {
@@ -254,8 +297,8 @@ fn eval_in(
             };
             match (e.vtype, raw) {
                 (ElemType::Struct, _) if depth < MAX_NEST => {
-                    if let Some(c) = e.child.as_deref().and_then(|c| lookup(structs, c).ok()) {
-                        fv.children = eval_in(structs, c, base, off, buf, ptr, readable, depth + 1);
+                    if let Some(c) = e.child.as_deref().and_then(|c| d.get(c)) {
+                        fv.children = eval_in(d, c, base, off, buf, ptr, readable, depth + 1)?;
                     }
                 }
                 (ElemType::Pointer, Some(r)) => {
@@ -266,7 +309,7 @@ fn eval_in(
                 (t, Some(r)) => fv.value = t.vtype().map(|vt| format_value(vt, r, &e.fmt())),
                 _ => {}
             }
-            fv
+            Ok(fv)
         })
         .collect()
 }
@@ -779,6 +822,7 @@ fn ct_vartype(e: &Element) -> &'static str {
 /// Cheat Engine `<Structures>` section. Inline nested structures, which Cheat Engine does not
 /// have, are written as byte arrays of the same size tagged `HHNested="1"`.
 pub fn to_ct_xml(structs: &[Structure], ptr_size: usize) -> String {
+    let d = Defs::new(structs);
     let mut x = String::from("<Structures StructVersion=\"2\">\n");
     for s in structs {
         x += &format!(
@@ -786,7 +830,7 @@ pub fn to_ct_xml(structs: &[Structure], ptr_size: usize) -> String {
             esc(&s.name)
         );
         for e in &s.elements {
-            let size = elem_size(structs, e, ptr_size, 0);
+            let size = d.elem_size(e, ptr_size, 0);
             let disp = if e.hex {
                 "Hexadecimal"
             } else if e.signed {
@@ -820,6 +864,17 @@ pub fn to_ct_xml(structs: &[Structure], ptr_size: usize) -> String {
 pub fn from_ct_xml(xml: &str) -> Result<Vec<Structure>> {
     let doc = roxmltree::Document::parse(xml.trim_start_matches('\u{feff}'))
         .map_err(|e| Error::Parse(format!("bad .CT XML: {e}")))?;
+    // Each <Element> belongs to its nearest <Structure> ancestor, found in one pre-order pass
+    // (scanning every structure's descendants is quadratic on hostile nesting).
+    let mut owner: Vec<Option<roxmltree::NodeId>> = vec![None; doc.descendants().map(|n| n.id().get_usize() + 1).max().unwrap_or(0)];
+    let mut elems: HashMap<roxmltree::NodeId, Vec<roxmltree::Node>> = HashMap::new();
+    for n in doc.descendants() {
+        let up = n.parent().and_then(|p| if p.has_tag_name("Structure") { Some(p.id()) } else { owner[p.id().get_usize()] });
+        owner[n.id().get_usize()] = up;
+        if n.has_tag_name("Element") && let Some(s) = up {
+            elems.entry(s).or_default().push(n);
+        }
+    }
     let mut out = Vec::new();
     for s in doc.descendants().filter(|n| n.has_tag_name("Structure")) {
         // Old tables (StructVersion 1) keep the name in a child node.
@@ -834,7 +889,7 @@ pub fn from_ct_xml(xml: &str) -> Result<Vec<Structure>> {
             })
             .unwrap_or_default();
         let mut elements = Vec::new();
-        for e in s.descendants().filter(|n| n.has_tag_name("Element")) {
+        for &e in elems.get(&s.id()).map_or(&[][..], Vec::as_slice) {
             let offset = match (e.attribute("Offset"), e.attribute("OffsetHex")) {
                 (Some(o), _) => o.trim().parse::<i64>().ok().map(|v| v as u64),
                 (None, Some(h)) => u64::from_str_radix(h.trim(), 16).ok(),
@@ -912,9 +967,10 @@ pub fn to_entries(
     only: Option<&[usize]>,
     first_id: i64,
 ) -> Result<Vec<TableEntry>> {
-    let s = find(structs, name)?;
+    let d = Defs::new(structs);
+    let s = d.find(name)?;
     let mut leaves = Vec::new();
-    collect_leaves(structs, s, 0, &mut leaves, 0);
+    collect_leaves(&d, s, 0, &mut leaves, 0)?;
     let mut out = Vec::new();
     for (top, off, e) in leaves {
         if only.is_some_and(|o| !o.contains(&top)) {
@@ -959,21 +1015,22 @@ pub fn to_entries(
 }
 
 fn collect_leaves<'a>(
-    structs: &'a [Structure],
+    d: &Defs<'a>,
     s: &'a Structure,
     rel: u64,
     out: &mut Vec<(usize, u64, &'a Element)>,
     depth: usize,
-) {
+) -> Result<()> {
     for (i, e) in s.elements.iter().enumerate() {
+        d.field()?;
         let off = rel.wrapping_add(e.offset);
         let nested = (e.vtype == ElemType::Struct && depth < MAX_NEST)
-            .then(|| e.child.as_deref().and_then(|c| lookup(structs, c).ok()))
+            .then(|| e.child.as_deref().and_then(|c| d.get(c)))
             .flatten();
         match nested {
             Some(c) => {
                 let start = out.len();
-                collect_leaves(structs, c, off, out, depth + 1);
+                collect_leaves(d, c, off, out, depth + 1)?;
                 // Leaves of a nested struct belong to the top-level element that embeds it.
                 if depth == 0 {
                     for l in &mut out[start..] {
@@ -984,4 +1041,5 @@ fn collect_leaves<'a>(
             None => out.push((i, off, e)),
         }
     }
+    Ok(())
 }

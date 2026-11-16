@@ -79,8 +79,12 @@ export function initLua({ openTableScript }) {
   }
 
   // ---------- dialogs from scripts ----------
+  // The open script dialog; closed when the backend stops waiting for it (Lua interrupted).
+  let dialogEl = null, dialogGone = false;
   async function showDialog(d) {
     shownDialog = d.id;
+    dialogGone = false;
+    queueMicrotask(() => { dialogEl = document.querySelector('body > dialog.dlg[open]:last-of-type'); });
     let value = null;
     if (d.kind === 'message') {
       await modal({ title: 'Message', text: d.text, buttons: [{ label: 'OK', value: 'ok', primary: true, kbd: 'Enter' }] });
@@ -93,7 +97,8 @@ export function initLua({ openTableScript }) {
         buttons: [{ label: 'OK', value: 'ok', primary: true, kbd: 'Enter' }, { label: 'Cancel', value: 'cancel', kbd: 'Esc' }] });
       value = r.value === 'ok' ? r.input : null;
     }
-    await api.luaDialogReply(d.id, value).catch(toast);
+    dialogEl = null;
+    if (!dialogGone) await api.luaDialogReply(d.id, value).catch(toast);
   }
 
   // ---------- beeps (hotkey sound setting, Lua beep()) ----------
@@ -118,7 +123,9 @@ export function initLua({ openTableScript }) {
       since = p.next;
       append(p.log);
       if (p.dialog && p.dialog.id !== shownDialog) showDialog(p.dialog);
+      else if (!p.dialog && dialogEl) { dialogGone = true; dialogEl.close('cancel'); }
       emit('table:version', p.table_version);
+      emit('backend:process', p.process);
       bound = new Set(p.hotkeys.map((k) => k.join(',')));
       if (busy !== p.busy) { busy = p.busy; sync(); }
       if (sound != null && p.sound > sound) beep();

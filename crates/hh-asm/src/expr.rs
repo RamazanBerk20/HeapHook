@@ -140,10 +140,15 @@ pub struct Ctx<'a> {
     pub mem: Option<&'a dyn Memory>,
 }
 
+/// Deepest nesting of parentheses, brackets and unary signs an expression may use; real
+/// pointer paths stay far below it, and it keeps the recursive parser off the stack limit.
+pub const MAX_EXPR_DEPTH: usize = 256;
+
 struct Parser<'a, 'c> {
     toks: Vec<Tok>,
     pos: usize,
     ctx: &'c Ctx<'a>,
+    depth: usize,
 }
 
 impl Parser<'_, '_> {
@@ -185,7 +190,19 @@ impl Parser<'_, '_> {
             }
         }
     }
+    /// Every recursive path (unary signs, `(...)`, `[...]`) goes through here.
     fn factor(&mut self) -> Result<u64> {
+        if self.depth >= MAX_EXPR_DEPTH {
+            return Err(Error::Parse(format!(
+                "expression nested deeper than {MAX_EXPR_DEPTH} levels"
+            )));
+        }
+        self.depth += 1;
+        let v = self.factor_inner();
+        self.depth -= 1;
+        v
+    }
+    fn factor_inner(&mut self) -> Result<u64> {
         if self.eat('-') {
             return Ok(self.factor()?.wrapping_neg());
         }
@@ -235,6 +252,7 @@ pub fn eval(expr: &str, ctx: &Ctx) -> Result<u64> {
         toks: tokenize(expr, ctx.lookup)?,
         pos: 0,
         ctx,
+        depth: 0,
     };
     if p.toks.is_empty() {
         return Err(Error::Parse("empty expression".into()));

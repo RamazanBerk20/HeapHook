@@ -223,6 +223,16 @@ pub struct LuaPoll {
     /// A console run or table script is executing (the interrupt button applies).
     pub busy: bool,
     pub sound: u64,
+    /// The opened process (`null` when none), so the UI notices an exit and can recover
+    /// its state after a reload.
+    pub process: Option<ProcessState>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ProcessState {
+    #[serde(flatten)]
+    pub info: crate::commands::Opened,
+    pub alive: bool,
 }
 
 /// Who a hotkey belongs to.
@@ -288,6 +298,8 @@ impl App {
         if src.trim().is_empty() {
             return Ok(());
         }
+        // Agreeing to the table's Lua script covers the `{$lua}` in its entries too.
+        *lock(&self.x.trust) = crate::cheat::Trust::Trusted;
         self.x.lua.console.push("info", "-- running the table's Lua script");
         self.lua_run(&src, "table script", false)
     }
@@ -313,6 +325,7 @@ impl App {
             hotkeys,
             busy: self.x.lua.busy.load(SeqCst),
             sound: c.sound.load(SeqCst),
+            process: self.session().ok().map(|s| ProcessState { info: s.info.clone(), alive: s.raw.is_alive() }),
         })
     }
 
@@ -423,6 +436,8 @@ impl App {
                     if app.x.live.take_dirty() || last_sync.elapsed() >= FREEZE_RESYNC {
                         app.sync_freeze();
                         last_sync = Instant::now();
+                        // Reap launched processes that exited, so none lingers as a zombie.
+                        lock(&app.x.children).retain_mut(|c| !matches!(c.try_wait(), Ok(Some(_))));
                     }
                     app.sync_global_hotkeys();
                 }

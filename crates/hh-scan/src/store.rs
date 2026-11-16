@@ -14,6 +14,7 @@
 //! its memory limit, so result counts are bounded by disk, not RAM.
 use std::borrow::Cow;
 use std::fs::File;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
@@ -43,16 +44,22 @@ pub(crate) struct Spill {
     next: AtomicU64,
     used: AtomicU64,
     limit: u64,
+    /// Explicit spill directory (`Scanner::set_spill_dir`); `None` = [`spill_dir`]'s choice.
+    dir: Option<PathBuf>,
 }
 
 impl Spill {
     pub fn new(limit: u64) -> Self {
-        Spill { file: OnceLock::new(), next: AtomicU64::new(0), used: AtomicU64::new(0), limit }
+        Spill { file: OnceLock::new(), next: AtomicU64::new(0), used: AtomicU64::new(0), limit, dir: None }
+    }
+    pub fn in_dir(self, dir: Option<PathBuf>) -> Self {
+        Spill { dir, ..self }
     }
 
     fn file(&self) -> Result<&Arc<File>> {
         if self.file.get().is_none() {
-            let _ = self.file.set(Arc::new(tempfile::tempfile()?));
+            // Anonymous (unlinked) file: nothing is left behind, even after a crash.
+            let _ = self.file.set(Arc::new(tempfile::tempfile_in(spill_dir(self.dir.as_deref()))?));
         }
         self.file.get().ok_or_else(|| Error::Other("spill file".into()))
     }
@@ -73,6 +80,50 @@ impl Spill {
     pub fn on_disk(&self) -> u64 {
         self.next.load(Ordering::Relaxed)
     }
+}
+
+/// Where spill files go: `explicit`, else `$HEAPHOOK_TMPDIR`, else the system temp dir unless
+/// it is RAM-backed (tmpfs, the default /tmp on most Linux desktops, where "spilling" would
+/// consume the very memory it should save): then `/var/tmp` or `~/.cache/heaphook`.
+pub(crate) fn spill_dir(explicit: Option<&Path>) -> PathBuf {
+    if let Some(d) = explicit {
+        return d.to_path_buf();
+    }
+    if let Some(d) = std::env::var_os("HEAPHOOK_TMPDIR").filter(|d| !d.is_empty()) {
+        return d.into();
+    }
+    let tmp = std::env::temp_dir();
+    let Ok(mounts) = std::fs::read_to_string("/proc/self/mountinfo") else { return tmp };
+    if !on_tmpfs(&mounts, &tmp) {
+        return tmp;
+    }
+    let cache = std::env::var_os("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| Path::new(&h).join(".cache")))
+        .map(|c| c.join("heaphook"));
+    for d in [Some(PathBuf::from("/var/tmp")), cache].into_iter().flatten() {
+        if std::fs::create_dir_all(&d).is_ok() && !on_tmpfs(&mounts, &d) && tempfile::tempfile_in(&d).is_ok() {
+            return d;
+        }
+    }
+    tmp
+}
+
+/// True if `path` lies on a tmpfs/ramfs mount according to `/proc/self/mountinfo` text.
+fn on_tmpfs(mountinfo: &str, path: &Path) -> bool {
+    let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    // Longest mount point containing the path wins. Fields: id parent dev root mountpoint
+    // options... - fstype source superoptions (mount points escape spaces as \040).
+    mountinfo
+        .lines()
+        .filter_map(|l| {
+            let (pre, post) = l.split_once(" - ")?;
+            let mp = pre.split(' ').nth(4)?.replace("\\040", " ");
+            Some((mp, post.split(' ').next()?.to_string()))
+        })
+        .filter(|(mp, _)| path.starts_with(mp))
+        .max_by_key(|(mp, _)| mp.len())
+        .is_some_and(|(_, fs)| fs == "tmpfs" || fs == "ramfs")
 }
 
 #[cfg(unix)]
@@ -410,5 +461,31 @@ mod tests {
         let b = sp.put(vec![1, 2, 3]).unwrap();
         assert!(matches!(b, Blob::Disk { .. }) && sp.on_disk() == 3);
         assert_eq!(&*b.clone().load().unwrap(), &[1, 2, 3]);
+    }
+
+    #[test]
+    fn spill_files_are_anonymous_and_avoid_tmpfs() {
+        let dir = tempfile::tempdir_in(".").unwrap();
+        let sp = Spill::new(0).in_dir(Some(dir.path().to_path_buf()));
+        let b = sp.put(vec![7; 4096]).unwrap();
+        assert_eq!(&*b.load().unwrap(), &[7; 4096][..]);
+        // The file is open but unlinked: nothing to clean up after a crash.
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+        assert_eq!(spill_dir(Some(dir.path())), dir.path());
+
+        let mi = "22 1 0:21 / / rw - ext4 /dev/sda1 rw\n\
+                  30 22 0:25 / /tmp rw,nosuid - tmpfs tmpfs rw\n\
+                  31 22 0:26 / /tmp/my\\040disk rw - ext4 /dev/sdb1 rw\n";
+        assert!(on_tmpfs(mi, Path::new("/tmp/x")));
+        assert!(!on_tmpfs(mi, Path::new("/var/tmp")));
+        assert!(!on_tmpfs(mi, Path::new("/tmp/my disk/y")));
+        assert!(!on_tmpfs(mi, Path::new("/tmpfoo")));
+        // Whatever this machine has, the default choice is not RAM-backed when avoidable.
+        if let Ok(m) = std::fs::read_to_string("/proc/self/mountinfo")
+            && std::env::var_os("HEAPHOOK_TMPDIR").is_none()
+            && !on_tmpfs(&m, Path::new("/var/tmp"))
+        {
+            assert!(!on_tmpfs(&m, &spill_dir(None)));
+        }
     }
 }

@@ -124,6 +124,8 @@ pub struct Shared {
     pub(crate) driver: AtomicBool,
     /// Processes started by `process_create`, reaped when they exit.
     pub(crate) children: Mutex<Vec<std::process::Child>>,
+    /// Whether `{$lua}` in the table's scripts may run (a loaded table must be agreed to).
+    pub(crate) trust: Mutex<crate::cheat::Trust>,
 }
 
 impl Default for Shared {
@@ -137,6 +139,7 @@ impl Default for Shared {
             hk: Mutex::default(),
             driver: AtomicBool::new(false),
             children: Mutex::default(),
+            trust: Mutex::default(),
         }
     }
 }
@@ -260,7 +263,7 @@ impl App {
             info: info.clone(),
             syms,
             dbg: Mutex::default(),
-            ptr: crate::ptr::Ptr::new(pid),
+            ptr: crate::ptr::Ptr::new(),
             tools: crate::tools::Tools::default(),
         };
         if let Some(old) = lock(&self.sess).replace(Arc::new(sess)) {
@@ -279,6 +282,11 @@ impl App {
     pub fn close_process(&self) -> R<()> {
         if self.session().is_err() {
             return Ok(());
+        }
+        // Undo the scripts' patches while the process is still there; a failure is logged and
+        // the process closed anyway (it must stay closable).
+        for (_, e) in self.disable_active_scripts() {
+            self.x.lua.console.push("err", &format!("{e}\nstill patched: the script could not be disabled"));
         }
         let _ = self.debug_detach();
         let Some(sess) = lock(&self.sess).take() else { return Ok(()) };
@@ -359,8 +367,12 @@ impl App {
         match hh_asm::resolve_address(&*sess.proc, &syms, expr) {
             Ok(a) => Ok(hex_addr(a)),
             // hh-asm does not know THREADSTACK<n> bases; pointer-scan paths do.
+            // Only THREADSTACK paths report the pointer-path error; anything else keeps
+            // hh-asm's message (the fallback's would be `unknown base Some("name")`).
             Err(e) => match expr.parse::<hh_ptr::PointerPath>() {
-                Ok(p) => hh_ptr::resolve(&*sess.proc, &p).map(hex_addr).map_err(s),
+                Ok(p) => hh_ptr::resolve(&*sess.proc, &p).map(hex_addr).map_err(|pe| {
+                    if expr.to_ascii_uppercase().contains("THREADSTACK") { s(pe) } else { s(&e) }
+                }),
                 Err(_) => Err(s(e)),
             },
         }
@@ -428,12 +440,12 @@ impl App {
         Ok(hex_bytes(&b, "").to_lowercase())
     }
 
-    /// `{$lua}` blocks run in the app's engine with `syntaxcheck` = true.
+    /// Never runs code: the editor checks on every keystroke and the script may come from an
+    /// untrusted table, so `{$lua}` blocks count as producing no text here.
     pub fn aa_check(&self, script: &str) -> R<Option<AaError>> {
         let sess = self.session()?;
         let syms = lock(&sess.syms).clone();
-        let _g = self.x.lua.enter();
-        Ok(hh_asm::aa_check(&*sess.proc, &syms, script, &mut self.x.lua.engine.aa_hooks(None, true)))
+        Ok(hh_asm::aa_check(&*sess.proc, &syms, script, &mut self.x.lua.engine.aa_hooks_check_only()))
     }
 
     /// Symbols the script registers stay registered for later expressions. `{$lua}` blocks

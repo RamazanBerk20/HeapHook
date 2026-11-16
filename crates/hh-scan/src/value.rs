@@ -57,19 +57,26 @@ pub struct ValueRef {
 }
 
 const DEFAULT_STR_LEN: usize = 16;
+/// Largest string / byte-array / binary value read in one piece; lengths come from cheat
+/// tables, so a hostile one must not size a multi-GB buffer.
+pub const MAX_VALUE_LEN: usize = 1 << 20;
 
-/// Bytes a value of this type occupies.
+/// Bytes a value of this type occupies (at most [`MAX_VALUE_LEN`]).
 pub fn value_size(vtype: VType, fmt: &Fmt) -> Result<usize> {
-    Ok(match vtype {
+    let n = match vtype {
         VType::Byte => 1,
         VType::Bytes2 => 2,
         VType::Bytes4 | VType::Float => 4,
         VType::Bytes8 | VType::Double => 8,
-        VType::String => fmt.len.unwrap_or(DEFAULT_STR_LEN) * if fmt.utf16 { 2 } else { 1 },
+        VType::String => fmt.len.unwrap_or(DEFAULT_STR_LEN).saturating_mul(if fmt.utf16 { 2 } else { 1 }),
         VType::Aob => fmt.len.unwrap_or(DEFAULT_STR_LEN),
         VType::Binary => fmt.len.unwrap_or(1),
         VType::All | VType::Grouped => return Err(Error::Unsupported("no fixed size for all/grouped")),
-    })
+    };
+    if n > MAX_VALUE_LEN {
+        return Err(Error::Parse(format!("value length {n} exceeds the {MAX_VALUE_LEN}-byte limit")));
+    }
+    Ok(n)
 }
 
 /// Formats raw little-endian bytes as the UI shows them.

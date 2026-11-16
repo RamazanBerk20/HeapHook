@@ -32,7 +32,9 @@ Rules for every agent:
 
 ## IPC (frontend <-> backend)
 
-Tauri commands, snake_case, all async, errors are strings. **Addresses are hex strings**
+Tauri commands, snake_case, all async, errors are strings. Top-level argument names are the
+Rust parameter names camelCased by Tauri (`pass_signal` -> `passSignal`); fields inside a struct
+argument keep their serde names. **Addresses are hex strings**
 (`"0x7ffd12340000"`) because JS numbers lose precision above 2^53. Values travel as strings
 formatted/parsed by the backend.
 
@@ -88,7 +90,11 @@ decreased decreased_by changed unchanged same_as_first`, plus `not: bool` to inv
 | `ptr_save_map` / `ptr_save_results` / `ptr_open_results` | `path` | – / – / `{count, max_level, target}` |
 | `table_get` | – | `{version, table}`; the backend owns the live table (Lua and hotkeys change it too) |
 | `table_put` | `table, base` (version the edit is based on) | new version; rejects `stale table version …` (refetch, replay the edit); never changes activation |
-| `table_open` / `table_export` | `path` (`.json` or `.CT`) | `{version, table}` (all inactive; the Lua script is NOT run) / – |
+| `table_open` / `table_export` | `path` (`.json` or `.CT`), `force?` | `{version, table}` (all inactive; the Lua script is NOT run; the current table's active scripts are disabled first, and if one cannot be the open is refused with `… could not be disabled …` unless `force`, which carries those entries over, still active, into a group) / – |
+| `table_trust` | `trust` | – (answer to a `needs consent: …` error from `table_set_active`: a table opened from a file runs no `{$lua}` until the user agrees, here or by running its table script; Settings `table_script: never` refuses instead of asking) |
+| `aa_check` (no execution) | | never runs `{$lua}` blocks (they count as empty text while checking) |
+| table limits | | groups nest at most 64 deep, at most 200000 entries, table files at most 64 MiB; `table_open`/`table_put` refuse more |
+| `close_process` (scripts) | | while the process lives, active scripts are disabled first (failures go to the Lua log, the close goes on); the app does the same on exit |
 | `table_set_active` | `ids, active` | – (CE activation: OnActivate/OnDeactivate, Auto Assembler with `{$lua}`, freeze, group options) |
 | `table_set_value` | `ids, value` | – (frozen entries freeze to the new value; groups with `moRecursiveSetValue` set children) |
 | `table_hotkey` | `id, index` | – (runs that entry hotkey's CE action) |
@@ -96,7 +102,7 @@ decreased decreased_by changed unchanged same_as_first`, plus `not: bool` to inv
 | `hotkey_press` | `keys: [vk]` (CE virtual-key codes, any order) | number of hotkeys fired (table and `createHotkey`) |
 | `lua_exec` | `code` | – (echo, prints, results and errors with traceback go to the log) |
 | `lua_interrupt` | – | – (also answers an open script dialog with cancel) |
-| `lua_poll` | `since` | `{log: [{seq, kind: in/out/result/err/info, text}], next, dialog: {id, kind: message/dialog/input, title, text, dlg_type, buttons, initial} or null, table_version, hotkeys: [[vk]], busy, sound}` |
+| `lua_poll` | `since` | `{log: [{seq, kind: in/out/result/err/info, text}], next, dialog: {id, kind: message/dialog/input, title, text, dlg_type, buttons, initial} or null, table_version, hotkeys: [[vk]], busy, sound, process: {pid, name, is_64bit, alive} or null}` (`process`: the opened process; the UI closes it when `alive` turns false and picks it up after a reload) |
 | `lua_dialog_reply` | `id, value` (`mb*` button for `dialog`, string for `input`, null = cancel) | – |
 | `settings_get` / `settings_set` | – / `settings` | `{freeze_interval_ms, live_update_ms, fast_scan, scan_alignment, scan_writable, scan_executable, scan_copy_on_write, lua_budget_ms, table_script: ask/never, bp_method, hotkey_sound, theme: system/light/dark, scan_threads, signals}` (stored in the platform config dir) |
 | `close_process` | – | – (detaches the debugger, stops scans/freezer, scripts marked off; patches stay) |
@@ -143,3 +149,13 @@ description_only, display_value_as_item}, hotkeys: [{action` (CE name, e.g. `Tog
 makes it a script entry)`, options: [CE group option names], ct_extra: [raw .CT XML], children: []}`.
 Table: `{entries, lua_script, comments, codes: [{description, address, bytes, before, after}],
 ct_extra: [raw .CT XML of unknown <CheatTable> children]}`.
+
+## Development bridge (not shipped)
+
+`cargo run -p heaphook --features dev-bridge -- --dev-bridge <port>` runs the backend without a
+window and serves `app/ui` plus every command on `http://127.0.0.1:<port>`, guarded by a random
+token printed at startup (open the printed URL; it carries `?hh_token=`). `POST /invoke/<cmd>`
+with header `x-hh-token` and the Tauri-style args object as the body answers `{"ok": value}` or
+`{"err": "text"}`. `main.rs` builds the Tauri commands and the bridge dispatch from one table, so
+names and argument decoding are the same. No native dialogs (`pick_path` errors; the UI asks for
+a path in a prompt like the mock) and no global hotkeys (in-app hotkeys still work).

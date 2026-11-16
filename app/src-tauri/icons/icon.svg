@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512">
+  <rect width="512" height="512" rx="113" fill="#F7F6F3"/>
+  <!-- memory cell -->
+  <rect x="132" y="132" width="248" height="248" fill="none" stroke="#111111" stroke-width="32" stroke-linejoin="miter"/>
+  <!-- hook: down through the cell, curving up on the left, ending past the cell edge -->
+  <path d="M300 84 V250 A56 56 0 0 1 188 250 V204" fill="none" stroke="#111111" stroke-width="32" stroke-linecap="butt" stroke-linejoin="miter"/>
+</svg>

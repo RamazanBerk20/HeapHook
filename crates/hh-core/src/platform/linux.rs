@@ -38,18 +38,56 @@ pub fn list_processes() -> Result<Vec<ProcessInfo>> {
     Ok(out)
 }
 
+/// State letter from a `stat` file.
+fn stat_state(path: &str) -> Option<char> {
+    let stat = fs::read_to_string(path).ok()?;
+    // comm may contain spaces and parens; the state follows the last ')'.
+    stat[stat.rfind(')')? + 1..].trim_start().chars().next()
+}
+
+/// Threads that have not exited, with their state letter; the main thread first.
+fn live_tasks(pid: Pid) -> Vec<(i32, char)> {
+    let Ok(dir) = fs::read_dir(format!("/proc/{pid}/task")) else {
+        return Vec::new();
+    };
+    let mut v: Vec<(i32, char)> = dir
+        .flatten()
+        .filter_map(|e| {
+            let tid: i32 = e.file_name().to_str()?.parse().ok()?;
+            let s = stat_state(&format!("/proc/{pid}/task/{tid}/stat"))?;
+            (!matches!(s, 'Z' | 'X')).then_some((tid, s))
+        })
+        .collect();
+    v.sort_by_key(|&(tid, _)| (tid != pid as i32, tid));
+    v
+}
+
+/// `/proc/<pid>`, or a live thread's directory once the main thread has exited
+/// (`pthread_exit` in main): the leader's maps, mem and exe then read as empty.
+fn proc_dir(pid: Pid) -> String {
+    let base = format!("/proc/{pid}");
+    if stat_state(&format!("{base}/stat")) != Some('Z') {
+        return base;
+    }
+    match live_tasks(pid).first() {
+        Some((tid, _)) => format!("{base}/task/{tid}"),
+        None => base,
+    }
+}
+
 pub fn open(pid: Pid) -> Result<Arc<dyn Process>> {
+    let dir = proc_dir(pid);
     // Opening mem needs the same ptrace access as everything else, so it doubles as the
-    // permission check.
+    // permission check. The fd keeps the address space, even if this thread exits later.
     let mem = OpenOptions::new()
         .read(true)
         .write(true)
-        .open(format!("/proc/{pid}/mem"))
+        .open(format!("{dir}/mem"))
         .map_err(|e| os_err(e, pid))?;
     // ELF class byte: 1 = 32-bit, 2 = 64-bit.
     let mut ident = [0u8; 5];
     let ptr_size =
-        match File::open(format!("/proc/{pid}/exe")).and_then(|f| f.read_exact_at(&mut ident, 0)) {
+        match File::open(format!("{dir}/exe")).and_then(|f| f.read_exact_at(&mut ident, 0)) {
             Ok(()) if ident[..4] == *b"\x7fELF" && ident[4] == 1 => 4,
             _ => 8,
         };
@@ -100,9 +138,7 @@ impl LinuxProcess {
     }
 
     fn state(&self) -> Option<char> {
-        let stat = fs::read_to_string(format!("/proc/{}/stat", self.pid)).ok()?;
-        // comm may contain spaces and parens; the state follows the last ')'.
-        stat[stat.rfind(')')? + 1..].trim_start().chars().next()
+        stat_state(&format!("/proc/{}/stat", self.pid))
     }
 
     fn signal(&self, sig: i32) -> Result<()> {
@@ -132,7 +168,8 @@ impl Memory for LinuxProcess {
             return Ok(n as usize);
         }
         let e = io::Error::last_os_error();
-        if e.raw_os_error() == Some(libc::ESRCH) {
+        // ESRCH also when only the main thread has exited; /proc/pid/mem still works then.
+        if e.raw_os_error() == Some(libc::ESRCH) && !self.is_alive() {
             return Err(Error::ProcessGone);
         }
         // /proc/pid/mem reads with FOLL_FORCE, so it also gets pages that are mapped without
@@ -160,7 +197,9 @@ impl Memory for LinuxProcess {
         let mut done = n.max(0) as usize;
         // The rest goes through /proc/pid/mem, which writes read-only pages (code) via COW.
         while done < data.len() {
-            let at = addr + done as u64;
+            let at = addr
+                .checked_add(done as u64)
+                .ok_or(Error::NoAccess { addr: u64::MAX })?;
             match self.mem.write_at(&data[done..], at) {
                 Ok(0) => return Err(self.gone_or(Error::NoAccess { addr: at })),
                 Ok(n) => done += n,
@@ -181,11 +220,16 @@ impl Process for LinuxProcess {
     }
 
     fn is_alive(&self) -> bool {
-        !matches!(self.state(), None | Some('Z' | 'X'))
+        match self.state() {
+            None | Some('X') => false,
+            // A zombie main thread with other threads still running is a live process.
+            Some('Z') => !live_tasks(self.pid).is_empty(),
+            _ => true,
+        }
     }
 
     fn regions(&self) -> Result<Vec<Region>> {
-        let maps = fs::read_to_string(format!("/proc/{}/maps", self.pid))
+        let maps = fs::read_to_string(format!("{}/maps", proc_dir(self.pid)))
             .map_err(|e| os_err(e, self.pid))?;
         Ok(parse_maps(&maps))
     }
@@ -233,14 +277,17 @@ impl Process for LinuxProcess {
         // SIGSTOP is asynchronous; wait until the kernel reports the stop.
         let deadline = Instant::now() + Duration::from_secs(1);
         loop {
-            match self.state() {
-                Some('T' | 't') => return Ok(()),
-                None | Some('Z' | 'X') => return Err(Error::ProcessGone),
-                _ if Instant::now() > deadline => {
-                    return Err(Error::Other("process did not stop".into()));
-                }
-                _ => std::thread::sleep(Duration::from_millis(1)),
+            let tasks = live_tasks(self.pid);
+            if tasks.is_empty() {
+                return Err(Error::ProcessGone);
             }
+            if tasks.iter().all(|t| matches!(t.1, 'T' | 't')) {
+                return Ok(());
+            }
+            if Instant::now() > deadline {
+                return Err(Error::Other("process did not stop".into()));
+            }
+            std::thread::sleep(Duration::from_millis(1));
         }
     }
 
@@ -307,7 +354,13 @@ impl Process for LinuxProcess {
             .ok_or(Error::NoAccess { addr })?
             .prot;
         let start = addr & !(PAGE - 1);
-        let len = (addr + size).next_multiple_of(PAGE) - start;
+        let len = addr
+            .checked_add(size)
+            .and_then(|end| end.checked_next_multiple_of(PAGE))
+            .ok_or_else(|| {
+                Error::Other(format!("protect range {addr:#x} + {size:#x} overflows"))
+            })?
+            - start;
         self.syscall(libc::SYS_mprotect, [start, len, prot_bits(prot), 0, 0, 0])?;
         Ok(old)
     }
@@ -427,16 +480,25 @@ mod inject {
             Ok(())
         }
 
-        /// Waits for the next stop; Err(ProcessGone) if the thread died instead.
-        fn wait(&mut self) -> Result<i32> {
+        /// Waits until `until` for the next stop: Ok(None) on timeout, Err(ProcessGone) if the
+        /// thread died instead.
+        fn wait(&mut self, until: Instant) -> Result<Option<i32>> {
             let mut st = 0;
+            let mut nap = Duration::from_micros(20);
             loop {
-                if unsafe { libc::waitpid(self.tid, &mut st, libc::__WALL) } != -1 {
-                    break;
-                }
-                let e = io::Error::last_os_error();
-                if e.kind() != io::ErrorKind::Interrupted {
-                    return Err(Error::Io(e));
+                match unsafe { libc::waitpid(self.tid, &mut st, libc::__WALL | libc::WNOHANG) } {
+                    0 if Instant::now() >= until => return Ok(None),
+                    0 => {
+                        std::thread::sleep(nap);
+                        nap = (nap * 2).min(Duration::from_millis(1));
+                    }
+                    -1 => {
+                        let e = io::Error::last_os_error();
+                        if e.kind() != io::ErrorKind::Interrupted {
+                            return Err(Error::Io(e));
+                        }
+                    }
+                    _ => break,
                 }
             }
             if !libc::WIFSTOPPED(st) {
@@ -450,7 +512,7 @@ mod inject {
             if st >> 16 == 0 && sig != libc::SIGTRAP && sig != (libc::SIGTRAP | 0x80) {
                 self.sig = sig;
             }
-            Ok(sig)
+            Ok(Some(sig))
         }
 
         fn regs(&self) -> io::Result<libc::user_regs_struct> {
@@ -475,79 +537,137 @@ mod inject {
     }
 
     impl LinuxProcess {
-        /// Runs syscall `nr` with `args` in the target's main thread and returns its result.
-        /// A negative errno from the target becomes `Error::Io`.
+        /// Runs syscall `nr` with `args` in one of the target's threads and returns its result.
+        /// A negative errno from the target becomes `Error::Io`. Never blocks for more than a
+        /// few seconds: a thread that will not stop is left running, untraced, with an error.
         pub(super) fn syscall(&self, nr: i64, args: [u64; 6]) -> Result<u64> {
             if self.ptr_size != 8 {
                 return Err(Error::Unsupported("remote syscalls in 32-bit processes"));
             }
-            let mut cache = self.ptrace.lock().unwrap_or_else(|e| e.into_inner());
-            let gadget = self.syscall_gadget(&mut cache)?;
+            let cache = &mut *self.ptrace.lock().unwrap_or_else(|e| e.into_inner());
+            let gadget = self.syscall_gadget(cache)?;
             let pid = self.pid;
-            let perr = |e: io::Error| os_err(e, pid);
+            // The main thread unless it has exited or sleeps uninterruptibly.
+            let tasks = live_tasks(pid);
+            let tid = tasks
+                .iter()
+                .find(|t| t.1 != 'D')
+                .or(tasks.first())
+                .ok_or(Error::ProcessGone)?
+                .0;
+            // The session runs on its own short-lived thread: when a tracer thread exits the
+            // kernel detaches its tracees and drops pending ptrace traps, which is the only way
+            // to let go of a thread that never reached a ptrace-stop.
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::Builder::new()
+                .name("hh-core ptrace".into())
+                .spawn(move || {
+                    let r = remote_syscall(pid, tid, gadget, nr, args, &tx);
+                    let _ = tx.send(r);
+                })?;
+            rx.recv_timeout(STOP_WAIT + SYSCALL_WAIT + Duration::from_secs(1))
+                .unwrap_or_else(|_| Err(timed_out(pid, tid, "the remote syscall")))
+        }
+    }
 
-            let tid = pid as i32;
-            if unsafe {
-                libc::ptrace(
-                    libc::PTRACE_SEIZE,
-                    tid,
-                    0usize,
-                    libc::PTRACE_O_TRACESYSGOOD as usize,
-                )
-            } == -1
-            {
-                return Err(perr(io::Error::last_os_error()));
-            }
-            let mut t = Tracee {
+    const STOP_WAIT: Duration = Duration::from_secs(2);
+    const SYSCALL_WAIT: Duration = Duration::from_secs(5);
+
+    fn timed_out(pid: Pid, tid: i32, what: &str) -> Error {
+        Error::Io(io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!(
+                "thread {tid} of process {pid} did not finish {what} in time (uninterruptible \
+                 sleep?); it was left running and untraced"
+            ),
+        ))
+    }
+
+    /// One ptrace session on `tid`; runs on a dedicated thread (see `syscall`). An early
+    /// error is also sent through `early` when the session keeps cleaning up afterwards.
+    fn remote_syscall(
+        pid: Pid,
+        tid: i32,
+        gadget: Addr,
+        nr: i64,
+        args: [u64; 6],
+        early: &std::sync::mpsc::Sender<Result<u64>>,
+    ) -> Result<u64> {
+        let perr = |e: io::Error| os_err(e, pid);
+        if unsafe {
+            libc::ptrace(
+                libc::PTRACE_SEIZE,
                 tid,
-                restore: None,
-                sig: 0,
-            };
-            t.req(libc::PTRACE_INTERRUPT, 0).map_err(perr)?;
-            t.wait()?;
-
-            let saved = t.regs().map_err(perr)?;
-            // If we interrupted a blocking syscall, the kernel would restart it on the way out
-            // of this stop, but our injected syscall takes that path instead. Do the restart
-            // by hand: point back at the `syscall` instruction with the original number.
-            let mut restore = saved;
-            if (saved.orig_rax as i64) >= 0 {
-                match -(saved.rax as i64) {
-                    512..=514 => (restore.rax, restore.rip) = (saved.orig_rax, saved.rip - 2),
-                    516 => {
-                        (restore.rax, restore.rip) =
-                            (libc::SYS_restart_syscall as u64, saved.rip - 2)
-                    }
-                    _ => {}
-                }
-            }
-            restore.orig_rax = u64::MAX;
-            t.restore = Some(restore);
-
-            let mut r = saved;
-            (r.rip, r.rax, r.orig_rax) = (gadget, nr as u64, u64::MAX);
-            (r.rdi, r.rsi, r.rdx, r.r10, r.r8, r.r9) =
-                (args[0], args[1], args[2], args[3], args[4], args[5]);
-            t.set_regs(&r).map_err(perr)?;
-
-            // Run to syscall entry, then to syscall exit; other stops (signals, group stop,
-            // the INTERRUPT trap) are stepped over.
-            for _ in 0..2 {
-                loop {
-                    t.req(libc::PTRACE_SYSCALL, 0).map_err(perr)?;
-                    if t.wait()? == libc::SIGTRAP | 0x80 {
-                        break;
-                    }
-                }
-            }
-            let ret = t.regs().map_err(perr)?.rax as i64;
-            drop(t);
-            if (-4095..0).contains(&ret) {
-                return Err(Error::Io(io::Error::from_raw_os_error(-ret as i32)));
-            }
-            Ok(ret as u64)
+                0usize,
+                libc::PTRACE_O_TRACESYSGOOD as usize,
+            )
+        } == -1
+        {
+            return Err(perr(io::Error::last_os_error()));
+        }
+        let mut t = Tracee {
+            tid,
+            restore: None,
+            sig: 0,
+        };
+        t.req(libc::PTRACE_INTERRUPT, 0).map_err(perr)?;
+        if t.wait(Instant::now() + STOP_WAIT)?.is_none() {
+            return Err(timed_out(pid, tid, "stopping for ptrace"));
         }
 
+        let saved = t.regs().map_err(perr)?;
+        // If we interrupted a blocking syscall, the kernel would restart it on the way out
+        // of this stop, but our injected syscall takes that path instead. Do the restart
+        // by hand: point back at the `syscall` instruction with the original number.
+        let mut restore = saved;
+        if (saved.orig_rax as i64) >= 0 {
+            let back = saved.rip.wrapping_sub(2);
+            match -(saved.rax as i64) {
+                512..=514 => (restore.rax, restore.rip) = (saved.orig_rax, back),
+                516 => (restore.rax, restore.rip) = (libc::SYS_restart_syscall as u64, back),
+                _ => {}
+            }
+        }
+        restore.orig_rax = u64::MAX;
+        t.restore = Some(restore);
+
+        let mut r = saved;
+        (r.rip, r.rax, r.orig_rax) = (gadget, nr as u64, u64::MAX);
+        (r.rdi, r.rsi, r.rdx, r.r10, r.r8, r.r9) =
+            (args[0], args[1], args[2], args[3], args[4], args[5]);
+        t.set_regs(&r).map_err(perr)?;
+
+        // Run to syscall entry, then to syscall exit; other stops (signals, group stop,
+        // the INTERRUPT trap) are stepped over.
+        let until = Instant::now() + SYSCALL_WAIT;
+        for _ in 0..2 {
+            loop {
+                t.req(libc::PTRACE_SYSCALL, 0).map_err(perr)?;
+                match t.wait(until)? {
+                    Some(s) if s == libc::SIGTRAP | 0x80 => break,
+                    Some(_) => {}
+                    None => {
+                        // The thread runs our registers: the caller gets its error now, and
+                        // this thread waits for any stop to put the real ones back (Drop).
+                        // If none comes, exiting detaches it anyway, with our registers.
+                        let e = timed_out(pid, tid, "the remote syscall");
+                        let _ = early.send(Err(timed_out(pid, tid, "the remote syscall")));
+                        let _ = t.req(libc::PTRACE_INTERRUPT, 0);
+                        let _ = t.wait(Instant::now() + Duration::from_secs(60));
+                        return Err(e);
+                    }
+                }
+            }
+        }
+        let ret = t.regs().map_err(perr)?.rax as i64;
+        drop(t);
+        if (-4095..0).contains(&ret) {
+            return Err(Error::Io(io::Error::from_raw_os_error(-ret as i32)));
+        }
+        Ok(ret as u64)
+    }
+
+    impl LinuxProcess {
         /// Any `0f 05` byte pair in executable memory works: we stop right after it runs.
         fn syscall_gadget(&self, cache: &mut Option<Addr>) -> Result<Addr> {
             let mut b = [0u8; 2];

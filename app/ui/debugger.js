@@ -180,7 +180,7 @@ export function initDebugger({ showView, mem }) {
       err.textContent = '';
       const c = cond.value.trim() || null;
       try {
-        if (bp) await api.debugSetCondition(bp.id, c);
+        if (bp) await api.debugSetCondition(bp.id, c ?? '');
         else {
           const t = addrI.value.trim();
           if (!t) throw 'Enter an address';
@@ -478,7 +478,9 @@ export function initDebugger({ showView, mem }) {
   });
   on('debug:nop', (d) => addToCode(d, true));
   on('debug:codelist', (d) => addToCode(d, false));
-  on('table:version', reloadCode);
+  // Emitted on every Lua poll; the code list only changes with the table.
+  let codeVer = null;
+  on('table:version', (v) => { if (v !== codeVer) { codeVer = v; reloadCode(); } });
 
   // ---------- break state: registers, stack, threads ----------
   const cpu = $('#cpu-list'), stk = $('#stk-list'), thr = $('#thr-list');

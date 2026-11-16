@@ -79,6 +79,24 @@ pub(crate) fn removed_active_scripts(old: &Table, new: &Table) -> Vec<i64> {
 #[derive(Default)]
 pub struct Live(Mutex<Inner>);
 
+/// Consent for the Lua in a table's scripts (`{$lua}` blocks; the table script asks itself).
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub enum Trust {
+    /// Built in this session, or the user agreed.
+    #[default]
+    Trusted,
+    /// Loaded from a file; ask before the first `{$lua}` runs.
+    Ask,
+    Declined,
+}
+
+/// Error prefix the UI answers with a question and `table_trust`.
+pub const NEEDS_CONSENT: &str = "needs consent:";
+
+fn runs_lua(e: &Entry) -> bool {
+    e.script.as_deref().is_some_and(|s| s.to_ascii_lowercase().contains("{$lua}"))
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct TableState {
     pub version: u64,
@@ -123,6 +141,23 @@ fn for_each_mut(list: &mut [Entry], f: &mut impl FnMut(&mut Entry)) {
         f(e);
         for_each_mut(&mut e.children, f);
     }
+}
+
+/// 1-based depth of entry `id` (0 when absent).
+fn depth_of(list: &[Entry], id: i64) -> usize {
+    let all = all(list);
+    let parent: HashMap<i64, Option<i64>> = all.iter().map(|(e, p)| (e.id, *p)).collect();
+    let (mut d, mut cur) = (0, parent.contains_key(&id).then_some(id));
+    while let Some(c) = cur {
+        d += 1;
+        cur = parent.get(&c).copied().flatten();
+    }
+    d
+}
+
+/// Levels in the tree `list` (1 for a leaf list).
+fn height(list: &[Entry]) -> usize {
+    list.iter().map(|e| 1 + height(&e.children)).max().unwrap_or(0)
 }
 
 /// Removes the entry (with its children) wherever it is.
@@ -199,6 +234,7 @@ impl Live {
         if base != g.version {
             return Err(format!("stale table version {base} (current {})", g.version));
         }
+        table::check_limits(&t.entries)?;
         let mut seen = HashSet::new();
         for (e, _) in all(&t.entries) {
             if e.id <= 0 || e.id > u32::MAX as i64 || !seen.insert(e.id) {
@@ -243,12 +279,28 @@ impl Live {
         (g.undo.len(), g.redo.len())
     }
 
-    /// A freshly loaded table: everything inactive.
-    pub fn replace(&self, mut t: Table) -> TableState {
+    /// A freshly loaded table: everything inactive, except the old entries `keep` (active
+    /// scripts that could not be disabled), carried over into a group so they still can be.
+    pub fn replace(&self, mut t: Table, keep: &[i64]) -> TableState {
         for_each_mut(&mut t.entries, &mut |e| e.frozen = false);
         let mut g = lock(&self.0);
+        let mut next = all(&t.entries).iter().map(|(e, _)| e.id).max().unwrap_or(0) + 1;
+        let (mut rt, mut carried) = (HashMap::new(), Vec::new());
+        for &id in keep {
+            let Some(mut e) = find_mut(&mut g.table.entries, id).map(|e| e.clone()) else { continue };
+            e.children.clear();
+            e.id = next;
+            if let Some(r) = g.rt.remove(&id) {
+                rt.insert(next, r);
+            }
+            carried.push(e);
+            next += 1;
+        }
+        if !carried.is_empty() {
+            t.entries.push(Entry { id: next, description: "Still active from the previous table".into(), children: carried, ..Entry::default() });
+        }
         g.table = t;
-        g.rt.clear();
+        g.rt = rt;
         g.cascade.clear();
         g.undo.clear();
         g.redo.clear();
@@ -365,6 +417,10 @@ impl TableHost for Live {
         }
         let new_parent = rec.parent.map(|p| p as i64);
         if new_parent != parent {
+            let sub = find_mut(&mut g.table.entries, id).map_or(1, |e| height(std::slice::from_ref(e)));
+            if new_parent.is_some_and(|p| depth_of(&g.table.entries, p) + sub > table::MAX_DEPTH) {
+                return Err(Error::Other(format!("moving record {id} there would nest groups more than {} levels deep", table::MAX_DEPTH)));
+            }
             let moved = take(&mut g.table.entries, id).expect("found above");
             match new_parent {
                 None => g.table.entries.push(moved),
@@ -383,6 +439,8 @@ impl TableHost for Live {
         let mut g = lock(&self.0);
         let id = all(&g.table.entries).iter().map(|(e, _)| e.id).max().unwrap_or(0) + 1;
         let e = Entry { id, description: "No description".into(), addr: "0".into(), ..Entry::default() };
+        // Past the depth limit the new record goes to the top level instead.
+        let parent = parent.filter(|&p| depth_of(&g.table.entries, p as i64) < table::MAX_DEPTH);
         match parent.and_then(|p| find_mut(&mut g.table.entries, p as i64)) {
             Some(p) => p.children.push(e),
             None => g.table.entries.push(e),
@@ -469,9 +527,40 @@ impl App {
 
     /// Loads a JSON or `.CT` file as the live table (everything inactive). Running its Lua
     /// script is a separate, user-confirmed step (`table_run_script`).
-    pub fn table_open(&self, path: &str) -> R<TableState> {
+    ///
+    /// Active scripts of the current table are disabled first (their patches would stay in
+    /// the game with nothing left to undo them). If one cannot be, the open is refused unless
+    /// `force`, which carries those entries over (still active) so they can be disabled later.
+    pub fn table_open(&self, path: &str, force: bool) -> R<TableState> {
         let t = table::load(Path::new(path))?;
-        Ok(self.x.live.replace(t))
+        let failed = self.disable_active_scripts();
+        if !failed.is_empty() && !force {
+            let why: Vec<String> = failed.iter().map(|f| f.1.clone()).collect();
+            return Err(format!("{}
+the table was not opened: these active scripts could not be disabled (open anyway to keep them in the new table)", why.join("\n")));
+        }
+        *lock(&self.x.trust) = Trust::Ask;
+        let keep: Vec<i64> = failed.into_iter().map(|f| f.0).collect();
+        let st = self.x.live.replace(t, &keep);
+        // Record callbacks, timers, hotkeys and forms of the previous table go with it.
+        {
+            let _g = self.x.lua.enter();
+            if let Err(e) = self.x.lua.engine.clear_table_state() {
+                self.x.lua.console.push("err", &format!("clearing the previous table's Lua state: {e}"));
+            }
+        }
+        self.sync_freeze();
+        Ok(st)
+    }
+
+    /// Runs `[DISABLE]` of every active script while the process lives; (id, error) of
+    /// those that failed.
+    pub(crate) fn disable_active_scripts(&self) -> Vec<(i64, String)> {
+        if !self.session().is_ok_and(|s| s.raw.is_alive()) {
+            return Vec::new();
+        }
+        let ids: Vec<i64> = all(&self.x.live.state().table.entries).into_iter().filter(|(e, _)| e.frozen && e.script.is_some()).map(|(e, _)| e.id).collect();
+        ids.into_iter().filter_map(|id| self.table_set_active(&[id], false).err().map(|e| (id, e))).collect()
     }
 
     /// Writes the live table; JSON or `.CT` by extension.
@@ -487,6 +576,9 @@ impl App {
     /// Activates/deactivates like CE: OnActivate/OnDeactivate, Auto Assembler (with `{$lua}`)
     /// for scripts, freeze for values, group options for children.
     pub fn table_set_active(&self, ids: &[i64], active: bool) -> R<()> {
+        if active {
+            self.check_trust(ids)?;
+        }
         let mut errs = Vec::new();
         {
             let _g = self.x.lua.enter();
@@ -498,6 +590,33 @@ impl App {
             errs.extend(self.cascade_locked());
         }
         if errs.is_empty() { Ok(()) } else { Err(errs.join("\n")) }
+    }
+
+    /// Refuses before anything runs when an entry (or a child a group option may enable)
+    /// would run `{$lua}` from a table the user has not agreed to.
+    fn check_trust(&self, ids: &[i64]) -> R<()> {
+        let trust = *lock(&self.x.trust);
+        if trust == Trust::Trusted {
+            return Ok(());
+        }
+        let Some(e) = ids.iter().filter_map(|&id| self.x.live.entry(id)).find_map(|e| {
+            all(std::slice::from_ref(&e)).into_iter().find(|(c, _)| runs_lua(c)).map(|(c, _)| c.description.clone())
+        }) else {
+            return Ok(());
+        };
+        if lock(&self.x.settings).table_script == "never" {
+            return Err(format!("{e}: not enabled: its script runs Lua and Settings say never to run a table's Lua"));
+        }
+        Err(match trust {
+            Trust::Declined => format!("{e}: not enabled: you chose not to run this table's Lua (open the table again to be asked again)"),
+            _ => format!("{NEEDS_CONSENT} {e}: this table's scripts run Lua code ({{$lua}}), which can use files and the process"),
+        })
+    }
+
+    /// The user's answer to [`NEEDS_CONSENT`] (or to running the table's Lua script).
+    pub fn table_trust(&self, trust: bool) -> R<()> {
+        *lock(&self.x.trust) = if trust { Trust::Trusted } else { Trust::Declined };
+        Ok(())
     }
 
     /// Caller holds the Lua lock.

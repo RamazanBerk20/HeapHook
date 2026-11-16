@@ -1,11 +1,24 @@
 // The only module that talks to the backend. Uses Tauri's invoke when running inside the
-// app (withGlobalTauri), otherwise the in-browser mock. One function per IPC command of
-// docs/CONTRACT.md; argument names below are the Tauri command parameter names.
+// app (withGlobalTauri), the development HTTP bridge when the page was opened from
+// `heaphook --dev-bridge <port>` (URL carries ?hh_token=), otherwise the in-browser mock.
+// One function per IPC command of docs/CONTRACT.md; argument names below are the Tauri
+// command parameter names.
 import { mockInvoke } from './mock.js';
 
 const tauri = window.__TAURI__?.core;
-export const isMock = !tauri;
-const call = tauri ? (cmd, args) => tauri.invoke(cmd, args) : mockInvoke;
+const bridgeToken = !tauri && new URLSearchParams(location.search).get('hh_token');
+export const isMock = !tauri && !bridgeToken;
+/** Real backend without native dialogs or global hotkeys (the dev bridge). */
+export const isBridge = !!bridgeToken;
+async function bridgeInvoke(cmd, args = {}) {
+  let r;
+  try {
+    r = await (await fetch('/invoke/' + cmd, { method: 'POST', headers: { 'x-hh-token': bridgeToken }, body: JSON.stringify(args) })).json();
+  } catch (e) { throw `dev bridge unreachable: ${e?.message || e}`; }
+  if ('err' in r) throw r.err;
+  return r.ok;
+}
+const call = tauri ? (cmd, args) => tauri.invoke(cmd, args) : bridgeToken ? bridgeInvoke : mockInvoke;
 
 export const api = {
   listProcesses: () => call('list_processes', {}),
@@ -42,7 +55,9 @@ export const api = {
   /** Whole-table edit based on `base`; rejects with "stale table version …" when the table moved -> new version */
   tablePut: (table, base) => call('table_put', { table, base }),
   /** Loads a .json/.CT file as the live table (everything inactive) -> {version, table} */
-  tableOpen: (path) => call('table_open', { path }),
+  tableOpen: (path, force = false) => call('table_open', { path, force }),
+  /** Answer to a "needs consent:" error: may the loaded table's {$lua} blocks run? */
+  tableTrust: (trust) => call('table_trust', { trust }),
   tableExport: (path) => call('table_export', { path }),
   /** CE activation: OnActivate/OnDeactivate, Auto Assembler, freeze, group options */
   tableSetActive: (ids, active) => call('table_set_active', { ids, active }),
@@ -167,9 +182,9 @@ export const api = {
   speedSet: (speed) => call('speed_set', { speed }),
 };
 
-/** Ask for a file path: native dialog in the app, a text prompt in the browser mock. */
+/** Ask for a file path: native dialog in the app, a text prompt in a browser (mock or bridge). */
 export async function askPath({ save, title, filters = [], dflt = '' }) {
-  if (isMock) {
+  if (!tauri) {
     const { prompt } = await import('./util.js');
     return prompt(title, dflt, { label: 'File path' });
   }

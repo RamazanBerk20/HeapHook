@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use common::*;
 use hh_core::Memory;
-use hh_lua::{Engine, EngineOptions, MemTable, STUBS, TableHost, stub_message};
+use hh_lua::{Engine, EngineOptions, MemTable, STUBS, TableHost, UNSUPPORTED, stub_message};
 
 #[test]
 fn memory_read_write() {
@@ -557,10 +557,24 @@ fn stubs_raise_clear_errors() {
             assert!(err.contains(&format!("stub:2: {want}")), "{n}: {err}");
         }
     }
-    let err = e.exec("createForm()", "s").unwrap_err().to_string();
-    assert!(err.contains("not supported yet: createForm"));
-    let err = e.exec("dbk_initialize()", "s").unwrap_err().to_string();
-    assert!(err.contains("not supported: dbk_initialize"));
+    for (cat, names) in STUBS {
+        let unsupported = UNSUPPORTED.iter().any(|u| u.0 == *cat);
+        for n in *names {
+            let m = stub_message(cat, n);
+            assert!(m.starts_with(if unsupported { "not supported in HeapHook: " } else { "not implemented yet: " }), "{m}");
+        }
+    }
+    let err = e.exec("createListView()", "s").unwrap_err().to_string();
+    assert!(err.contains("not implemented yet: createListView"), "{err}");
+    for (f, why) in [("dbk_initialize", "kernel driver"), ("dbvm_initialize", "hypervisor"), ("injectDll", "injection"), ("mono_initialize", "mono"), ("createD3DHook", "injection")] {
+        let err = e.exec(&format!("{f}()"), "s").unwrap_err().to_string();
+        assert!(err.contains(&format!("not supported in HeapHook: {f}")) && err.contains(why), "{err}");
+    }
+    // Implemented now: no longer stubs.
+    for f in ["createForm", "createButton", "debug_setBreakpoint", "createStructure", "loadTable", "getCurrentMemscan", "createProcess", "getMainForm"] {
+        assert!(!STUBS.iter().any(|(_, n)| n.contains(&f)), "{f} still listed");
+        assert_eq!(run(&e, &format!("return type({f})")), ["function"]);
+    }
 }
 
 #[test]

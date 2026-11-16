@@ -190,7 +190,7 @@ impl WinProcess {
     /// Length of the run of committed, readable pages starting at `addr`, capped at `max`.
     fn readable_len(&self, addr: Addr, max: usize) -> usize {
         let mut end = addr;
-        while end < addr + max as u64 {
+        while end < addr.saturating_add(max as u64) {
             let Some(m) = self.query(end) else { break };
             if m.State != MEM_COMMIT || !prot_from(m.Protect).r {
                 break;
@@ -432,10 +432,12 @@ impl Process for WinProcess {
         let mut si: SYSTEM_INFO = unsafe { std::mem::zeroed() };
         unsafe { GetSystemInfo(&mut si) };
         let gran = si.dwAllocationGranularity as u64;
-        let (low, high) = (
-            si.lpMinimumApplicationAddress as u64,
-            si.lpMaximumApplicationAddress as u64 + 1,
-        );
+        let mut high = si.lpMaximumApplicationAddress as u64 + 1;
+        if self.ptr_size == 4 {
+            // A 32-bit target cannot use addresses at or above 4 GiB (the top 64 KiB is reserved).
+            high = high.min(0xFFFF_0000);
+        }
+        let low = si.lpMinimumApplicationAddress as u64;
         // Everything that is not MEM_FREE (reserved counts as used) within reach of `near`.
         let mut used = Vec::new();
         let mut addr = near.saturating_sub(0x8000_0000).max(low);

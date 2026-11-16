@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use hh_asm::{AaHooks, AaState, Ctx, SymbolTable};
 use hh_core::{Addr, Error, Process, Prot, Region, RegionKind, Result};
-use hh_scan::{FirstScan, NextScan, Rounding, ScanOptions, ScanType, Scanner, Tri, VType};
+use hh_scan::{CustomType, FirstScan, NextScan, NextScanEx, Rounding, ScanOptions, ScanType, Scanner, Tri, VType};
 use mlua::{AnyUserData, FromLuaMulti, Function, IntoLuaMulti, Lua, MultiValue, Table, Value, Variadic};
 
 use crate::{Internals, RecId, Record, STUBS, State, guard, stub_message};
@@ -38,12 +38,13 @@ pub(crate) fn value_text(lua: &Lua, v: &Value) -> String {
     }
 }
 
-fn rt(e: Error) -> mlua::Error {
+pub(crate) fn rt(e: Error) -> mlua::Error {
     mlua::Error::runtime(e.to_string())
 }
 
-/// CE `mb*` button -> the `mr*` result clicking it gives.
-pub(crate) fn button_result(mb: i64) -> i64 {
+/// CE `mb*` button -> the `mr*` result clicking it gives (for [`crate::Host::message_dialog`]
+/// implementations).
+pub fn button_result(mb: i64) -> i64 {
     match mb {
         0 => 6,
         1 => 7,
@@ -60,15 +61,15 @@ pub(crate) fn button_result(mb: i64) -> i64 {
     }
 }
 
-struct B<'a> {
-    lua: &'a Lua,
-    t: Table,
-    st: &'a Arc<State>,
-    names: std::cell::RefCell<Vec<String>>,
+pub(crate) struct B<'a> {
+    pub(crate) lua: &'a Lua,
+    pub(crate) t: Table,
+    pub(crate) st: &'a Arc<State>,
+    pub(crate) names: std::cell::RefCell<Vec<String>>,
 }
 
 impl B<'_> {
-    fn f<A, R, F>(&self, name: &str, f: F) -> LR<()>
+    pub(crate) fn f<A, R, F>(&self, name: &str, f: F) -> LR<()>
     where
         A: FromLuaMulti,
         R: IntoLuaMulti,
@@ -82,7 +83,7 @@ impl B<'_> {
 
 // ---------------------------------------------------------------- argument helpers
 
-fn int_of(v: &Value) -> Option<i64> {
+pub(crate) fn int_of(v: &Value) -> Option<i64> {
     match v {
         Value::Integer(i) => Some(*i),
         Value::Number(n) if n.is_finite() => Some(*n as i64),
@@ -99,7 +100,7 @@ fn int_of(v: &Value) -> Option<i64> {
     }
 }
 
-fn num_of(v: &Value) -> Option<f64> {
+pub(crate) fn num_of(v: &Value) -> Option<f64> {
     match v {
         Value::Integer(i) => Some(*i as f64),
         Value::Number(n) => Some(*n),
@@ -108,7 +109,7 @@ fn num_of(v: &Value) -> Option<f64> {
     }
 }
 
-fn str_of(v: &Value) -> Option<String> {
+pub(crate) fn str_of(v: &Value) -> Option<String> {
     match v {
         Value::String(s) => Some(s.to_string_lossy()),
         Value::Integer(i) => Some(i.to_string()),
@@ -117,11 +118,11 @@ fn str_of(v: &Value) -> Option<String> {
     }
 }
 
-fn truthy(v: &Value) -> bool {
+pub(crate) fn truthy(v: &Value) -> bool {
     !matches!(v, Value::Nil | Value::Boolean(false))
 }
 
-fn arg(a: &[Value], i: usize) -> Value {
+pub(crate) fn arg(a: &[Value], i: usize) -> Value {
     a.get(i).cloned().unwrap_or(Value::Nil)
 }
 
@@ -137,7 +138,7 @@ pub(crate) fn resolve(st: &State, expr: &str, local: bool) -> Result<Addr> {
 }
 
 /// CE functions take an address as a number or as an address expression string.
-fn addr(st: &State, v: &Value, local: bool) -> Result<Addr> {
+pub(crate) fn addr(st: &State, v: &Value, local: bool) -> Result<Addr> {
     match v {
         Value::Integer(i) => Ok(*i as u64),
         Value::Number(n) if n.is_finite() => Ok(*n as i64 as u64),
@@ -146,11 +147,13 @@ fn addr(st: &State, v: &Value, local: bool) -> Result<Addr> {
     }
 }
 
-fn need_proc(st: &State, local: bool) -> LR<Arc<dyn Process>> {
-    st.target(local).ok_or_else(|| mlua::Error::runtime("no process opened"))
+pub(crate) fn need_proc(st: &State, local: bool) -> LR<Arc<dyn Process>> {
+    st.target(local).ok_or_else(|| {
+        mlua::Error::runtime(if local && !st.allow_os { "access to HeapHook's own memory is disabled" } else { "no process opened" })
+    })
 }
 
-fn bytes_table(lua: &Lua, b: &[u8]) -> LR<Table> {
+pub(crate) fn bytes_table(lua: &Lua, b: &[u8]) -> LR<Table> {
     lua.create_sequence_from(b.iter().copied())
 }
 
@@ -269,6 +272,9 @@ fn pid_of(name: &str) -> Option<u32> {
 
 // ---------------------------------------------------------------- memory
 
+/// Most values `readBytes` returns as separate results (the table form has no limit).
+const MAX_MULTI: usize = 8000;
+
 fn install_memory(b: &B) -> LR<()> {
     for local in [false, true] {
         let sfx = if local { "Local" } else { "" };
@@ -330,6 +336,12 @@ fn install_memory(b: &B) -> LR<()> {
             }
             if as_table.unwrap_or(false) {
                 return Ok(MultiValue::from_iter([Value::Table(bytes_table(lua, &b)?)]));
+            }
+            if b.len() > MAX_MULTI {
+                return Err(mlua::Error::runtime(format!(
+                    "readBytes: {} values is too many to return separately (max {MAX_MULTI}); pass true as the third argument to get a table",
+                    b.len()
+                )));
             }
             Ok(b.into_iter().map(|x| Value::Integer(x as i64)).collect())
         })?;
@@ -400,12 +412,12 @@ fn install_memory(b: &B) -> LR<()> {
     Ok(())
 }
 
-fn read_into(st: &State, a: &Value, local: bool, buf: &mut [u8]) -> bool {
+pub(crate) fn read_into(st: &State, a: &Value, local: bool, buf: &mut [u8]) -> bool {
     let (Some(p), Ok(a)) = (st.target(local), addr(st, a, local)) else { return false };
     p.read_exact(a, buf).is_ok()
 }
 
-fn write_at(st: &State, a: &Value, local: bool, data: &[u8]) -> bool {
+pub(crate) fn write_at(st: &State, a: &Value, local: bool, data: &[u8]) -> bool {
     let (Some(p), Ok(a)) = (st.target(local), addr(st, a, local)) else { return false };
     p.write(a, data).is_ok()
 }
@@ -413,7 +425,7 @@ fn write_at(st: &State, a: &Value, local: bool, data: &[u8]) -> bool {
 // ---------------------------------------------------------------- scanning
 
 /// `"+W-C*X"`: + must have, - must not have, * don't care. Returns (W, X, C).
-fn prot_flags(s: Option<&str>) -> (Tri, Tri, Tri) {
+pub(crate) fn prot_flags(s: Option<&str>) -> (Tri, Tri, Tri) {
     let (mut w, mut x, mut c) = (Tri::Any, Tri::Any, Tri::Any);
     let mut sign = Tri::Yes;
     for ch in s.unwrap_or("").chars() {
@@ -430,7 +442,7 @@ fn prot_flags(s: Option<&str>) -> (Tri, Tri, Tri) {
     (w, x, c)
 }
 
-fn tri_ok(t: Tri, v: bool) -> bool {
+pub(crate) fn tri_ok(t: Tri, v: bool) -> bool {
     match t {
         Tri::Yes => v,
         Tri::No => !v,
@@ -438,7 +450,7 @@ fn tri_ok(t: Tri, v: bool) -> bool {
     }
 }
 
-fn is_cow(r: &Region) -> bool {
+pub(crate) fn is_cow(r: &Region) -> bool {
     r.prot.w && !r.shared && matches!(r.kind, RegionKind::Image | RegionKind::Mapped)
 }
 
@@ -492,7 +504,7 @@ fn module_range(st: &State, name: &str) -> Option<(Addr, Addr)> {
     Some((m.base, m.base + m.size))
 }
 
-fn ce_vtype(n: i64) -> Option<(VType, bool)> {
+pub(crate) fn ce_vtype(n: i64) -> Option<(VType, bool)> {
     Some(match n {
         0 => (VType::Byte, false),
         1 => (VType::Bytes2, false),
@@ -527,7 +539,34 @@ fn ce_scan_type(n: i64) -> LR<ScanType> {
     })
 }
 
-fn scanner(st: &State, id: i64) -> LR<Arc<Scanner>> {
+/// A custom type from a preset name (`'4 byte big endian'`) or a table with
+/// `hh_scan::CustomType`'s fields (`size`, `big_endian`, `float`, `signed`, `scale`, `offset`,
+/// `bit_start`, `bit_len`, `binary`).
+fn custom_type(v: &Value) -> LR<CustomType> {
+    let ct = match v {
+        Value::String(s) => {
+            let n = s.to_string_lossy();
+            CustomType::preset(&n).ok_or_else(|| mlua::Error::runtime(format!("unknown custom type {n}")))?
+        }
+        Value::Table(t) => {
+            let g = |k: &str| t.get::<Value>(k).unwrap_or(Value::Nil);
+            let mut ct = CustomType::int(int_of(&g("size")).unwrap_or(4).clamp(0, 255) as u8, truthy(&g("signed")));
+            ct.big_endian = truthy(&g("big_endian"));
+            ct.float = truthy(&g("float"));
+            ct.scale = num_of(&g("scale")).unwrap_or(1.0);
+            ct.offset = num_of(&g("offset")).unwrap_or(0.0);
+            ct.bit_start = int_of(&g("bit_start")).unwrap_or(0).clamp(0, 255) as u8;
+            ct.bit_len = int_of(&g("bit_len")).unwrap_or(0).clamp(0, 255) as u8;
+            ct.binary = truthy(&g("binary"));
+            ct
+        }
+        _ => return Err(mlua::Error::runtime("vtCustom scan: set memscan.CustomType first")),
+    };
+    ct.validate().map_err(rt)?;
+    Ok(ct)
+}
+
+pub(crate) fn scanner(st: &State, id: i64) -> LR<Arc<Scanner>> {
     st.scans.lock().unwrap().get(&id).cloned().ok_or_else(|| mlua::Error::runtime("memscan was destroyed"))
 }
 
@@ -586,11 +625,17 @@ fn install_scan(b: &B, h: &B) -> LR<()> {
     })?;
     h.f("ms_count", |_, st, id: i64| Ok(scanner(st, id)?.count() as i64))?;
     // (id, scanoption, vartype, roundingtype, input1, input2, start, stop, protectionflags,
-    //  alignmenttype, alignmentparam, isHex, isNotABinaryString, isUnicode, isCaseSensitive)
+    //  alignmenttype, alignmentparam, isHex, isNotABinaryString, isUnicode, isCaseSensitive,
+    //  customtype, not)
     h.f("ms_first", |_, st, a: Variadic<Value>| {
         let s = scanner(st, int_of(&arg(&a, 0)).unwrap_or(0))?;
-        let (vtype, utf16) = ce_vtype(int_of(&arg(&a, 2)).unwrap_or(2))
-            .ok_or_else(|| mlua::Error::runtime("unsupported variable type"))?;
+        let vt = int_of(&arg(&a, 2)).unwrap_or(2);
+        let custom = if vt == 13 { Some(custom_type(&arg(&a, 15))?) } else { None };
+        let (vtype, utf16) = if custom.is_some() {
+            (VType::Bytes4, false)
+        } else {
+            ce_vtype(vt).ok_or_else(|| mlua::Error::runtime("unsupported variable type"))?
+        };
         let (w, x, c) = prot_flags(str_of(&arg(&a, 8)).as_deref());
         let param = str_of(&arg(&a, 10)).unwrap_or_default();
         let atype = int_of(&arg(&a, 9)).unwrap_or(1);
@@ -616,6 +661,7 @@ fn install_scan(b: &B, h: &B) -> LR<()> {
                 2 => Rounding::Truncated,
                 _ => Rounding::Rounded,
             },
+            custom,
             ..ScanOptions::default()
         };
         let req = FirstScan {
@@ -623,24 +669,30 @@ fn install_scan(b: &B, h: &B) -> LR<()> {
             scan_type: ce_scan_type(int_of(&arg(&a, 1)).unwrap_or(1))?,
             value: str_of(&arg(&a, 4)),
             value2: str_of(&arg(&a, 5)),
-            not: false,
+            not: truthy(&arg(&a, 16)),
             opts,
         };
         Ok(s.first_scan(&req).map_err(rt)?.count as i64)
     })?;
     // (id, scanoption, roundingtype, input1, input2, isHex, isNotABinaryString, isUnicode,
-    //  isCaseSensitive, isPercentage)
+    //  isCaseSensitive, isPercentage, savedResultName, not)
     h.f("ms_next", |_, st, a: Variadic<Value>| {
         let s = scanner(st, int_of(&arg(&a, 0)).unwrap_or(0))?;
-        let req = NextScan {
-            scan_type: ce_scan_type(int_of(&arg(&a, 1)).unwrap_or(1))?,
-            value: str_of(&arg(&a, 3)),
-            value2: str_of(&arg(&a, 4)),
-            not: false,
-            percent: Some(truthy(&arg(&a, 9))),
+        let req = NextScanEx {
+            scan: NextScan {
+                scan_type: ce_scan_type(int_of(&arg(&a, 1)).unwrap_or(1))?,
+                value: str_of(&arg(&a, 3)),
+                value2: str_of(&arg(&a, 4)),
+                not: truthy(&arg(&a, 11)),
+                percent: Some(truthy(&arg(&a, 9))),
+            },
+            compare_to: str_of(&arg(&a, 10)).filter(|n| !n.is_empty()),
         };
-        Ok(s.next_scan(&req).map_err(rt)?.count as i64)
+        Ok(s.next_scan_ex(&req).map_err(rt)?.count as i64)
     })?;
+    h.f("ms_save", |_, st, (id, name): (i64, String)| scanner(st, id)?.save_scan(&name).map_err(rt))?;
+    h.f("ms_saved", |_, st, id: i64| Ok(scanner(st, id)?.saved_scans()))?;
+    h.f("ms_delsaved", |_, st, (id, name): (i64, String)| scanner(st, id)?.delete_saved_scan(&name).map_err(rt))?;
     h.f("ms_row", |_, st, (id, i): (i64, i64)| {
         let rows = scanner(st, id)?.results(i.max(0) as u64, 1).map_err(rt)?;
         Ok(match rows.into_iter().next() {
@@ -701,7 +753,7 @@ pub(crate) fn lua_block_hook(
             };
             g.set("memrec", mr)?;
             g.set("syntaxcheck", check)?;
-            let r = lua.load(&src).set_name("={$lua}").eval::<Value>();
+            let r = lua.load(&src).set_name("={$lua}").set_mode(mlua::chunk::ChunkMode::Text).eval::<Value>();
             g.set("memrec", old.0)?;
             g.set("syntaxcheck", old.1)?;
             r
@@ -721,8 +773,9 @@ fn install_asm(b: &B) -> LR<()> {
             (i @ Value::Table(_), _) => (false, i),
             (_, i) => (false, i),
         };
-        let Some(p) = st.target(local) else {
-            return (false, "no process opened").into_lua_multi(lua);
+        let p = match need_proc(st, local) {
+            Ok(p) => p,
+            Err(e) => return (false, err_text(&e)).into_lua_multi(lua),
         };
         let prev = match &info {
             Value::Table(t) => Some(t.get::<AnyUserData>("__state")?.borrow::<AaState>()?.clone()),
@@ -804,7 +857,7 @@ fn install_asm(b: &B) -> LR<()> {
 
 // ---------------------------------------------------------------- memory records
 
-fn rec_addr(st: &State, r: &Record) -> Result<Addr> {
+pub(crate) fn rec_addr(st: &State, r: &Record) -> Result<Addr> {
     let p = st.proc().ok_or(Error::Other("no process opened".into()))?;
     let mut a = resolve(st, &r.address, false)?;
     for o in &r.offsets {
@@ -813,7 +866,10 @@ fn rec_addr(st: &State, r: &Record) -> Result<Addr> {
     Ok(a)
 }
 
-fn rec_value(st: &State, r: &Record) -> Result<String> {
+pub(crate) fn rec_value(st: &State, r: &Record) -> Result<String> {
+    if r.group_header {
+        return Ok(String::new());
+    }
     if r.script.is_some() {
         return Ok("<script>".into());
     }
@@ -829,7 +885,7 @@ fn rec_value(st: &State, r: &Record) -> Result<String> {
 }
 
 fn rec_type(r: &Record) -> i64 {
-    if r.script.is_some() {
+    if r.script.is_some() && !r.group_header {
         return 11;
     }
     match r.vtype {
@@ -847,8 +903,64 @@ fn rec_type(r: &Record) -> i64 {
     }
 }
 
+fn has_opt(r: &Record, o: &str) -> bool {
+    r.options.iter().any(|x| x.eq_ignore_ascii_case(o))
+}
+
+fn children(t: &dyn crate::TableHost, id: RecId) -> Vec<RecId> {
+    t.ids().into_iter().filter(|&c| t.get(c).is_some_and(|c| c.parent == Some(id))).collect()
+}
+
+/// moRecursiveSetValue: a group (or script) entry passes a set value to its value children.
+fn set_value_rec(st: &State, t: &dyn crate::TableHost, id: RecId, v: &str, depth: usize) -> Result<()> {
+    if depth > 64 {
+        return Ok(());
+    }
+    for c in children(t, id) {
+        let Some(mut r) = t.get(c) else { continue };
+        if r.group_header || r.script.is_some() {
+            if has_opt(&r, "moRecursiveSetValue") {
+                set_value_rec(st, t, c, v, depth + 1)?;
+            }
+            continue;
+        }
+        let p = st.proc().ok_or(Error::Other("no process opened".into()))?;
+        hh_scan::write_value(&*p, rec_addr(st, &r)?, r.vtype, v, &r.fmt)?;
+        if r.active {
+            r.frozen_value = Some(v.to_string());
+            t.set(r)?;
+        }
+    }
+    Ok(())
+}
+
+/// `"[moA,moB]"`, `"moA, moB"` or a table of names.
+fn parse_options(v: &Value) -> LR<Vec<String>> {
+    Ok(match v {
+        Value::Table(t) => t.sequence_values::<String>().collect::<LR<_>>()?,
+        v => str_of(v)
+            .unwrap_or_default()
+            .split(|c: char| c == ',' || c == '[' || c == ']' || c.is_whitespace())
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect(),
+    })
+}
+
+fn lines_of(v: &Value) -> LR<Vec<String>> {
+    Ok(match v {
+        Value::Table(t) => t.sequence_values::<Value>().map(|x| x.map(|x| str_of(&x).unwrap_or_default())).collect::<LR<_>>()?,
+        v => str_of(v).unwrap_or_default().lines().map(str::to_string).collect(),
+    })
+}
+
 fn install_records(h: &B) -> LR<()> {
     h.f("mr_ids", |_, st, ()| Ok(st.table().ids()))?;
+    h.f("al_selected", |_, st, ()| Ok(st.table().selected()))?;
+    h.f("al_select", |_, st, ids: Vec<RecId>| {
+        st.table().set_selected(&ids);
+        Ok(())
+    })?;
     h.f("mr_create", |_, st, parent: Option<RecId>| Ok(st.table().create(parent)))?;
     h.f("mr_delete", |_, st, id: RecId| {
         st.table().delete(id);
@@ -873,9 +985,29 @@ fn install_records(h: &B) -> LR<()> {
             "ShowAsSigned" => Value::Boolean(r.fmt.signed),
             "StringSize" | "AobSize" => Value::Integer(r.fmt.len.unwrap_or(16) as i64),
             "Unicode" => Value::Boolean(r.fmt.utf16),
-            "Children" => {
-                let kids = t.ids().into_iter().filter(|&c| t.get(c).is_some_and(|c| c.parent == Some(id)));
-                Value::Table(lua.create_sequence_from(kids)?)
+            "Children" => Value::Table(lua.create_sequence_from(children(&*t, id))?),
+            "IsGroupHeader" => Value::Boolean(r.group_header),
+            "Options" => s(&format!("[{}]", r.options.join(",")))?,
+            "OptionList" => Value::Table(lua.create_sequence_from(r.options.iter().cloned())?),
+            "Collapsed" => Value::Boolean(r.collapsed),
+            "IsReadable" => Value::Boolean(r.group_header || r.script.is_some() || rec_value(st, &r).is_ok()),
+            "DropDownList" => Value::Table(lua.create_sequence_from(r.dropdown.iter().cloned())?),
+            "DropDownReadOnly" => Value::Boolean(r.dropdown_readonly),
+            "DropDownDescriptionOnly" => Value::Boolean(r.dropdown_description_only),
+            "DisplayAsDropDownListItem" => Value::Boolean(r.dropdown_display_as_item),
+            "Index" => t.ids().iter().position(|&x| x == id).map_or(Value::Nil, |i| Value::Integer(i as i64)),
+            "Hotkeys" => {
+                let out = lua.create_table()?;
+                for hk in &r.hotkeys {
+                    let e = lua.create_table()?;
+                    e.set("ID", hk.id)?;
+                    e.set("Keys", lua.create_sequence_from(hk.keys.iter().copied())?)?;
+                    e.set("Action", hk.action)?;
+                    e.set("Value", hk.value.as_str())?;
+                    e.set("Description", hk.description.as_str())?;
+                    out.push(e)?;
+                }
+                Value::Table(out)
             }
             _ => Value::Nil,
         })
@@ -905,7 +1037,10 @@ fn install_records(h: &B) -> LR<()> {
             }
             "Value" => {
                 let s = str_of(&v).ok_or_else(bad)?;
-                if r.script.is_some() {
+                if r.group_header || r.script.is_some() {
+                    if has_opt(&r, "moRecursiveSetValue") {
+                        set_value_rec(st, &*t, id, &s, 0).map_err(rt)?;
+                    }
                     return Ok(());
                 }
                 let p = need_proc(st, false)?;
@@ -926,6 +1061,33 @@ fn install_records(h: &B) -> LR<()> {
             "ShowAsSigned" => r.fmt.signed = truthy(&v),
             "StringSize" | "AobSize" => r.fmt.len = int_of(&v).map(|n| n.max(0) as usize),
             "Unicode" => r.fmt.utf16 = truthy(&v),
+            "IsGroupHeader" => {
+                r.group_header = truthy(&v);
+                if r.group_header {
+                    r.script = None;
+                }
+            }
+            "Options" => r.options = parse_options(&v)?,
+            "Collapsed" => r.collapsed = truthy(&v),
+            "DropDownList" => r.dropdown = lines_of(&v)?,
+            "DropDownReadOnly" => r.dropdown_readonly = truthy(&v),
+            "DropDownDescriptionOnly" => r.dropdown_description_only = truthy(&v),
+            "DisplayAsDropDownListItem" => r.dropdown_display_as_item = truthy(&v),
+            "Hotkeys" => {
+                let Value::Table(tb) = v else { return Err(bad()) };
+                let mut out = Vec::new();
+                for e in tb.sequence_values::<Table>() {
+                    let e = e?;
+                    out.push(crate::RecordHotkey {
+                        id: e.get::<Option<u32>>("ID")?.unwrap_or(0),
+                        keys: e.get::<Option<Vec<i64>>>("Keys")?.unwrap_or_default(),
+                        action: e.get::<Option<i64>>("Action")?.unwrap_or(0),
+                        value: e.get::<Value>("Value").map(|v| str_of(&v).unwrap_or_default())?,
+                        description: e.get::<Value>("Description").map(|v| str_of(&v).unwrap_or_default())?,
+                    });
+                }
+                r.hotkeys = out;
+            }
             _ => return Err(mlua::Error::runtime(format!("unknown memory record property {key}"))),
         }
         t.set(r).map_err(rt)
@@ -939,8 +1101,10 @@ fn install_records(h: &B) -> LR<()> {
         }
         let mut new_state = None;
         let mut frozen = None;
-        if let Some(script) = &r.script {
-            if execute {
+        if r.group_header {
+            // A header only changes state; its children follow the group options.
+        } else if let Some(script) = &r.script {
+            if execute && !script.trim().is_empty() {
                 let Some(p) = st.proc() else { return Ok((false, Some("no process opened".to_string()))) };
                 match aa_run(lua, st, &*p, script, active, r.aa_state.as_ref(), Some(id)) {
                     Ok(s) => new_state = active.then_some(s),
@@ -1019,9 +1183,16 @@ fn install_misc(b: &B, h: &B) -> LR<()> {
     b.f("getTickCount", now)?;
     h.f("now", now)?;
     h.f("sleep", |_, st, ms: f64| {
-        let end = std::time::Instant::now() + Duration::from_secs_f64(ms.max(0.0) / 1000.0);
+        // NaN and negatives sleep 0; huge values (math.huge) sleep until the budget or an
+        // interrupt ends them.
+        let ms = if ms.is_nan() { 0.0 } else { ms.clamp(0.0, 1e15) };
+        let end = std::time::Instant::now().checked_add(Duration::from_secs_f64(ms / 1000.0));
         loop {
             st.check()?;
+            let Some(end) = end else {
+                std::thread::sleep(Duration::from_millis(10));
+                continue;
+            };
             let left = end.saturating_duration_since(std::time::Instant::now());
             if left.is_zero() {
                 return Ok(());
@@ -1059,6 +1230,10 @@ pub(crate) fn install(lua: &Lua, st: &Arc<State>, allow_os: bool) -> LR<Internal
     install_asm(&b)?;
     install_records(&h)?;
     install_misc(&b, &h)?;
+    crate::ext::install(&b, &h)?;
+    crate::debug::install(&h)?;
+    crate::ui::install(&h)?;
+    h.f("aborted", |_, st, ()| Ok(st.aborted()))?;
 
     let stubs = lua.create_table()?;
     for (cat, names) in STUBS {
@@ -1073,6 +1248,11 @@ pub(crate) fn install(lua: &Lua, st: &Arc<State>, allow_os: bool) -> LR<Internal
         tick: out.get("tick")?,
         setactive: out.get("setactive")?,
         hotkey: out.get("hotkey")?,
+        rechotkey: out.get("rechotkey")?,
+        clear: out.get("clear")?,
+        uievent: out.get("uievent")?,
+        uiinput: out.get("uiinput")?,
+        breakpoint: out.get("breakpoint")?,
     })
 }
 

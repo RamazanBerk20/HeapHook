@@ -134,3 +134,85 @@ fn pointers_to() {
     let q = PointerQuery { max_offset: 0, ..q };
     assert_eq!(find_pointers(&p, &q, &Progress::new()).unwrap()[0].addr, 0x400010);
 }
+
+// ---------------------------------------------------------------- hostile input (release audit)
+
+#[test]
+fn pointer_search_stops_at_max_results() {
+    let mut p = FakeProc::new();
+    // 64k slots all pointing at the target.
+    p.add(0x100000, 0x200000u64.to_le_bytes().repeat(0x10000), RW, RegionKind::Private, None);
+    p.add(0x900000, 0x200000u64.to_le_bytes().repeat(0x10000), RW, RegionKind::Private, None);
+    let q = PointerQuery { target: 0x200000, max_results: 3, ..Default::default() };
+    let h = find_pointers(&p, &q, &Progress::new()).unwrap();
+    assert_eq!(h.iter().map(|h| h.addr).collect::<Vec<_>>(), [0x100000, 0x100008, 0x100010]);
+}
+
+#[test]
+fn wrapping_ranges_are_rejected() {
+    let p = proc_();
+    let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let f = dir.path().join("wrap.hhmem");
+    let snap = snapshot(&p, &[Range { start: 0x10000, size: 0x20 }], &Progress::new()).unwrap();
+    save_snapshot(&snap, &f).unwrap();
+    let mut raw = std::fs::read(&f).unwrap();
+    raw[16..24].copy_from_slice(&(u64::MAX - 4).to_le_bytes());
+    std::fs::write(&f, &raw).unwrap();
+    assert!(load_snapshot(&f).is_err());
+    assert!(fill(&p, u64::MAX - 4, 0x10, &[0]).is_err());
+    assert!(copy(&p, 0x10000, u64::MAX - 4, 0x10).is_err());
+}
+
+#[test]
+fn pe_import_walk_is_bounded() {
+    // 4096 descriptors, each pointing at the same 64k-slot thunk array.
+    let mut img = vec![0u8; 0x20000 + 0x10000 * 8 + 8];
+    img[..2].copy_from_slice(b"MZ");
+    img[0x3C..0x40].copy_from_slice(&0x40u32.to_le_bytes());
+    img[0x40..0x44].copy_from_slice(b"PE\0\0");
+    img[0x44..0x46].copy_from_slice(&0x8664u16.to_le_bytes());
+    img[0x46] = 1; // one (empty) section header
+    img[0x54..0x56].copy_from_slice(&0xF0u16.to_le_bytes());
+    let opt = 0x58;
+    img[opt..opt + 2].copy_from_slice(&0x20bu16.to_le_bytes());
+    img[opt + 108..opt + 112].copy_from_slice(&16u32.to_le_bytes());
+    img[opt + 120..opt + 124].copy_from_slice(&0x1000u32.to_le_bytes());
+    for i in 0..4096 {
+        let d = 0x1000 + i * 20;
+        img[d..d + 4].copy_from_slice(&0x20000u32.to_le_bytes());
+    }
+    for j in 0..0x10000 {
+        img[0x20000 + j * 8] = 1;
+    }
+    let mut p = FakeProc::new();
+    p.add(0x400000, img, RX, RegionKind::Image, None);
+    p.module("imp.dll", 0x400000, 0xA0008);
+    let t = std::time::Instant::now();
+    let e = hh_tools::headers::summary(&p, &p.modules[0]).unwrap_err().to_string();
+    assert!(e.contains("import slots"), "{e}");
+    assert!(t.elapsed().as_secs() < 10, "{:?}", t.elapsed());
+}
+
+#[cfg(unix)]
+#[test]
+fn elf_headers_never_open_a_fifo() {
+    let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let fifo = dir.path().join("lib.so");
+    if !std::process::Command::new("mkfifo").arg(&fifo).status().is_ok_and(|s| s.success()) {
+        return;
+    }
+    let mut elf = vec![0u8; 0x1000];
+    elf[..4].copy_from_slice(b"\x7fELF");
+    elf[4] = 2;
+    elf[5] = 1;
+    let mut p = FakeProc::new();
+    p.add(0x500000, elf, RX, RegionKind::Image, None);
+    p.modules.push(hh_core::Module { name: "lib.so".into(), path: fifo.to_str().unwrap().into(), base: 0x500000, size: 0x1000 });
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let r = hh_tools::headers::summary(&p, &p.modules[0]).map(|h| h.source);
+        let _ = tx.send(r);
+    });
+    let r = rx.recv_timeout(std::time::Duration::from_secs(10)).expect("headers view hung on a FIFO");
+    assert!(r.is_err() || r.unwrap() == "memory");
+}

@@ -1,6 +1,7 @@
 //! Auto Assembler: runs Cheat Engine style scripts (`[ENABLE]`/`[DISABLE]`, alloc, labels,
 //! aobscan, db, ...) against a `Process`.
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use hh_core::{Addr, Error, Module, Process, Prot, Result};
 use serde::{Deserialize, Serialize};
@@ -126,24 +127,49 @@ fn strip_comments(s: &str) -> String {
     out
 }
 
-fn replace_word(line: &str, name: &str, value: &str) -> String {
+/// Most bytes a script may expand to (defines, includes, `{$lua}` output), counted over every
+/// preprocessed line; real scripts are a few KB.
+pub const MAX_SCRIPT_BYTES: usize = 8 << 20;
+/// Most `define`s per script; each one is applied to every later line.
+pub const MAX_DEFINES: usize = 1024;
+/// Most `{$lua}` block runs per script (also stops a block that emits itself).
+pub const MAX_LUA_BLOCKS: usize = 256;
+/// Most `include`s per script, over all nesting levels.
+pub const MAX_INCLUDES: usize = 256;
+/// Most bytes one `readmem` may copy, and all of a script's `readmem`s together.
+pub const MAX_READMEM_BYTES: u64 = 16 << 20;
+/// Most bytes a script may assemble in total (`nop N` and `readmem` multiply quickly).
+pub const MAX_ASSEMBLED_BYTES: usize = 64 << 20;
+/// Longest AOB pattern, in bytes; real signatures are well under 100.
+pub const MAX_PATTERN_LEN: usize = 1024;
+
+/// Whole-word, case-insensitive replace of `name` by `value`. `None` once the result would
+/// exceed `limit` bytes.
+fn replace_word(line: &str, name: &str, value: &str, limit: usize) -> Option<String> {
     let is_id = |c: char| c.is_alphanumeric() || c == '_';
-    let mut out = String::new();
-    let mut rest = line;
-    while let Some(pos) = rest.to_ascii_lowercase().find(&name.to_ascii_lowercase()) {
-        let before_ok = rest[..pos].chars().next_back().is_none_or(|c| !is_id(c));
-        let after = &rest[pos + name.len()..];
-        let after_ok = after.chars().next().is_none_or(|c| !is_id(c));
-        out.push_str(&rest[..pos]);
-        out.push_str(if before_ok && after_ok {
-            value
-        } else {
-            &rest[pos..pos + name.len()]
-        });
-        rest = after;
+    if name.is_empty() {
+        return Some(line.to_string());
     }
-    out.push_str(rest);
-    out
+    // ASCII lowercasing keeps byte offsets, so positions in `lower` index `line` too.
+    let (lower, lname) = (line.to_ascii_lowercase(), name.to_ascii_lowercase());
+    let mut out = String::with_capacity(line.len());
+    let (mut last, mut from) = (0, 0);
+    while let Some(p) = lower[from..].find(&lname) {
+        let (pos, end) = (from + p, from + p + name.len());
+        let before_ok = line[..pos].chars().next_back().is_none_or(|c| !is_id(c));
+        let after_ok = line[end..].chars().next().is_none_or(|c| !is_id(c));
+        if before_ok && after_ok {
+            out.push_str(&line[last..pos]);
+            out.push_str(value);
+            last = end;
+            if out.len() > limit {
+                return None;
+            }
+        }
+        from = end;
+    }
+    out.push_str(&line[last..]);
+    (out.len() <= limit).then_some(out)
 }
 
 /// `name(args)` -> (lowercase name, args).
@@ -245,27 +271,48 @@ fn section_lines(
     (out, has_disable)
 }
 
+/// Shared by every nesting level of one script's preprocessing.
+#[derive(Default)]
+struct Budget {
+    bytes: usize,
+    lua_runs: usize,
+    includes: usize,
+}
+
 /// Expands `{$lua}` blocks, `include`, and `define` into plain lines.
 fn preprocess(
     mut lines: Vec<(usize, String)>,
     hooks: &mut AaHooks,
     lua_blocks: &mut Vec<String>,
     depth: usize,
+    budget: &mut Budget,
 ) -> R<Vec<(usize, String)>> {
     let mut out: Vec<(usize, String)> = Vec::new();
     let mut defines: Vec<(String, String)> = Vec::new();
     let mut i = 0;
     while i < lines.len() {
-        let (ln, raw) = lines[i].clone();
-        let mut line = raw.clone();
+        let ln = lines[i].0;
+        let mut line = std::mem::take(&mut lines[i].1);
+        let too_big = || AaError {
+            line: ln,
+            message: format!("script expands to more than {MAX_SCRIPT_BYTES} bytes"),
+        };
         for (n, v) in &defines {
-            line = replace_word(&line, n, v);
+            line = replace_word(&line, n, v, MAX_SCRIPT_BYTES).ok_or_else(too_big)?;
+        }
+        budget.bytes = budget.bytes.saturating_add(line.len());
+        if budget.bytes > MAX_SCRIPT_BYTES {
+            return Err(too_big());
         }
         let lower = line.to_ascii_lowercase();
         i += 1;
         if lower.starts_with("{$") {
             match lower.as_str() {
                 _ if lower.starts_with("{$lua:") => {
+                    budget.lua_runs += 1;
+                    if budget.lua_runs > MAX_LUA_BLOCKS {
+                        return err(ln, format!("more than {MAX_LUA_BLOCKS} {{$lua}} blocks"));
+                    }
                     let src = lower
                         .get(6..lower.len().saturating_sub(1))
                         .and_then(|n| n.parse::<usize>().ok())
@@ -309,11 +356,18 @@ fn preprocess(
                     .map(|c| open + c + 1)
                     .unwrap_or(line.len());
                 let value = line[comma..line.trim_end().len() - 1].trim().to_string();
+                if defines.len() >= MAX_DEFINES {
+                    return err(ln, format!("more than {MAX_DEFINES} defines"));
+                }
                 defines.push((args[0].clone(), value));
             }
             Some((name, args)) if name == "include" => {
                 if depth > 8 {
                     return err(ln, "include nesting too deep");
+                }
+                budget.includes += 1;
+                if budget.includes > MAX_INCLUDES {
+                    return err(ln, format!("more than {MAX_INCLUDES} includes"));
                 }
                 let Some(inc) = hooks.include.as_mut() else {
                     return err(ln, "include needs a file loader");
@@ -324,7 +378,7 @@ fn preprocess(
                     .map(|l| (ln, l.trim().to_string()))
                     .filter(|(_, l)| !l.is_empty())
                     .collect();
-                out.extend(preprocess(new, hooks, lua_blocks, depth + 1)?);
+                out.extend(preprocess(new, hooks, lua_blocks, depth + 1, budget)?);
             }
             _ => out.push((ln, line)),
         }
@@ -371,6 +425,11 @@ fn parse_pattern(s: &str) -> Result<Vec<(u8, u8)>> {
     if out.is_empty() {
         return Err(bad());
     }
+    if out.len() > MAX_PATTERN_LEN {
+        return Err(Error::Parse(format!(
+            "pattern longer than {MAX_PATTERN_LEN} bytes"
+        )));
+    }
     Ok(out)
 }
 
@@ -386,9 +445,30 @@ pub fn aob_scan(
     pattern: &str,
     max: usize,
 ) -> Result<Vec<Addr>> {
+    aob_scan_cancellable(p, start, stop, pattern, max, &AtomicBool::new(false))
+}
+
+/// [`aob_scan`] that stops with `Err(Other("cancelled"))` once `cancel` is set (checked
+/// every MiB).
+pub fn aob_scan_cancellable(
+    p: &dyn Process,
+    start: Addr,
+    stop: Addr,
+    pattern: &str,
+    max: usize,
+    cancel: &AtomicBool,
+) -> Result<Vec<Addr>> {
     let pat = parse_pattern(pattern)?;
+    // Anchor on a fixed byte (preferring one that is not common filler) and let memchr skip
+    // to its occurrences instead of comparing the whole pattern at every byte.
+    let fixed = || pat.iter().enumerate().filter(|(_, (_, m))| *m == 0xFF);
+    let anchor = fixed()
+        .find(|(_, (b, _))| !matches!(b, 0x00 | 0xFF | 0x90 | 0xCC))
+        .or_else(|| fixed().next())
+        .map(|(k, (b, _))| (k, *b));
     const CHUNK: u64 = 1 << 20;
     let mut hits = Vec::new();
+    let mut buf = Vec::new();
     for r in p.regions()? {
         if !r.prot.r {
             continue;
@@ -396,19 +476,28 @@ pub fn aob_scan(
         let (lo, hi) = (r.start.max(start), r.start.saturating_add(r.size).min(stop));
         let mut a = lo;
         while a < hi {
-            let len = (hi - a).min(CHUNK) + pat.len() as u64 - 1;
-            let mut buf = vec![0u8; len as usize];
+            if cancel.load(Ordering::Relaxed) {
+                return Err(Error::Other("cancelled".into()));
+            }
+            let span = (hi - a).min(CHUNK) as usize;
+            buf.resize(span + pat.len() - 1, 0);
             let n = p.read(a, &mut buf).unwrap_or(0);
-            for off in 0..n.saturating_sub(pat.len() - 1) {
-                if a + off as u64 >= hi {
-                    break;
-                }
-                if matches_at(&buf[off..n], &pat) {
+            let hay = &buf[..n];
+            let mut test = |off: usize| {
+                let hit = off < span && matches_at(&hay[off..], &pat);
+                if hit {
                     hits.push(a + off as u64);
-                    if hits.len() >= max {
-                        return Ok(hits);
-                    }
                 }
+                hit && hits.len() >= max
+            };
+            let done = match anchor {
+                Some((k, b)) => hay
+                    .get(k..)
+                    .is_some_and(|h| memchr::memchr_iter(b, h).any(&mut test)),
+                None => (0..n.min(span)).any(test),
+            };
+            if done {
+                return Ok(hits);
             }
             a = a.saturating_add(CHUNK);
         }
@@ -536,7 +625,7 @@ fn run(
         }
         return Ok(AaState::default());
     }
-    let lines = preprocess(lines, hooks, &mut lua_blocks, 0)?;
+    let lines = preprocess(lines, hooks, &mut lua_blocks, 0, &mut Budget::default())?;
     let bits = bitness(p);
     let mut r = Run {
         p,
@@ -568,6 +657,7 @@ fn run(
 
     let result = (|| -> R<()> {
         let mut in_struct: Option<(usize, String, u64)> = None;
+        let mut readmem_total = 0u64;
         for (ln, line) in &lines {
             let ln = *ln;
             let lower = line.to_ascii_lowercase();
@@ -586,7 +676,11 @@ fn run(
                         .insert(format!("{sname}.{m}").to_ascii_lowercase(), *off);
                 }
                 if !data.is_empty() {
-                    *off += struct_size(data, bits).map_err(at(ln))?;
+                    let n = struct_size(data, bits).map_err(at(ln))?;
+                    *off = off.checked_add(n).ok_or_else(|| AaError {
+                        line: ln,
+                        message: format!("struct {sname} is larger than 2^64 bytes"),
+                    })?;
                 }
                 continue;
             }
@@ -803,7 +897,14 @@ fn run(
                         line: ln,
                         message: "bad size".into(),
                     })?;
-                    let mut buf = vec![0u8; n.min(1 << 20) as usize];
+                    readmem_total = readmem_total.saturating_add(n);
+                    if readmem_total > MAX_READMEM_BYTES {
+                        return err(
+                            ln,
+                            format!("readmem: more than {MAX_READMEM_BYTES} bytes per script"),
+                        );
+                    }
+                    let mut buf = vec![0u8; n as usize];
                     p.read_exact(a, &mut buf).map_err(at(ln))?;
                     items.push((ln, Item::Bytes(buf)));
                 }
@@ -842,7 +943,10 @@ fn run(
                 } else {
                     format!("__anon{}", anon - 1)
                 };
-                *s = replace_word(&replace_word(s, "@f", &f), "@b", &b);
+                // Cannot fail: the labels are shorter than any line the limit would reject.
+                *s = replace_word(s, "@f", &f, usize::MAX)
+                    .and_then(|t| replace_word(&t, "@b", &b, usize::MAX))
+                    .unwrap_or_default();
             }
             _ => {}
         }
@@ -1032,7 +1136,16 @@ fn place(r: &Run, items: &[(usize, Item)], labels: &HashSet<String>, bits: u32) 
         let mut changed = false;
         let mut unresolved: Option<(usize, String)> = None;
         let mut out = Vec::new();
+        let mut total = 0usize;
         for (i, (ln, it)) in items.iter().enumerate() {
+            if let Item::Bytes(b) = it {
+                // Copied once, after placement converged.
+                let c = cur.unwrap_or(0);
+                cur = Some(c.wrapping_add(b.len() as u64));
+                total = total.saturating_add(b.len());
+                out.push((*ln, c, Vec::new()));
+                continue;
+            }
             let ln = *ln;
             if let Item::Label(l) = it {
                 let Some(c) = cur else {
@@ -1074,7 +1187,7 @@ fn place(r: &Run, items: &[(usize, Item)], labels: &HashSet<String>, bits: u32) 
                     };
                     Some(assemble_line(t, c, bits, &lookup).map_err(at(ln))?)
                 }
-                Item::Bytes(b) => Some(b.clone()),
+                Item::Bytes(_) => None,
                 Item::Reassemble(e) => {
                     let Some(c) = cur else {
                         return err(ln, "code without an address");
@@ -1105,6 +1218,13 @@ fn place(r: &Run, items: &[(usize, Item)], labels: &HashSet<String>, bits: u32) 
                     changed = true;
                 }
                 b.resize(sizes[i], 0x90);
+                total = total.saturating_add(b.len());
+                if total > MAX_ASSEMBLED_BYTES {
+                    return err(
+                        ln,
+                        format!("script assembles to more than {MAX_ASSEMBLED_BYTES} bytes"),
+                    );
+                }
                 let c = cur.unwrap_or(0);
                 cur = Some(c.wrapping_add(b.len() as u64));
                 out.push((ln, c, b));
@@ -1113,6 +1233,16 @@ fn place(r: &Run, items: &[(usize, Item)], labels: &HashSet<String>, bits: u32) 
         if !changed && now == prev {
             if let Some((ln, n)) = unresolved {
                 return err(ln, format!("label '{n}' is used but never defined"));
+            }
+            let raw = items.iter().filter_map(|(_, it)| match it {
+                Item::Bytes(b) => Some(Some(b)),
+                Item::Asm(_) | Item::Reassemble(_) => Some(None),
+                _ => None,
+            });
+            for (o, b) in out.iter_mut().zip(raw) {
+                if let Some(b) = b {
+                    o.2 = b.clone();
+                }
             }
             return Ok((out, now));
         }
@@ -1164,11 +1294,11 @@ pub fn injection_template(p: &dyn Process, addr: Addr, kind: Template) -> Result
     let mut f = formatter();
     let (mut code, mut orig) = (String::new(), Vec::new());
     while orig.len() < 5 {
-        let (ins, bytes) = decode_at(p, addr + orig.len() as u64)?;
+        let (ins, bytes) = decode_at(p, addr.wrapping_add(orig.len() as u64))?;
         if ins.is_invalid() {
             return Err(Error::Parse(format!(
                 "cannot decode instruction at {:X}",
-                addr + orig.len() as u64
+                addr.wrapping_add(orig.len() as u64)
             )));
         }
         let mut t = String::new();
@@ -1203,11 +1333,11 @@ pub fn injection_template(p: &dyn Process, addr: Addr, kind: Template) -> Result
             let mut pat = orig.clone();
             while cands.len() > 1 && pat.len() < 64 {
                 let mut b = [0u8];
-                p.read_exact(addr + pat.len() as u64, &mut b)?;
+                p.read_exact(addr.wrapping_add(pat.len() as u64), &mut b)?;
                 let off = pat.len() as u64;
                 cands.retain(|c| {
                     let mut x = [0u8];
-                    p.read_exact(c + off, &mut x).is_ok() && x == b
+                    p.read_exact(c.wrapping_add(off), &mut x).is_ok() && x == b
                 });
                 pat.push(b[0]);
             }

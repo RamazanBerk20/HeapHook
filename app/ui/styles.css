@@ -127,7 +127,7 @@ input[type=checkbox] { accent-color: var(--text); margin: 0; width: 14px; height
 
 .badge {
   display: inline-block; padding: 2px 7px; border-radius: 999px; font-size: 10px; font-weight: 600;
-  letter-spacing: 0.06em; text-transform: uppercase; line-height: 14px;
+  letter-spacing: 0.06em; text-transform: uppercase; line-height: 14px; white-space: nowrap;
 }
 .badge.yellow { background: var(--yellow-bg); color: var(--yellow); }
 .badge.green { background: var(--green-bg); color: var(--green); }

@@ -17,6 +17,7 @@ struct Fake {
     read_delay: AtomicU64,
     /// Start addresses of regions reported as shared mappings.
     shared: Vec<Addr>,
+    pid: AtomicU32,
 }
 
 const RW: Prot = Prot { r: true, w: true, x: false };
@@ -31,6 +32,7 @@ impl Fake {
             resumes: AtomicU32::new(0),
             read_delay: AtomicU64::new(0),
             shared: Vec::new(),
+            pid: AtomicU32::new(1),
         }
     }
     fn region(&self, addr: Addr) -> Result<(usize, usize)> {
@@ -76,7 +78,7 @@ impl Memory for Fake {
 
 impl Process for Fake {
     fn pid(&self) -> Pid {
-        1
+        self.pid.load(Relaxed)
     }
     fn regions(&self) -> Result<Vec<Region>> {
         Ok(self
@@ -1126,4 +1128,76 @@ fn unicode_case_and_codepages() {
     assert_eq!(find("CÉL", false, Some(28591)).unwrap(), [A + 0xc0]);
     assert!(find("x", false, Some(932)).is_err());
     assert!(find("€", false, Some(28591)).is_err());
+}
+
+// ---------------------------------------------------------------- hostile input (release audit)
+
+#[test]
+fn table_value_lengths_are_capped() {
+    let p = fake();
+    let huge = Fmt { len: Some(1 << 40), ..Fmt::default() };
+    assert!(value_size(VType::String, &huge).is_err());
+    assert!(value_size(VType::Aob, &huge).is_err());
+    assert!(value_size(VType::String, &Fmt { len: Some(usize::MAX), utf16: true, ..Fmt::default() }).is_err());
+    assert_eq!(value_size(VType::Aob, &Fmt { len: Some(MAX_VALUE_LEN), ..Fmt::default() }).unwrap(), MAX_VALUE_LEN);
+    let refs = [ValueRef { addr: A, vtype: VType::String, fmt: huge }, ValueRef { addr: A, vtype: VType::Byte, fmt: Fmt::default() }];
+    assert_eq!(read_values(&*p, &refs), [None, Some("0".into())]);
+    let ex = [ValueRefEx { r: refs[0].clone(), custom: None }];
+    assert_eq!(read_values_ex(&*p, &ex), [None]);
+}
+
+#[test]
+fn bigger_than_max_and_smaller_than_min_match_nothing() {
+    let p = fake();
+    let s = scanner(&p);
+    for (st, v) in [(ScanType::Bigger, i128::MAX.to_string()), (ScanType::Smaller, i128::MIN.to_string())] {
+        for vt in [VType::Byte, VType::Bytes4, VType::Bytes8] {
+            let mut f = first(vt, st, &v);
+            f.opts.signed = true;
+            assert_eq!(s.first_scan(&f).map(|c| c.count).unwrap_or(0), 0, "{st:?} {vt:?}");
+        }
+    }
+}
+
+#[test]
+fn bad_alignments_and_group_spans_are_rejected() {
+    let p = fake();
+    let s = scanner(&p);
+    for a in [0, u64::MAX, (1 << 32) + 1] {
+        let mut f = first(VType::Bytes4, ScanType::Exact, "1");
+        f.opts.alignment = Some(a);
+        assert!(s.first_scan(&f).is_err(), "{a:#x}");
+    }
+    let mut f = first(VType::Bytes4, ScanType::Exact, "1");
+    f.opts.alignment = Some(1 << 32);
+    assert!(s.first_scan(&f).is_ok());
+    for g in ["w:FFFFFFFFFFFFFFFF 1:0", "w:18446744073709551615 1:0", "w:900000 w:900000 1:0", "BS:99999999 OOO 1:0", "BA:0 1:0"] {
+        assert!(s.first_scan(&first(VType::Grouped, ScanType::Exact, g)).is_err(), "{g}");
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn pause_leaves_an_already_stopped_target_stopped() {
+    use std::process::Command;
+    let mut child = Command::new("sleep").arg("30").spawn().unwrap();
+    let pid = child.id();
+    Command::new("kill").args(["-STOP", &pid.to_string()]).status().unwrap();
+    let stat = || std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap_or_default();
+    for _ in 0..200 {
+        if stat().rsplit_once(')').is_some_and(|(_, r)| r.trim_start().starts_with(['T', 't'])) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let p = fake();
+    p.pid.store(pid, Relaxed);
+    let s = scanner(&p);
+    let mut f = first(VType::Bytes4, ScanType::Exact, "1");
+    f.opts.pause_while_scanning = true;
+    s.first_scan(&f).unwrap();
+    let counts = (p.suspends.load(Relaxed), p.resumes.load(Relaxed));
+    let _ = child.kill();
+    let _ = child.wait();
+    assert_eq!(counts, (0, 0));
 }

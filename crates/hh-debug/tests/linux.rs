@@ -587,3 +587,778 @@ fn process_exit_ends_session() {
     assert_eq!(d.state().unwrap(), State::Exited);
     assert!(d.pause().is_err());
 }
+
+/// Item 1(a): while one thread steps over a software breakpoint (original byte back in
+/// place) the other threads must not run past it unseen.
+#[test]
+fn software_breakpoint_hot_loop_from_many_threads() {
+    let mut t = Target::spawn();
+    let d = Debugger::attach(t.pid()).unwrap();
+    let bp = Breakpoint {
+        action: Action::Record,
+        ..Breakpoint::execute(t.addr("hot"))
+    };
+    let id = d.add_breakpoint(bp, Hooks::default()).unwrap();
+    let (threads, iters) = (4u64, 5000u64);
+    t.send(&format!("hot {threads} {iters}"));
+    assert_eq!(
+        t.lines.recv_timeout(Duration::from_secs(60)).unwrap(),
+        format!("hot {}", threads * iters)
+    );
+    let info = &d.breakpoints().unwrap()[0];
+    assert_eq!(info.hits, threads * iters, "missed hits");
+    let n: u64 = d.records(id).unwrap().iter().map(|r| r.count).sum();
+    assert_eq!(n, threads * iters);
+    d.detach().unwrap();
+    let mut b = [0u8];
+    hh_core::open(t.pid())
+        .unwrap()
+        .read(t.addr("hot"), &mut b)
+        .unwrap();
+    assert_eq!(b[0], 0xf0, "no stray int3");
+}
+
+fn raw_byte(pid: u32, a: u64) -> u8 {
+    let mut b = [0u8];
+    hh_core::open(pid).unwrap().read(a, &mut b).unwrap();
+    b[0]
+}
+
+fn proc_state(pid: u32) -> char {
+    let s = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();
+    s[s.rfind(')').unwrap() + 2..].chars().next().unwrap()
+}
+
+fn wait_until(f: impl Fn() -> bool) {
+    for _ in 0..500 {
+        if f() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    panic!("condition not reached");
+}
+
+impl Target {
+    fn recv_long(&mut self) -> String {
+        match self.lines.recv_timeout(Duration::from_secs(60)) {
+            Ok(l) => l,
+            Err(e) => {
+                std::thread::sleep(Duration::from_millis(200));
+                panic!("target answer: {e:?}; target {:?}", self.child.try_wait());
+            }
+        }
+    }
+}
+
+/// Item 1(b): a forked child inherits neither int3 bytes nor page protections.
+#[test]
+fn fork_child_runs_without_our_patches() {
+    let mut t = Target::spawn();
+    let d = Debugger::attach(t.pid()).unwrap();
+    let store = t.addr("store");
+    let bp = Breakpoint {
+        action: Action::Record,
+        ..Breakpoint::execute(store)
+    };
+    let id = d.add_breakpoint(bp, Hooks::default()).unwrap();
+    let w = d
+        .add_watch_range(
+            t.addr("value"),
+            8,
+            BpKind::Write,
+            Action::Record,
+            Hooks::default(),
+            BpOptions::default(),
+        )
+        .unwrap();
+    for _ in 0..2 {
+        assert_eq!(t.cmd("fork"), "fork 42");
+        wait_for(&d, |e| matches!(e, Event::Forked { .. }));
+    }
+    // The child's store is neither a hit nor a crash.
+    assert_eq!(d.breakpoints().unwrap()[0].hits, 0);
+    assert_eq!(t.cmd("store"), "ok 101 200");
+    let infos = d.breakpoints().unwrap();
+    assert_eq!(infos.iter().find(|i| i.id == id).unwrap().hits, 1);
+    assert_eq!(infos.iter().find(|i| i.id == w).unwrap().hits, 1);
+}
+
+/// Item 1(b): a vfork child (posix_spawn) shares our memory, so it is stepped over our
+/// breakpoints until it execs.
+#[test]
+fn vfork_child_steps_over_breakpoints() {
+    let mut t = Target::spawn();
+    let d = Debugger::attach(t.pid()).unwrap();
+    let execve = t.addr("execve");
+    let bp = Breakpoint {
+        action: Action::Record,
+        ..Breakpoint::execute(execve)
+    };
+    d.add_breakpoint(bp, Hooks::default()).unwrap();
+    for _ in 0..3 {
+        assert_eq!(t.cmd("spawntrue"), "spawn 0");
+    }
+    // Guests are not our threads and their hits do not count.
+    assert_eq!(d.breakpoints().unwrap()[0].hits, 0);
+    assert_eq!(d.threads().unwrap().len(), 1);
+    assert_eq!(raw_byte(t.pid(), execve), 0xcc);
+    d.detach().unwrap();
+    assert_ne!(raw_byte(t.pid(), execve), 0xcc);
+    assert_eq!(t.cmd("spawntrue"), "spawn 0");
+}
+
+/// Item 1(c): after execve every breakpoint is disabled and nothing is written into the new
+/// image; the loader hook comes back.
+#[test]
+fn exec_disables_breakpoints() {
+    let mut t = Target::spawn();
+    let d = Debugger::attach(t.pid()).unwrap();
+    let old = t.addr("store");
+    let sw = d
+        .add_breakpoint(Breakpoint::execute(old), Hooks::default())
+        .unwrap();
+    d.add_breakpoint(
+        Breakpoint::watch(t.addr("value"), 8, BpKind::Write),
+        Hooks::default(),
+    )
+    .unwrap();
+    t.send("store");
+    wait_break(&d);
+    d.cont(false).unwrap();
+    assert_eq!(t.recv(), "ok 101 200");
+    t.send("exec");
+    t.info = serde_json::from_str(&t.recv()).unwrap();
+    wait_for(&d, |e| matches!(e, Event::Exec));
+    let infos = d.breakpoints().unwrap();
+    assert!(
+        infos.iter().all(|i| !i.enabled && i.slot.is_none()),
+        "{infos:?}"
+    );
+    assert_eq!(infos.iter().find(|i| i.id == sw).unwrap().hits, 1);
+    let store = t.addr("store");
+    assert_ne!(raw_byte(t.pid(), store), 0xcc);
+    assert_eq!(t.cmd("store"), "ok 101 200");
+    let id = d
+        .add_breakpoint(Breakpoint::execute(store), Hooks::default())
+        .unwrap();
+    t.send("store");
+    let (tid, r, _) = wait_break(&d);
+    assert_eq!((tid, r), (t.pid(), BreakReason::Breakpoint(id)));
+    d.cont(false).unwrap();
+    assert_eq!(t.recv(), "ok 102 200");
+    assert_eq!(t.cmd("dlopen libm.so.6"), "ok 102 200");
+    wait_for(
+        &d,
+        |e| matches!(e, Event::ModuleLoaded(m) if m.name.starts_with("libm")),
+    );
+}
+
+/// Item 1(d): the main thread exits while another keeps the process alive.
+#[test]
+fn main_thread_exit() {
+    let mut t = Target::spawn();
+    let pid = t.pid();
+    let d = Debugger::attach(pid).unwrap();
+    assert_eq!(t.cmd("exitmain"), "ok");
+    wait_for(
+        &d,
+        |e| matches!(e, Event::ThreadExited { tid } if *tid == pid),
+    );
+    assert!(d.threads().unwrap().iter().all(|th| th.tid != pid));
+    let id = d
+        .add_breakpoint(Breakpoint::execute(t.addr("store")), Hooks::default())
+        .unwrap();
+    t.send("store");
+    let (tid, r, _) = wait_break(&d);
+    assert_ne!(tid, pid);
+    assert_eq!(r, BreakReason::Breakpoint(id));
+    d.cont(false).unwrap();
+    assert_eq!(t.recv(), "ok 101 200");
+    d.pause().unwrap();
+    assert_ne!(wait_break(&d).0, pid);
+    d.cont(false).unwrap();
+    let p = d.process();
+    let a = p
+        .alloc(
+            0x1000,
+            Prot {
+                r: true,
+                w: true,
+                x: false,
+            },
+            None,
+        )
+        .unwrap();
+    p.free(a, 0x1000).unwrap();
+    t.send("quit");
+    wait_for(&d, |e| matches!(e, Event::ProcessExited { code: Some(0) }));
+}
+
+#[test]
+fn main_thread_exit_then_detach() {
+    let mut t = Target::spawn();
+    let d = Debugger::attach(t.pid()).unwrap();
+    d.add_breakpoint(Breakpoint::execute(t.addr("store")), Hooks::default())
+        .unwrap();
+    assert_eq!(t.cmd("exitmain"), "ok");
+    wait_for(&d, |e| matches!(e, Event::ThreadExited { .. }));
+    d.detach().unwrap();
+    assert_eq!(t.cmd("store"), "ok 101 200");
+}
+
+/// Item 1(e): dropping the debugger in awkward states leaves the target running, untraced
+/// and unpatched.
+#[test]
+fn drop_while_broken_or_stepping() {
+    let mut t = Target::spawn();
+    let pid = t.pid();
+    let store = t.addr("store");
+    // Broken at a breakpoint.
+    let d = Debugger::attach(pid).unwrap();
+    d.add_breakpoint(Breakpoint::execute(store), Hooks::default())
+        .unwrap();
+    t.send("store");
+    wait_break(&d);
+    drop(d);
+    assert_eq!(t.recv(), "ok 101 200");
+    assert_eq!((tracer_pid(pid), raw_byte(pid, store)), (0, 0x48));
+    // During a step over a long call (temporary breakpoint armed, thread running).
+    let call = t.addr("call");
+    let d = Debugger::attach(pid).unwrap();
+    d.add_breakpoint(Breakpoint::execute(call), Hooks::default())
+        .unwrap();
+    t.send("callsleep 300");
+    let (tid, _, _) = wait_break(&d);
+    d.step_over(tid).unwrap();
+    std::thread::sleep(Duration::from_millis(50));
+    drop(d);
+    assert_eq!(t.recv(), "ok");
+    assert_eq!(tracer_pid(pid), 0);
+    assert_eq!((raw_byte(pid, call), raw_byte(pid, call + 2)), (0xff, 0xc3));
+    // In the middle of a hot multi-threaded breakpoint loop.
+    let d = Debugger::attach(pid).unwrap();
+    let bp = Breakpoint {
+        action: Action::Record,
+        ..Breakpoint::execute(t.addr("hot"))
+    };
+    d.add_breakpoint(bp, Hooks::default()).unwrap();
+    t.send("hot 4 200000");
+    std::thread::sleep(Duration::from_millis(150));
+    assert!(d.breakpoints().unwrap()[0].hits > 0);
+    drop(d);
+    assert_eq!(t.recv_long(), "hot 800000");
+    assert_eq!((tracer_pid(pid), raw_byte(pid, t.addr("hot"))), (0, 0xf0));
+}
+
+#[test]
+fn drop_with_pending_signal_and_page_watch() {
+    let mut t = Target::spawn();
+    let pid = t.pid();
+    let d = Debugger::attach(pid).unwrap();
+    d.set_signal_action(10, SignalAction::Break).unwrap();
+    d.add_watch_range(
+        t.addr("buf"),
+        64,
+        BpKind::Access,
+        Action::Record,
+        Hooks::default(),
+        BpOptions::default(),
+    )
+    .unwrap();
+    t.send("raise 10");
+    let (_, r, _) = wait_break(&d);
+    assert!(matches!(r, BreakReason::Signal { code: 10, .. }));
+    drop(d);
+    // The signal the break was about is delivered, the page is usable again.
+    assert_eq!(t.recv(), "sig 1 0");
+    assert_eq!(t.cmd("bufw 8"), "buf 1");
+    assert_eq!(tracer_pid(pid), 0);
+}
+
+/// Item 1(f): job-control stops survive attach, breaks and detach.
+#[test]
+fn job_control_stop() {
+    let mut t = Target::spawn();
+    let pid = t.pid();
+    let d = Debugger::attach(pid).unwrap();
+    let id = d
+        .add_breakpoint(Breakpoint::execute(t.addr("store")), Hooks::default())
+        .unwrap();
+    unsafe { libc::kill(pid as i32, libc::SIGSTOP) };
+    wait_until(|| matches!(proc_state(pid), 't' | 'T'));
+    std::thread::sleep(Duration::from_millis(50));
+    t.send("store");
+    assert!(t.lines.recv_timeout(Duration::from_millis(300)).is_err());
+    assert_eq!(d.state().unwrap(), State::Running);
+    // A pause and continue keep it stopped.
+    d.pause().unwrap();
+    wait_break(&d);
+    d.cont(false).unwrap();
+    assert!(t.lines.recv_timeout(Duration::from_millis(300)).is_err());
+    unsafe { libc::kill(pid as i32, libc::SIGCONT) };
+    let (_, r, _) = wait_break(&d);
+    assert_eq!(r, BreakReason::Breakpoint(id));
+    d.cont(false).unwrap();
+    assert_eq!(t.recv(), "ok 101 200");
+    // Detached while stopped: stays stopped, SIGCONT resumes it.
+    unsafe { libc::kill(pid as i32, libc::SIGSTOP) };
+    wait_until(|| matches!(proc_state(pid), 't' | 'T'));
+    std::thread::sleep(Duration::from_millis(50));
+    d.detach().unwrap();
+    assert_eq!(tracer_pid(pid), 0);
+    t.send("store");
+    assert!(t.lines.recv_timeout(Duration::from_millis(300)).is_err());
+    assert_eq!(proc_state(pid), 'T');
+    unsafe { libc::kill(pid as i32, libc::SIGCONT) };
+    assert_eq!(t.recv(), "ok 102 200");
+}
+
+/// Item 1(g): pass / ignore / break per signal, defaults and reset.
+#[test]
+fn signal_policy() {
+    let table = signal_table();
+    let def = |c| table.iter().find(|s| s.code == c).unwrap().default;
+    assert_eq!(def(11), SignalAction::Break);
+    assert_eq!(def(10), SignalAction::Pass);
+    assert_eq!(table.iter().find(|s| s.code == 10).unwrap().name, "SIGUSR1");
+
+    let mut t = Target::spawn();
+    let d = Debugger::attach(t.pid()).unwrap();
+    assert_eq!(d.signal_action(10).unwrap(), SignalAction::Pass);
+    assert_eq!(t.cmd("raise 10"), "sig 1 0");
+    assert!(matches!(
+        wait_for(&d, |e| matches!(e, Event::Signal { .. })),
+        Event::Signal {
+            code: 10,
+            passed: true,
+            ..
+        }
+    ));
+    d.set_signal_action(10, SignalAction::Ignore).unwrap();
+    assert_eq!(t.cmd("raise 10"), "sig 1 0");
+    assert!(matches!(
+        wait_for(&d, |e| matches!(e, Event::Signal { .. })),
+        Event::Signal { passed: false, .. }
+    ));
+    d.set_signal_action(10, SignalAction::Break).unwrap();
+    d.set_signal_action(12, SignalAction::Break).unwrap();
+    t.send("raise 10");
+    assert!(matches!(
+        wait_break(&d).1,
+        BreakReason::Signal { code: 10, .. }
+    ));
+    d.cont(true).unwrap();
+    assert_eq!(t.recv(), "sig 2 0");
+    t.send("raise 12");
+    assert!(matches!(
+        wait_break(&d).1,
+        BreakReason::Signal { code: 12, .. }
+    ));
+    d.cont(false).unwrap();
+    assert_eq!(t.recv(), "sig 2 0");
+    let all = d.signal_actions().unwrap();
+    assert!(all.contains(&(10, SignalAction::Break)) && all.contains(&(11, SignalAction::Break)));
+    d.reset_signal_action(10).unwrap();
+    assert_eq!(d.signal_action(10).unwrap(), SignalAction::Pass);
+    assert_eq!(d.signal_action(12).unwrap(), SignalAction::Break);
+    d.set_signal_action(11, SignalAction::Pass).unwrap();
+    d.reset_signal_actions().unwrap();
+    assert_eq!(d.signal_action(12).unwrap(), SignalAction::Pass);
+    assert_eq!(d.signal_action(11).unwrap(), SignalAction::Break);
+    assert_eq!(t.cmd("raise 12"), "sig 2 1");
+}
+
+/// Item 2: enable/disable in place, hooks and options replaced in place.
+#[test]
+fn enable_disable_and_options_in_place() {
+    let mut t = Target::spawn();
+    let d = Debugger::attach(t.pid()).unwrap();
+    let store = t.addr("store");
+    let rec = Breakpoint {
+        action: Action::Record,
+        ..Breakpoint::execute(store)
+    };
+    let id = d.add_breakpoint(rec, Hooks::default()).unwrap();
+    let hw = d
+        .add_breakpoint(
+            Breakpoint::watch(t.addr("value"), 8, BpKind::Write),
+            Hooks::default(),
+        )
+        .unwrap();
+    t.cmd("store");
+    d.set_enabled(id, false).unwrap();
+    d.set_enabled(hw, false).unwrap();
+    assert_eq!(raw_byte(t.pid(), store), 0x48);
+    t.cmd("store");
+    let info = d.breakpoints().unwrap();
+    assert!(
+        info.iter()
+            .all(|i| !i.enabled && i.hits == 1 && i.slot.is_none())
+    );
+    assert_eq!(d.records(id).unwrap().len(), 1);
+    // All four slots can be taken while it is disabled; enabling then fails cleanly.
+    let others: Vec<BpId> = (0..4)
+        .map(|_| {
+            d.add_breakpoint(
+                Breakpoint::watch(t.addr("value2"), 8, BpKind::Write),
+                Hooks::default(),
+            )
+            .unwrap()
+        })
+        .collect();
+    assert!(d.set_enabled(hw, false).is_ok());
+    assert!(d.set_enabled(hw, true).is_err());
+    d.remove_breakpoint(others[0]).unwrap();
+    d.set_enabled(hw, true).unwrap();
+    d.set_enabled(id, true).unwrap();
+    t.cmd("store");
+    let info = d.breakpoints().unwrap();
+    assert_eq!(info.iter().find(|i| i.id == id).unwrap().hits, 2);
+    assert_eq!(info.iter().find(|i| i.id == hw).unwrap().hits, 2);
+
+    // Condition replaced in place keeps the count.
+    d.set_condition(id, Some(Arc::new(|c: &Context| c.rsi == 999)))
+        .unwrap();
+    t.cmd("store");
+    assert_eq!(d.breakpoints().unwrap()[0].hits, 2);
+    d.set_hooks(id, Hooks::default()).unwrap();
+    t.cmd("store");
+    assert_eq!(d.breakpoints().unwrap()[0].hits, 3);
+
+    // Break after 2 skipped hits, once.
+    let b = d
+        .add_breakpoint_with(
+            Breakpoint::execute(t.addr("outer")),
+            Hooks::default(),
+            BpOptions {
+                skip_hits: 2,
+                one_shot: true,
+                ..BpOptions::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(t.cmd("outer"), "ok 106 200");
+    assert_eq!(t.cmd("outer"), "ok 107 200");
+    t.send("outer");
+    assert_eq!(wait_break(&d).1, BreakReason::Breakpoint(b));
+    d.cont(false).unwrap();
+    assert_eq!(t.recv(), "ok 108 200");
+    assert_eq!(t.cmd("outer"), "ok 109 200");
+    let i = d
+        .breakpoints()
+        .unwrap()
+        .into_iter()
+        .find(|i| i.id == b)
+        .unwrap();
+    assert_eq!((i.hits, i.enabled), (3, false));
+
+    // Recorder auto-stop after 2 more hits (`outer` hit it too).
+    let hits = |d: &Debugger| {
+        d.breakpoints()
+            .unwrap()
+            .into_iter()
+            .find(|i| i.id == id)
+            .unwrap()
+    };
+    let before = hits(&d).hits;
+    d.set_options(
+        id,
+        BpOptions {
+            max_hits: Some(before + 2),
+            ..BpOptions::default()
+        },
+    )
+    .unwrap();
+    for _ in 0..4 {
+        t.cmd("store");
+    }
+    wait_for(
+        &d,
+        |e| matches!(e, Event::BreakpointDisabled { bp } if *bp == id),
+    );
+    let i = hits(&d);
+    assert_eq!((i.hits, i.enabled), (before + 2, false));
+}
+
+/// Item 3: page-protection watches over a range larger than a debug register.
+#[test]
+fn page_watch_range() {
+    let mut t = Target::spawn();
+    let d = Debugger::attach(t.pid()).unwrap();
+    let (buf, store, load) = (t.addr("buf"), t.addr("store"), t.addr("load"));
+    // 6000 bytes from buf+1000: spans two pages.
+    let w = d
+        .add_watch_range(
+            buf + 1000,
+            6000,
+            BpKind::Write,
+            Action::Record,
+            Hooks::default(),
+            BpOptions::default(),
+        )
+        .unwrap();
+    assert_eq!(t.cmd("bufw 1000"), "buf 1");
+    assert_eq!(t.cmd("bufw 6992"), "buf 1");
+    assert_eq!(t.cmd("bufw 6992"), "buf 2");
+    // Same pages but outside the range, and reads: not reported.
+    assert_eq!(t.cmd("bufw 0"), "buf 1");
+    assert_eq!(t.cmd("bufw 7000"), "buf 1");
+    assert_eq!(t.cmd("bufr 2000"), "buf 0");
+    let mut recs = d.records(w).unwrap();
+    recs.sort_by_key(|r| r.address);
+    let got: Vec<_> = recs
+        .iter()
+        .map(|r| (r.address, r.count, r.insn, r.ip))
+        .collect();
+    assert_eq!(
+        got,
+        [
+            (Some(buf + 1000), 1, Some(store), store + 3),
+            (Some(buf + 6992), 2, Some(store), store + 3)
+        ]
+    );
+    assert_eq!(d.breakpoints().unwrap()[0].len, 6000);
+    // Access watch with break: stops after the read with the reader known.
+    let a = d
+        .add_watch_range(
+            buf + 2 * 4096 + 16,
+            32,
+            BpKind::Access,
+            Action::Break,
+            Hooks::default(),
+            BpOptions::default(),
+        )
+        .unwrap();
+    t.send("bufr 8208");
+    let (_, r, c) = wait_break(&d);
+    assert_eq!((r, c.rip), (BreakReason::Breakpoint(a), load + 3));
+    d.cont(false).unwrap();
+    assert_eq!(t.recv(), "buf 0");
+    // Removing restores the protections.
+    d.remove_breakpoint(w).unwrap();
+    d.remove_breakpoint(a).unwrap();
+    let prot = |a: u64| {
+        d.process()
+            .regions()
+            .unwrap()
+            .into_iter()
+            .find(|r| a >= r.start && a < r.start + r.size)
+            .unwrap()
+            .prot
+    };
+    assert!(prot(buf).w && prot(buf + 8192).r);
+    assert_eq!(t.cmd("bufw 1000"), "buf 2");
+}
+
+/// Item 4: step over a whole `rep` instruction and over recursive calls; step out of a
+/// recursion level; run to an address for one thread only.
+#[test]
+fn stepping_rep_recursion_and_run_to_thread() {
+    let mut t = Target::spawn();
+    let d = Debugger::attach(t.pid()).unwrap();
+    let (rep, rec) = (t.addr("rep"), t.addr("rec"));
+    let b = d
+        .add_breakpoint(Breakpoint::execute(rep + 5), Hooks::default())
+        .unwrap();
+    t.send("rep 100");
+    let (tid, _, c) = wait_break(&d);
+    assert_eq!((c.rip, c.rcx), (rep + 5, 100));
+    d.step_over(tid).unwrap();
+    let (_, r, c) = wait_break(&d);
+    assert_eq!((r, c.rip, c.rcx), (BreakReason::Step, rep + 7, 0));
+    d.cont(false).unwrap();
+    assert_eq!(t.recv(), "rep 100");
+    d.remove_breakpoint(b).unwrap();
+
+    // `call rec` in rec(2) (rdi == 1 after the dec); the deeper call hits the same address.
+    let hooks = Hooks {
+        condition: Some(Arc::new(|c: &Context| c.rdi == 1)),
+        ..Hooks::default()
+    };
+    let b = d
+        .add_breakpoint(Breakpoint::execute(rec + 8), hooks)
+        .unwrap();
+    t.send("rec 3");
+    let (tid, _, at) = wait_break(&d);
+    d.step_over(tid).unwrap();
+    let (_, r, c) = wait_break(&d);
+    assert_eq!((r, c.rip, c.rsp), (BreakReason::Step, rec + 13, at.rsp));
+    // Step out of this level returns into the caller's level, right after its call.
+    d.step_out(tid).unwrap();
+    let (_, r, c) = wait_break(&d);
+    assert_eq!((r, c.rip, c.rsp), (BreakReason::Step, rec + 13, at.rsp + 8));
+    d.cont(false).unwrap();
+    assert_eq!(t.recv(), "ok");
+    d.remove_breakpoint(b).unwrap();
+
+    // run_to_thread: another thread reaching the address first does not stop.
+    let hot = t.addr("hot");
+    let b = d
+        .add_breakpoint(Breakpoint::execute(hot), Hooks::default())
+        .unwrap();
+    t.send("hot 3 3000");
+    let (first, _, _) = wait_break(&d);
+    d.remove_breakpoint(b).unwrap();
+    let other = d
+        .threads()
+        .unwrap()
+        .into_iter()
+        .map(|th| th.tid)
+        .find(|&x| x != first && x != t.pid())
+        .unwrap();
+    d.run_to_thread(other, hot).unwrap();
+    let (tid, r, c) = wait_break(&d);
+    assert_eq!((tid, r, c.rip), (other, BreakReason::Step, hot));
+    d.cont(false).unwrap();
+    assert_eq!(t.recv_long(), "hot 9000");
+    assert_eq!(raw_byte(t.pid(), hot), 0xf0);
+}
+
+/// Item 5 + 6: validated, annotated backtrace; records name the accessing instruction.
+#[test]
+fn backtrace_symbols_and_record_insn() {
+    let mut t = Target::spawn();
+    let d = Debugger::attach(t.pid()).unwrap();
+    let (store, outer) = (t.addr("store"), t.addr("outer"));
+    d.add_breakpoint(Breakpoint::execute(store), Hooks::default())
+        .unwrap();
+    t.send("outer");
+    let (tid, _, _) = wait_break(&d);
+    let f = d.backtrace_frames(tid, 16).unwrap();
+    assert_eq!(f[0].addr, store);
+    assert!(
+        f[0].symbol.as_deref().unwrap_or("").contains("hh_store"),
+        "{f:?}"
+    );
+    assert!(
+        f[0].module
+            .as_deref()
+            .unwrap_or("")
+            .starts_with("hh-debug-target")
+    );
+    let p = d.process();
+    let regions = p.regions().unwrap();
+    for fr in &f[1..] {
+        assert!(
+            regions
+                .iter()
+                .any(|r| r.prot.x && fr.addr >= r.start && fr.addr < r.start + r.size)
+        );
+    }
+    // With rbp pointing at a hand-made frame [next=0, ret=outer+6] the walk finds outer.
+    let mut c = d.context(tid).unwrap();
+    let frame = c.rsp - 64;
+    p.write(frame, &0u64.to_le_bytes()).unwrap();
+    p.write(frame + 8, &(outer + 6).to_le_bytes()).unwrap();
+    let saved = c.rbp;
+    c.rbp = frame;
+    d.set_context(tid, c.clone()).unwrap();
+    assert_eq!(d.backtrace(tid, 8).unwrap(), [store, outer + 6]);
+    // Garbage return address: the walk stops.
+    p.write(frame + 8, &(outer + 3).to_le_bytes()).unwrap();
+    assert_eq!(d.backtrace(tid, 8).unwrap(), [store]);
+    c.rbp = saved;
+    d.set_context(tid, c).unwrap();
+    d.remove_breakpoint(1).unwrap();
+    d.cont(false).unwrap();
+    assert_eq!(t.recv(), "ok 101 200");
+
+    let w = d
+        .add_breakpoint(
+            Breakpoint::watch(t.addr("value"), 8, BpKind::Write),
+            Hooks::default(),
+        )
+        .unwrap();
+    t.cmd("store");
+    let r = &d.records(w).unwrap()[0];
+    assert_eq!((r.ip, r.insn), (store + 3, Some(store)));
+}
+
+/// Audit 1: removing / disabling a software breakpoint on a hot instruction while other
+/// threads keep hitting it must not leave any of them at A+1.
+#[test]
+fn remove_hot_breakpoint_while_running() {
+    let mut t = Target::spawn();
+    let d = Debugger::attach(t.pid()).unwrap();
+    let hot = t.addr("hot");
+    let rec = Breakpoint {
+        action: Action::Record,
+        ..Breakpoint::execute(hot)
+    };
+    t.send("hot 4 100000");
+    let mut id = d.add_breakpoint(rec.clone(), Hooks::default()).unwrap();
+    for i in 0..30 {
+        std::thread::sleep(Duration::from_millis(5));
+        if i % 2 == 0 {
+            d.remove_breakpoint(id).unwrap();
+            id = d.add_breakpoint(rec.clone(), Hooks::default()).unwrap();
+        } else {
+            d.set_enabled(id, false).unwrap();
+            d.set_enabled(id, true).unwrap();
+        }
+    }
+    d.remove_breakpoint(id).unwrap();
+    assert_eq!(t.recv_long(), "hot 400000");
+    assert!(
+        d.events()
+            .iter()
+            .all(|e| !matches!(e, Event::Break { .. } | Event::ProcessExited { .. }))
+    );
+}
+
+/// Audit 3: a write through the wrapper that covers an armed int3 from before (a hook
+/// over the breakpointed instruction) drops that breakpoint instead of re-planting 0xCC.
+#[test]
+fn write_over_breakpoint_drops_it() {
+    let mut t = Target::spawn();
+    let d = Debugger::attach(t.pid()).unwrap();
+    let outer = t.addr("outer");
+    let id = d
+        .add_breakpoint(Breakpoint::execute(outer + 1), Hooks::default())
+        .unwrap();
+    let p = d.process();
+    let mut code = [0u8; 8];
+    p.read(outer, &mut code).unwrap();
+    assert_eq!(raw_byte(t.pid(), outer + 1), 0xcc);
+    p.write(outer, &code).unwrap();
+    assert_eq!(raw_byte(t.pid(), outer + 1), 0xe8);
+    wait_for(
+        &d,
+        |e| matches!(e, Event::BreakpointDisabled { bp } if *bp == id),
+    );
+    assert!(!d.breakpoints().unwrap()[0].enabled);
+    assert_eq!(t.cmd("outer"), "ok 101 200");
+    // Re-enabling arms it again at the new bytes.
+    d.set_enabled(id, true).unwrap();
+    t.send("outer");
+    assert_eq!(wait_break(&d).1, BreakReason::Breakpoint(id));
+    d.cont(false).unwrap();
+    assert_eq!(t.recv(), "ok 102 200");
+}
+
+/// Audit 8: distinct records are capped, the overflow counted.
+#[test]
+fn records_are_capped() {
+    let mut t = Target::spawn();
+    let d = Debugger::attach(t.pid()).unwrap();
+    let n = std::sync::atomic::AtomicU64::new(0);
+    let n = Arc::new(n);
+    let hooks = Hooks {
+        address_of: Some(Arc::new(move |_: &Context| {
+            Some(n.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+        })),
+        ..Hooks::default()
+    };
+    let bp = Breakpoint {
+        action: Action::Record,
+        ..Breakpoint::execute(t.addr("hot"))
+    };
+    let id = d.add_breakpoint(bp, hooks).unwrap();
+    let total = MAX_RECORDS as u64 + 100;
+    t.send(&format!("hot 1 {total}"));
+    assert_eq!(t.recv_long(), format!("hot {total}"));
+    let info = &d.breakpoints().unwrap()[0];
+    assert_eq!((info.hits, info.records_dropped), (total, 100));
+    assert_eq!(d.records(id).unwrap().len(), MAX_RECORDS);
+}

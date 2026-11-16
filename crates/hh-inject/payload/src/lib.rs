@@ -1,6 +1,6 @@
 //! HeapHook speedhack payload: a library loaded into the target that scales the target's
 //! view of time. The supported route is Linux `LD_PRELOAD` at launch (`hh_inject::launch`);
-//! the runtime-hook entry points in `linux.rs` / `windows.rs` are not used by the host.
+//! the runtime-hook entry points in `windows.rs` are not used by the host.
 //! The host finds the exported [`HH_SPEEDHACK`] control block in the target and
 //! writes `speed` then bumps `generation`; every hooked clock notices the new generation on
 //! its next call and rebases (virtual = base_virt + (real - base_real) * speed), so time stays
@@ -107,7 +107,7 @@ struct Rec {
 impl Rec {
     fn at(&self, real: i64) -> i64 {
         self.virt
-            .wrapping_add((real.wrapping_sub(self.real) as f64 * self.speed) as i64)
+            .saturating_add((real.saturating_sub(self.real) as f64 * self.speed) as i64)
     }
 }
 

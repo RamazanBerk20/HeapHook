@@ -16,6 +16,15 @@ use hh_debug::ThreadInfo;
 use hh_scan::{FirstScan, Fmt, FrozenEntry, NextScan, ResultRow, ScanCount, ScanProgress, VType, ValueRef};
 use serde_json::Value;
 use tauri::{Manager, State};
+
+use heaphook::tools::{CodeRow, EvalReq, JobProgress, Page, SigOut, SnapInfo, XRefOut};
+use hh_tools::dissect::{DissectOptions, DissectSummary};
+use hh_tools::headers::HeaderSummary;
+use hh_tools::memory::{DiffRange, FileSummary, PointerHit, PointerQuery, Range, RegionInfo, RestoreSummary};
+use hh_tools::structure::{FieldValue, SpiderHit, SpiderOptions, Structure};
+
+#[cfg(feature = "dev-bridge")]
+mod bridge;
 use tauri_plugin_dialog::DialogExt;
 use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
 
@@ -27,88 +36,160 @@ async fn run<T: Send + 'static>(app: &App, f: impl FnOnce(&App) -> R<T> + Send +
 
 type St<'a> = State<'a, App>;
 
-#[tauri::command]
-async fn list_processes(app: St<'_>) -> R<Vec<ProcessInfo>> { run(&app, |a| a.list_processes()).await }
-#[tauri::command]
-async fn open_process(app: St<'_>, pid: u32) -> R<Opened> { run(&app, move |a| a.open_process(pid)).await }
-#[tauri::command]
-async fn regions(app: St<'_>) -> R<Vec<RegionOut>> { run(&app, |a| a.regions()).await }
-#[tauri::command]
-async fn modules(app: St<'_>) -> R<Vec<ModuleOut>> { run(&app, |a| a.modules()).await }
-#[tauri::command]
-async fn read_memory(app: St<'_>, addr: String, len: usize) -> R<String> { run(&app, move |a| a.read_memory(&addr, len)).await }
-#[tauri::command]
-async fn write_bytes(app: St<'_>, addr: String, hex: String) -> R<()> { run(&app, move |a| a.write_bytes(&addr, &hex)).await }
-#[tauri::command]
-async fn read_values(app: St<'_>, reqs: Vec<ValueRef>) -> R<Vec<Option<String>>> { run(&app, move |a| a.read_values(reqs)).await }
-#[tauri::command]
-#[allow(clippy::too_many_arguments)]
-async fn write_value(app: St<'_>, addr: String, vtype: VType, value: String, len: Option<usize>, utf16: Option<bool>, signed: Option<bool>, hex: Option<bool>) -> R<()> {
-    let fmt = Fmt { len: len.filter(|&l| l > 0), utf16: utf16.unwrap_or(false), signed: signed.unwrap_or(false), hex: hex.unwrap_or(false) };
-    run(&app, move |a| a.write_value(&addr, vtype, &value, &fmt)).await
+/// Tauri command body: `run` goes to the blocking pool, `now` answers on the IPC thread.
+macro_rules! tauri_body {
+    (run, $app:ident, $a:ident, $body:expr) => {
+        run(&$app, move |$a: &App| $body).await
+    };
+    (now, $app:ident, $a:ident, $body:expr) => {{
+        let $a: &App = &$app;
+        $body
+    }};
 }
-#[tauri::command]
-async fn resolve_address(app: St<'_>, expr: String) -> R<String> { run(&app, move |a| a.resolve_address(&expr)).await }
-#[tauri::command]
-async fn scan_first(app: St<'_>, req: FirstScan) -> R<ScanCount> { run(&app, move |a| a.scan_first(&req)).await }
-#[tauri::command]
-async fn scan_next(app: St<'_>, req: NextScan) -> R<ScanCount> { run(&app, move |a| a.scan_next(&req)).await }
-#[tauri::command]
-async fn scan_undo(app: St<'_>) -> R<()> { run(&app, |a| a.scan_undo()).await }
-#[tauri::command]
-async fn scan_new(app: St<'_>) -> R<()> { run(&app, |a| a.scan_new()).await }
-#[tauri::command]
-async fn scan_cancel(app: St<'_>) -> R<()> { app.scan_cancel() }
-#[tauri::command]
-async fn scan_progress(app: St<'_>) -> R<ScanProgress> { app.scan_progress() }
-#[tauri::command]
-async fn scan_results(app: St<'_>, offset: u64, limit: usize) -> R<Vec<ResultRow>> { run(&app, move |a| a.scan_results(offset, limit)).await }
-#[tauri::command]
-async fn set_frozen(app: St<'_>, entries: Vec<FrozenEntry>) -> R<()> { run(&app, move |a| a.set_frozen(&entries)).await }
-#[tauri::command]
-async fn disassemble(app: St<'_>, addr: String, count: usize) -> R<Vec<DisasmOut>> { run(&app, move |a| a.disassemble(&addr, count)).await }
-#[tauri::command]
-async fn assemble(app: St<'_>, addr: String, text: String) -> R<String> { run(&app, move |a| a.assemble(&addr, &text)).await }
-#[tauri::command]
-async fn aa_check(app: St<'_>, script: String) -> R<Option<AaError>> { run(&app, move |a| a.aa_check(&script)).await }
-#[tauri::command]
-async fn aa_execute(app: St<'_>, script: String, enable: bool, state: Option<AaState>) -> R<AaState> { run(&app, move |a| a.aa_execute(&script, enable, state.as_ref())).await }
-#[tauri::command]
-async fn table_load(app: St<'_>, path: String) -> R<Table> { run(&app, move |a| a.table_load(&path)).await }
-#[tauri::command]
-async fn table_save(app: St<'_>, path: String, table: TableIn) -> R<()> { run(&app, move |a| a.table_save(&path, table)).await }
 
-// ---------- live cheat table, Lua, hotkeys, settings ----------
-#[tauri::command]
-async fn table_get(app: St<'_>) -> R<TableState> { app.table_get() }
-#[tauri::command]
-async fn table_put(app: St<'_>, table: Table, base: u64) -> R<u64> { run(&app, move |a| a.table_put(table, base)).await }
-#[tauri::command]
-async fn table_open(app: St<'_>, path: String) -> R<TableState> { run(&app, move |a| a.table_open(&path)).await }
-#[tauri::command]
-async fn table_export(app: St<'_>, path: String) -> R<()> { run(&app, move |a| a.table_export(&path)).await }
-#[tauri::command]
-async fn table_set_active(app: St<'_>, ids: Vec<i64>, active: bool) -> R<()> { run(&app, move |a| a.table_set_active(&ids, active)).await }
-#[tauri::command]
-async fn table_set_value(app: St<'_>, ids: Vec<i64>, value: String) -> R<()> { run(&app, move |a| a.table_set_value(&ids, &value)).await }
-#[tauri::command]
-async fn table_hotkey(app: St<'_>, id: i64, index: usize) -> R<()> { run(&app, move |a| a.table_hotkey(id, index)).await }
-#[tauri::command]
-async fn table_run_script(app: St<'_>) -> R<()> { run(&app, |a| a.table_run_script()).await }
-#[tauri::command]
-async fn hotkey_press(app: St<'_>, keys: Vec<u32>) -> R<usize> { run(&app, move |a| a.hotkey_press(&keys)).await }
-#[tauri::command]
-async fn lua_exec(app: St<'_>, code: String) -> R<()> { run(&app, move |a| a.lua_exec(&code)).await }
-#[tauri::command]
-async fn lua_interrupt(app: St<'_>) -> R<()> { app.lua_interrupt() }
-#[tauri::command]
-async fn lua_poll(app: St<'_>, since: u64) -> R<LuaPoll> { app.lua_poll(since) }
-#[tauri::command]
-async fn lua_dialog_reply(app: St<'_>, id: u64, value: Value) -> R<()> { app.lua_dialog_reply(DialogReply { id, value }) }
-#[tauri::command]
-async fn settings_get(app: St<'_>) -> R<Settings> { app.settings_get() }
-#[tauri::command]
-async fn settings_set(app: St<'_>, settings: Settings) -> R<Settings> { run(&app, move |a| a.settings_set(settings)).await }
+/// The one command table. Each line becomes a `#[tauri::command]` (argument names are the
+/// Tauri parameter names, camelCased on the wire by Tauri) and, with the `dev-bridge`
+/// feature, a case of [`dispatch`] that decodes the same arguments the same way.
+macro_rules! commands {
+    ($( $mode:ident $name:ident ( $($arg:ident : $ty:ty),* ) -> $ret:ty = |$a:ident| $body:expr ; )*) => {
+        $(
+            #[tauri::command]
+            #[allow(clippy::too_many_arguments)]
+            async fn $name(app: St<'_>, $($arg: $ty),*) -> R<$ret> { tauri_body!($mode, app, $a, $body) }
+        )*
+
+        fn handler() -> impl Fn(tauri::ipc::Invoke) -> bool + Send + Sync + 'static {
+            tauri::generate_handler![pick_path $(, $name)*]
+        }
+
+        /// Runs command `cmd` with Tauri-style `args` (a JSON object keyed by camelCase
+        /// parameter name); `None` for an unknown command.
+        #[cfg(feature = "dev-bridge")]
+        fn dispatch(app: &App, cmd: &str, args: &Value) -> Option<R<Value>> {
+            match cmd {
+                $( stringify!($name) => Some((|| {
+                    $( let $arg: $ty = bridge::arg(args, stringify!($name), stringify!($arg))?; )*
+                    let $a: &App = app;
+                    let r: R<$ret> = $body;
+                    serde_json::to_value(r?).map_err(|e| e.to_string())
+                })()), )*
+                _ => None,
+            }
+        }
+    };
+}
+
+commands! {
+    run list_processes() -> Vec<ProcessInfo> = |a| a.list_processes();
+    run open_process(pid: u32) -> Opened = |a| a.open_process(pid);
+    run regions() -> Vec<RegionOut> = |a| a.regions();
+    run modules() -> Vec<ModuleOut> = |a| a.modules();
+    run read_memory(addr: String, len: usize) -> String = |a| a.read_memory(&addr, len);
+    run write_bytes(addr: String, hex: String) -> () = |a| a.write_bytes(&addr, &hex);
+    run read_values(reqs: Vec<ValueRef>) -> Vec<Option<String>> = |a| a.read_values(reqs);
+    run write_value(addr: String, vtype: VType, value: String, len: Option<usize>, utf16: Option<bool>, signed: Option<bool>, hex: Option<bool>) -> () = |a| { let fmt = Fmt { len: len.filter(|&l| l > 0), utf16: utf16.unwrap_or(false), signed: signed.unwrap_or(false), hex: hex.unwrap_or(false) }; a.write_value(&addr, vtype, &value, &fmt) };
+    run resolve_address(expr: String) -> String = |a| a.resolve_address(&expr);
+    run scan_first(req: FirstScan) -> ScanCount = |a| a.scan_first(&req);
+    run scan_next(req: NextScan) -> ScanCount = |a| a.scan_next(&req);
+    run scan_undo() -> () = |a| a.scan_undo();
+    run scan_new() -> () = |a| a.scan_new();
+    now scan_cancel() -> () = |a| a.scan_cancel();
+    now scan_progress() -> ScanProgress = |a| a.scan_progress();
+    run scan_results(offset: u64, limit: usize) -> Vec<ResultRow> = |a| a.scan_results(offset, limit);
+    run set_frozen(entries: Vec<FrozenEntry>) -> () = |a| a.set_frozen(&entries);
+    run disassemble(addr: String, count: usize) -> Vec<DisasmOut> = |a| a.disassemble(&addr, count);
+    run assemble(addr: String, text: String) -> String = |a| a.assemble(&addr, &text);
+    run aa_check(script: String) -> Option<AaError> = |a| a.aa_check(&script);
+    run aa_execute(script: String, enable: bool, state: Option<AaState>) -> AaState = |a| a.aa_execute(&script, enable, state.as_ref());
+    run table_load(path: String) -> Table = |a| a.table_load(&path);
+    run table_save(path: String, table: TableIn) -> () = |a| a.table_save(&path, table);
+    now table_get() -> TableState = |a| a.table_get();
+    run table_put(table: Table, base: u64) -> u64 = |a| a.table_put(table, base);
+    run table_open(path: String, force: Option<bool>) -> TableState = |a| a.table_open(&path, force.unwrap_or(false));
+    run table_trust(trust: bool) -> () = |a| a.table_trust(trust);
+    run table_export(path: String) -> () = |a| a.table_export(&path);
+    run table_set_active(ids: Vec<i64>, active: bool) -> () = |a| a.table_set_active(&ids, active);
+    run table_set_value(ids: Vec<i64>, value: String) -> () = |a| a.table_set_value(&ids, &value);
+    run table_hotkey(id: i64, index: usize) -> () = |a| a.table_hotkey(id, index);
+    run table_run_script() -> () = |a| a.table_run_script();
+    run hotkey_press(keys: Vec<u32>) -> usize = |a| a.hotkey_press(&keys);
+    run lua_exec(code: String) -> () = |a| a.lua_exec(&code);
+    now lua_interrupt() -> () = |a| a.lua_interrupt();
+    now lua_poll(since: u64) -> LuaPoll = |a| a.lua_poll(since);
+    now lua_dialog_reply(id: u64, value: Value) -> () = |a| a.lua_dialog_reply(DialogReply { id, value });
+    now settings_get() -> Settings = |a| a.settings_get();
+    run settings_set(settings: Settings) -> Settings = |a| a.settings_set(settings);
+    run debug_attach() -> DebugStatus = |a| a.debug_attach();
+    run debug_detach() -> () = |a| a.debug_detach();
+    run debug_status() -> DebugStatus = |a| a.debug_status();
+    run debug_add_breakpoint(req: BpReq) -> u32 = |a| a.debug_add_breakpoint(&req);
+    run debug_remove_breakpoint(id: u32) -> () = |a| a.debug_remove_breakpoint(id);
+    run debug_set_enabled(id: u32, enabled: bool) -> () = |a| a.debug_set_enabled(id, enabled);
+    run debug_breakpoints() -> Vec<BpOut> = |a| a.debug_breakpoints();
+    run debug_records(id: u32) -> Vec<RecordOut> = |a| a.debug_records(id);
+    run debug_clear_records(id: u32) -> () = |a| a.debug_clear_records(id);
+    run debug_trace(id: u32) -> Vec<TraceOut> = |a| a.debug_trace(id);
+    run debug_threads() -> Vec<ThreadInfo> = |a| a.debug_threads();
+    run debug_suspend_thread(tid: u32, suspend: bool) -> () = |a| a.debug_suspend_thread(tid, suspend);
+    run debug_context(tid: u32) -> Value = |a| a.debug_context(tid);
+    run debug_set_register(tid: u32, name: String, value: String) -> () = |a| a.debug_set_register(tid, &name, &value);
+    run debug_stack(tid: u32, count: usize) -> Vec<StackOut> = |a| a.debug_stack(tid, count);
+    run debug_continue(pass_signal: bool) -> () = |a| a.debug_continue(pass_signal);
+    run debug_pause() -> () = |a| a.debug_pause();
+    run debug_step(tid: u32, kind: String) -> () = |a| a.debug_step(tid, &kind);
+    run debug_run_to(addr: String) -> () = |a| a.debug_run_to(&addr);
+    run nop_instruction(addr: String) -> String = |a| a.nop_instruction(&addr);
+    run ptr_scan(req: PtrScanReq) -> PtrInfo = |a| a.ptr_scan(&req);
+    run ptr_rescan(req: PtrRescanReq) -> PtrInfo = |a| a.ptr_rescan(&req);
+    now ptr_progress() -> PtrProgress = |a| a.ptr_progress();
+    now ptr_cancel() -> () = |a| a.ptr_cancel();
+    run ptr_results(offset: u64, limit: usize, vtype: VType, fmt: Option<Fmt>) -> Vec<PtrRow> = |a| a.ptr_results(offset, limit, vtype, &fmt.unwrap_or_default());
+    run ptr_entry(index: u64, vtype: String, description: String) -> Value = |a| a.ptr_entry(index, &vtype, &description);
+    run ptr_save_map(path: String) -> () = |a| a.ptr_save_map(&path);
+    run ptr_save_results(path: String) -> () = |a| a.ptr_save_results(&path);
+    run ptr_open_results(path: String) -> PtrInfo = |a| a.ptr_open_results(&path);
+    run close_process() -> () = |a| a.close_process();
+    run table_undo() -> TableState = |a| a.table_history(false);
+    run table_redo() -> TableState = |a| a.table_history(true);
+    now tools_progress() -> JobProgress = |a| a.tools_progress();
+    now tools_cancel() -> () = |a| a.tools_cancel();
+    now struct_get() -> Vec<Structure> = |a| a.struct_get();
+    run struct_set(structs: Vec<Structure>) -> () = |a| a.struct_set(structs);
+    run struct_guess(name: String, addr: String, size: usize) -> Structure = |a| a.struct_guess(&name, &addr, size);
+    run struct_eval(reqs: Vec<EvalReq>) -> Vec<Result<Vec<FieldValue>, String>> = |a| a.struct_eval(&reqs);
+    run struct_expand(owner: String, index: usize, field_addr: String, size: usize) -> EvalReq = |a| a.struct_expand(&owner, index, &field_addr, size);
+    run struct_entries(name: String, root: String, path: Vec<u64>, only: Option<Vec<usize>>) -> Vec<heaphook::table::Entry> = |a| a.struct_entries(&name, &root, &path, only);
+    run struct_spider(groups: Vec<Vec<String>>, opts: SpiderOptions) -> Vec<SpiderHit> = |a| a.struct_spider(&groups, &opts);
+    run dissect_run(modules: Vec<String>, opts: DissectOptions) -> DissectSummary = |a| a.dissect_run(&modules, &opts);
+    now dissect_summary() -> Option<DissectSummary> = |a| a.dissect_summary();
+    run dissect_list(kind: String, filter: String, offset: usize, limit: usize) -> Page<Value> = |a| a.dissect_list(&kind, &filter, offset, limit);
+    run dissect_xrefs(addr: String, len: u64, offset: usize, limit: usize) -> Page<XRefOut> = |a| a.dissect_xrefs(&addr, len, offset, limit);
+    run regions_info() -> Vec<RegionInfo> = |a| a.regions_info();
+    run mem_protect(addr: String, size: u64, prot: hh_core::Prot) -> hh_core::Prot = |a| a.mem_protect(&addr, size, prot);
+    run mem_save(ranges: Vec<Range>, path: String) -> FileSummary = |a| a.mem_save(&ranges, &path);
+    run mem_load(path: String, relocate: Option<String>) -> RestoreSummary = |a| a.mem_load(&path, relocate.as_deref());
+    run mem_fill(addr: String, len: u64, pattern: String) -> () = |a| a.mem_fill(&addr, len, &pattern);
+    run mem_copy(src: String, dst: String, len: u64) -> () = |a| a.mem_copy(&src, &dst, len);
+    run snapshot_take(ranges: Vec<Range>, label: String) -> SnapInfo = |a| a.snapshot_take(&ranges, &label);
+    now snapshot_list() -> Vec<SnapInfo> = |a| a.snapshot_list();
+    now snapshot_delete(id: u64) -> () = |a| a.snapshot_delete(id);
+    run snapshot_diff(id: u64, max: usize) -> Vec<DiffRange> = |a| a.snapshot_diff(id, max);
+    run find_pointers(query: PointerQuery) -> Vec<PointerHit> = |a| a.find_pointers(&query);
+    run module_header(name: String) -> HeaderSummary = |a| a.module_header(&name);
+    run aob_signature(addr: String) -> SigOut = |a| a.aob_signature(&addr);
+    run aa_template(addr: String, kind: String) -> String = |a| a.aa_template(&addr, &kind);
+    run code_list() -> Vec<CodeRow> = |a| a.code_list();
+    run code_add(addr: String, description: String) -> usize = |a| a.code_add(&addr, &description);
+    run code_remove(index: usize) -> () = |a| a.code_remove(index);
+    run code_nop(index: usize) -> () = |a| a.code_nop(index);
+    run code_restore(index: usize, force: bool) -> () = |a| a.code_restore(index, force);
+    run debug_set_condition(id: u32, condition: String) -> () = |a| a.debug_set_condition(id, &condition);
+    now debug_signals() -> Vec<(u32, &'static str, &'static str)> = |_a| Ok(heaphook::debug::SIGNALS.to_vec());
+    run ptr_sort(key: String, column: usize, desc: bool, vtype: VType, fmt: Option<Fmt>) -> PtrInfo = |a| a.ptr_sort(&key, column, desc, vtype, &fmt.unwrap_or_default());
+    run process_create(req: heaphook::inject::CreateReq) -> Opened = |a| a.process_create(&req);
+    run speed_get() -> Option<hh_inject::SpeedhackStatus> = |a| a.speed_get();
+    run speed_set(speed: f64) -> hh_inject::SpeedhackStatus = |a| a.speed_set(speed);
+}
 
 /// CE virtual-key code -> the key's `Code` name (modifiers excluded).
 fn code_name(vk: u32) -> Option<String> {
@@ -147,165 +228,6 @@ fn shortcut_of(keys: &[u32]) -> Option<Shortcut> {
     Some(Shortcut::new((!mods.is_empty()).then_some(mods), code?))
 }
 
-// ---------- debugger ----------
-#[tauri::command]
-async fn debug_attach(app: St<'_>) -> R<DebugStatus> { run(&app, |a| a.debug_attach()).await }
-#[tauri::command]
-async fn debug_detach(app: St<'_>) -> R<()> { run(&app, |a| a.debug_detach()).await }
-#[tauri::command]
-async fn debug_status(app: St<'_>) -> R<DebugStatus> { run(&app, |a| a.debug_status()).await }
-#[tauri::command]
-async fn debug_add_breakpoint(app: St<'_>, req: BpReq) -> R<u32> { run(&app, move |a| a.debug_add_breakpoint(&req)).await }
-#[tauri::command]
-async fn debug_remove_breakpoint(app: St<'_>, id: u32) -> R<()> { run(&app, move |a| a.debug_remove_breakpoint(id)).await }
-#[tauri::command]
-async fn debug_set_enabled(app: St<'_>, id: u32, enabled: bool) -> R<()> { run(&app, move |a| a.debug_set_enabled(id, enabled)).await }
-#[tauri::command]
-async fn debug_breakpoints(app: St<'_>) -> R<Vec<BpOut>> { run(&app, |a| a.debug_breakpoints()).await }
-#[tauri::command]
-async fn debug_records(app: St<'_>, id: u32) -> R<Vec<RecordOut>> { run(&app, move |a| a.debug_records(id)).await }
-#[tauri::command]
-async fn debug_clear_records(app: St<'_>, id: u32) -> R<()> { run(&app, move |a| a.debug_clear_records(id)).await }
-#[tauri::command]
-async fn debug_trace(app: St<'_>, id: u32) -> R<Vec<TraceOut>> { run(&app, move |a| a.debug_trace(id)).await }
-#[tauri::command]
-async fn debug_threads(app: St<'_>) -> R<Vec<ThreadInfo>> { run(&app, |a| a.debug_threads()).await }
-#[tauri::command]
-async fn debug_suspend_thread(app: St<'_>, tid: u32, suspend: bool) -> R<()> { run(&app, move |a| a.debug_suspend_thread(tid, suspend)).await }
-#[tauri::command]
-async fn debug_context(app: St<'_>, tid: u32) -> R<Value> { run(&app, move |a| a.debug_context(tid)).await }
-#[tauri::command]
-async fn debug_set_register(app: St<'_>, tid: u32, name: String, value: String) -> R<()> { run(&app, move |a| a.debug_set_register(tid, &name, &value)).await }
-#[tauri::command]
-async fn debug_stack(app: St<'_>, tid: u32, count: usize) -> R<Vec<StackOut>> { run(&app, move |a| a.debug_stack(tid, count)).await }
-#[tauri::command]
-async fn debug_continue(app: St<'_>, pass_signal: bool) -> R<()> { run(&app, move |a| a.debug_continue(pass_signal)).await }
-#[tauri::command]
-async fn debug_pause(app: St<'_>) -> R<()> { run(&app, |a| a.debug_pause()).await }
-#[tauri::command]
-async fn debug_step(app: St<'_>, tid: u32, kind: String) -> R<()> { run(&app, move |a| a.debug_step(tid, &kind)).await }
-#[tauri::command]
-async fn debug_run_to(app: St<'_>, addr: String) -> R<()> { run(&app, move |a| a.debug_run_to(&addr)).await }
-#[tauri::command]
-async fn nop_instruction(app: St<'_>, addr: String) -> R<String> { run(&app, move |a| a.nop_instruction(&addr)).await }
-
-// ---------- pointer scanner ----------
-#[tauri::command]
-async fn ptr_scan(app: St<'_>, req: PtrScanReq) -> R<PtrInfo> { run(&app, move |a| a.ptr_scan(&req)).await }
-#[tauri::command]
-async fn ptr_rescan(app: St<'_>, req: PtrRescanReq) -> R<PtrInfo> { run(&app, move |a| a.ptr_rescan(&req)).await }
-#[tauri::command]
-async fn ptr_progress(app: St<'_>) -> R<PtrProgress> { app.ptr_progress() }
-#[tauri::command]
-async fn ptr_cancel(app: St<'_>) -> R<()> { app.ptr_cancel() }
-#[tauri::command]
-async fn ptr_results(app: St<'_>, offset: u64, limit: usize, vtype: VType, fmt: Option<Fmt>) -> R<Vec<PtrRow>> {
-    run(&app, move |a| a.ptr_results(offset, limit, vtype, &fmt.unwrap_or_default())).await
-}
-#[tauri::command]
-async fn ptr_entry(app: St<'_>, index: u64, vtype: String, description: String) -> R<Value> { run(&app, move |a| a.ptr_entry(index, &vtype, &description)).await }
-#[tauri::command]
-async fn ptr_save_map(app: St<'_>, path: String) -> R<()> { run(&app, move |a| a.ptr_save_map(&path)).await }
-#[tauri::command]
-async fn ptr_save_results(app: St<'_>, path: String) -> R<()> { run(&app, move |a| a.ptr_save_results(&path)).await }
-#[tauri::command]
-async fn ptr_open_results(app: St<'_>, path: String) -> R<PtrInfo> { run(&app, move |a| a.ptr_open_results(&path)).await }
-
-// ---------- tools (hh-tools), table history, process close ----------
-use heaphook::tools::{CodeRow, EvalReq, JobProgress, Page, SigOut, SnapInfo, XRefOut};
-use hh_tools::dissect::{DissectOptions, DissectSummary};
-use hh_tools::headers::HeaderSummary;
-use hh_tools::memory::{DiffRange, FileSummary, PointerHit, PointerQuery, Range, RegionInfo, RestoreSummary};
-use hh_tools::structure::{FieldValue, SpiderHit, SpiderOptions, Structure};
-
-#[tauri::command]
-async fn close_process(app: St<'_>) -> R<()> { run(&app, |a| a.close_process()).await }
-#[tauri::command]
-async fn table_undo(app: St<'_>) -> R<TableState> { run(&app, |a| a.table_history(false)).await }
-#[tauri::command]
-async fn table_redo(app: St<'_>) -> R<TableState> { run(&app, |a| a.table_history(true)).await }
-#[tauri::command]
-async fn tools_progress(app: St<'_>) -> R<JobProgress> { app.tools_progress() }
-#[tauri::command]
-async fn tools_cancel(app: St<'_>) -> R<()> { app.tools_cancel() }
-#[tauri::command]
-async fn struct_get(app: St<'_>) -> R<Vec<Structure>> { app.struct_get() }
-#[tauri::command]
-async fn struct_set(app: St<'_>, structs: Vec<Structure>) -> R<()> { run(&app, move |a| a.struct_set(structs)).await }
-#[tauri::command]
-async fn struct_guess(app: St<'_>, name: String, addr: String, size: usize) -> R<Structure> { run(&app, move |a| a.struct_guess(&name, &addr, size)).await }
-#[tauri::command]
-async fn struct_eval(app: St<'_>, reqs: Vec<EvalReq>) -> R<Vec<Result<Vec<FieldValue>, String>>> { run(&app, move |a| a.struct_eval(&reqs)).await }
-#[tauri::command]
-async fn struct_expand(app: St<'_>, owner: String, index: usize, field_addr: String, size: usize) -> R<EvalReq> { run(&app, move |a| a.struct_expand(&owner, index, &field_addr, size)).await }
-#[tauri::command]
-async fn struct_entries(app: St<'_>, name: String, root: String, path: Vec<u64>, only: Option<Vec<usize>>) -> R<Vec<heaphook::table::Entry>> {
-    run(&app, move |a| a.struct_entries(&name, &root, &path, only)).await
-}
-#[tauri::command]
-async fn struct_spider(app: St<'_>, groups: Vec<Vec<String>>, opts: SpiderOptions) -> R<Vec<SpiderHit>> { run(&app, move |a| a.struct_spider(&groups, &opts)).await }
-#[tauri::command]
-async fn dissect_run(app: St<'_>, modules: Vec<String>, opts: DissectOptions) -> R<DissectSummary> { run(&app, move |a| a.dissect_run(&modules, &opts)).await }
-#[tauri::command]
-async fn dissect_summary(app: St<'_>) -> R<Option<DissectSummary>> { app.dissect_summary() }
-#[tauri::command]
-async fn dissect_list(app: St<'_>, kind: String, filter: String, offset: usize, limit: usize) -> R<Page<Value>> { run(&app, move |a| a.dissect_list(&kind, &filter, offset, limit)).await }
-#[tauri::command]
-async fn dissect_xrefs(app: St<'_>, addr: String, len: u64, offset: usize, limit: usize) -> R<Page<XRefOut>> { run(&app, move |a| a.dissect_xrefs(&addr, len, offset, limit)).await }
-#[tauri::command]
-async fn regions_info(app: St<'_>) -> R<Vec<RegionInfo>> { run(&app, |a| a.regions_info()).await }
-#[tauri::command]
-async fn mem_protect(app: St<'_>, addr: String, size: u64, prot: hh_core::Prot) -> R<hh_core::Prot> { run(&app, move |a| a.mem_protect(&addr, size, prot)).await }
-#[tauri::command]
-async fn mem_save(app: St<'_>, ranges: Vec<Range>, path: String) -> R<FileSummary> { run(&app, move |a| a.mem_save(&ranges, &path)).await }
-#[tauri::command]
-async fn mem_load(app: St<'_>, path: String, relocate: Option<String>) -> R<RestoreSummary> { run(&app, move |a| a.mem_load(&path, relocate.as_deref())).await }
-#[tauri::command]
-async fn mem_fill(app: St<'_>, addr: String, len: u64, pattern: String) -> R<()> { run(&app, move |a| a.mem_fill(&addr, len, &pattern)).await }
-#[tauri::command]
-async fn mem_copy(app: St<'_>, src: String, dst: String, len: u64) -> R<()> { run(&app, move |a| a.mem_copy(&src, &dst, len)).await }
-#[tauri::command]
-async fn snapshot_take(app: St<'_>, ranges: Vec<Range>, label: String) -> R<SnapInfo> { run(&app, move |a| a.snapshot_take(&ranges, &label)).await }
-#[tauri::command]
-async fn snapshot_list(app: St<'_>) -> R<Vec<SnapInfo>> { app.snapshot_list() }
-#[tauri::command]
-async fn snapshot_delete(app: St<'_>, id: u64) -> R<()> { app.snapshot_delete(id) }
-#[tauri::command]
-async fn snapshot_diff(app: St<'_>, id: u64, max: usize) -> R<Vec<DiffRange>> { run(&app, move |a| a.snapshot_diff(id, max)).await }
-#[tauri::command]
-async fn find_pointers(app: St<'_>, query: PointerQuery) -> R<Vec<PointerHit>> { run(&app, move |a| a.find_pointers(&query)).await }
-#[tauri::command]
-async fn module_header(app: St<'_>, name: String) -> R<HeaderSummary> { run(&app, move |a| a.module_header(&name)).await }
-#[tauri::command]
-async fn aob_signature(app: St<'_>, addr: String) -> R<SigOut> { run(&app, move |a| a.aob_signature(&addr)).await }
-#[tauri::command]
-async fn aa_template(app: St<'_>, addr: String, kind: String) -> R<String> { run(&app, move |a| a.aa_template(&addr, &kind)).await }
-#[tauri::command]
-async fn code_list(app: St<'_>) -> R<Vec<CodeRow>> { run(&app, |a| a.code_list()).await }
-#[tauri::command]
-async fn code_add(app: St<'_>, addr: String, description: String) -> R<usize> { run(&app, move |a| a.code_add(&addr, &description)).await }
-#[tauri::command]
-async fn code_remove(app: St<'_>, index: usize) -> R<()> { run(&app, move |a| a.code_remove(index)).await }
-#[tauri::command]
-async fn code_nop(app: St<'_>, index: usize) -> R<()> { run(&app, move |a| a.code_nop(index)).await }
-#[tauri::command]
-async fn code_restore(app: St<'_>, index: usize, force: bool) -> R<()> { run(&app, move |a| a.code_restore(index, force)).await }
-#[tauri::command]
-async fn debug_set_condition(app: St<'_>, id: u32, condition: String) -> R<()> { run(&app, move |a| a.debug_set_condition(id, &condition)).await }
-#[tauri::command]
-async fn debug_signals() -> R<Vec<(u32, &'static str, &'static str)>> { Ok(heaphook::debug::SIGNALS.to_vec()) }
-#[tauri::command]
-async fn ptr_sort(app: St<'_>, key: String, column: usize, desc: bool, vtype: VType, fmt: Option<Fmt>) -> R<PtrInfo> {
-    run(&app, move |a| a.ptr_sort(&key, column, desc, vtype, &fmt.unwrap_or_default())).await
-}
-
-#[tauri::command]
-async fn process_create(app: St<'_>, req: heaphook::inject::CreateReq) -> R<Opened> { run(&app, move |a| a.process_create(&req)).await }
-#[tauri::command]
-async fn speed_get(app: St<'_>) -> R<Option<hh_inject::SpeedhackStatus>> { run(&app, |a| a.speed_get()).await }
-#[tauri::command]
-async fn speed_set(app: St<'_>, speed: f64) -> R<hh_inject::SpeedhackStatus> { run(&app, move |a| a.speed_set(speed)).await }
-
 /// Native open/save dialog; `None` when the user cancels. `filters`: `[[name, [ext, ..]], ..]`.
 #[tauri::command]
 async fn pick_path(handle: tauri::AppHandle, save: bool, title: String, filters: Vec<(String, Vec<String>)>, default: Option<String>) -> R<Option<String>> {
@@ -330,6 +252,10 @@ async fn pick_path(handle: tauri::AppHandle, save: bool, title: String, filters:
 }
 
 fn main() {
+    #[cfg(feature = "dev-bridge")]
+    if let Some(port) = bridge::port_arg() {
+        return bridge::serve(port, dispatch);
+    }
     // Registered shortcut id -> its CE key combo.
     let combos: Arc<Mutex<HashMap<u32, Vec<u32>>>> = Arc::default();
     let pressed = combos.clone();
@@ -375,24 +301,13 @@ fn main() {
             app.start_driver();
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![
-            list_processes, open_process, regions, modules, read_memory, write_bytes, read_values,
-            write_value, resolve_address, scan_first, scan_next, scan_undo, scan_new, scan_cancel,
-            scan_progress, scan_results, set_frozen, disassemble, assemble, aa_check, aa_execute,
-            table_load, table_save, debug_attach, debug_detach, debug_status, debug_add_breakpoint,
-            debug_remove_breakpoint, debug_set_enabled, debug_breakpoints, debug_records, debug_clear_records,
-            debug_trace, debug_threads, debug_suspend_thread, debug_context, debug_set_register, debug_stack,
-            debug_continue, debug_pause, debug_step, debug_run_to, nop_instruction, ptr_scan, ptr_rescan,
-            ptr_progress, ptr_cancel, ptr_results, ptr_entry, ptr_save_map, ptr_save_results, ptr_open_results,
-            pick_path, table_get, table_put, table_open, table_export, table_set_active, table_set_value,
-            table_hotkey, table_run_script, hotkey_press, lua_exec, lua_interrupt, lua_poll, lua_dialog_reply,
-            settings_get, settings_set, close_process, table_undo, table_redo, tools_progress, tools_cancel,
-            struct_get, struct_set, struct_guess, struct_eval, struct_expand, struct_entries, struct_spider,
-            dissect_run, dissect_summary, dissect_list, dissect_xrefs, regions_info, mem_protect, mem_save, mem_load,
-            mem_fill, mem_copy, snapshot_take, snapshot_list, snapshot_delete, snapshot_diff, find_pointers,
-            module_header, aob_signature, aa_template, code_list, code_add, code_remove, code_nop, code_restore,
-            debug_set_condition, debug_signals, ptr_sort, process_create, speed_get, speed_set
-        ])
-        .run(tauri::generate_context!())
-        .expect("failed to start HeapHook");
+        .invoke_handler(handler())
+        .build(tauri::generate_context!())
+        .expect("failed to start HeapHook")
+        .run(|h, ev| {
+            // Quitting with the process still running: undo active scripts, stop freezing.
+            if let tauri::RunEvent::Exit = ev {
+                let _ = h.state::<App>().close_process();
+            }
+        });
 }

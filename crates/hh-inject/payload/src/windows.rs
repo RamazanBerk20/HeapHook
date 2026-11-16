@@ -10,6 +10,9 @@
 //! `NtDelayExecution`. Not caught: `rdtsc`, `KUSER_SHARED_DATA` reads, direct syscalls,
 //! `NtQuerySystemTime` / waits with timeouts (`WaitForSingleObject`, ...), and winmm if it is
 //! loaded after hooking.
+// The detour relay `FF 25 00000000` is `jmp [rip+0]` only in 64-bit mode.
+#[cfg(not(target_arch = "x86_64"))]
+compile_error!("the speedhack payload supports x86-64 only");
 use std::ffi::CStr;
 use std::ptr::null_mut;
 use std::sync::atomic::Ordering::{Acquire, Relaxed, Release, SeqCst};

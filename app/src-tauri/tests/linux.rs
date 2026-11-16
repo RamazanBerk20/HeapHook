@@ -358,7 +358,8 @@ fn pointer_scan_finds_static_chain_rescans_and_exports() {
     let (i, _) = find(&app, n).expect("chain after sorting");
     // A value filter that matches nothing empties the set.
     let none: PtrRescanReq = de(json!({"value": "99999", "vtype": "4bytes"}));
-    let saved = std::env::temp_dir().join(format!("hh-test-{}.hhptr", std::process::id()));
+    let tmp = tempfile::tempdir().unwrap();
+    let saved = tmp.path().join("t.hhptr");
     app.ptr_save_results(saved.to_str().unwrap()).unwrap();
     assert_eq!(app.ptr_rescan(&none).unwrap().count, 0);
     assert_eq!(app.ptr_open_results(saved.to_str().unwrap()).unwrap().count, info2.count);
@@ -372,11 +373,9 @@ fn pointer_scan_finds_static_chain_rescans_and_exports() {
     assert_eq!(vals, [Some("4243".into())]);
 
     // Pointer map save works too.
-    let map = std::env::temp_dir().join(format!("hh-test-{}.hhpmap", std::process::id()));
+    let map = tmp.path().join("t.hhpmap");
     app.ptr_save_map(map.to_str().unwrap()).unwrap();
     assert!(std::fs::metadata(&map).unwrap().len() > 16);
-    std::fs::remove_file(&map).unwrap();
-    std::fs::remove_file(&saved).unwrap();
     app.debug_detach().unwrap();
 }
 
@@ -558,7 +557,8 @@ fn aa_entry_with_lua_block_enables_and_disables() {
     let script = format!("[ENABLE]\n{}[DISABLE]\n{}", block(4321, "enable"), block(123456, "disable"));
     assert!(app.aa_check(&script).unwrap().is_none(), "{:?}", app.aa_check(&script));
     let bad = "[ENABLE]\n{$lua}\nerror('lua says no')\n{$asm}\n[DISABLE]\n";
-    assert!(app.aa_check(bad).unwrap().expect("error").message.contains("lua says no"));
+    // The live check never runs Lua (it would run untrusted code on every keystroke).
+    assert!(app.aa_check(bad).unwrap().is_none(), "aa_check ran the {{$lua}} block");
     put(&app, vec![Entry { id: 1, description: "lua patch".into(), script: Some(script), ..Entry::default() }]);
 
     app.table_set_active(&[1], true).unwrap();
@@ -705,17 +705,16 @@ fn ct_round_trip_of_the_live_table() {
         structures: hh_tools::structure::from_json(r#"[{"name":"player","elements":[{"offset":0,"vtype":"pointer","description":"inv","child":"inv"},{"offset":16,"vtype":"4bytes","signed":true},{"offset":24,"vtype":"string","size":12,"utf16":true}]},{"name":"inv","elements":[{"offset":8,"vtype":"float","description":"weight"}]}]"#).unwrap(),
     };
     app.table_put(t.clone(), 0).unwrap();
-    let dir = std::env::temp_dir().join(format!("hh-live-ct-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
     for name in ["t.CT", "t.json"] {
         let p = dir.join(name);
         app.table_export(p.to_str().unwrap()).unwrap();
-        let back = app.table_open(p.to_str().unwrap()).unwrap();
+        let back = app.table_open(p.to_str().unwrap(), false).unwrap();
         assert_eq!(back.table, t, "{name}");
     }
     let ct = std::fs::read_to_string(dir.join("t.CT")).unwrap();
     assert!(ct.contains("<LuaScript>print('table &lt;script&gt;')") && ct.contains("moHideChildren=\"1\""), "{ct}");
-    std::fs::remove_dir_all(dir).unwrap();
 }
 
 // ---------------------------------------------------------------- analysis tools (hh-tools)
@@ -758,15 +757,14 @@ fn structure_dissect_follows_the_chain_and_exports_an_entry() {
     assert_eq!(t.cmd("inc")["chain_value"], 4243);
     assert_eq!(app.read_values(de(json!([{"addr": a, "vtype": "4bytes"}]))).unwrap(), [Some("4243".into())]);
     // Saved with the table: JSON and .CT keep the definitions.
-    let dir = std::env::temp_dir().join(format!("hh-structs-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
     let before = app.struct_get().unwrap();
     for name in ["s.json", "s.CT"] {
         let p = dir.join(name);
         app.table_export(p.to_str().unwrap()).unwrap();
-        assert_eq!(app.table_open(p.to_str().unwrap()).unwrap().table.structures, before, "{name}");
+        assert_eq!(app.table_open(p.to_str().unwrap(), false).unwrap().table.structures, before, "{name}");
     }
-    std::fs::remove_dir_all(dir).unwrap();
 }
 
 #[test]
@@ -801,7 +799,8 @@ fn memory_tools_save_load_snapshot_pointers() {
     app.open_process(t.child.id()).unwrap();
     let i32a = t.addr("i32");
     let range: Vec<hh_tools::memory::Range> = de(json!([{"start": i32a, "size": 64}]));
-    let file = std::env::temp_dir().join(format!("hh-mem-{}.hhmem", std::process::id()));
+    let tmp = tempfile::tempdir().unwrap();
+    let file = tmp.path().join("t.hhmem");
     let sum = app.mem_save(&range, file.to_str().unwrap()).unwrap();
     assert_eq!(sum.bytes, 64);
     app.write_value(&i32a, de(json!("4bytes")), "999", &Fmt::default()).unwrap();
@@ -809,7 +808,6 @@ fn memory_tools_save_load_snapshot_pointers() {
     let r = app.mem_load(file.to_str().unwrap(), None).unwrap();
     assert!(r.failed.is_empty());
     assert_eq!(t.cmd("get")["i32"], 123456);
-    std::fs::remove_file(&file).unwrap();
 
     // Snapshot, inc, diff: the i32 changed.
     let snap = app.snapshot_take(&range, "before inc").unwrap();
@@ -956,4 +954,160 @@ fn create_process_with_speedhack() {
     assert!(app.speed_set(2.0).is_err());
     let _ = Command::new("kill").arg(info.pid.to_string()).status();
     app.close_process().unwrap();
+}
+
+// ---------- found by driving the real UI through the dev bridge ----------
+
+#[test]
+fn unknown_symbol_keeps_the_assembler_error_text() {
+    let t = Target::spawn();
+    let app = App::default();
+    app.open_process(t.child.id()).unwrap();
+    let e = app.resolve_address("nosuchsymbol+5").unwrap_err();
+    assert!(!e.contains("Some("), "debug formatting leaked into the error: {e}");
+    assert!(app.resolve_address("hh-target+10").is_ok());
+}
+
+#[test]
+fn lua_poll_reports_the_process_and_its_exit() {
+    let mut t = Target::spawn();
+    let app = App::default();
+    assert!(app.lua_poll(0).unwrap().process.is_none());
+    let pid = t.child.id();
+    app.open_process(pid).unwrap();
+    let p = serde_json::to_value(app.lua_poll(0).unwrap()).unwrap();
+    assert_eq!(p["process"], json!({"pid": pid, "name": "hh-target", "is_64bit": true, "alive": true}));
+    t.send("quit");
+    t.child.wait().unwrap();
+    wait("exit seen", || (!app.lua_poll(0).unwrap().process.unwrap().alive).then_some(()));
+    app.close_process().unwrap();
+    assert!(app.lua_poll(0).unwrap().process.is_none());
+}
+
+#[test]
+fn failed_speedhack_launch_leaves_nothing_open() {
+    // A static-pie binary never loads the preloaded library (and exits at once).
+    let app = App::default();
+    let e = app.process_create(&de(json!({"program": "/usr/bin/sln", "speedhack": true}))).unwrap_err();
+    assert!(!e.is_empty());
+    assert_eq!(app.regions().unwrap_err(), "no process opened", "after: {e}");
+}
+
+// ---------- release audit ----------
+
+/// An AA script whose `{$lua}` block writes `v` to `addr` (proof the block ran).
+fn lua_writes(addr: &str, v: u32) -> String {
+    format!("[ENABLE]\n{{$lua}}\nwriteInteger({addr}, {v})\nreturn nil\n{{$asm}}\n[DISABLE]\n")
+}
+
+#[test]
+fn aa_check_never_runs_lua() {
+    let mut t = Target::spawn();
+    let app = App::default();
+    app.open_process(t.child.id()).unwrap();
+    assert!(app.aa_check(&lua_writes(&t.addr("i32"), 777)).unwrap().is_none());
+    assert_eq!(t.cmd("get")["i32"], 123456, "the syntax check executed the {{$lua}} block");
+}
+
+#[test]
+fn loaded_table_lua_needs_consent() {
+    let mut t = Target::spawn();
+    let app = App::default();
+    app.open_process(t.child.id()).unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let p = tmp.path().join("t.json");
+    let table = Table { entries: vec![Entry { id: 1, description: "lua".into(), script: Some(lua_writes(&t.addr("i32"), 777)), ..Entry::default() }], ..Table::default() };
+    heaphook::table::save(&p, &table).unwrap();
+    app.table_open(p.to_str().unwrap(), false).unwrap();
+    let e = app.table_set_active(&[1], true).unwrap_err();
+    assert!(e.starts_with(heaphook::cheat::NEEDS_CONSENT), "{e}");
+    assert_eq!(t.cmd("get")["i32"], 123456);
+    // Settings "never" refuses without asking.
+    let mut st = app.settings_get().unwrap();
+    st.table_script = "never".into();
+    app.settings_set(st.clone()).unwrap();
+    assert!(app.table_set_active(&[1], true).unwrap_err().contains("never"));
+    st.table_script = "ask".into();
+    app.settings_set(st).unwrap();
+    app.table_trust(false).unwrap();
+    assert!(app.table_set_active(&[1], true).unwrap_err().contains("chose not to"));
+    assert_eq!(t.cmd("get")["i32"], 123456);
+    app.table_trust(true).unwrap();
+    app.table_set_active(&[1], true).unwrap();
+    assert_eq!(t.cmd("get")["i32"], 777);
+    // Opening a table again asks again.
+    app.table_open(p.to_str().unwrap(), false).unwrap();
+    assert!(app.table_set_active(&[1], true).unwrap_err().starts_with(heaphook::cheat::NEEDS_CONSENT));
+}
+
+#[test]
+fn deep_or_huge_tables_are_refused_not_crashing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let n = 10_000;
+    let mut xml = String::from("<CheatTable><CheatEntries>");
+    for i in 0..n {
+        xml += &format!("<CheatEntry><ID>{i}</ID><Description>\"g\"</Description><GroupHeader>1</GroupHeader><CheatEntries>");
+    }
+    for _ in 0..n {
+        xml += "</CheatEntries></CheatEntry>";
+    }
+    xml += "</CheatEntries></CheatTable>";
+    let ct = tmp.path().join("deep.CT");
+    std::fs::write(&ct, &xml).unwrap();
+    let app = App::default();
+    let e = app.table_open(ct.to_str().unwrap(), false).unwrap_err();
+    assert!(e.contains("64 levels"), "{e}");
+    // JSON as deep as serde allows, and a put just past the limit.
+    let mut deep = Entry { id: 1, ..Entry::default() };
+    for id in 2..=66 {
+        deep = Entry { id, children: vec![deep], ..Entry::default() };
+    }
+    let base = app.table_get().unwrap().version;
+    assert!(app.table_put(Table { entries: vec![deep.clone()], ..Table::default() }, base).unwrap_err().contains("64 levels"));
+    let js = tmp.path().join("deep.json");
+    heaphook::table::save(&js, &Table { entries: vec![deep], ..Table::default() }).unwrap();
+    assert!(app.table_open(js.to_str().unwrap(), false).is_err());
+    // Too big a file is refused before it is read.
+    let big = tmp.path().join("big.json");
+    std::fs::File::create(&big).unwrap().set_len(heaphook::table::MAX_FILE + 1).unwrap();
+    assert!(app.table_open(big.to_str().unwrap(), false).unwrap_err().contains("too big"));
+}
+
+#[test]
+fn opening_a_table_or_closing_disables_active_scripts() {
+    let mut t = Target::spawn();
+    let app = App::default();
+    app.open_process(t.child.id()).unwrap();
+    let a = t.addr("i32");
+    let ok = format!("[ENABLE]\n{a}:\ndd #999\n[DISABLE]\n{a}:\ndd #123456\n");
+    // Its [DISABLE] writes to an unmapped address, so it cannot be disabled.
+    let stuck = format!("[ENABLE]\n{a}:\ndd #999\n[DISABLE]\n10:\ndd 0\n");
+    put(&app, vec![Entry { id: 1, description: "ok".into(), script: Some(ok), ..Entry::default() }]);
+    app.table_set_active(&[1], true).unwrap();
+    assert_eq!(t.cmd("get")["i32"], 999);
+    let tmp = tempfile::tempdir().unwrap();
+    let p = tmp.path().join("other.json");
+    heaphook::table::save(&p, &Table::default()).unwrap();
+    app.table_open(p.to_str().unwrap(), false).unwrap();
+    assert_eq!(t.cmd("get")["i32"], 123456, "table_open left the script's patch in");
+
+    put(&app, vec![Entry { id: 1, description: "stuck".into(), script: Some(stuck), ..Entry::default() }]);
+    app.table_set_active(&[1], true).unwrap();
+    let e = app.table_open(p.to_str().unwrap(), false).unwrap_err();
+    assert!(e.contains("could not be disabled"), "{e}");
+    assert!(entry(&app, 1).frozen, "refused open must keep the table");
+    let st = app.table_open(p.to_str().unwrap(), true).unwrap();
+    let g = &st.table.entries[0];
+    assert_eq!((g.description.as_str(), g.children.len()), ("Still active from the previous table", 1));
+    assert!(g.children[0].frozen && g.children[0].description == "stuck");
+
+    // close_process undoes what it can.
+    let mut cur = app.table_get().unwrap();
+    cur.table.entries.push(Entry { id: 99, description: "ok".into(), script: Some(format!("[ENABLE]\n{a}:\ndd #5\n[DISABLE]\n{a}:\ndd #123456\n")), ..Entry::default() });
+    app.table_put(cur.table, cur.version).unwrap();
+    app.table_set_active(&[99], true).unwrap();
+    assert_eq!(t.cmd("get")["i32"], 5);
+    app.close_process().unwrap();
+    assert_eq!(t.cmd("get")["i32"], 123456, "close_process left the script's patch in");
+    assert!(log_text(&app).contains("still patched"), "{}", log_text(&app));
 }

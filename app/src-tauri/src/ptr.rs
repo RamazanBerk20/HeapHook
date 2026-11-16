@@ -11,7 +11,8 @@ use serde::{Deserialize, Serialize};
 use crate::commands::{App, R, hex_addr, lock, parse_addr, s};
 
 pub struct Ptr {
-    dir: PathBuf,
+    /// Private (0700, unpredictable name) scratch directory, removed on drop.
+    dir: std::sync::OnceLock<tempfile::TempDir>,
     seq: AtomicU64,
     running: AtomicBool,
     cancel: AtomicBool,
@@ -27,11 +28,9 @@ pub struct Ptr {
 const MAX_SORT: u64 = 2_000_000;
 
 impl Ptr {
-    pub(crate) fn new(pid: u32) -> Self {
-        static N: AtomicU64 = AtomicU64::new(0);
-        let dir = std::env::temp_dir().join(format!("heaphook-{}-{pid}-{}", std::process::id(), N.fetch_add(1, Relaxed)));
+    pub(crate) fn new() -> Self {
         Ptr {
-            dir,
+            dir: std::sync::OnceLock::new(),
             seq: AtomicU64::new(0),
             running: AtomicBool::new(false),
             cancel: AtomicBool::new(false),
@@ -44,8 +43,19 @@ impl Ptr {
     }
 
     fn temp(&self, ext: &str) -> R<PathBuf> {
-        std::fs::create_dir_all(&self.dir).map_err(s)?;
-        Ok(self.dir.join(format!("{}.{ext}", self.seq.fetch_add(1, Relaxed))))
+        let dir = match self.dir.get() {
+            Some(d) => d,
+            None => {
+                let mut b = tempfile::Builder::new();
+                b.prefix("heaphook-ptr-");
+                #[cfg(unix)]
+                b.permissions(std::os::unix::fs::PermissionsExt::from_mode(0o700));
+                let d = b.tempdir().map_err(s)?;
+                let _ = self.dir.set(d);
+                self.dir.get().expect("set above")
+            }
+        };
+        Ok(dir.path().join(format!("{}.{ext}", self.seq.fetch_add(1, Relaxed))))
     }
 
     /// Marks an operation as running until the guard drops.
@@ -72,7 +82,7 @@ impl Ptr {
         let info = PtrInfo::of(&f);
         *lock(&self.order) = None;
         if let Some(old) = lock(&self.file).replace(Arc::new(f))
-            && old.path().starts_with(&self.dir)
+            && self.dir.get().is_some_and(|d| old.path().starts_with(d.path()))
         {
             let _ = std::fs::remove_file(old.path());
         }
@@ -81,12 +91,6 @@ impl Ptr {
 
     fn file(&self) -> R<Arc<ResultFile>> {
         lock(&self.file).clone().ok_or_else(|| "no pointer scan results".into())
-    }
-}
-
-impl Drop for Ptr {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.dir);
     }
 }
 
@@ -373,5 +377,22 @@ impl App {
     pub fn ptr_open_results(&self, path: &str) -> R<PtrInfo> {
         let f = ResultFile::open(Path::new(path)).map_err(s)?;
         Ok(self.session()?.ptr.set_file(f))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    #[cfg(unix)]
+    fn scratch_dir_is_private_and_unpredictable() {
+        use std::os::unix::fs::PermissionsExt;
+        let (a, b) = (super::Ptr::new(), super::Ptr::new());
+        let (pa, pb) = (a.temp("x").unwrap(), b.temp("x").unwrap());
+        let da = pa.parent().unwrap();
+        assert_ne!(da, pb.parent().unwrap());
+        assert_eq!(std::fs::metadata(da).unwrap().permissions().mode() & 0o777, 0o700);
+        assert!(!da.file_name().unwrap().to_string_lossy().contains(&std::process::id().to_string()));
+        drop(a);
+        assert!(!da.exists(), "scratch dir left behind");
     }
 }

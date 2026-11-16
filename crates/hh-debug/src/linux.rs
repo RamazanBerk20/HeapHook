@@ -1,6 +1,12 @@
 //! Linux backend: every thread is PTRACE_SEIZEd (new threads via PTRACE_O_TRACECLONE) and
 //! polled with waitpid(tid, WNOHANG | __WALL). waitpid(-1) is never used, so other children
 //! of the host process are left alone. All calls happen on the debugger thread.
+//!
+//! Forks are followed just far enough to keep children alive: a child with its own memory
+//! gets our int3 bytes and page protections removed and is detached at once; a child that
+//! shares our memory (vfork, `CLONE_VM`) stays traced as a "guest" until it execs or exits.
+//! PTRACE_O_TRACEEXIT tells us when a thread (notably the main one) is on its way out, so a
+//! zombie leader is never waited for.
 use std::collections::BTreeMap;
 use std::io;
 use std::mem::{offset_of, zeroed};
@@ -10,7 +16,12 @@ use hh_core::{Addr, Error, Pid, Process, Prot, Result};
 use crate::engine::{Mode, Raw};
 use crate::{Context, Fpu, SignalAction, Tid};
 
-const OPTS: usize = (libc::PTRACE_O_TRACECLONE | libc::PTRACE_O_TRACEEXEC) as usize;
+const OPTS: usize = (libc::PTRACE_O_TRACECLONE
+    | libc::PTRACE_O_TRACEEXEC
+    | libc::PTRACE_O_TRACEFORK
+    | libc::PTRACE_O_TRACEVFORK
+    | libc::PTRACE_O_TRACEVFORKDONE
+    | libc::PTRACE_O_TRACEEXIT) as usize;
 const PAGE: u64 = 4096;
 const DR_OFF: usize = offset_of!(libc::user, u_debugreg);
 
@@ -26,6 +37,25 @@ struct T {
     pass: bool,
     /// The last resume was a single-step.
     step: bool,
+    /// A child process sharing our memory (not one of our threads).
+    guest: bool,
+    /// Past PTRACE_EVENT_EXIT: it only gets to finish dying (a leader stays a zombie).
+    exiting: bool,
+    /// Blocked in vfork until the child execs or exits: cannot be stopped, runs no user code.
+    vforking: bool,
+    /// Stopped by our PTRACE_INTERRUPT (a SIGTRAP may still be queued behind that stop).
+    interrupted: bool,
+}
+
+/// The thread has a SIGTRAP queued (e.g. it executed an int3 just before our interrupt).
+fn trap_pending(pid: Pid, tid: Tid) -> bool {
+    std::fs::read_to_string(format!("/proc/{pid}/task/{tid}/status"))
+        .ok()
+        .and_then(|s| {
+            let l = s.lines().find(|l| l.starts_with("SigPnd:"))?;
+            u64::from_str_radix(l[7..].trim(), 16).ok()
+        })
+        .is_some_and(|m| m & (1 << (libc::SIGTRAP - 1)) != 0)
 }
 
 pub(crate) struct Os {
@@ -36,7 +66,11 @@ pub(crate) struct Os {
     gadget: Option<Addr>,
     /// Round-robin start for poll, so a busy thread cannot starve the others.
     cursor: Tid,
+    /// Events a timed-out halt collected, delivered by `poll`.
+    backlog: Vec<(Tid, Raw)>,
 }
+
+const HALT_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
 
 fn pt(req: libc::c_uint, tid: Tid, addr: usize, data: usize) -> io::Result<i64> {
     // PEEK requests return data, so -1 is only an error when errno says so.
@@ -94,18 +128,46 @@ fn bytes_to_words(b: &[u8], w: &mut [u32]) {
     }
 }
 
+use SignalAction::{Break, Pass};
+
+/// Standard signals and the default action of a new session (crash signals break).
+pub(crate) const SIGNALS: &[(u32, &str, SignalAction)] = &[
+    (1, "SIGHUP", Pass),
+    (2, "SIGINT", Pass),
+    (3, "SIGQUIT", Pass),
+    (4, "SIGILL", Break),
+    (5, "SIGTRAP", Break),
+    (6, "SIGABRT", Pass),
+    (7, "SIGBUS", Break),
+    (8, "SIGFPE", Break),
+    (10, "SIGUSR1", Pass),
+    (11, "SIGSEGV", Break),
+    (12, "SIGUSR2", Pass),
+    (13, "SIGPIPE", Pass),
+    (14, "SIGALRM", Pass),
+    (15, "SIGTERM", Pass),
+    (16, "SIGSTKFLT", Pass),
+    (17, "SIGCHLD", Pass),
+    (18, "SIGCONT", Pass),
+    (19, "SIGSTOP", Pass),
+    (20, "SIGTSTP", Pass),
+    (21, "SIGTTIN", Pass),
+    (22, "SIGTTOU", Pass),
+    (23, "SIGURG", Pass),
+    (24, "SIGXCPU", Pass),
+    (25, "SIGXFSZ", Pass),
+    (26, "SIGVTALRM", Pass),
+    (27, "SIGPROF", Pass),
+    (28, "SIGWINCH", Pass),
+    (29, "SIGIO", Pass),
+    (30, "SIGPWR", Pass),
+    (31, "SIGSYS", Pass),
+];
+
 impl Os {
-    pub fn default_policy() -> Vec<(u32, SignalAction)> {
-        [
-            libc::SIGSEGV,
-            libc::SIGILL,
-            libc::SIGBUS,
-            libc::SIGFPE,
-            libc::SIGTRAP,
-        ]
-        .map(|s| (s as u32, SignalAction::Break))
-        .into()
-    }
+    /// The signal a fault on a protected page raises.
+    pub const PAGE_FAULT: u32 = libc::SIGSEGV as u32;
+    pub const PAGE_WATCH: bool = true;
 
     pub fn pid(&self) -> Pid {
         self.pid
@@ -123,6 +185,7 @@ impl Os {
             dr: ([0; 4], 0),
             gadget: None,
             cursor: 0,
+            backlog: Vec::new(),
         };
         // Threads may appear while we seize; clones of seized threads are traced automatically,
         // the rest show up on the next listing.
@@ -157,8 +220,13 @@ impl Os {
         if os.th.is_empty() {
             return Err(Error::ProcessGone);
         }
-        let raws = os.halt_all()?;
-        Ok((os, raws))
+        match os.halt_all() {
+            Ok(raws) => Ok((os, raws)),
+            Err(e) => {
+                let _ = os.detach();
+                Err(e)
+            }
+        }
     }
 
     /// Address of the dynamic loader's r_brk (called on every dlopen/dlclose), from the
@@ -208,14 +276,31 @@ impl Os {
         self.th.get(&tid).is_some_and(|t| t.stopped)
     }
 
+    /// Running user code (not stopped, not on its way out).
+    pub fn is_running(&self, tid: Tid) -> bool {
+        self.th
+            .get(&tid)
+            .is_some_and(|t| !t.stopped && !t.exiting && !t.vforking)
+    }
+
+    /// AT_ENTRY of the current image (after an exec the loader hook is found from there).
+    pub fn exec_entry(&self) -> Option<Addr> {
+        let auxv = std::fs::read(format!("/proc/{}/auxv", self.pid)).ok()?;
+        auxv.chunks_exact(16).find_map(|c| {
+            let (k, v) = c.split_at(8);
+            (k == 9u64.to_le_bytes()).then(|| u64::from_le_bytes(v.try_into().unwrap())) // AT_ENTRY
+        })
+    }
+
     /// Restarts a thread after a stop nobody asked for, the way it was running before.
     fn restart(&mut self, tid: Tid) -> Result<()> {
         let Some(t) = self.th.get_mut(&tid) else {
             return Ok(());
         };
-        let req = match (t.step, t.group) {
-            (true, _) => libc::PTRACE_SINGLESTEP,
-            (_, true) => libc::PTRACE_LISTEN,
+        let req = match (t.exiting, t.step, t.group) {
+            (true, ..) => libc::PTRACE_CONT,
+            (_, true, _) => libc::PTRACE_SINGLESTEP,
+            (_, _, true) => libc::PTRACE_LISTEN,
             _ => libc::PTRACE_CONT,
         };
         t.stopped = false;
@@ -260,7 +345,7 @@ impl Os {
         t.sig = 0;
         t.pass = false;
         match ev {
-            libc::PTRACE_EVENT_CLONE => {
+            libc::PTRACE_EVENT_CLONE | libc::PTRACE_EVENT_FORK | libc::PTRACE_EVENT_VFORK => {
                 let mut new: libc::c_ulong = 0;
                 pt(
                     libc::PTRACE_GETEVENTMSG,
@@ -269,26 +354,97 @@ impl Os {
                     &mut new as *mut libc::c_ulong as usize,
                 )
                 .map_err(perr)?;
-                self.th.entry(new as Tid).or_insert(T {
-                    fresh: true,
-                    ..T::default()
-                });
-                Ok(Some(Raw::ThreadCreated(new as Tid)))
+                let new = new as Tid;
+                let thread = ev == libc::PTRACE_EVENT_CLONE
+                    && std::path::Path::new(&format!("/proc/{}/task/{new}", self.pid)).exists();
+                if thread {
+                    self.th.entry(new).or_insert(T {
+                        fresh: true,
+                        ..T::default()
+                    });
+                    return Ok(Some(Raw::ThreadCreated(new)));
+                }
+                // A new process. kcmp says whether it shares our memory; without kcmp, only a
+                // plain fork is assumed not to.
+                let r = unsafe {
+                    libc::syscall(libc::SYS_kcmp, tid, new, 1 /* KCMP_VM */, 0, 0)
+                };
+                let shared = match r {
+                    0 => true,
+                    1..=3 => false,
+                    _ => ev != libc::PTRACE_EVENT_FORK,
+                };
+                if shared {
+                    if ev == libc::PTRACE_EVENT_VFORK {
+                        t.vforking = true;
+                    }
+                    self.th.insert(
+                        new,
+                        T {
+                            fresh: true,
+                            guest: true,
+                            ..T::default()
+                        },
+                    );
+                    return Ok(Some(Raw::GuestCreated(new)));
+                }
+                // Wait for its first stop so it can be cleaned up and detached.
+                loop {
+                    match wait(new, 0) {
+                        Ok(Some(st)) if libc::WIFSTOPPED(st) => return Ok(Some(Raw::Forked(new))),
+                        Ok(Some(_)) | Err(_) => return Ok(None), // already gone
+                        Ok(None) => {}
+                    }
+                }
+            }
+            libc::PTRACE_EVENT_EXEC if t.guest => {
+                // A guest got its own image: nothing of ours left in it.
+                let _ = pt(libc::PTRACE_DETACH, tid, 0, 0);
+                self.th.remove(&tid);
+                Ok(Some(Raw::ThreadExited))
             }
             libc::PTRACE_EVENT_EXEC => {
                 // Every other thread is gone; the execing one now has the leader's tid.
                 let pid = self.pid;
-                self.th.retain(|&k, _| k == pid);
+                for (&k, _) in self.th.iter().filter(|(k, _)| **k != pid) {
+                    let _ = wait(k, libc::WNOHANG); // reap if already reportable
+                }
+                self.th.retain(|&k, t| k == pid || t.guest);
+                self.th.insert(
+                    pid,
+                    T {
+                        stopped: true,
+                        ..T::default()
+                    },
+                );
+                self.gadget = None;
+                self.dr = ([0; 4], 0);
                 Ok(Some(Raw::Exec))
+            }
+            libc::PTRACE_EVENT_VFORK_DONE => {
+                t.vforking = false;
+                if !halting {
+                    self.restart(tid)?;
+                }
+                Ok(None)
+            }
+            libc::PTRACE_EVENT_EXIT => {
+                t.exiting = true;
+                if !halting {
+                    self.restart(tid)?;
+                }
+                // A leader's real exit is only reported once the whole group is gone.
+                Ok((tid == self.pid).then_some(Raw::ThreadExited))
             }
             libc::PTRACE_EVENT_STOP => {
                 // Our interrupt, a new thread's first stop, or a group stop.
                 let fresh = std::mem::take(&mut t.fresh);
+                t.interrupted = halting;
                 t.group = matches!(
                     sig,
                     libc::SIGSTOP | libc::SIGTSTP | libc::SIGTTIN | libc::SIGTTOU
                 );
-                if fresh {
+                if fresh && !t.guest {
                     let (a, d) = self.dr;
                     self.write_dr(tid, a, d)?;
                 }
@@ -329,6 +485,9 @@ impl Os {
     }
 
     pub fn poll(&mut self) -> Result<Option<(Tid, Raw)>> {
+        if !self.backlog.is_empty() {
+            return Ok(Some(self.backlog.remove(0)));
+        }
         let c = self.cursor;
         let tids: Vec<Tid> = self
             .th
@@ -364,24 +523,41 @@ impl Os {
             let running: Vec<Tid> = self
                 .th
                 .iter()
-                .filter(|(_, t)| !t.stopped)
+                .filter(|(_, t)| !t.stopped && !t.exiting && !t.vforking)
                 .map(|(&k, _)| k)
                 .collect();
             if running.is_empty() {
+                self.take_queued_traps(&mut out)?;
                 return Ok(out);
             }
             for &t in &running {
                 let _ = pt(libc::PTRACE_INTERRUPT, t, 0, 0);
             }
+            // Bounded: a thread that cannot stop (uninterruptible sleep) must not hang every
+            // debugger call. What was collected so far is handed to `poll` instead.
+            let deadline = std::time::Instant::now() + HALT_WAIT;
+            let mut spins = 0;
             for t in running {
-                while self.th.get(&t).is_some_and(|x| !x.stopped) {
-                    match wait(t, 0) {
+                while self
+                    .th
+                    .get(&t)
+                    .is_some_and(|x| !x.stopped && !x.exiting && !x.vforking)
+                {
+                    match wait(t, libc::WNOHANG) {
                         Ok(Some(st)) => {
                             if let Some(raw) = self.decode(t, st, true)? {
                                 out.push((t, raw));
                             }
                         }
-                        Ok(None) => {}
+                        Ok(None) if std::time::Instant::now() > deadline => {
+                            self.backlog.extend(out);
+                            return Err(Error::Other(format!("thread {t} does not stop")));
+                        }
+                        Ok(None) if spins < 2000 => {
+                            spins += 1;
+                            std::thread::yield_now();
+                        }
+                        Ok(None) => std::thread::sleep(std::time::Duration::from_micros(50)),
                         Err(e) if e.raw_os_error() == Some(libc::ECHILD) => {
                             self.th.remove(&t);
                             if t == self.pid {
@@ -395,29 +571,73 @@ impl Os {
         }
     }
 
+    /// The kernel reports our interrupt before a signal already queued, so a thread that
+    /// executed an int3 can sit in the interrupt stop at A+1 with its SIGTRAP pending
+    /// (detaching would then kill the target with it). Let each such thread take the
+    /// signal now (it stops again right away) so the engine sees the trap and rewinds.
+    fn take_queued_traps(&mut self, out: &mut Vec<(Tid, Raw)>) -> Result<()> {
+        let tids: Vec<Tid> = self
+            .th
+            .iter()
+            .filter(|(_, t)| t.stopped && t.interrupted && !t.exiting && !t.group)
+            .map(|(&k, _)| k)
+            .collect();
+        for tid in tids {
+            if let Some(t) = self.th.get_mut(&tid) {
+                t.interrupted = false;
+            }
+            if !trap_pending(self.pid, tid) || pt(libc::PTRACE_CONT, tid, 0, 0).is_err() {
+                continue;
+            }
+            if let Some(t) = self.th.get_mut(&tid) {
+                t.stopped = false;
+            }
+            let deadline = std::time::Instant::now() + HALT_WAIT;
+            while self.th.get(&tid).is_some_and(|t| !t.stopped && !t.exiting) {
+                match wait(tid, libc::WNOHANG) {
+                    Ok(Some(st)) => {
+                        if let Some(raw) = self.decode(tid, st, true)? {
+                            out.push((tid, raw));
+                        }
+                    }
+                    Ok(None) if std::time::Instant::now() > deadline => {
+                        return Err(Error::Other(format!("thread {tid} does not stop")));
+                    }
+                    Ok(None) => std::thread::yield_now(),
+                    Err(_) => {
+                        self.th.remove(&tid);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub fn resume(&mut self, mode: &dyn Fn(Tid) -> Mode) -> Result<()> {
         for (&tid, t) in self.th.iter_mut() {
             if !t.stopped {
                 continue;
             }
             let m = mode(tid);
-            if m == Mode::Stay {
+            if m == Mode::Stay && !t.exiting {
                 continue;
             }
             let sig = if t.pass { t.sig } else { 0 };
+            // Job control wins: a group-stopped thread stays stopped (a step it was asked for
+            // happens when SIGCONT wakes it, see `restart`).
             let req = match m {
-                Mode::Step => libc::PTRACE_SINGLESTEP,
+                _ if t.exiting => libc::PTRACE_CONT,
                 _ if t.group => libc::PTRACE_LISTEN,
+                Mode::Step => libc::PTRACE_SINGLESTEP,
                 _ => libc::PTRACE_CONT,
             };
             match pt(req, tid, 0, sig as usize) {
                 Err(e) if !is_esrch(&e) => return Err(perr(e)),
                 _ => {}
             }
-            *t = T {
-                step: m == Mode::Step,
-                ..T::default()
-            };
+            t.step = m == Mode::Step && !t.exiting;
+            (t.stopped, t.fresh, t.group, t.sig, t.pass) = (false, false, false, 0, false);
+            t.interrupted = false;
         }
         Ok(())
     }
@@ -646,17 +866,24 @@ impl Os {
         if mem.pointer_size() != 8 {
             return Err(Error::Unsupported("remote syscalls in 32-bit processes"));
         }
-        let tid = match self.is_stopped(self.pid) {
+        let usable = |t: &T| t.stopped && !t.exiting;
+        let tid = match self.th.get(&self.pid).is_some_and(usable) {
             true => self.pid,
             false => {
                 *self
                     .th
                     .iter()
-                    .find(|(_, t)| t.stopped)
+                    .filter(|(_, t)| usable(t))
+                    .min_by_key(|(_, t)| t.guest)
                     .ok_or(Error::ProcessGone)?
                     .0
             }
         };
+        self.syscall_on(tid, mem, nr, args)
+    }
+
+    /// Runs syscall `nr` in the stopped (traced) task `tid`.
+    fn syscall_on(&mut self, tid: Tid, mem: &dyn Process, nr: i64, args: [u64; 6]) -> Result<u64> {
         let gadget = self.gadget(mem)?;
         let saved = self.regs(tid)?;
         // A thread stopped inside an interrupted syscall would have the kernel restart it on
@@ -692,6 +919,9 @@ impl Os {
                 self.th.remove(&tid);
                 break Err(Error::ProcessGone);
             }
+            if st >> 16 != 0 {
+                continue; // an event stop (e.g. exit): step on
+            }
             if st >> 16 == 0 && libc::WSTOPSIG(st) != libc::SIGTRAP {
                 // shortcut: keeps only the last signal that arrives during the few-µs syscall.
                 keep = (libc::WSTOPSIG(st), true);
@@ -702,9 +932,14 @@ impl Os {
                 Err(e) => break Err(e),
             }
         };
-        if let Some(t) = self.th.get_mut(&tid) {
-            (t.sig, t.pass) = keep;
-            self.set_regs(tid, &restore)?;
+        match self.th.get_mut(&tid) {
+            Some(t) => {
+                (t.sig, t.pass) = keep;
+                self.set_regs(tid, &restore)?;
+            }
+            // A forked child we are about to detach.
+            None if res.is_ok() => self.set_regs(tid, &restore)?,
+            None => {}
         }
         let ret = res? as i64;
         if (-4095..0).contains(&ret) {
@@ -785,6 +1020,47 @@ impl Os {
         Err(Error::Other(format!(
             "no free memory within 2 GiB of {near:#x}"
         )))
+    }
+
+    /// mprotect for page watches; the process must be halted.
+    pub fn mprotect(&mut self, mem: &dyn Process, start: Addr, len: u64, prot: Prot) -> Result<()> {
+        self.syscall(
+            mem,
+            libc::SYS_mprotect,
+            [start, len, prot_bits(prot), 0, 0, 0],
+        )
+        .map(|_| ())
+    }
+
+    /// mprotect inside a stopped, traced forked child.
+    pub fn mprotect_child(
+        &mut self,
+        child: Pid,
+        mem: &dyn Process,
+        start: Addr,
+        len: u64,
+        prot: Prot,
+    ) -> Result<()> {
+        let args = [start, len, prot_bits(prot), 0, 0, 0];
+        self.syscall_on(child, mem, libc::SYS_mprotect, args)
+            .map(|_| ())
+    }
+
+    /// Writes into a stopped, traced forked child (we may, as its tracer).
+    pub fn write_child(&self, child: Pid, addr: Addr, data: &[u8]) -> Result<()> {
+        use std::os::unix::fs::FileExt;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(format!("/proc/{child}/mem"))?
+            .write_all_at(data, addr)?;
+        Ok(())
+    }
+
+    pub fn detach_child(&self, child: Pid) -> Result<()> {
+        let _ = self.poke_dr(child, 7, 0);
+        pt(libc::PTRACE_DETACH, child, 0, 0)
+            .map_err(perr)
+            .map(|_| ())
     }
 
     pub fn free(&mut self, mem: &dyn Process, addr: Addr, size: u64) -> Result<()> {

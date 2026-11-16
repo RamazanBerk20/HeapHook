@@ -375,6 +375,150 @@ fn errors() {
     ));
 }
 
+// ---- odd targets: this test binary re-run with HH_CORE_TEST_CHILD set ----------------------
+
+/// Runs before `main` (on the main thread) when this binary is started as a test target:
+/// - `main-exit`: a worker thread answers stdin lines, then the main thread calls pthread_exit.
+/// - `vfork`: the main thread sits in vfork (uninterruptible sleep) for 4 s, then answers stdin.
+extern "C" fn test_child() {
+    use std::io::{BufRead, Write};
+    let Ok(mode) = std::env::var("HH_CORE_TEST_CHILD") else {
+        return;
+    };
+    let serve = || {
+        for l in std::io::stdin().lock().lines() {
+            let Ok(l) = l else { break };
+            println!("ok {l}");
+        }
+        unsafe { libc::_exit(0) }
+    };
+    match mode.as_str() {
+        "main-exit" => {
+            std::thread::spawn(move || {
+                println!("ready");
+                serve()
+            });
+            // The raw exit syscall ends only this thread, like pthread_exit without its
+            // forced unwind (which must not cross this extern "C" frame).
+            unsafe { libc::syscall(libc::SYS_exit, 0) };
+            unreachable!()
+        }
+        "vfork" => {
+            println!("ready");
+            let _ = std::io::stdout().flush();
+            #[allow(deprecated)]
+            if unsafe { libc::vfork() } == 0 {
+                unsafe {
+                    libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
+                    libc::sleep(4);
+                    libc::_exit(0);
+                }
+            }
+            println!("resumed");
+            serve()
+        }
+        _ => unsafe { libc::_exit(2) },
+    }
+}
+
+#[used]
+#[unsafe(link_section = ".init_array")]
+static TEST_CHILD: extern "C" fn() = test_child;
+
+fn spawn_odd(mode: &str) -> Target {
+    let mut child = Command::new(std::env::current_exe().unwrap())
+        .env("HH_CORE_TEST_CHILD", mode)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut line = String::new();
+    stdout.read_line(&mut line).unwrap();
+    assert_eq!(line.trim(), "ready");
+    Target {
+        child,
+        stdin,
+        stdout,
+        info: Value::Null,
+    }
+}
+
+fn wait_for(what: &str, mut f: impl FnMut() -> bool) {
+    let t = std::time::Instant::now();
+    while !f() {
+        assert!(t.elapsed().as_secs() < 5, "timed out waiting for {what}");
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+
+fn tracer_pid(pid: u32) -> String {
+    std::fs::read_to_string(format!("/proc/{pid}/status"))
+        .unwrap()
+        .lines()
+        .find_map(|l| l.strip_prefix("TracerPid:").map(|v| v.trim().to_owned()))
+        .unwrap()
+}
+
+const RW: Prot = Prot {
+    r: true,
+    w: true,
+    x: false,
+};
+
+#[test]
+fn remote_syscall_after_main_thread_exit() {
+    let mut t = spawn_odd("main-exit");
+    wait_for("the main thread to exit", || state(t.pid()) == 'Z');
+    let p = hh_core::open(t.pid()).unwrap();
+    assert!(p.is_alive());
+    assert_eq!(p.pointer_size(), 8);
+    assert!(!p.regions().unwrap().is_empty());
+    let a = p.alloc(4096, RW, None).unwrap();
+    p.write(a, b"hello").unwrap();
+    let mut b = [0u8; 5];
+    p.read_exact(a, &mut b).unwrap();
+    assert_eq!(&b, b"hello");
+    p.free(a, 4096).unwrap();
+    // The worker thread survived the injection.
+    writeln!(t.stdin, "ping").unwrap();
+    let mut line = String::new();
+    t.stdout.read_line(&mut line).unwrap();
+    assert_eq!(line.trim(), "ok ping");
+}
+
+#[test]
+fn remote_syscall_times_out_and_leaves_target_running() {
+    let mut t = spawn_odd("vfork");
+    wait_for("vfork sleep", || state(t.pid()) == 'D');
+    let p = hh_core::open(t.pid()).unwrap();
+    let start = std::time::Instant::now();
+    let e = p.alloc(4096, RW, None).unwrap_err();
+    assert!(start.elapsed().as_secs() < 4, "{:?}", start.elapsed());
+    assert!(e.to_string().contains("untraced"), "{e}");
+    wait_for("detach", || tracer_pid(t.pid()) == "0");
+    // Once vfork returns the target runs on: no leftover ptrace stop.
+    let mut line = String::new();
+    t.stdout.read_line(&mut line).unwrap();
+    assert_eq!(line.trim(), "resumed");
+    writeln!(t.stdin, "ping").unwrap();
+    line.clear();
+    t.stdout.read_line(&mut line).unwrap();
+    assert_eq!(line.trim(), "ok ping");
+    assert_eq!(tracer_pid(t.pid()), "0");
+    let a = p.alloc(4096, RW, None).unwrap();
+    p.free(a, 4096).unwrap();
+}
+
+#[test]
+fn protect_overflow_is_an_error() {
+    let t = Target::spawn();
+    let p = hh_core::open(t.pid()).unwrap();
+    assert!(p.protect(t.addr("i32"), u64::MAX, RW).is_err());
+    assert!(p.write(u64::MAX - 1, &[0; 4]).is_err());
+}
+
 fn is_root() -> bool {
     std::fs::read_to_string("/proc/self/status")
         .unwrap()

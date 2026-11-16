@@ -73,7 +73,16 @@ fn machine(m: u64, pe: bool) -> String {
     }
 }
 
+/// Most import descriptors read, and most import slots counted over all of them.
+const MAX_IMPORT_LIBS: usize = 4096;
+const MAX_IMPORT_SLOTS: usize = 1 << 20;
+/// Import slots fetched per read.
+const SLOT_BLOCK: usize = 4096;
+/// Longest section name shown; a hostile string table has no NUL for megabytes.
+const MAX_NAME: usize = 256;
+
 fn cstr(b: &[u8]) -> String {
+    let b = &b[..b.len().min(MAX_NAME)];
     let n = b.iter().position(|&c| c == 0).unwrap_or(b.len());
     String::from_utf8_lossy(&b[..n]).into_owned()
 }
@@ -94,14 +103,11 @@ pub fn summary(p: &dyn Process, m: &Module) -> Result<HeaderSummary> {
                 paths.push(format!("/proc/{}/root{}", p.pid(), m.path));
             }
             for path in paths {
-                if let Ok(file) = std::fs::read(&path) {
-                    let src = |o: u64, len: usize| {
-                        let o = usize::try_from(o).ok()?;
-                        file.get(o..o.checked_add(len)?.min(file.len())).map(<[u8]>::to_vec)
-                    };
-                    if let Ok(s) = parse_elf(&src, m.base, "file") {
-                        return Ok(s);
-                    }
+                // Regular files only, read by range: the path comes from the target's memory map.
+                if let Ok(src) = hh_asm::module_file_reader(&path)
+                    && let Ok(s) = parse_elf(&src, m.base, "file")
+                {
+                    return Ok(s);
                 }
             }
             parse_elf(&mem, m.base, "memory")
@@ -141,7 +147,7 @@ pub(crate) fn parse_pe(src: Src, base: Addr) -> Result<HeaderSummary> {
             let c = uint(s, 36, 4);
             Section {
                 name: cstr(&s[..8]),
-                addr: base + uint(s, 12, 4),
+                addr: base.wrapping_add(uint(s, 12, 4)),
                 size: uint(s, 8, 4),
                 prot: Prot {
                     r: c & 0x4000_0000 != 0,
@@ -160,21 +166,31 @@ pub(crate) fn parse_pe(src: Src, base: Addr) -> Result<HeaderSummary> {
     let (mut libs, mut funcs) = (0usize, 0usize);
     if let Some((rva, _)) = dir(1).filter(|d| d.0 != 0) {
         let w = if is_64 { 8 } else { 4 };
-        for i in 0..4096u64 {
-            let Ok(d) = rd(src, rva + i * 20, 20) else { break };
+        // Bulk reads; a short read is the end of readable memory.
+        let descs = src(rva, MAX_IMPORT_LIBS * 20).unwrap_or_default();
+        for d in descs.chunks_exact(20) {
             if d.iter().all(|&b| b == 0) {
                 break;
             }
             libs += 1;
-            let thunks = match uint(&d, 0, 4) {
-                0 => uint(&d, 16, 4),
+            let mut at = match uint(d, 0, 4) {
+                0 => uint(d, 16, 4),
                 t => t,
             };
-            for j in 0..65536u64 {
-                match rd(src, thunks + j * w, w as usize) {
-                    Ok(t) if uint(&t, 0, w as usize) != 0 => funcs += 1,
-                    _ => break,
+            'slots: while let Some(block) = src(at, SLOT_BLOCK * w) {
+                for t in block.chunks_exact(w) {
+                    if uint(t, 0, w) == 0 {
+                        break 'slots;
+                    }
+                    funcs += 1;
+                    if funcs > MAX_IMPORT_SLOTS {
+                        return Err(bad("more than MAX_IMPORT_SLOTS import slots"));
+                    }
                 }
+                if block.len() < SLOT_BLOCK * w {
+                    break;
+                }
+                at = at.saturating_add((SLOT_BLOCK * w) as u64);
             }
         }
     }
@@ -183,7 +199,7 @@ pub(crate) fn parse_pe(src: Src, base: Addr) -> Result<HeaderSummary> {
         is_64,
         machine: machine(uint(&h, 4, 2), true),
         kind: if chars & 0x2000 != 0 { "dll" } else { "exe" }.into(),
-        entry: if entry_rva == 0 { 0 } else { base + entry_rva },
+        entry: if entry_rva == 0 { 0 } else { base.wrapping_add(entry_rva) },
         image_base,
         sections,
         imports: Some(funcs),

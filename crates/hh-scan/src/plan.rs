@@ -4,7 +4,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::hexaddr;
 use crate::value::{
-    CustomType, Enc, NumVal, Num, Pattern, Prim, Rounding, VType, Val, binary_bits, float_interval, parse_aob, parse_num,
+    CustomType, Enc, MAX_VALUE_LEN, NumVal, Num, Pattern, Prim, Rounding, VType, Val, binary_bits, float_interval, parse_aob,
+    parse_num,
     parse_string, shifted, with_num,
 };
 
@@ -300,8 +301,9 @@ pub(crate) fn num_cmp(ty: Ty, st: ScanType, v1: Option<&str>, v2: Option<&str>, 
             match (fl, st == ScanType::Bigger) {
                 (true, true) => NumCmp::F(v.f.next_up(), f64::INFINITY),
                 (true, false) => NumCmp::F(f64::NEG_INFINITY, v.f.next_down()),
-                (false, true) => NumCmp::I(v.int()? + 1, i128::MAX),
-                (false, false) => NumCmp::I(i128::MIN, v.int()? - 1),
+                // Nothing is bigger than i128::MAX (or smaller than MIN): an empty range.
+                (false, true) => v.int()?.checked_add(1).map_or(NumCmp::I(1, 0), |lo| NumCmp::I(lo, i128::MAX)),
+                (false, false) => v.int()?.checked_sub(1).map_or(NumCmp::I(1, 0), |hi| NumCmp::I(i128::MIN, hi)),
             }
         }
         ScanType::Between => {
@@ -640,8 +642,11 @@ pub(crate) fn compile_first(req: &FirstScan) -> Result<(Kind, Plan)> {
             let step = 16u64.checked_pow(d.len() as u32).ok_or_else(|| Error::Parse("too many last digits".into()))?;
             (step, off)
         }
-        _ => (group_align.or(o.alignment).unwrap_or(natural as u64).max(1), 0),
+        _ => (group_align.or(o.alignment).unwrap_or(natural as u64), 0),
     };
+    if !(1..=MAX_ALIGN).contains(&k.align) {
+        return Err(Error::Parse(format!("alignment must be 1..={MAX_ALIGN:#x}, got {:#x}", k.align)));
+    }
     Ok((k, plan))
 }
 
@@ -786,6 +791,9 @@ fn group_tokens(s: &str) -> Result<Vec<(String, String)>> {
     }
 }
 
+/// Largest scan alignment (or last-digits step); bigger ones only overflow address math.
+const MAX_ALIGN: u64 = 1 << 32;
+
 pub(crate) fn parse_group(s: &str, o: &ScanOptions) -> Result<Group> {
     let mut g = Group { elems: Vec::new(), span: 0, ooo: None, align: None };
     let (mut ooo, mut bs) = (false, DEFAULT_BLOCK);
@@ -796,6 +804,7 @@ pub(crate) fn parse_group(s: &str, o: &ScanOptions) -> Result<Group> {
         usize::try_from(n).map_err(|_| Error::Parse(format!("bad size {v:?}")))
     });
     let no = NumOpts { hex: o.hex, rounding: o.rounding, percent: false };
+    let too_wide = || Error::Parse(format!("group wider than {MAX_VALUE_LEN} bytes"));
     for (k, v) in group_tokens(s)? {
         let e = match k.as_str() {
             "ooo" => {
@@ -803,7 +812,7 @@ pub(crate) fn parse_group(s: &str, o: &ScanOptions) -> Result<Group> {
                 continue;
             }
             "ba" => {
-                g.align = Some(dec(&v)?.max(1) as u64);
+                g.align = Some(dec(&v)? as u64);
                 continue;
             }
             "bs" => {
@@ -827,7 +836,10 @@ pub(crate) fn parse_group(s: &str, o: &ScanOptions) -> Result<Group> {
         };
         let w = e.width();
         g.elems.push((g.span, e));
-        g.span += w;
+        g.span = g.span.checked_add(w).filter(|&n| n <= MAX_VALUE_LEN).ok_or_else(too_wide)?;
+    }
+    if bs > MAX_VALUE_LEN {
+        return Err(too_wide());
     }
     if g.elems.is_empty() || g.span == 0 {
         return Err(Error::Parse("empty group".into()));
