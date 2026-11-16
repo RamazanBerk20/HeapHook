@@ -11,7 +11,7 @@ depends=('webkit2gtk-4.1' 'gtk3')
 makedepends=('cargo')
 options=('!lto')
 source=("$pkgname-$_tag.tar.gz::$url/archive/refs/tags/v$_tag.tar.gz")
-sha256sums=('SKIP')
+sha256sums=('bf5bad6b6334ec8fcc8fd625cdf7a04f96cf39594b15c3a893cde1d3e323b90f')
 _src="HeapHook-$_tag"
 
 prepare() {
