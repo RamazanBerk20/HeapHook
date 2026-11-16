@@ -80,6 +80,8 @@ const P = {
   key: '<circle cx="7" cy="12" r="3.5"/><path d="M10.5 12H21M17 12v3.5M20.5 12v2.5"/>',
   struct: '<rect x="3" y="4" width="7" height="5" rx="1"/><rect x="14" y="15" width="7" height="5" rx="1"/><path d="M6.5 9v8.5H14M6.5 13H14"/>',
   clock: '<circle cx="12" cy="12" r="8"/><path d="M12 8v4l3 2"/>',
+  info: '<circle cx="12" cy="12" r="9"/><path d="M12 11v6M12 7.5h.01"/>',
+  server: '<rect x="3" y="4" width="18" height="7" rx="1.5"/><rect x="3" y="13" width="18" height="7" rx="1.5"/><path d="M7 7.5h.01M7 16.5h.01"/>',
 };
 export const icon = (name, cls = '') =>
   `<svg class="ic ${cls}" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">${P[name]}</svg>`;
@@ -94,6 +96,40 @@ export function toast(msg, kind = 'error') {
 /** Run an async action and surface its error string as a toast. */
 export async function attempt(fn) {
   try { return await fn(); } catch (e) { toast(e?.message || e); return undefined; }
+}
+
+// ---------- busy indicator ----------
+// One indicator in the top bar for any operation that takes longer than 300 ms. Several
+// operations stack; the newest is shown. `cancel` adds a Cancel button (and Esc) when the
+// backend can stop the operation.
+const busyOps = [];
+function busyRender() {
+  const el = $('#busy');
+  if (!el) return;
+  const op = busyOps.filter((o) => o.shown).at(-1);
+  el.hidden = !op;
+  if (!op) return;
+  $('#busy-text').textContent = op.label + '…';
+  const c = $('#busy-cancel');
+  c.hidden = !op.cancel;
+  c.onclick = () => op.cancel?.();
+}
+/** True while a cancellable busy operation is shown (Esc cancels it). */
+export function busyCancel() {
+  const op = busyOps.filter((o) => o.shown && o.cancel).at(-1);
+  if (op) op.cancel();
+  return !!op;
+}
+/** Awaits `work` (a promise or function returning one); shows `label` after 300 ms. */
+export async function busy(label, work, { cancel = null } = {}) {
+  const op = { label, cancel, shown: false };
+  busyOps.push(op);
+  const t = setTimeout(() => { op.shown = true; busyRender(); }, 300);
+  try { return await (typeof work === 'function' ? work() : work); } finally {
+    clearTimeout(t);
+    busyOps.splice(busyOps.indexOf(op), 1);
+    busyRender();
+  }
 }
 
 // ---------- splitters ----------

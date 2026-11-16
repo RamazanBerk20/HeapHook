@@ -7,6 +7,7 @@ pub mod debug;
 pub mod inject;
 pub mod lua;
 pub mod ptr;
+pub mod remote;
 pub mod settings;
 pub mod table;
 pub mod tools;

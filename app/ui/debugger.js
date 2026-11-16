@@ -149,7 +149,9 @@ export function initDebugger({ showView, mem }) {
     h('span.mono.muted.hits', { title: b.records_dropped ? `Hits; ${nf.format(b.records_dropped)} not recorded (record list full)` : 'Hits' },
       b.records_dropped ? h('span.dropped', { 'aria-label': 'record list full' }, '! ') : null, nf.format(b.hits)))));
     bpList.setAttribute('aria-activedescendant', bps[bpSel] ? 'bp-' + bps[bpSel].id : '');
-    if (!bps.length) bpList.append(h('p.empty', null, dbg.attached ? 'No breakpoints. F5 in the disassembler sets one.' : 'Debugger not attached.'));
+    if (!bps.length) bpList.append(h('p.empty', null, ...(dbg.attached ? ['No breakpoints. ', h('kbd', null, 'F5'), ' in the disassembler sets one.']
+      : state.proc?.remote ? ['The debugger works on local processes only; this target is on ', state.proc.remote, '.']
+        : !state.proc ? ['Open a process (', h('kbd', null, 'Ctrl P'), '), then attach the debugger.'] : ['Debugger not attached. ', h('kbd', null, 'Ctrl Shift D'), ' attaches it.'])));
   }
   /** Method, action, hit options and condition; why it is off when the debugger switched it off. */
   function bpInfo(b) {
@@ -277,6 +279,7 @@ export function initDebugger({ showView, mem }) {
     e.preventDefault(); e.stopPropagation();
     renderBps();
   });
+  on('debug:bps-changed', () => attempt(loadBps));
   on('debug:bp-dialog', async (addr) => { if (await attach()) { await attempt(loadBps); bpDialog({ addr }); } });
   on('debug:toggle-bp', async (addr) => {
     if (!(await attach())) return;

@@ -79,7 +79,7 @@ export function formDialog(title, fields, { ok = 'OK', text = '' } = {}) {
 }
 
 /** A dialog with a list (vlist) and a toolbar; returns {dialog, body, close}. */
-function listDialog(title, { wide = true } = {}) {
+export function listDialog(title, { wide = true } = {}) {
   const body = h('div.tool-body');
   const d = h('dialog.dlg' + (wide ? '.dlg-tool' : ''), { 'aria-label': title },
     h('div.dlg-head', null, h('h2', null, title), h('button.btn.ghost.icon', { type: 'button', 'aria-label': 'Close (Esc)', title: 'Close (Esc)', onclick: () => d.close(), html: '<svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" aria-hidden="true"><path d="M18 6 6 18M6 6l12 12"/></svg>' })),
@@ -263,10 +263,13 @@ export async function headerDialog(mod) {
 }
 
 // ---------- AOB signature / injection script ----------
-export async function aobScript(addr) {
-  const script = await attempt(() => api.aaTemplate(addr, 'aob'));
-  if (script) emit('table:script', { description: `AOB injection at ${fmtAddr(addr)}`, script });
+const INJECT = { aob: 'AOB injection', code: 'Code injection', full: 'Full injection' };
+/** Auto Assembler template at addr (kind aob | code | full) as a new table script entry. */
+export async function injectScript(addr, kind = 'aob') {
+  const script = await attempt(() => api.aaTemplate(addr, kind));
+  if (script) emit('table:script', { description: `${INJECT[kind]} at ${fmtAddr(addr)}`, script });
 }
+export const aobScript = (addr) => injectScript(addr, 'aob');
 
 export async function signatureDialog(addr) {
   const s = await attempt(() => api.aobSignature(addr));

@@ -7,7 +7,8 @@
 // edit as a whole-table put based on the version it saw; a stale put is refetched and the
 // edit replayed. Activation and value writes are backend commands.
 import { api, askPath } from './backend.js';
-import { $, h, icon, fmtAddr, wire, isHexAddr, attempt, toast, contextMenu, store, modal } from './util.js';
+import { $, h, icon, fmtAddr, wire, isHexAddr, attempt, toast, contextMenu, store, modal, rafThrottle } from './util.js';
+import { listCustomTypes, editCustomType, ctLabel } from './custom.js';
 import { state, addSource, addTicker, emit, on, TICK_MS } from './core.js';
 import { comboOf, comboText, MODS } from './keys.js';
 
@@ -34,6 +35,20 @@ alloc(newmem,1024)
 dealloc(newmem)
 `;
 
+let editMetaHook = null;
+/**
+ * Edits table-level fields (symbols, disasm_comments, ...) in place: `fn(table)` mutates them and
+ * must be safe to run again (a stale put replays it on the refetched table).
+ */
+export async function editTableMeta(fn) {
+  if (editMetaHook) return editMetaHook(fn);
+  for (let i = 0; ; i++) {
+    const { version, table } = await api.tableGet();
+    fn(table);
+    try { await api.tablePut(table, version); return; } catch (e) { if (!/stale/.test(String(e)) || i >= 3) throw e; }
+  }
+}
+
 export function initTable(root) {
   const grid = $('.tbl', root), body = $('.tbl-body', root);
   let roots = [], seq = 1, cursor = null, anchor = null, clip = null, tablePath = store.get('tablePath', 'table.json');
@@ -50,6 +65,8 @@ export function initTable(root) {
   const isScript = (e) => typeof e.script === 'string';
   const isGroup = (e) => !isScript(e) && !e.addr;
   const isValue = (e) => !isScript(e) && !isGroup(e);
+  /** A Cheat Engine custom type the table names but does not define: kept as is, never read or written. */
+  const unsupported = (e) => !!e.custom_name && !e.custom;
   const opt = (e, o) => (e.options || []).includes(o);
   const walk = (list, f, parent = null) => list.forEach((e, i) => { f(e, list, i, parent); walk(e.children, f, e); });
   function find(id) { let r = null; walk(roots, (e, list, index, parent) => { if (e.id === id) r = { e, list, index, parent }; }); return r; }
@@ -83,7 +100,10 @@ export function initTable(root) {
     version = st.version;
     const t = st.table;
     roots = (t.entries || []).map(norm);
-    meta = { lua_script: t.lua_script || '', comments: t.comments || '', codes: t.codes || [], structures: t.structures || [], ct_extra: t.ct_extra || [] };
+    // Every table field rides along in puts (custom_types, symbols, disasm_comments, ...), not only the ones edited here.
+    const { entries: _e, ...rest } = t;
+    meta = { ...rest, lua_script: t.lua_script || '', comments: t.comments || '', codes: t.codes || [], structures: t.structures || [], ct_extra: t.ct_extra || [] };
+    emit('table:meta', meta);
     let max = 0;
     walk(roots, (e) => { max = Math.max(max, e.id); });
     seq = max + 1;
@@ -116,6 +136,7 @@ export function initTable(root) {
 
   // ---------- rendering ----------
   const typeText = (e) => isScript(e) ? 'Auto Assembler script' : isGroup(e) ? '' :
+    unsupported(e) ? `Custom: ${e.custom_name} (unsupported)` : e.custom ? ctLabel(e.custom_name, e.custom) :
     e.vtype === 'string' ? `String[${e.len || 16}]${e.utf16 ? ' UTF-16' : ''}` : e.vtype === 'aob' ? `Array of byte[${e.len || 8}]` : VNAME[e.vtype] || e.vtype;
   const addrText = (e) => {
     if (isScript(e)) return '<script>';
@@ -132,7 +153,7 @@ export function initTable(root) {
     const it = e.dropdown?.display_value_as_item && itemOf(e, v);
     return it ? it.text : v;
   };
-  const valueText = (e) => isValue(e) ? shown(e, R(e.id).value) : '';
+  const valueText = (e) => !isValue(e) ? '' : unsupported(e) ? 'unsupported' : shown(e, R(e.id).value);
 
   function rowEl({ e, depth }) {
     const r = R(e.id), active = e.frozen;
@@ -181,39 +202,77 @@ export function initTable(root) {
     if (s.ids.length) cursor = s.ids[0];
     render();
   });
+  // Virtualized: only the rows in view (plus a few) exist; the spacer gives the scroll height.
+  const spacer = h('div.tbl-spacer', { 'aria-hidden': 'true' }), layer = h('div.tbl-layer', { role: 'presentation' });
+  body.replaceChildren(spacer, layer);
+  const OVER = 6;
+  let first = 0, editingId = null;
+  function paint() {
+    if (editingId != null) return; // an inline editor lives in a row; repaint after it closes
+    const vis = Math.ceil(body.clientHeight / ROW) + 1;
+    first = Math.max(0, Math.min(Math.floor(body.scrollTop / ROW) - OVER, flat.length - vis - OVER));
+    const end = Math.min(flat.length, first + vis + OVER * 2);
+    spacer.style.height = flat.length * ROW + 'px';
+    layer.style.transform = `translateY(${first * ROW}px)`;
+    const rows = [];
+    for (let i = first; i < end; i++) { const r = rowEl(flat[i]); r.setAttribute('aria-rowindex', i + 2); rows.push(r); }
+    layer.replaceChildren(...rows);
+    grid.setAttribute('aria-activedescendant', cursor != null && rowOf(cursor) ? 'te-' + cursor : '');
+    resolveVisible();
+  }
+  const paintSoon = rafThrottle(paint);
+  body.addEventListener('scroll', paintSoon, { passive: true });
+  new ResizeObserver(paintSoon).observe(body);
   function render() {
     flatten();
     if (cursor != null && !flat.some((f) => f.e.id === cursor)) cursor = flat[0]?.e.id ?? null;
-    body.replaceChildren(...flat.map(rowEl));
+    grid.setAttribute('aria-rowcount', flat.length + 1);
+    paint();
     $('#tbl-empty').hidden = flat.length > 0;
-    grid.setAttribute('aria-activedescendant', cursor != null ? 'te-' + cursor : '');
     $('#tbl-count').textContent = flat.length ? String(all().length) : '';
     $('#tb-lua').classList.toggle('has', !!meta.lua_script.trim());
     $('#tb-comments').classList.toggle('has', !!meta.comments.trim());
-    resolveAll();
+    $('#tb-labels')?.classList.toggle('has', !!meta.symbols?.length);
     syncSel();
   }
   function rowOf(id) { return document.getElementById('te-' + id); }
-  function scrollToCursor() { rowOf(cursor)?.scrollIntoView({ block: 'nearest' }); }
+  /** Scrolls the cursor row into view and makes sure it is rendered. */
+  function scrollToCursor() {
+    const i = cursorIdx();
+    if (i < 0) return;
+    const top = i * ROW, h_ = body.clientHeight;
+    if (top < body.scrollTop) body.scrollTop = top;
+    else if (top + ROW > body.scrollTop + h_) body.scrollTop = top + ROW - h_;
+    if (!rowOf(cursor)) paint();
+  }
 
   // ---------- addresses (display only; the backend resolves for freezing) ----------
   const exprOf = (e) => e.offsets.reduce((x, off) => `[${x}]+${off}`, e.addr);
-  let resolving = false;
-  async function resolveAll() {
-    if (!state.proc || resolving) return;
+  let resolving = false, resolveAgain = false;
+  /** One resolve_many call for the rows in view (the backend resolves what it freezes itself). */
+  async function resolveVisible() {
+    if (!state.proc) return;
+    if (resolving) { resolveAgain = true; return; }
     resolving = true;
     try {
-      await Promise.all(all().filter(isValue).map(async (e) => {
-        const r = R(e.id);
-        let a = null;
-        if (!e.offsets.length && isHexAddr(e.addr)) a = BigInt('0x' + e.addr.trim().replace(/^0x/i, ''));
-        else a = await api.resolveAddress(exprOf(e)).then(BigInt, () => null);
+      const es = [];
+      for (let i = first; i < Math.min(flat.length, first + layer.childElementCount); i++) if (isValue(flat[i].e)) es.push(flat[i].e);
+      const lit = (e) => !e.offsets.length && isHexAddr(e.addr);
+      const ask = es.filter((e) => !lit(e));
+      const got = ask.length ? await api.resolveMany(ask.map(exprOf)).catch(() => ask.map(() => null)) : [];
+      const res = new Map(ask.map((e, i) => [e, got[i]]));
+      for (const e of es) {
+        const r = R(e.id), s = lit(e) ? '0x' + e.addr.trim().replace(/^0x/i, '') : res.get(e);
+        const a = s == null ? null : BigInt(s);
         if (a !== r.addr) { r.addr = a; const c = rowOf(e.id)?.querySelector('.c-addr'); if (c && !c.querySelector('input')) c.textContent = addrText(e); }
-      }));
-    } finally { resolving = false; }
+      }
+    } finally {
+      resolving = false;
+      if (resolveAgain) { resolveAgain = false; resolveVisible(); }
+    }
   }
   let tickN = 0;
-  addTicker(() => { if (++tickN % Math.max(1, Math.round(1000 / TICK_MS)) === 0) return resolveAll(); });
+  addTicker(() => { if (++tickN % Math.max(1, Math.round(1000 / TICK_MS)) === 0) return resolveVisible(); });
 
   // ---------- live values ----------
   addSource({
@@ -225,9 +284,9 @@ export function initTable(root) {
       const reqs = [];
       for (const { e } of flat.slice(lo, hi)) {
         const a = R(e.id).addr;
-        if (!isValue(e) || a == null) continue;
+        if (!isValue(e) || a == null || unsupported(e)) continue;
         this.ids.push(e);
-        reqs.push({ addr: wire(a), vtype: e.vtype, len: e.len || undefined, utf16: e.utf16, signed: e.signed, hex: e.hex });
+        reqs.push({ addr: wire(a), vtype: e.vtype, len: e.len || undefined, utf16: e.utf16, signed: e.signed, hex: e.hex, custom: e.custom || undefined });
       }
       return reqs;
     },
@@ -251,6 +310,8 @@ export function initTable(root) {
 
   // ---------- actions ----------
   async function toggleActive(targets = topSelected()) {
+    const bad = targets.filter(unsupported);
+    if (bad.length) { toast(`${bad.length > 1 ? bad.length + ' entries use' : '"' + bad[0].description + '" uses'} a custom type HeapHook cannot read; ${bad.length > 1 ? 'they are' : 'it is'} not frozen`, 'info'); targets = targets.filter((t) => !unsupported(t)); }
     if (!targets.length) return;
     const on_ = !targets[0].frozen;
     await chain; // pending edits first
@@ -395,13 +456,13 @@ export function initTable(root) {
     } else if (toggle) { sel.has(id) ? sel.delete(id) : sel.add(id); anchor = id; }
     else { sel.clear(); sel.add(id); anchor = id; }
     cursor = id;
-    for (const r of body.children) {
+    for (const r of layer.children) {
       const rid = +r.dataset.id;
       r.setAttribute('aria-selected', String(sel.has(rid)));
       r.classList.toggle('cursor', rid === cursor);
     }
-    grid.setAttribute('aria-activedescendant', 'te-' + cursor);
     scrollToCursor();
+    grid.setAttribute('aria-activedescendant', 'te-' + cursor);
     syncSel();
   }
   const cursorIdx = () => flat.findIndex((f) => f.e.id === cursor);
@@ -525,20 +586,37 @@ export function initTable(root) {
       { label: 'Table Lua script…', run: editTableScript },
       { label: 'Generate a trainer…', run: trainerDialog },
       { label: 'Table comments…', run: editComments },
+      { label: 'Labels…', run: labelsDialog },
     ], grid);
   }
 
   // ---------- inline edit ----------
-  function editCell(id, col) {
-    const e = byId(id), row = rowOf(id);
-    if (!e || !row) return;
+  async function editCell(id, col) {
+    const e = byId(id);
+    if (!e || editingId != null) return;
     if (col !== 'description' && !isValue(e)) return;
+    if (col === 'value' && unsupported(e)) { toast(`${typeText(e)}: HeapHook has no definition for this custom type, so the value cannot be read or changed`, 'info'); return; }
+    const customs = col === 'vtype' ? await listCustomTypes().catch(() => []) : null;
+    const i = flat.findIndex((f) => f.e.id === id);
+    if (i < 0) return;
+    if (i * ROW < body.scrollTop || (i + 1) * ROW > body.scrollTop + body.clientHeight) body.scrollTop = Math.max(0, i * ROW - body.clientHeight / 2);
+    paint();
+    const row = rowOf(id);
+    if (!row) return;
+    editingId = id;
     const cell = row.querySelector(`[data-col="${col}"]`);
     row.draggable = false;
     const dd = col === 'value' ? e.dropdown : null;
     let input;
     if (col === 'vtype') {
-      input = h('select.cell-input', { 'aria-label': 'Value type' }, VTYPES.map(([v, l]) => h('option', { value: v, selected: v === e.vtype }, l)));
+      const curCt = e.custom_name || (e.custom ? ctLabel(null, e.custom) : null);
+      input = h('select.cell-input', { 'aria-label': 'Value type' },
+        h('optgroup', { label: 'Types' }, VTYPES.map(([v, l]) => h('option', { value: v, selected: !curCt && v === e.vtype }, l))),
+        h('optgroup', { label: 'Custom types' },
+          customs.map((c) => h('option', { value: 'ct:' + c.name, selected: c.name === e.custom_name }, ctLabel(c.name, c.ct))),
+          e.custom_name && !customs.some((c) => c.name === e.custom_name) ? h('option', { value: 'keep', selected: true }, typeText(e)) : null,
+          h('option', { value: 'ct-new' }, 'New custom type…')));
+      input._customs = customs;
     } else if (dd?.read_only && dd.options.length) {
       const cur = itemOf(e, R(e.id).value);
       input = h('select.cell-input.mono', { 'aria-label': 'Value' }, dd.options.map((o) =>
@@ -561,12 +639,16 @@ export function initTable(root) {
     const finish = async (ok) => {
       if (done) return;
       done = true;
+      editingId = null;
       const v = input.value;
-      if (!ok) { cell.replaceChildren(...keep); row.draggable = true; grid.focus(); return; }
+      if (!ok || v === 'keep') { cell.replaceChildren(...keep); row.draggable = true; grid.focus(); paintSoon(); return; }
       if (col === 'value') { await writeValue(e, v); render(); }
       else if (col === 'description') edit([id], (x) => { x.description = v; });
       else if (col === 'addr') { R(id).addr = null; edit([id], (x) => { x.addr = v.trim(); }); }
-      else if (col === 'vtype') edit([id], (x) => { x.vtype = v; if (v === 'string' && !x.len) x.len = 16; if (v === 'aob' && !x.len) x.len = 8; });
+      else if (col === 'vtype' && v.startsWith('ct')) {
+        const pick = v === 'ct-new' ? await editCustomType(null) : input._customs.find((c) => 'ct:' + c.name === v);
+        if (pick) edit([id], (x) => { x.custom = pick.ct; x.custom_name = pick.name; }); else render();
+      } else if (col === 'vtype') edit([id], (x) => { x.vtype = v; delete x.custom; delete x.custom_name; if (v === 'string' && !x.len) x.len = 16; if (v === 'aob' && !x.len) x.len = 8; });
       grid.focus();
     };
     input.addEventListener('keydown', (ev) => {
@@ -579,7 +661,7 @@ export function initTable(root) {
   }
   /** Writes through the backend, so frozen entries freeze to the new value. */
   async function writeValue(e, v) {
-    const targets = sel.has(e.id) ? selectedAll().filter((x) => isValue(x) || opt(x, 'moRecursiveSetValue')) : [e];
+    const targets = (sel.has(e.id) ? selectedAll().filter((x) => isValue(x) || opt(x, 'moRecursiveSetValue')) : [e]).filter((x) => !unsupported(x));
     // One write per flag set: hex entries need the 0x prefix, decimal ones must not get it.
     const groups = new Map();
     for (const t of targets) { const w = wireValue(t, v); groups.set(w, [...(groups.get(w) || []), t.id]); }
@@ -682,7 +764,8 @@ export function initTable(root) {
         signed: f.elements.signed.checked, hex: f.elements.hex.checked,
       };
       if (!p.addr) { toast('Address is empty'); return; }
-      if (e) { R(e.id).addr = null; edit([e.id], (x) => Object.assign(x, p)); } else add([p]);
+      // The dialog has no custom types: picking another type there drops the custom one.
+      if (e) { R(e.id).addr = null; edit([e.id], (x) => { if (p.vtype !== x.vtype) { delete x.custom; delete x.custom_name; } Object.assign(x, p); }); } else add([p]);
       grid.focus();
     };
     d.returnValue = '';
@@ -780,6 +863,7 @@ export function initTable(root) {
     chain = chain.then(refetch);
   }
 
+  const keyOf = (keys) => [...(keys || [])].sort((a, b) => a - b).join('+');
   function hotkeyDialog(id) {
     const e = byId(id);
     if (!e) return;
@@ -793,7 +877,14 @@ export function initTable(root) {
       const keyBtn = h('button.btn.hk-keys.mono', { type: 'button', 'aria-label': 'Key combination; focus and press keys' }, comboText(keys));
       const val = h('input.mono', { value: hk.value ?? '', 'aria-label': 'Value', spellcheck: 'false', autocomplete: 'off' });
       const desc = h('input', { value: hk.description ?? '', 'aria-label': 'Description', autocomplete: 'off' });
-      const sync = () => { val.disabled = !HK_VALUE.has(act.value); keyBtn.textContent = keys.length ? comboText(keys) : 'Press keys…'; };
+      const warn = h('p.hk-warn', { role: 'status', hidden: true });
+      const sync = () => {
+        val.disabled = !HK_VALUE.has(act.value); keyBtn.textContent = keys.length ? comboText(keys) : 'Press keys…';
+        // Same combination on another entry: allowed (CE fires both), but worth knowing.
+        const k = keyOf(keys), clash = k ? all().filter((x) => x.id !== id && x.hotkeys.some((hk2) => keyOf(hk2.keys) === k)) : [];
+        warn.hidden = !clash.length;
+        warn.textContent = clash.length ? `${comboText(keys)} is also the hotkey of ${clash.slice(0, 3).map((x) => '"' + x.description + '"').join(', ')}${clash.length > 3 ? ` and ${clash.length - 3} more` : ''}. Both fire when you press it.` : '';
+      };
       act.onchange = sync;
       keyBtn.onkeydown = (ev) => {
         if (ev.key === 'Tab' && !ev.ctrlKey && !ev.altKey) return;
@@ -805,10 +896,10 @@ export function initTable(root) {
       };
       keyBtn.onblur = sync;
       const row = h('div.hk-row', null, act, keyBtn, val, desc,
-        h('button.btn.icon', { type: 'button', 'aria-label': 'Remove hotkey', html: icon('x'), onclick: () => row.remove() }));
+        h('button.btn.icon', { type: 'button', 'aria-label': 'Remove hotkey', html: icon('x'), onclick: () => { row.remove(); warn.remove(); } }));
       // The id stays: Lua's MemoryRecordHotkey objects find their hotkey by it.
       row.read = () => ({ ...(hk.id != null ? { id: hk.id } : {}), action: act.value, keys, value: HK_VALUE.has(act.value) ? val.value.trim() : null, description: desc.value.trim() || null });
-      rows.append(row);
+      rows.append(row, warn);
       sync();
       return keyBtn;
     };
@@ -817,7 +908,7 @@ export function initTable(root) {
     d.onkeydown = (ev) => { if ((ev.ctrlKey || ev.metaKey) && ev.key === 'Enter' && !ev.target.classList.contains('hk-keys')) { ev.preventDefault(); d.close('ok'); } };
     d.onclose = () => {
       if (d.returnValue !== 'ok') { grid.focus(); return; }
-      const list = [...rows.children].map((r) => r.read()).filter((k) => k.keys.length);
+      const list = [...rows.children].filter((r) => r.read).map((r) => r.read()).filter((k) => k.keys.length);
       edit([id], (x) => { x.hotkeys = list; });
       grid.focus();
     };
@@ -872,6 +963,50 @@ export function initTable(root) {
     };
     d.returnValue = '';
     d.showModal();
+  }
+
+  // ---------- user-defined symbols (labels) ----------
+  /** Table labels (CE <UserdefinedSymbols>): name = address expression, usable in every address field. */
+  function labelsDialog() {
+    const rowsEl = h('div.lb-rows', { role: 'group', 'aria-label': 'Labels' });
+    const err = h('p.hint.err', { role: 'alert' });
+    const addRow = (s = { name: '', address: '' }) => {
+      const name = h('input.mono', { value: s.name, 'aria-label': 'Label name', spellcheck: 'false', autocomplete: 'off', placeholder: 'player_hp' });
+      const addr = h('input.mono', { value: s.address, 'aria-label': 'Address expression', spellcheck: 'false', autocomplete: 'off', placeholder: 'game.exe+1A2B' });
+      const out = h('span.lb-res.mono.muted');
+      const check = async () => { const v = addr.value.trim(); out.textContent = !v || !state.proc ? '' : await api.resolveAddress(v).then(fmtAddr, () => '??'); };
+      addr.addEventListener('input', check);
+      const row = h('div.lb-row', null, name, addr, out, h('button.btn.icon', { type: 'button', 'aria-label': 'Remove label', html: icon('x'), onclick: () => row.remove() }));
+      row.read = () => ({ name: name.value.trim(), address: addr.value.trim() });
+      rowsEl.append(row);
+      check();
+      return name;
+    };
+    (meta.symbols || []).forEach(addRow);
+    const form = h('form', { method: 'dialog' },
+      h('h2', null, 'Labels'),
+      h('p.hint', null, 'Names for addresses, saved with the table. Every address field and the disassembler understand them (game.exe+1A2B becomes player_hp).'),
+      h('div.lb-head', { 'aria-hidden': 'true' }, h('span', null, 'Name'), h('span', null, 'Address'), h('span', null, 'Now'), h('span')),
+      rowsEl,
+      h('button.btn.ghost', { type: 'button', onclick: () => addRow().focus() }, h('span', { html: icon('plus') }), 'Add label'),
+      err,
+      h('div.dlg-actions', null,
+        h('button.btn.primary', { value: 'ok', type: 'submit' }, 'Save ', h('kbd', null, 'Ctrl Enter')),
+        h('button.btn', { value: 'cancel', type: 'submit', formnovalidate: true }, 'Cancel ', h('kbd', null, 'Esc'))));
+    const d = h('dialog.dlg', { 'aria-label': 'Labels' }, form);
+    d.onkeydown = (ev) => { if ((ev.ctrlKey || ev.metaKey) && ev.key === 'Enter') { ev.preventDefault(); form.requestSubmit(form.querySelector('[value=ok]')); } };
+    form.addEventListener('submit', (ev) => {
+      if (ev.submitter?.value !== 'ok') return;
+      const list = [...rowsEl.children].map((r) => r.read()).filter((s) => s.name || s.address);
+      const bad = list.find((s) => !/^[A-Za-z_][\w.]*$/.test(s.name) || !s.address);
+      const dup = list.find((s, i) => list.findIndex((t) => t.name === s.name) !== i);
+      if (bad || dup) { ev.preventDefault(); err.textContent = bad ? `"${bad.name || bad.address}": a label needs a name (letters, digits, _ and ., not starting with a digit) and an address` : `"${dup.name}" is listed twice`; return; }
+      commit(() => { meta.symbols = list; });
+    });
+    d.addEventListener('close', () => { d.remove(); grid.focus(); });
+    document.body.append(d);
+    d.showModal();
+    if (!meta.symbols?.length) addRow().focus(); else rowsEl.querySelector('input')?.focus();
   }
 
   // ---------- trainer generator ----------
@@ -996,6 +1131,10 @@ export function initTable(root) {
   $('#tb-lua').addEventListener('click', editTableScript);
   $('#tb-comments').addEventListener('click', editComments);
   $('#tb-trainer').addEventListener('click', trainerDialog);
+  $('#tb-comments').before(h('button.btn.ghost#tb-labels', { type: 'button', title: 'Names for addresses, saved with the table', onclick: labelsDialog, html: icon('note') + 'Labels' }));
+  $('.tbl-head', root).setAttribute('aria-rowindex', '1');
+  // Other views (the disassembler's comments and labels) edit table fields through the same ordered commit.
+  editMetaHook = (fn) => commit(() => { fn(meta); }).then(() => emit('table:meta', meta));
   refetch();
 
   return { addDialog: () => entryDialog(), save, load, focus: () => grid.focus(), editTableScript };

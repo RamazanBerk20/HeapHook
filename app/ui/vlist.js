@@ -28,7 +28,12 @@ export function vlist(host, o) {
     spacer.style.height = total * ROW + 'px';
     layer.style.transform = `translateY(${first * ROW}px)`;
     empty.hidden = total > 0;
-    if (o.empty) empty.textContent = typeof o.empty === 'function' ? o.empty() : o.empty;
+    if (o.empty && !total) {
+      // A string, or [string | Node] for hints with <kbd> keys.
+      const v = typeof o.empty === 'function' ? o.empty() : o.empty;
+      if (Array.isArray(v)) { const key = v.map((x) => (x instanceof Node ? x.outerHTML : x)).join(''); if (empty._key !== key) { empty._key = key; empty.replaceChildren(...v); } }
+      else if (empty.textContent !== v) { empty._key = null; empty.textContent = v; }
+    }
     const k = Math.max(0, Math.min(vis + 1, total - first));
     while (pool.length < k) {
       const r = h('div.vl-row', { role: 'row', id: `${id}-r${pool.length}`, style: `grid-template-columns:${o.cols}` });

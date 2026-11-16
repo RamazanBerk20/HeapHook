@@ -13,7 +13,7 @@ use std::sync::Mutex;
 use hh_asm::AaState;
 use hh_core::{Addr, Error, Result as HResult};
 use hh_lua::{RecId, Record, RecordHotkey, TableHost};
-use hh_scan::{Fmt, FreezeMode, FrozenEntry};
+use hh_scan::{Fmt, FreezeMode, FrozenEntry, FrozenEntryEx};
 use serde::Serialize;
 
 use crate::commands::{App, R, lock, parse_addr};
@@ -226,8 +226,9 @@ fn record(e: &Entry, parent: Option<i64>, rt: Option<&Rt>) -> Record {
     r.description = e.description.clone();
     r.address = e.addr.clone();
     r.offsets = e.offsets.iter().map(|o| parse_off(o)).collect();
-    r.vtype = e.vtype;
-    r.fmt = fmt_of(e);
+    // hh-lua has no custom types: it sees a custom entry's first 8 bytes as a plain integer,
+    // which `sync_freeze` turns back into bytes (see `custom_frozen_value`).
+    (r.vtype, r.fmt) = if e.custom.is_some() { (hh_scan::VType::Bytes8, Fmt::default()) } else { (e.vtype, fmt_of(e)) };
     r.group_header = is_group(e);
     r.script = e.script.clone();
     r.color = color_in(e.color.as_deref());
@@ -444,7 +445,9 @@ impl TableHost for Live {
             // A header turned into a value entry needs an address to stay one.
             e.addr = if rec.address.trim().is_empty() && rec.script.is_none() { "0".into() } else { rec.address.clone() };
             e.script = rec.script.clone();
-            e.vtype = rec.vtype;
+            if e.custom.is_none() {
+                e.vtype = rec.vtype;
+            }
         }
         if old.options != rec.options {
             e.options = rec.options.clone();
@@ -482,10 +485,12 @@ impl TableHost for Live {
         if old.offsets != rec.offsets {
             e.offsets = rec.offsets.iter().map(|&o| fmt_off(o)).collect();
         }
-        e.len = rec.fmt.len.unwrap_or(0);
-        e.signed = rec.fmt.signed;
-        e.hex = rec.fmt.hex;
-        e.utf16 = rec.fmt.utf16;
+        if e.custom.is_none() {
+            e.len = rec.fmt.len.unwrap_or(0);
+            e.signed = rec.fmt.signed;
+            e.hex = rec.fmt.hex;
+            e.utf16 = rec.fmt.utf16;
+        }
         if old.color != rec.color {
             e.color = color_out(rec.color);
         }
@@ -753,8 +758,17 @@ the table was not opened: these active scripts could not be disabled (open anywa
 
     fn write_entry(&self, e: &Entry, value: &str) -> R<()> {
         let a = self.entry_addr(e)?;
-        hh_scan::write_value(&*self.session()?.proc, a, e.vtype, value, &fmt_of(e)).map_err(|x| x.to_string())?;
+        let p = self.session()?.proc.clone();
+        match (&e.custom, &e.custom_name) {
+            (Some(ct), _) => hh_scan::write_custom(&*p, a, ct, value, &fmt_of(e)),
+            (None, Some(n)) => return Err(format!("custom type {n:?} is not supported by HeapHook")),
+            _ => hh_scan::write_value(&*p, a, e.vtype, value, &fmt_of(e)),
+        }
+        .map_err(|x| x.to_string())?;
         self.x.live.set_frozen_value(e.id, value);
+        if e.custom.is_some() {
+            lock(&self.x.custom_frozen).insert(e.id, value.to_string());
+        }
         Ok(())
     }
 
@@ -782,17 +796,35 @@ the table was not opened: these active scripts could not be disabled (open anywa
     /// Hands the active value entries to the freezer (addresses re-resolved).
     pub(crate) fn sync_freeze(&self) {
         let Ok(sess) = self.session() else { return };
-        let list: Vec<FrozenEntry> = self
-            .x
-            .live
-            .frozen()
+        let active = self.x.live.frozen();
+        // hh-lua formats record values by `vtype` only, so a custom entry's frozen value is
+        // read here, with its type, when it turns active.
+        let mut cf = lock(&self.x.custom_frozen);
+        cf.retain(|id, _| active.iter().any(|(e, _)| e.id == *id && e.custom.is_some()));
+        let list: Vec<FrozenEntryEx> = active
             .into_iter()
+            .filter_map(|(e, value)| match &e.custom {
+                None => Some((e, value)),
+                Some(ct) => {
+                    let v = match cf.entry(e.id) {
+                        std::collections::hash_map::Entry::Occupied(o) => o.get().clone(),
+                        // The engine's value at activation: 8 bytes as an unsigned integer.
+                        std::collections::hash_map::Entry::Vacant(v) => {
+                            let b = hh_scan::parse_value(hh_scan::VType::Bytes8, &value, &Fmt::default()).ok()?;
+                            v.insert(ct.format(&b, &fmt_of(&e))).clone()
+                        }
+                    };
+                    Some((e, v))
+                }
+            })
+            // An unsupported custom type has nothing to write.
+            .filter(|(e, _)| e.custom.is_some() || e.custom_name.is_none())
             .filter_map(|(e, value)| {
                 let addr = self.entry_addr(&e).ok()?;
-                Some(FrozenEntry { addr, vtype: e.vtype, value, mode: e.freeze_mode, fmt: fmt_of(&e) })
+                Some(FrozenEntryEx { entry: FrozenEntry { addr, vtype: e.vtype, value, mode: e.freeze_mode, fmt: fmt_of(&e) }, custom: e.custom })
             })
             .collect();
-        if let Err(e) = sess.freezer.set(&list) {
+        if let Err(e) = sess.freezer.set_ex(&list) {
             self.x.lua.console.push("err", &format!("freeze: {e}"));
         }
     }

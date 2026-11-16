@@ -402,6 +402,9 @@ pub struct ProcessState {
     #[serde(flatten)]
     pub info: crate::commands::Opened,
     pub alive: bool,
+    /// Remote target whose connection dropped: why.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lost: Option<String>,
 }
 
 /// Who a hotkey belongs to.
@@ -494,7 +497,11 @@ impl App {
             hotkeys,
             busy: self.x.lua.busy.load(SeqCst),
             sound: c.sound.load(SeqCst),
-            process: self.session().ok().map(|s| ProcessState { info: s.info.clone(), alive: s.raw.is_alive() }),
+            process: self.session().ok().map(|s| {
+                let alive = s.raw.is_alive();
+                let lost = if alive { None } else { self.remote_lost() };
+                ProcessState { info: s.info.clone(), alive, lost }
+            }),
             selection: self.x.live.selection(),
             ui_seq: lock(&c.ui).seq,
         })
@@ -592,10 +599,11 @@ impl App {
         let mut k = keys.to_vec();
         k.sort_unstable();
         k.dedup();
+        let gap = HOTKEY_DEDUPE.max(Duration::from_millis(lock(&self.x.settings).hotkey_delay_ms));
         {
             let mut g = lock(&self.x.hk);
             let now = Instant::now();
-            if g.last.get(&k).is_some_and(|t| now.duration_since(*t) < HOTKEY_DEDUPE) {
+            if g.last.get(&k).is_some_and(|t| now.duration_since(*t) < gap) {
                 return Ok(0);
             }
             g.last.insert(k.clone(), now);
@@ -668,7 +676,7 @@ impl App {
                         app.sync_freeze();
                         last_sync = Instant::now();
                         // Reap launched processes that exited, so none lingers as a zombie.
-                        lock(&app.x.children).retain_mut(|c| !matches!(c.try_wait(), Ok(Some(_))));
+                        app.reap_children();
                     }
                     app.sync_global_hotkeys();
                 }

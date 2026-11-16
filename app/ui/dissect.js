@@ -2,8 +2,8 @@
 // functions, referenced strings, referenced functions and code caves; the selected item's
 // cross references are listed below. Enter jumps to the disassembler.
 import { api } from './backend.js';
-import { $, $$, h, fmtAddr, fmtSize, nf, attempt, toast, rafThrottle } from './util.js';
-import { on, emit } from './core.js';
+import { $, $$, h, fmtAddr, fmtSize, nf, attempt, toast, rafThrottle, busy } from './util.js';
+import { state, on, emit } from './core.js';
 import { vlist, pager } from './vlist.js';
 import { progressStrip, runJob } from './memtools.js';
 
@@ -39,7 +39,7 @@ export function initDissect({ showView }) {
     if (!names.length) { toast('Pick at least one module'); return; }
     $('#dc-run').disabled = true;
     const opts = { recursive: $('#dc-rec').checked, min_string: +$('#dc-minstr').value || 4, min_cave: +$('#dc-mincave').value || 32 };
-    const s = await runJob(() => api.dissectRun(names, opts), strip, 'Dissecting');
+    const s = await runJob(() => busy('Dissecting code', api.dissectRun(names, opts), { cancel: () => api.toolsCancel() }), strip, 'Dissecting');
     $('#dc-run').disabled = false;
     if (!s) return;
     summary = s;
@@ -68,7 +68,8 @@ export function initDissect({ showView }) {
     $('#dc-list').replaceChildren();
     list = vlist($('#dc-list'), {
       cols: t.cols, head: t.head, label: t.label,
-      empty: () => (summary ? 'Nothing matches.' : 'Run a dissection first.'),
+      empty: () => (summary ? 'Nothing matches.' : !state.proc ? ['No process. Open one with ', h('kbd', null, 'Ctrl P'), ' to analyze its code.']
+        : ['No dissection yet. Tick the modules on the left and press ', h('kbd', null, 'Ctrl Enter'), ' (Run): it finds functions, referenced strings, called functions and code caves, and lets the disassembler show who references an address.']),
       count: src.count, item: src.item,
       cells: (x) => tab === 'strings' ? [fmtAddr(x.addr), h('span', { role: 'gridcell', class: 'dc-str' }, JSON.stringify(x.text).slice(1, -1)), nf.format(x.refs)]
         : tab === 'caves' ? [fmtAddr(x.addr), fmtSize(x.len), x.byte === 0xcc ? 'CC (int3)' : x.byte.toString(16).toUpperCase().padStart(2, '0')]
@@ -132,6 +133,7 @@ export function initDissect({ showView }) {
     for (const i of $$('input', modList)) i.checked = i.value === name;
     run([name]);
   });
+  on('process:closed', () => { summary = null; mods = []; modList.replaceChildren(h('p.empty', null, 'Open a process to list its modules.')); showSummary(); src.clear(); list.refresh({ reset: true }); setTarget(null); });
   on('process:opened', async () => { summary = null; target = null; await loadMods(); showSummary(); src.clear(); xsrc.clear(); list.refresh({ reset: true }); setTarget(null); });
 
   $('#dc-run').addEventListener('click', () => run());

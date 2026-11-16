@@ -2,8 +2,8 @@
 // (columns, in groups like Cheat Engine), pointer fields expanding into child structures,
 // type / description / size edits, in-place value edits, "add to cheat table" with the
 // pointer path, and the structure spider. Definitions live in the backend's table.
-import { api } from './backend.js';
-import { $, h, icon, fmtAddr, wire, attempt, toast, prompt, contextMenu, nf } from './util.js';
+import { api, askPath } from './backend.js';
+import { $, h, icon, fmtAddr, wire, attempt, toast, prompt, contextMenu, nf, busy, store } from './util.js';
 import { state, emit, on, addTicker } from './core.js';
 import { vlist } from './vlist.js';
 import { formDialog, progressStrip, runJob, hexNum } from './memtools.js';
@@ -34,6 +34,11 @@ export function initStructs({ showView }) {
   const view = $('#view-struct'), sel = $('#st-sel'), colsBar = $('#st-cols'), host = $('#st-tree');
   let structs = [], cur = null, groups = [[]], rows = [], list = null, ncols = -1, editing = false, gen = 0;
   const expanded = new Set();
+  // CE's lock: one column's values frozen as the baseline; "highlight changes" marks values that
+  // moved since the last refresh, or differ from the locked column.
+  let locked = null; // {ci, vals: Map(row key -> value)}
+  let hilite = store.get('st.hilite', true);
+  const prevVals = new Map(), chgAt = new Map(); // `${key}|${ci}` -> value / time it changed
   const columns = () => groups.flatMap((g, gi) => g.map((c) => ({ ...c, gi })));
   const groupIdx = () => { let k = 0; return groups.map((g) => g.map(() => k++)); };
 
@@ -76,6 +81,12 @@ export function initStructs({ showView }) {
     }
     try { await level(cur, cols.map((c) => c.addr), 0, '', []); } catch (e) { if (g === gen) toast(e); }
     if (g !== gen) return;
+    const now = performance.now();
+    for (const r of out) (r.vals || []).forEach((v, ci) => {
+      const k = r.key + '|' + ci, val = v?.value ?? null;
+      if (prevVals.has(k) && prevVals.get(k) !== val) chgAt.set(k, now);
+      prevVals.set(k, val);
+    });
     rows = out;
     render();
   }
@@ -88,9 +99,11 @@ export function initStructs({ showView }) {
     const colW = cols.map(() => 'minmax(120px, 1fr)').join(' ');
     list = vlist(host, {
       cols: `minmax(130px, 0.6fr) 96px minmax(140px, 1fr) ${colW}`,
-      head: ['Offset', 'Type', 'Description', ...cols.map((c) => h('span', { class: 'st-colhead', title: c.expr }, `${groups.length > 1 ? 'G' + (c.gi + 1) + ' · ' : ''}${fmtAddr(c.addr)}`))],
+      head: ['Offset', 'Type', 'Description', ...cols.map((c, ci) => h('span', { class: 'st-colhead', title: c.expr }, `${groups.length > 1 ? 'G' + (c.gi + 1) + ' · ' : ''}${fmtAddr(c.addr)}${locked?.ci === ci ? ' · locked' : ''}`))],
       label: 'Structure fields', row: 22,
-      empty: () => (!structs.length ? 'No structure yet. Open one at an address: the cheat table, scan results, memory view and registers have "Open in structure dissector", or press G here.' : !cols.length ? 'Add an address column (A).' : 'No fields.'),
+      empty: () => (!state.proc ? ['No process. Open one with ', h('kbd', null, 'Ctrl P'), ', then dissect a structure at an address.']
+        : !structs.length ? ['No structure yet. Press ', h('kbd', null, 'G'), ' to dissect at an address, or use "Open in structure dissector" in the cheat table, scan results, memory view or registers. ', h('kbd', null, 'Ctrl I'), ' imports structures from a file.']
+          : !cols.length ? ['Add an address column with ', h('kbd', null, 'A'), '.'] : 'No fields.'),
       count: () => rows.length, item: (i) => rows[i],
       rowClass: (r) => (r.error ? 'st-errrow' : ''),
       cells(r) {
@@ -101,7 +114,13 @@ export function initStructs({ showView }) {
           h('span', { role: 'gridcell', class: 'st-off', style: `padding-left:${r.depth * 14}px` }, caret, hex(r.offset)),
           h('span', { role: 'gridcell', class: 'st-type' }, (TNAME[r.vtype] || r.vtype) + (SIZED.has(r.vtype) ? `[${r.size}]` : '') + (r.child && r.vtype === 'pointer' ? ` → ${r.child}` : '')),
           h('span', { role: 'gridcell', class: 'st-desc' }, r.description || ''),
-          ...r.vals.map((v) => h('span', { role: 'gridcell', class: 'st-val ' + cls }, v == null ? '??' : v.value ?? (r.vtype === 'struct' ? '' : '??'))),
+          ...r.vals.map((v, ci) => {
+            const txt = v == null ? '??' : v.value ?? (r.vtype === 'struct' ? '' : '??');
+            const k = r.key + '|' + ci, base = locked?.vals.get(r.key);
+            // Locked: every column is compared with the locked column's values at lock time.
+            const changed = hilite && r.vtype !== 'struct' && (locked ? locked.vals.has(r.key) && (v?.value ?? null) !== base : performance.now() - (chgAt.get(k) || 0) < 1500);
+            return h('span', { role: 'gridcell', class: 'st-val ' + cls + (changed ? ' chg' : ''), title: changed && locked ? `Locked value: ${base ?? '??'}` : null }, txt);
+          }),
         ];
       },
       onActivate: (i, r, e) => (e?.type === 'dblclick' && r?.kids ? toggle(r, true) : editValue(i, 0)),
@@ -118,9 +137,47 @@ export function initStructs({ showView }) {
     colsBar.replaceChildren(...groups.map((g, gi) => h('div.st-group', { role: 'group', 'aria-label': `Group ${gi + 1}` },
       h('span.st-glabel', null, groups.length > 1 ? `Group ${gi + 1}` : 'Addresses'),
       ...g.map((c, ci) => h('span.st-chip.mono', { title: c.expr }, c.expr === fmtAddr(c.addr) ? c.expr : `${c.expr} = ${fmtAddr(c.addr)}`,
-        h('button.st-x', { type: 'button', 'aria-label': `Remove ${c.expr}`, html: icon('x'), onclick: () => { g.splice(ci, 1); if (!g.length && groups.length > 1) groups.splice(gi, 1); render(); evalTree(); } }))),
+        h('button.st-lock', { type: 'button', 'aria-pressed': String(locked?.ci === flatIdx(gi, ci)), title: 'Lock: freeze these values as the baseline (L)', onclick: () => toggleLock(flatIdx(gi, ci)) }, locked?.ci === flatIdx(gi, ci) ? 'Locked' : 'Lock'),
+        h('button.st-x', { type: 'button', 'aria-label': `Remove ${c.expr}`, html: icon('x'), onclick: () => { g.splice(ci, 1); if (!g.length && groups.length > 1) groups.splice(gi, 1); locked = null; render(); evalTree(); } }))),
       h('button.btn.ghost.icon', { type: 'button', 'aria-label': `Add an address to group ${gi + 1}`, title: 'Add address (A)', html: icon('plus'), onclick: () => addColumn(gi) }))),
     h('button.btn.ghost', { type: 'button', onclick: () => { groups.push([]); addColumn(groups.length - 1); } }, h('span', { html: icon('group') }), 'Group'));
+  }
+
+  const flatIdx = (gi, ci) => groups.slice(0, gi).reduce((n, g) => n + g.length, 0) + ci;
+  function toggleLock(ci) {
+    if (locked?.ci === ci) locked = null;
+    else locked = { ci, vals: new Map(rows.filter((r) => r.vals).map((r) => [r.key, r.vals[ci]?.value ?? null])) };
+    list?.head && build(); // the column title says which one is locked
+    render();
+    toast(locked ? 'Column locked: values that differ from its current values are highlighted' : 'Column unlocked', 'info');
+  }
+  function toggleHilite() {
+    hilite = !hilite; store.set('st.hilite', hilite);
+    hlBtn.setAttribute('aria-pressed', String(hilite));
+    render();
+  }
+  // ---------- export / import ----------
+  const ST_FILTERS = [['Structures', ['json', 'xml']], ['HeapHook JSON', ['json']], ['Cheat Engine XML', ['xml']]];
+  async function exportStructs() {
+    if (!structs.length) { toast('No structures to export'); return; }
+    const v = await formDialog('Export structures', [{ name: 'which', label: 'Export', type: 'select', value: cur ? 'cur' : 'all', options: [...(cur ? [['cur', `Only ${cur}`]] : []), ['all', `All ${structs.length} structures`]] }],
+      { ok: 'Choose file', text: '.json keeps HeapHook\'s format; .xml is Cheat Engine\'s <Structures>.' });
+    if (!v) return;
+    const p = await askPath({ save: true, title: 'Export structures', filters: ST_FILTERS, dflt: (v.which === 'cur' ? cur : 'structures') + '.json' });
+    if (!p) return;
+    if (await attempt(async () => { await api.structExport(p, v.which === 'cur' ? [cur] : []); return true; })) toast(`Exported to ${p}`, 'info');
+    list?.focus();
+  }
+  async function importStructs() {
+    const p = await askPath({ save: false, title: 'Import structures', filters: [...ST_FILTERS, ['All files', ['*']]], dflt: 'structures.json' });
+    if (!p) return;
+    const names = await attempt(() => api.structImport(p));
+    if (!names) return;
+    if (names.length) cur = names[0];
+    await loadStructs();
+    render(); evalTree();
+    toast(names.length ? `Imported ${names.join(', ')}` : 'The file had no structures', 'info');
+    list?.focus();
   }
 
   // ---------- columns ----------
@@ -148,7 +205,7 @@ export function initStructs({ showView }) {
     let name = v.use;
     if (!name) {
       if (!v.name) { toast('Give the new structure a name'); return; }
-      const st = await attempt(() => api.structGuess(v.name, wire(BigInt(addr)), hexNum(v.size) || 0x100));
+      const st = await attempt(() => busy('Guessing the structure layout', api.structGuess(v.name, wire(BigInt(addr)), hexNum(v.size) || 0x100)));
       if (!st) return;
       name = st.name;
     }
@@ -157,10 +214,10 @@ export function initStructs({ showView }) {
     if (v.mode === 'replace' || !columns().length) groups = [[c]];
     else if (v.mode === 'group') groups.push([c]);
     else groups[0].push(c);
-    expanded.clear();
+    expanded.clear(); locked = null;
     await loadStructs();
     render();
-    await evalTree();
+    await busy('Reading the structure', evalTree());
     list.focus();
   }
   async function newStructure() {
@@ -334,6 +391,8 @@ export function initStructs({ showView }) {
     else if (k === 'Insert') addElement(r && !r.error ? r : null);
     else if (k === 'Delete' && r && !r.error) removeElement(r);
     else if (k.toLowerCase() === 'a') addColumn(0);
+    else if (k.toLowerCase() === 'l' && columns().length) toggleLock(Math.max(0, locked ? locked.ci : 0));
+    else if (k.toLowerCase() === 'h') toggleHilite();
     else if (k.toLowerCase() === 'g') newStructure();
     else if (/^[1-9]$/.test(k) && +k <= columns().length) editValue(i, +k - 1);
     else return false;
@@ -385,9 +444,14 @@ export function initStructs({ showView }) {
   $('#st-spider-btn').addEventListener('click', spider);
   $('#st-rename').addEventListener('click', renameStruct);
   $('#st-delete').addEventListener('click', deleteStruct);
+  const hlBtn = h('button.btn.ghost#st-hilite', { type: 'button', 'aria-pressed': String(hilite), title: 'Highlight values that changed, or differ from the locked column (H)', onclick: toggleHilite }, h('span.bl', null, 'Highlight changes'), ' ', h('kbd', null, 'H'));
+  $('#st-rename').before(hlBtn,
+    h('button.btn.ghost.icon#st-import', { type: 'button', 'aria-label': 'Import structures (Ctrl I)', title: 'Import structures (Ctrl I)', html: icon('folder'), onclick: importStructs }),
+    h('button.btn.ghost.icon#st-export', { type: 'button', 'aria-label': 'Export structures (Ctrl Shift E)', title: 'Export structures (Ctrl Shift E)', html: icon('save'), onclick: exportStructs }));
   $('#st-spider-close').addEventListener('click', () => { spHost.hidden = true; list?.focus(); });
   on('struct:open', ({ addr, expr }) => openAt(addr, expr));
-  on('process:opened', () => { groups = [[]]; expanded.clear(); rows = []; hits = []; loadStructs().then(render); });
+  on('process:opened', () => { groups = [[]]; expanded.clear(); rows = []; hits = []; locked = null; prevVals.clear(); loadStructs().then(render); });
+  on('process:closed', () => { groups = [[]]; rows = []; locked = null; render(); });
   let structVer = null;
   on('table:version', (v) => { if (!view.hidden && v !== structVer) { structVer = v; loadStructs(); } });
   addTicker(() => (!view.hidden && !editing && state.proc && columns().length ? evalTree() : null));
@@ -395,6 +459,8 @@ export function initStructs({ showView }) {
     if (e.target.closest('input,select,textarea')) return;
     const k = e.key.toLowerCase();
     if (e.altKey && k === 's') spider();
+    else if ((e.ctrlKey || e.metaKey) && e.shiftKey && k === 'e') exportStructs();
+    else if ((e.ctrlKey || e.metaKey) && k === 'i') importStructs();
     else return;
     e.preventDefault();
   });

@@ -32,6 +32,12 @@ pub struct Settings {
     pub theme: String,
     /// Debugger: signal number -> `pass` / `ignore` / `break` (unlisted: hh-debug's default).
     pub signals: std::collections::BTreeMap<String, String>,
+    /// How hard scans compete with the target for CPU: `normal`, `low` or `idle`.
+    pub scan_priority: String,
+    /// Directory for scan result spill files; empty = hh-scan's default.
+    pub scan_spill_dir: String,
+    /// A hotkey cannot fire again sooner than this (ms).
+    pub hotkey_delay_ms: u64,
 }
 
 impl Default for Settings {
@@ -52,6 +58,9 @@ impl Default for Settings {
             hotkey_sound: false,
             theme: "system".into(),
             signals: Default::default(),
+            scan_priority: "normal".into(),
+            scan_spill_dir: String::new(),
+            hotkey_delay_ms: 150,
         }
     }
 }
@@ -78,6 +87,9 @@ impl Settings {
         pick(&mut self.table_script, &["ask", "never"], &d.table_script);
         pick(&mut self.bp_method, &["software", "hardware"], &d.bp_method);
         pick(&mut self.theme, &["system", "light", "dark"], &d.theme);
+        pick(&mut self.scan_priority, &["normal", "low", "idle"], &d.scan_priority);
+        self.scan_spill_dir = self.scan_spill_dir.trim().to_string();
+        self.hotkey_delay_ms = self.hotkey_delay_ms.min(10_000);
         self.signals.retain(|k, v| k.parse::<u32>().is_ok() && ["pass", "ignore", "break"].contains(&v.as_str()));
         self
     }

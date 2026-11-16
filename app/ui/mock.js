@@ -287,6 +287,8 @@ function resolveExpr(expr) {
     if (t === '(') { const a = sum(); expect(')'); return a; }
     if (t === '-') return -atom();
     if (t == null) err(`unexpected end of '${expr}'`);
+    const us = T?.table?.symbols?.find((s) => s.name === t);
+    if (us) return resolveExpr(us.address);
     const low = t.toLowerCase();
     const m = P.mods.find((m) => m.name.toLowerCase() === low);
     if (m) return m.base;
@@ -365,7 +367,7 @@ function aaCheck(script) {
 
 // ---------- scanning ----------
 let S = null; // current scan
-let prog = { done: 0, total: 0, found: 0, running: false };
+let prog = { done: 0, total: 0, found: 0, running: false, paused: false };
 let cancelled = false;
 // yield to the UI between chunks; MessageChannel is not clamped like setTimeout
 const tick = () => new Promise((r) => { const c = new MessageChannel(); c.port1.onmessage = () => r(); c.port2.postMessage(0); });
@@ -428,16 +430,17 @@ function makeTest(sc, req) {
 async function runScan(fn) {
   if (prog.running) err('a scan is already running');
   cancelled = false;
-  prog = { done: 0, total: 0, found: 0, running: true };
-  try { return await fn(); } finally { prog.running = false; }
+  prog = { done: 0, total: 0, found: 0, running: true, paused: false };
+  try { return await fn(); } finally { prog.running = false; prog.paused = false; }
 }
 
 const tri = (v, flag) => v === 'any' || v == null || (v === 'yes') === flag;
 
 async function scanFirst(req) {
   need();
-  const { vtype, scan_type } = req;
+  const { scan_type } = req;
   const opts = req.opts || {};
+  const vtype = opts.custom ? customVtype(opts.custom) : req.vtype;
   if (vtype === 'grouped') err('grouped scans are not supported by the mock backend');
   if (!SIZE[vtype] && vtype !== 'string' && vtype !== 'aob') err(`unknown value type '${vtype}'`);
   if (!FIRST_TYPES.includes(scan_type)) err(`'${scan_type}' needs a previous scan`);
@@ -462,12 +465,14 @@ async function scanFirst(req) {
         for (let f = r.flat + (a - r.start); a <= stop; a += align, f += align) if (!test || test(m, f)) out[n++] = f;
         prog.done = doneBase + (a - r.start); prog.found = n;
         await tick();
+        while (prog.paused && !cancelled) await new Promise((r) => setTimeout(r, 100));
         if (cancelled) err('scan cancelled');
       }
       doneBase += r.size;
     }
     prog.done = prog.total;
     sc.results = out.subarray(0, n);
+    sc.saved = new Map();
     sc.first = sc.prev = m;
     sc.undo = null;
     S = sc;
@@ -479,8 +484,11 @@ async function scanNext(req) {
   need();
   if (!S) err('no first scan');
   if (!NEXT_TYPES.includes(req.scan_type)) err(`unknown scan type '${req.scan_type}'`);
+  const cmp = req.compare_to, sv = cmp && cmp !== 'first' ? S.saved.get(cmp) || err(`no saved scan named "${cmp}"`) : null;
+  const ref = cmp === 'first' ? S.first : sv ? sv.mem : null;
   return runScan(async () => {
-    const base = makeTest(S, req);
+    const tst = makeTest(ref ? { ...S, prev: ref } : S, req);
+    const base = sv && tst ? (m, f) => sv.set.has(f) && tst(m, f) : tst;
     const test = base && req.not ? (m, f) => !base(m, f) : base;
     const src = S.results, out = new Uint32Array(src.length), m = P.mem.slice();
     prog.total = src.length;
@@ -490,6 +498,7 @@ async function scanNext(req) {
       for (; i < stop; i++) if (!test || test(m, src[i])) out[n++] = src[i];
       prog.done = i; prog.found = n;
       await tick();
+      while (prog.paused && !cancelled) await new Promise((r) => setTimeout(r, 100));
       if (cancelled) err('scan cancelled');
     }
     S.undo = { results: S.results, prev: S.prev };
@@ -502,8 +511,8 @@ async function scanNext(req) {
 // ---------- command table ----------
 const C = {
   list_processes: () => PROCS.map(([pid, name, exe]) => ({ pid, name, exe })),
-  open_process({ pid }) {
-    const pr = PROCS.find((p) => p[0] === pid) || err(`no process with pid ${pid}`);
+  open_process({ pid }, pr = PROCS.find((p) => p[0] === pid) || err(`no process with pid ${pid}`)) {
+    if (pid < 1000) err(`cannot attach to pid ${pid}: ptrace: Operation not permitted (os error 1)`);
     clearInterval(ticker);
     S = null; frozen.length = 0; overrides.clear(); D = null; PS = null; DIS = null; SNAPS.length = 0;
     const p = build({ pid: pr[0], name: pr[1], exe: pr[2] });
@@ -569,16 +578,21 @@ const C = {
   },
   scan_new() { S = null; return null; },
   scan_cancel() { if (prog.running) cancelled = true; return null; },
-  scan_progress: () => ({ ...prog }),
-  scan_results({ offset, limit }) {
+  scan_progress: () => ({ ...prog, spilled: prog.found > 3_000_000 ? prog.found * 8 : 0, spill_dir: loadSettings().scan_spill_dir || '/tmp/heaphook-scan' }),
+  scan_results({ offset, limit, saved }) {
     if (!S) return [];
+    const sv = saved ? S.saved.get(saved) || err(`no saved scan named "${saved}"`) : null;
     const out = [], end = Math.min(S.results.length, offset + limit);
     const o = { hex: S.opts.hex, utf16: S.opts.utf16 };
     for (let i = offset; i < end; i++) {
       const f = S.results[i], z = S.size;
+      // "all" scans: the mock calls small values 2-byte matches (the real scanner records the type that matched)
+      const vt = S.vtype !== 'all' ? S.vtype : num(P.mem.subarray(f, f + 4), '4bytes') < 65536 ? '2bytes' : '4bytes';
       out.push({
-        addr: hx(addrOfFlat(f)), value: fmt(P.mem.subarray(f, f + z), S.vtype, o),
-        previous: fmt(S.prev.subarray(f, f + z), S.vtype, o), first: fmt(S.first.subarray(f, f + z), S.vtype, o),
+        addr: hx(addrOfFlat(f)), value: fmt(P.mem.subarray(f, f + z), vt, o),
+        previous: fmt(S.prev.subarray(f, f + z), vt, o), first: fmt(S.first.subarray(f, f + z), vt, o), vtype: vt,
+        ...(S.vtype === 'binary' ? { bit: S.opts.bit_start ?? 0 } : {}),
+        ...(sv ? { saved: sv.set.has(f) ? fmt(sv.mem.subarray(f, f + z), vt, o) : null } : {}),
       });
     }
     return out;
@@ -1091,7 +1105,7 @@ const hkBindings = () => {
   for (const [id, k] of luaHotkeys) out.push([[...k].sort((a, b) => a - b), null, id]);
   return out;
 };
-const SETTINGS = { freeze_interval_ms: 100, live_update_ms: 300, fast_scan: true, scan_alignment: 4, scan_writable: 'yes', scan_executable: 'any',
+const SETTINGS = { scan_priority: 'normal', scan_spill_dir: '', hotkey_delay_ms: 150, freeze_interval_ms: 100, live_update_ms: 300, fast_scan: true, scan_alignment: 4, scan_writable: 'yes', scan_executable: 'any',
   scan_copy_on_write: 'no', scan_threads: 0, lua_budget_ms: 30000, lua_memory_mb: 1024, table_script: 'ask', bp_method: 'software', hotkey_sound: false, theme: 'system', signals: {} };
 function loadSettings() { try { return { ...SETTINGS, ...JSON.parse(localStorage.getItem('hh.mocksettings')) }; } catch { return { ...SETTINGS }; } }
 
@@ -1733,7 +1747,137 @@ const TOOLS = {
   },
 };
 
+// ---------- 1.0: saved scans, custom types, remote targets, code/memory/structure helpers ----------
+/** Mock only: a custom type behaves like the plain type of its size (no endianness, scale or bits). */
+function customVtype(ct) { return ct.float ? (ct.size === 8 ? 'double' : 'float') : { 1: 'byte', 2: '2bytes', 4: '4bytes', 8: '8bytes' }[ct.size] || '4bytes'; }
+const withCustom = (q) => (q.custom ? { ...q, vtype: customVtype(q.custom), signed: q.custom.signed } : q);
+const PRESET = { scale: 1, offset: 0, bit_start: 0, bit_len: 0, binary: false, signed: false };
+const PRESETS = [
+  { name: '2 Byte Big Endian', size: 2, big_endian: true, float: false, ...PRESET },
+  { name: '4 Byte Big Endian', size: 4, big_endian: true, float: false, ...PRESET },
+  { name: 'Float Big Endian', size: 4, big_endian: true, float: true, ...PRESET },
+];
+let REMOTE = null, LOST = null;
+const REMOTE_PROCS = [[811, 'sshd', '/usr/sbin/sshd'], [1402, 'gamesrv', '/srv/game/gamesrv'], [1890, 'Game.exe', 'C:\\Games\\Demo\\Game.exe'], [2004, 'hh-server', '/usr/local/bin/heaphook-server']];
+const remoteSaved = () => { try { return JSON.parse(localStorage.getItem('hh.mockremote')) || {}; } catch { return {}; } };
+const localOnly = (f, what) => (args) => (P?.remote ? err(`${what} works on local processes only (the target is remote)`) : f(args));
+function funcAt(a) {
+  if (DIS) { const f = DIS.funcs.filter((x) => x.addr <= a).at(-1); if (f && a - f.addr < 0x400) return { start: f.addr, name: f.name, source: 'dissection' }; }
+  for (let s = a, i = 0; i < 0x200; i++, s--) { const v = view(s, 1); if (v && v[0] === 0x55) return { start: s, name: symbolize(s), source: 'heuristic' }; }
+  return { start: a, name: symbolize(a), source: 'heuristic' };
+}
+const NEW = {
+  scan_save({ name }) {
+    if (!S) err('no scan to save');
+    name = String(name || '').trim();
+    if (!name) err('the name is empty');
+    if (name === 'first') err('"first" is reserved for the first scan');
+    const r = S.results.slice();
+    const has = (f) => { let lo = 0, hi = r.length; while (lo < hi) { const m = (lo + hi) >> 1; if (r[m] < f) lo = m + 1; else hi = m; } return r[lo] === f; };
+    S.saved.set(name, { mem: P.mem.slice(), set: { has }, count: r.length });
+    return null;
+  },
+  scan_saved: () => (S ? [...S.saved].map(([name, v]) => ({ name, count: v.count, kept: Math.min(v.count, 200000) })) : []),
+  scan_delete_saved({ name }) { if (!S?.saved.delete(name)) err(`no saved scan named "${name}"`); return null; },
+  scan_pause() { if (prog.running) prog.paused = true; return null; },
+  scan_resume() { prog.paused = false; return null; },
+  custom_presets: () => PRESETS,
+  custom_validate({ custom: c }) {
+    if (!c || !(c.size >= 1 && c.size <= 8)) return 'size must be 1 to 8 bytes';
+    if (c.float && c.size !== 4 && c.size !== 8) return 'a float type must be 4 or 8 bytes';
+    if (!Number.isFinite(c.scale) || c.scale === 0) return 'scale must be a number other than 0';
+    if (!Number.isFinite(c.offset)) return 'offset must be a number';
+    if (c.bit_start < 0 || c.bit_len < 0 || c.bit_start + c.bit_len > c.size * 8) return `bits ${c.bit_start}..${c.bit_start + c.bit_len} do not fit in ${c.size} byte(s)`;
+    if (c.float && (c.bit_len || c.binary)) return 'a float type cannot use bit fields or binary display';
+    return null;
+  },
+  read_values: ({ reqs }) => C_read_values({ reqs: reqs.map(withCustom) }),
+  write_value: (a) => C_write_value(withCustom(a)),
+  set_frozen: ({ entries }) => C_set_frozen({ entries: entries.map(withCustom) }),
+  resolve_many: ({ exprs }) => exprs.map((e) => { try { return P ? hx(resolveExpr(e)) : null; } catch { return null; } }),
+
+  remote_saved: () => { const r = remoteSaved(); return { addr: r.addr || '', has_token: !!r.token }; },
+  remote_forget() { try { localStorage.removeItem('hh.mockremote'); } catch { /* storage blocked */ } return null; },
+  async remote_connect({ addr, token, remember }) {
+    await sleep(400);
+    if (!/^[\w.-]+:\d+$/.test(addr || '')) err(`invalid server address "${addr}" (host:port)`);
+    const tok = token || remoteSaved().token || err('no token given and none is remembered');
+    if (tok === 'wrong') err('authentication failed: the server rejected the token');
+    if (addr.startsWith('down')) err(`could not connect to ${addr}: Connection refused (os error 111)`);
+    REMOTE = { addr };
+    try { localStorage.setItem('hh.mockremote', JSON.stringify({ addr, ...(remember ? { token: tok } : {}) })); } catch { /* storage blocked */ }
+    return { addr };
+  },
+  remote_status: () => (REMOTE ? { addr: REMOTE.addr, connected: true } : null),
+  remote_processes: () => (REMOTE || err('not connected to a server'), REMOTE_PROCS.map(([pid, name, exe]) => ({ pid, name, exe }))),
+  remote_open({ pid }) {
+    if (!REMOTE) err('not connected to a server');
+    const pr = REMOTE_PROCS.find((p) => p[0] === pid) || err(`no process with pid ${pid} on ${REMOTE.addr}`);
+    const r = C.open_process({ pid: pid + 1000 }, pr);
+    P.remote = REMOTE.addr; LOST = null;
+    return { ...r, pid, remote: REMOTE.addr };
+  },
+  remote_disconnect() { if (P?.remote) TOOLS.close_process(); REMOTE = null; return null; },
+  lua_poll: (a) => {
+    const r = C_lua_poll(a);
+    if (r.process && P?.remote) Object.assign(r.process, { pid: P.pid, remote: P.remote }, LOST ? { alive: false, lost: LOST } : {});
+    return r;
+  },
+  debug_attach: localOnly(DBG.debug_attach, 'The debugger'),
+  module_header: localOnly(TOOLS.module_header, 'Reading module headers'),
+  speed_set: localOnly(TOOLS.speed_set, 'The speedhack'),
+
+  code_function({ addr }) { need(); const f = funcAt(A(addr)); return { ...f, start: hx(f.start) }; },
+  code_targets({ addr }) {
+    need();
+    const f = funcAt(A(addr)), rows = [];
+    let a = f.start;
+    for (let i = 0; i < 400; i++) {
+      const d = decode(a);
+      if (!d) break;
+      if (d.target != null) rows.push({ from: hx(a), to: hx(d.target), kind: d.text.startsWith('call') ? 'call' : d.text.startsWith('jmp') ? 'jump' : 'cond_jump', text: d.text, name: symbolize(d.target) || null });
+      a += d.len;
+      if (d.text === 'ret') break;
+    }
+    return { start: hx(f.start), end: hx(a), source: f.source, rows };
+  },
+  mem_compare({ path, max = 10000 }) {
+    need();
+    fs ??= loadFs();
+    const file = fs[path]?.blocks ? fs[path] : err(`file not found: ${path}`), out = [];
+    for (const b of file.blocks) {
+      const old = cleanHex(b.hex), a0 = parseAddr(b.addr), cur = readMem(a0, old.length);
+      for (let i = 0; i < old.length && out.length < max; i++) {
+        if (cur && cur[i] === old[i]) continue;
+        let j = i + 1;
+        while (j < old.length && j - i < 256 && !(cur && cur[j] === old[j])) j++;
+        out.push({ addr: hx(a0 + i), len: j - i, old: hexs(old.subarray(i, j)), new: cur ? hexs(cur.subarray(i, j)) : '' });
+        i = j - 1;
+      }
+    }
+    return out;
+  },
+  struct_export({ path, names = [] }) {
+    const list = structs().filter((x) => !names.length || names.includes(x.name));
+    if (!list.length) err('no structures to export');
+    return C.table_save({ path, table: { structures: list } });
+  },
+  struct_import({ path }) {
+    fs ??= loadFs();
+    const list = fs[path]?.structures || err(`no structures in ${path}`);
+    tEdit((t) => list.forEach((x) => putStruct(t, clone(x))));
+    return list.map((x) => x.name);
+  },
+  app_info: () => ({ version: '1.0.0-rc.1 (mock)', license: 'Apache-2.0', remote_ok: true, platform: 'linux-x86_64' }),
+};
+const C_read_values = C.read_values, C_write_value = C.write_value, C_set_frozen = C.set_frozen;
+let C_lua_poll = null;
+// Mock-only switch for trying the "connection lost" path from the console: __hhMock.dropRemote()
+globalThis.__hhMock = { dropRemote(why = 'connection reset by peer') { if (P?.remote) { LOST = why; REMOTE = null; } } };
+
 Object.assign(C, DBG, PTR, LIVE, TOOLS);
+C_lua_poll = C.lua_poll;
+Object.assign(C, NEW);
 
 function loadFs() { try { return JSON.parse(localStorage.getItem('hh.mockfs')) || {}; } catch { return {}; } }
 

@@ -4,7 +4,7 @@ import { api } from './backend.js';
 import { $, attempt, toast, h } from './util.js';
 import { state, emit, setTick } from './core.js';
 
-const NUM = ['freeze_interval_ms', 'live_update_ms', 'scan_alignment', 'lua_budget_ms', 'lua_memory_mb', 'scan_threads'];
+const NUM = ['freeze_interval_ms', 'live_update_ms', 'scan_alignment', 'lua_budget_ms', 'lua_memory_mb', 'scan_threads', 'hotkey_delay_ms'];
 
 function apply(s) {
   state.settings = s;
@@ -42,6 +42,8 @@ export async function initSettings() {
       if (el.type === 'checkbox') el.checked = !!cur[el.name]; else el.value = cur[el.name];
     }
     d.returnValue = '';
+    $('#st-spill-hint').textContent = 'Loading the current directory…';
+    api.scanProgress().then((p) => { $('#st-spill-hint').textContent = p?.spill_dir ? `Results that do not fit in memory currently go to ${p.spill_dir}` : ''; }, () => { $('#st-spill-hint').textContent = ''; });
     d.showModal();
     f.elements.theme.focus();
   }
@@ -55,7 +57,7 @@ export async function initSettings() {
     const next = { ...state.settings };
     for (const el of f.elements) {
       if (!el.name || !(el.name in next)) continue;
-      next[el.name] = el.type === 'checkbox' ? el.checked : NUM.includes(el.name) ? Math.max(0, Math.round(+el.value || 0)) : el.value;
+      next[el.name] = el.type === 'checkbox' ? el.checked : NUM.includes(el.name) ? Math.max(0, Math.round(+el.value || 0)) : el.name === 'scan_spill_dir' ? el.value.trim() : el.value;
     }
     if (sigs.length) next.signals = Object.fromEntries(sigs.filter(([c, , dflt]) => sigSel.get(c).value !== dflt).map(([c]) => [String(c), sigSel.get(c).value]));
     const saved = await attempt(() => api.settingsSet(next));

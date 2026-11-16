@@ -2,7 +2,7 @@
 // of paths; only the visible window is fetched, again on every tick for live values), rescan,
 // save / open results, save pointer map, compare against saved maps.
 import { api, askPath } from './backend.js';
-import { $, h, fmtAddr, nf, attempt, toast, rafThrottle, store, icon } from './util.js';
+import { $, h, fmtAddr, nf, attempt, toast, rafThrottle, store, icon, busy } from './util.js';
 import { state, emit, on, addTicker } from './core.js';
 import { VTYPES } from './table.js';
 
@@ -75,9 +75,19 @@ export function initPtrscan({ showView }) {
   }
 
   const set = (el, t) => { if (el.textContent !== t) el.textContent = t; };
+  let emptyFor = '';
   function render() {
     const L = levels();
     $('#ptr-empty').hidden = !!info;
+    if (!info) {
+      const k = state.proc ? 'proc' : 'none';
+      if (emptyFor !== k) {
+        emptyFor = k;
+        $('#ptr-empty').replaceChildren(...(state.proc
+          ? ['No pointer scan yet. Right-click a cheat-table entry or scan result and choose ', h('b', null, 'Pointer scan for this address'), ', press ', h('kbd', null, 'N'), ' here, or open saved results.']
+          : ['Pointer scans find stable paths (module + offsets) to a value that moves between runs. Open a process with ', h('kbd', null, 'Ctrl P'), ', or open saved results.']));
+      }
+    }
     vp.hidden = !info; head.hidden = !info;
     $('#ptr-count').textContent = info ? nf.format(count()) : '';
     $('#ptr-target').textContent = info ? '→ ' + fmtAddr(info.target) : '';
@@ -248,7 +258,7 @@ export function initPtrscan({ showView }) {
         if (req.compare.some((c) => !c.target)) throw 'Each compared pointer map needs the address of the value in it';
       } catch (err) { toast(err); return; }
       showView('ptr');
-      op(() => api.ptrScan(req));
+      op(() => busy('Pointer scan', api.ptrScan(req), { cancel: () => api.ptrCancel() }));
     };
     dScan.showModal();
     el.target.focus(); el.target.select();
@@ -303,6 +313,7 @@ export function initPtrscan({ showView }) {
 
   addTicker(() => (state.view === 'ptr' && !running ? fetchRows() : null));
   on('process:opened', () => setInfo(null));
+  on('process:closed', () => render());
   render();
 
   return { get running() { return running; }, cancel, focus: () => vp.focus(), newScan: () => scanDialog() };

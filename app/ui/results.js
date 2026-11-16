@@ -8,12 +8,33 @@ const ROW = 22, PAGE = 256, MAXPX = 4_000_000, MAX_ADD = 2000;
 
 export function initResults(root) {
   const vp = $('.vl-viewport', root), spacer = $('.vl-spacer', root), layer = $('.vl-rows', root);
-  const countEl = $('#res-count');
-  let scan = { count: 0, vtype: '4bytes', hex: false, len: 0, utf16: false };
+  const countEl = $('#res-count'), savedSel = $('#res-saved'), empty = $('#res-empty');
+  const headBit = $('.vl-head .c-bit', root), headSaved = $('.vl-head .c-saved', root);
+  let scan = { count: 0, vtype: '4bytes', hex: false, len: 0, utf16: false, custom: null, custom_name: null, has: false };
+  let busyScan = false, diff = '', isBinary = false;
   let gen = 0, first = 0, vis = 0, cursor = -1, anchor = -1, ignoreScroll = false;
   const pages = new Map(), pending = new Set(), live = new Map(), pool = [];
 
   const count = () => scan.count;
+  // "all" scans: each row says which type matched
+  const rowType = (r) => (scan.vtype === 'all' ? r?.vtype || '4bytes' : scan.vtype);
+  function columns() {
+    isBinary = scan.has && scan.vtype === 'binary';
+    headBit.hidden = !isBinary; headSaved.hidden = !diff;
+    root.style.setProperty('--res-cols', `minmax(124px, 1.15fr)${isBinary ? ' 36px' : ''} 1fr 1fr 1fr${diff ? ' 1fr' : ''}`);
+  }
+  function showEmpty() {
+    empty.hidden = !!count() && !busyScan;
+    empty.innerHTML = !state.proc ? 'Open a process with <kbd>Ctrl P</kbd> to scan its memory.'
+      : busyScan ? 'Scanning… <kbd>Esc</kbd> cancels.'
+        : scan.has ? 'Nothing matched. <kbd>Ctrl Z</kbd> undoes the last scan, <kbd>Ctrl N</kbd> starts a new one.'
+          : 'Type a value and press <kbd>Enter</kbd> for a first scan (<kbd>Alt 1</kbd> focuses it), or choose <b>Unknown initial value</b>. <kbd>Ctrl Enter</kbd> scans from anywhere.';
+  }
+  function resetRows() {
+    gen++;
+    pages.clear(); pending.clear(); live.clear();
+  }
+  savedSel.addEventListener('change', () => { diff = savedSel.value; resetRows(); columns(); schedule(); });
   const scaled = () => count() * ROW > MAXPX;
   const totalPx = () => Math.min(count() * ROW, MAXPX);
   const maxFirst = () => Math.max(0, count() - vis);
@@ -27,7 +48,7 @@ export function initResults(root) {
     if (!pending.has(p)) {
       pending.add(p);
       const g = gen;
-      api.scanResults(p * PAGE, PAGE).then((rows) => {
+      (diff ? api.scanResultsSaved(p * PAGE, PAGE, diff) : api.scanResults(p * PAGE, PAGE)).then((rows) => {
         if (g !== gen) return;
         pending.delete(p);
         pages.set(p, rows);
@@ -47,7 +68,8 @@ export function initResults(root) {
     while (pool.length < n) {
       const r = h('div.vl-row', { role: 'row', id: 'res-r' + pool.length },
         h('span.c-addr', { role: 'gridcell' }), h('span.c-val', { role: 'gridcell' }),
-        h('span.c-prev', { role: 'gridcell' }), h('span.c-first', { role: 'gridcell' }));
+        h('span.c-prev', { role: 'gridcell' }), h('span.c-first', { role: 'gridcell' }), h('span.c-saved', { role: 'gridcell' }));
+      r.children[0].after(h('span.c-bit', { role: 'gridcell' }));
       pool.push(r); layer.append(r);
     }
     for (let k = 0; k < pool.length; k++) {
@@ -60,11 +82,15 @@ export function initResults(root) {
       const selected = i >= lo && i <= hi && cursor >= 0;
       r.setAttribute('aria-selected', String(selected));
       r.classList.toggle('cursor', i === cursor);
-      const d = rowData(i), [a, v, p, f] = r.children;
-      if (!d) { set(a, '…'); set(v, ''); set(p, ''); set(f, ''); continue; }
+      const d = rowData(i), [a, b, v, p, f, sv] = r.children;
+      b.hidden = !isBinary; sv.hidden = !diff;
+      if (!d) { set(a, '…'); set(b, ''); set(v, ''); set(p, ''); set(f, ''); set(sv, ''); continue; }
       const val = live.get(i) ?? d.value;
-      set(a, fmtAddr(d.addr)); set(v, val ?? '??'); set(p, d.previous); set(f, d.first);
+      set(a, fmtAddr(d.addr)); set(b, d.bit == null ? '' : String(d.bit)); set(v, val ?? '??'); set(p, d.previous); set(f, d.first);
+      set(sv, diff ? d.saved ?? '–' : '');
       v.classList.toggle('chg', val !== d.previous);
+      sv.classList.toggle('chg', !!diff && d.saved != null && val !== d.saved);
+      a.title = scan.vtype === 'all' && d.vtype ? `${fmtAddr(d.addr)} · ${d.vtype}` : '';
     }
     const ci = cursor - first;
     if (ci >= 0 && ci < n) vp.setAttribute('aria-activedescendant', 'res-r' + ci);
@@ -103,7 +129,8 @@ export function initResults(root) {
     const rows = await attempt(selectedRows);
     if (!rows?.length) return;
     emit('table:add', rows.map((r) => ({
-      addr: fmtAddr(r.addr), vtype: scan.vtype === 'all' ? '4bytes' : scan.vtype, len: scan.len, utf16: scan.utf16, hex: scan.hex,
+      addr: fmtAddr(r.addr), vtype: rowType(r), len: scan.len, utf16: scan.utf16, hex: scan.hex,
+      ...(scan.custom ? { custom: scan.custom, custom_name: scan.custom_name } : {}),
     })));
     toast(`Added ${rows.length} address${rows.length > 1 ? 'es' : ''} to the table`, 'info');
   }
@@ -117,7 +144,7 @@ export function initResults(root) {
   }
   function onAddr(event) {
     const d = cursor >= 0 && rowData(cursor);
-    if (d) emit(event, { addr: d.addr, vtype: scan.vtype === 'all' ? '4bytes' : scan.vtype, len: scan.len, utf16: scan.utf16, description: 'Pointer to ' + fmtAddr(d.addr) });
+    if (d) emit(event, { addr: d.addr, vtype: rowType(d), len: scan.len, utf16: scan.utf16, description: 'Pointer to ' + fmtAddr(d.addr) });
   }
   function menu(x, y) {
     contextMenu(x, y, [
@@ -173,19 +200,20 @@ export function initResults(root) {
         const d = rowData(i);
         if (!d) continue;
         this.idx.push(i);
-        reqs.push({ addr: d.addr, vtype: scan.vtype === 'all' ? '4bytes' : scan.vtype, len: scan.len || undefined, utf16: scan.utf16, hex: scan.hex });
+        reqs.push({ addr: d.addr, vtype: rowType(d), len: scan.len || undefined, utf16: scan.utf16, hex: scan.hex, ...(scan.custom ? { custom: scan.custom } : {}) });
       }
       return reqs;
     },
     apply(vals) { live.clear(); this.idx.forEach((i, k) => live.set(i, vals[k])); schedule(); },
   });
 
+  columns(); showEmpty();
   return {
     /** New result set (or none). scan: {count, vtype, hex, len, utf16} */
     set(s) {
-      scan = { ...scan, ...s };
-      gen++;
-      pages.clear(); pending.clear(); live.clear();
+      scan = { ...scan, custom: null, custom_name: null, ...s, has: !!s.has };
+      resetRows();
+      columns(); showEmpty();
       first = 0; cursor = -1; anchor = -1;
       ignoreScroll = vp.scrollTop !== 0;
       vp.scrollTop = 0;
@@ -194,5 +222,15 @@ export function initResults(root) {
       render();
     },
     focus: () => vp.focus(),
+    /** The scanner is (not) running a scan: loading text in the empty pane. */
+    setBusy(b) { busyScan = b; showEmpty(); },
+    /** Saved scans [{name, count, kept}] for the "diff against" select. */
+    setSaved(list) {
+      const cur = savedSel.value;
+      savedSel.replaceChildren(h('option', { value: '' }, 'No saved scan'), ...list.map((x) => h('option', { value: x.name }, x.name)));
+      savedSel.value = list.some((x) => x.name === cur) ? cur : '';
+      $('#res-saved-wrap').hidden = !list.length;
+      if (savedSel.value !== diff) { diff = savedSel.value; resetRows(); columns(); schedule(); }
+    },
   };
 }

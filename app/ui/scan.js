@@ -1,7 +1,8 @@
 // Scan panel: value inputs, scan/value type, options, First/Next/Undo/New, progress, cancel.
 import { api } from './backend.js';
-import { $, $$, h, nf, toast } from './util.js';
+import { $, $$, h, nf, toast, busy, fmtSize, icon, prompt, attempt } from './util.js';
 import { state, on } from './core.js';
+import { listCustomTypes, editCustomType } from './custom.js';
 
 const FIRST = [['exact', 'Exact value'], ['bigger', 'Bigger than'], ['smaller', 'Smaller than'], ['between', 'Value between'], ['unknown', 'Unknown initial value']];
 const NEXT = [...FIRST.slice(0, 4), ['increased', 'Increased'], ['increased_by', 'Increased by'], ['decreased', 'Decreased'],
@@ -16,12 +17,46 @@ export function initScan(results) {
   const v1 = el('v1'), v2 = el('v2'), st = el('scan-type'), vt = el('vtype');
   const bFirst = el('btn-first'), bNext = el('btn-next'), bUndo = el('btn-undo'), bCancel = el('btn-cancel');
   const bar = el('scan-bar'), progWrap = el('scan-progress'), found = el('found');
+  const bPause = el('btn-pause'), spill = el('scan-spill'), cmpTo = el('cmp-to'), savedList = el('saved-list'), ctGroup = el('vtype-custom');
   // Extra memory options built here: last hex digits of the address, and the grouped-scan syntax hint.
   const ldOn = h('input', { type: 'checkbox' }), ld = h('input.mono.num', { type: 'text', maxlength: '8', placeholder: 'A0', 'aria-label': 'Last digits of the address (hex)', spellcheck: 'false', autocomplete: 'off', style: 'width:72px' });
   el('o-fast').closest('.align-row').after(h('div.align-row', null, h('label.check', null, ldOn, ' Last digits (hex)'), ld));
   const gHint = h('p.hint.mono', { hidden: true }, "Grouped: 4:100 2:7 f:12.5 d:2.25 s:'text' su:'wide' w:8 2:*  (1 2 4 8 f d numbers, s / su text, w:n skips n bytes, * = any; BA:n OOO BS:n)");
   v1.after(gHint);
-  let hasScan = false, running = false, canUndo = false, count = 0, prevCount = 0, scanMeta = {};
+  let hasScan = false, running = false, paused = false, canUndo = false, count = 0, prevCount = 0, scanMeta = {};
+  let customs = [], lastVt = vt.value; // listCustomTypes() rows; option value "ct:<index>"
+
+  // ---------- custom types in the Value type select ----------
+  const customOf = (v = vt.value) => (v.startsWith('ct:') ? customs[+v.slice(3)] : null);
+  async function loadCustoms(select) {
+    const cur = customOf()?.name;
+    customs = await listCustomTypes();
+    ctGroup.replaceChildren(...customs.map((c, i) => h('option', { value: 'ct:' + i }, c.preset ? c.name : 'Custom: ' + c.name)), h('option', { value: 'ct:new' }, 'New custom type…'));
+    const want = select ?? cur;
+    const i = want ? customs.findIndex((c) => c.name === want) : -1;
+    if (i >= 0) vt.value = 'ct:' + i; else if (vt.value.startsWith('ct:')) vt.value = '4bytes';
+    lastVt = vt.value;
+    sync();
+  }
+
+  // ---------- saved scans ----------
+  async function refreshSaved() {
+    const list = hasScan ? (await api.scanSaved().catch(() => [])) || [] : [];
+    const cur = cmpTo.value;
+    cmpTo.replaceChildren(h('option', { value: '' }, 'Previous scan'), h('option', { value: 'first' }, 'First scan'), ...list.map((s) => h('option', { value: s.name }, 'Saved: ' + s.name)));
+    cmpTo.value = cur === '' || cur === 'first' || list.some((s) => s.name === cur) ? cur : '';
+    savedList.replaceChildren(...(list.length ? list.map((s) => h('li', null,
+      h('span.name', null, s.name), h('span.muted.mono', { title: s.kept < s.count ? `the Saved column can show ${nf.format(s.kept)} of them` : '' }, nf.format(s.count)),
+      h('button.btn.ghost.icon', { type: 'button', 'aria-label': `Delete saved scan ${s.name}`, title: 'Delete', html: icon('trash'),
+        onclick: async () => { if (await attempt(() => api.scanDeleteSaved(s.name)) !== undefined) refreshSaved(); } })))
+      : [h('li.muted', null, 'None yet. Save the current results to compare later scans against them.')]));
+    results.setSaved(list);
+  }
+  el('btn-save-scan').addEventListener('click', async () => {
+    const name = (await prompt('Save scan', `Scan ${count ? nf.format(count) : ''}`.trim(), { label: 'Name', hint: 'Saved scans last until the next New scan or process change. "first" is reserved.', mono: false }))?.trim();
+    if (!name) return;
+    if (await attempt(() => api.scanSave(name)) !== undefined) { toast(`Saved the ${nf.format(count)} results as "${name}"`, 'info'); refreshSaved(); }
+  });
 
   // tri-state option buttons
   const setTri = (b, v) => { b.dataset.v = v; b.setAttribute('aria-checked', TRI_ARIA[v]); b.querySelector('.tri-v').textContent = v; };
@@ -50,6 +85,13 @@ export function initScan(results) {
     vt.disabled = hasScan || running;
     el('opt-float').hidden = !['float', 'double', 'all'].includes(ty);
     el('opt-string').hidden = ty !== 'string';
+    el('opt-binary').hidden = ty !== 'binary';
+    el('opt-all').hidden = ty !== 'all';
+    el('o-codepage').disabled = el('o-utf16').checked;
+    el('saved-scans').hidden = !hasScan;
+    bPause.innerHTML = icon(paused ? 'play' : 'pause');
+    bPause.title = paused ? 'Resume the scan' : 'Pause the scan';
+    bPause.setAttribute('aria-label', bPause.title);
     gHint.hidden = ty !== 'grouped';
     el('opt-percent').hidden = !['between', 'increased_by', 'decreased_by'].includes(t) || hasScan;
     v1.placeholder = { string: 'text', aob: '8B 45 ?? 89', binary: '01001011' }[ty] || (el('o-hex').checked ? 'hex' : 'decimal');
@@ -60,7 +102,8 @@ export function initScan(results) {
     bNext.disabled = running || !hasScan;
     bUndo.disabled = running || !canUndo;
     progWrap.hidden = !running;
-    found.textContent = running ? 'Scanning…' : hasScan ? `${nf.format(count)} found` : 'No scan yet';
+    found.textContent = running ? (paused ? 'Paused' : 'Scanning…') : hasScan ? `${nf.format(count)} found` : 'No scan yet';
+    if (!running) spill.hidden = true;
   }
 
   function opts() {
@@ -76,7 +119,19 @@ export function initScan(results) {
       alignment: fast ? Math.max(1, +el('o-align').value || 1) : 1,
       hex: el('o-hex').checked, case_sensitive: el('o-case').checked, utf16: el('o-utf16').checked,
       rounding: el('o-round').value, percent: el('o-percent').checked, pause_while_scanning: el('o-pause').checked, threads: state.settings.scan_threads || null,
+      priority: state.settings.scan_priority || 'normal', ...typeOpts(),
     };
+  }
+  // Options that depend on the value type.
+  function typeOpts() {
+    const ty = vt.value, c = customOf();
+    if (c) return { custom: c.ct };
+    if (ty === 'string') return el('o-utf16').checked ? {} : { codepage: +el('o-codepage').value };
+    if (ty === 'all') return { all_types: $$('#opt-all input:checked').map((i) => i.value) };
+    if (ty !== 'binary') return {};
+    const len = el('o-bit-len').value.trim(), start = el('o-bit-start').value.trim();
+    if (start && !(+start >= 0 && +start <= 7)) throw 'Start bit must be 0 to 7 (or empty for any)';
+    return { binary_decimal: el('o-bin-dec').checked, ...(len ? { bit_len: Math.max(1, Math.round(+len)) } : {}), ...(start ? { bit_start: Math.round(+start) } : {}) };
   }
 
   async function run(kind) {
@@ -85,39 +140,46 @@ export function initScan(results) {
     const t = st.value;
     if (!NO_VALUE.has(t) && !v1.value.trim()) { toast('Enter a value to scan for'); v1.focus(); return; }
     const req = { scan_type: t, value: v1.value, value2: t === 'between' ? v2.value : null, not: el('o-not').checked };
-    running = true; sync();
+    if (kind === 'next' && cmpTo.value) req.compare_to = cmpTo.value;
+    running = true; paused = false; sync(); results.setBusy(true);
     bar.style.transform = 'scaleX(0)';
     const poll = setInterval(async () => {
       const p = await api.scanProgress().catch(() => null);
-      if (!p || !p.total) return;
+      if (!p) return;
+      if (!!p.paused !== paused) { paused = !!p.paused; sync(); }
+      spill.hidden = !(p.spilled > 0);
+      if (p.spilled > 0) spill.textContent = `${fmtSize(p.spilled)} spilled to ${p.spill_dir}`;
+      if (!p.total) return;
       bar.style.transform = `scaleX(${Math.min(1, p.done / p.total)})`;
       el('scan-bar-wrap').setAttribute('aria-valuenow', Math.round((100 * p.done) / p.total));
-      found.textContent = `Scanning… ${nf.format(p.found)} so far`;
+      found.textContent = `${paused ? 'Paused' : 'Scanning…'} ${nf.format(p.found)} so far`;
     }, 100);
     try {
       let r;
       if (kind === 'first') {
-        const o = opts();
-        r = await api.scanFirst({ vtype: vt.value, ...req, opts: o });
-        const ty = vt.value;
+        const o = opts(), c = customOf();
+        const ty = c ? '4bytes' : vt.value; // a custom type rides on a numeric placeholder; opts.custom decides
+        r = await busy('Scanning', () => api.scanFirst({ vtype: ty, ...req, opts: o }), { cancel });
         scanMeta = {
-          vtype: ty, hex: o.hex, utf16: o.utf16 && ty === 'string',
+          vtype: ty, hex: o.hex, utf16: o.utf16 && ty === 'string', custom: c?.ct || null, custom_name: c?.name || null,
           len: ty === 'string' ? v1.value.length : ty === 'aob' ? v1.value.trim().split(/\s+/).length : 0,
         };
         canUndo = false;
       } else {
-        r = await api.scanNext(req);
+        r = await busy('Scanning', () => api.scanNext(req), { cancel });
         prevCount = count; canUndo = true;
       }
       hasScan = true;
       count = r.count;
-      results.set({ count, ...scanMeta });
+      results.set({ count, ...scanMeta, has: true });
     } catch (e) {
       toast(e);
     } finally {
       clearInterval(poll);
-      running = false;
+      running = false; paused = false;
+      results.setBusy(false);
       fillTypes();
+      refreshSaved();
     }
   }
   async function newScan() {
@@ -126,6 +188,7 @@ export function initScan(results) {
     hasScan = false; canUndo = false; count = 0;
     results.set({ count: 0 });
     fillTypes();
+    refreshSaved();
     v1.focus();
   }
   async function undo() {
@@ -133,29 +196,49 @@ export function initScan(results) {
     try {
       await api.scanUndo();
       canUndo = false; count = prevCount;
-      results.set({ count, ...scanMeta });
+      results.set({ count, ...scanMeta, has: true });
       sync();
+      refreshSaved();
     } catch (e) { toast(e); }
   }
   const cancel = () => running && api.scanCancel().catch(toast);
+  const togglePause = () => running && (paused ? api.scanResume() : api.scanPause()).then(() => { paused = !paused; sync(); }, toast);
 
   bFirst.addEventListener('click', () => (hasScan ? newScan() : run('first')));
   bNext.addEventListener('click', () => run('next'));
   bUndo.addEventListener('click', undo);
   bCancel.addEventListener('click', cancel);
+  bPause.addEventListener('click', togglePause);
   st.addEventListener('change', sync);
-  vt.addEventListener('change', () => { el('o-align').value = ALIGN[vt.value] || 1; sync(); });
+  vt.addEventListener('change', async () => {
+    if (vt.value === 'ct:new') {
+      vt.value = lastVt;
+      const r = await editCustomType(null);
+      if (r) await loadCustoms(r.name);
+      vt.focus();
+      return;
+    }
+    lastVt = vt.value;
+    const c = customOf();
+    el('o-align').value = c ? Math.min(4, c.ct.size) : ALIGN[vt.value] || 1;
+    sync();
+  });
+  let tver = null; // the table's custom types change with the table
+  on('table:version', (v) => { if (v !== tver) { tver = v; loadCustoms(); } });
   el('o-hex').addEventListener('change', sync);
+  el('o-utf16').addEventListener('change', sync);
   for (const i of [v1, v2]) i.addEventListener('keydown', (e) => {
     if (e.key === 'Enter') { e.preventDefault(); run(hasScan ? 'next' : 'first'); }
   });
-  on('process:opened', () => { hasScan = false; canUndo = false; count = 0; results.set({ count: 0 }); fillTypes(); });
-  on('process:closed', () => { hasScan = false; canUndo = false; count = 0; results.set({ count: 0 }); fillTypes(); });
+  on('process:opened', () => { hasScan = false; canUndo = false; count = 0; results.set({ count: 0 }); fillTypes(); refreshSaved(); });
+  on('process:closed', () => { hasScan = false; canUndo = false; count = 0; results.set({ count: 0 }); fillTypes(); refreshSaved(); });
 
   fillTypes();
+  loadCustoms();
   return {
-    run: () => run(hasScan ? 'next' : 'first'), newScan, undo, cancel,
+    run: () => run(hasScan ? 'next' : 'first'), newScan, undo, cancel, togglePause,
     get running() { return running; },
+    get hasScan() { return hasScan; },
     focusValue: () => (el('v1-wrap').hidden ? st : v1).focus(),
   };
 }

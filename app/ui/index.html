@@ -14,6 +14,7 @@
     <span class="proc-text"><span id="proc-label">No process</span><span id="proc-meta" class="muted mono"></span></span>
     <kbd>Ctrl P</kbd>
   </button>
+  <button id="remote-badge" class="badge blue remote-badge" type="button" hidden aria-haspopup="menu" title="The target is on a remote server. Click to disconnect."></button>
   <nav class="tabs" role="tablist" aria-label="Views">
     <button role="tab" type="button" data-view="scan" title="Scanner" aria-controls="view-scan" aria-selected="true" data-icon="scan"><span class="bl">Scanner</span> <kbd>Ctrl 1</kbd></button>
     <button role="tab" type="button" data-view="mem" title="Memory" aria-controls="view-mem" aria-selected="false" tabindex="-1" data-icon="memory"><span class="bl">Memory</span> <kbd>Ctrl 2</kbd></button>
@@ -24,6 +25,7 @@
     <button role="tab" type="button" data-view="code" title="Code analysis" aria-controls="view-code" aria-selected="false" tabindex="-1" data-icon="code"><span class="bl">Code</span> <kbd>Ctrl 7</kbd></button>
   </nav>
   <span class="grow"></span>
+  <span id="busy" class="busy" role="status" aria-live="polite" hidden><span class="spin" aria-hidden="true"></span><span id="busy-text"></span><button id="busy-cancel" class="btn ghost" type="button" hidden>Cancel <kbd>Esc</kbd></button></span>
   <button id="dbg-btn" class="dbg-btn" type="button" data-state="detached" aria-describedby="dbg-state" title="Attach or detach the debugger (Ctrl Shift D)" data-icon="bug">
     <span id="dbg-state" class="dbg-state" role="status">Debugger off</span>
   </button>
@@ -33,6 +35,7 @@
   <button title="Save (Ctrl S)" id="tbl-save" class="btn ghost" type="button" data-icon="save"><span class="bl">Save</span> <kbd>Ctrl S</kbd></button>
   <button id="settings-btn" class="btn ghost icon" type="button" aria-label="Settings (Ctrl ,)" title="Settings (Ctrl ,)" data-icon="gear"></button>
   <button id="help-btn" class="btn ghost icon" type="button" aria-label="Keyboard shortcuts (F1)" title="Keyboard shortcuts (F1)" data-icon="keyboard"></button>
+  <button id="about-btn" class="btn ghost icon" type="button" aria-label="About HeapHook" title="About HeapHook" data-icon="info"></button>
 </header>
 
 <main>
@@ -42,15 +45,17 @@
       <section id="results" class="panel results" aria-labelledby="res-title">
         <div class="panel-head">
           <h2 id="res-title">Results <span id="res-count" class="count mono"></span></h2>
+          <label id="res-saved-wrap" class="field-inline res-saved" hidden>Diff against <select id="res-saved" class="compact" aria-label="Show the values of a saved scan"></select></label>
           <span class="hints"><kbd>Alt 2</kbd> focus · <kbd>Enter</kbd> add to table · <kbd>Ctrl M</kbd> browse</span>
         </div>
         <div class="vl-head cols-res" role="presentation">
-          <span>Address</span><span>Value</span><span>Previous</span><span>First</span>
+          <span>Address</span><span class="c-bit" hidden title="Bit offset in the byte">Bit</span><span>Value</span><span>Previous</span><span>First</span><span class="c-saved" hidden>Saved</span>
         </div>
         <div class="vl-viewport" role="grid" aria-label="Scan results" aria-multiselectable="true" tabindex="0">
           <div class="vl-spacer"></div>
           <div class="vl-rows cols-res" role="rowgroup"></div>
         </div>
+        <p id="res-empty" class="empty" role="status"></p>
       </section>
 
       <div id="div-scan" class="divider dv-x" role="separator" aria-orientation="vertical" aria-label="Resize scan panel" tabindex="0"></div>
@@ -60,6 +65,7 @@
           <div class="sp-status">
             <span id="found" class="found" role="status">No scan yet</span>
           </div>
+          <p id="scan-spill" class="hint mono" hidden></p>
           <div class="sp-actions">
             <button id="btn-first" class="btn primary" type="button">First scan <kbd>Enter</kbd></button>
             <button id="btn-next" class="btn" type="button" disabled>Next scan <kbd>Enter</kbd></button>
@@ -67,6 +73,7 @@
           </div>
           <div id="scan-progress" class="sp-progress" hidden>
             <div id="scan-bar-wrap" class="bar-wrap" role="progressbar" aria-label="Scan progress" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><div id="scan-bar" class="bar"></div></div>
+            <button id="btn-pause" class="btn icon" type="button" aria-label="Pause the scan" title="Pause the scan" data-icon="pause"></button>
             <button id="btn-cancel" class="btn" type="button">Cancel <kbd>Esc</kbd></button>
           </div>
 
@@ -101,8 +108,26 @@
               <option value="aob">Array of byte</option>
               <option value="all">All</option>
               <option value="grouped">Grouped</option>
+              <optgroup id="vtype-custom" label="Custom types"></optgroup>
             </select>
           </div>
+          <div id="opt-binary" class="opt-row" hidden>
+            <label class="check"><input id="o-bin-dec" type="checkbox"> Decimal</label>
+            <label class="field-inline">Bits <input id="o-bit-len" class="mono num" type="number" min="1" max="64" placeholder="auto" aria-label="Bit length (empty = length of the value)"></label>
+            <label class="field-inline">Start bit <input id="o-bit-start" class="mono num" type="number" min="0" max="7" placeholder="any" aria-label="Start bit 0 to 7 (empty = any)"></label>
+          </div>
+          <fieldset id="opt-all" class="group" hidden>
+            <legend>Types to try (none = every numeric type)</legend>
+            <div class="checks">
+              <label class="check"><input type="checkbox" value="byte"> Byte</label>
+              <label class="check"><input type="checkbox" value="2bytes"> 2 Bytes</label>
+              <label class="check"><input type="checkbox" value="4bytes"> 4 Bytes</label>
+              <label class="check"><input type="checkbox" value="8bytes"> 8 Bytes</label>
+              <label class="check"><input type="checkbox" value="float"> Float</label>
+              <label class="check"><input type="checkbox" value="double"> Double</label>
+              <label class="check"><input type="checkbox" value="string"> String</label>
+            </div>
+          </fieldset>
           <div id="opt-float" class="field" hidden>
             <label for="o-round">Float matching</label>
             <select id="o-round">
@@ -114,7 +139,18 @@
           <div id="opt-string" class="checks" hidden>
             <label class="check"><input id="o-case" type="checkbox"> Case sensitive</label>
             <label class="check"><input id="o-utf16" type="checkbox"> UTF-16</label>
+            <label class="field-inline">Code page <select id="o-codepage" class="compact" aria-label="Code page">
+              <option value="65001">UTF-8</option><option value="1252">Windows-1252</option><option value="28591">ISO-8859-1</option></select></label>
           </div>
+          <fieldset id="saved-scans" class="group" hidden>
+            <legend>Saved scans</legend>
+            <div class="field">
+              <label for="cmp-to">Next scan compares to</label>
+              <select id="cmp-to"><option value="">Previous scan</option><option value="first">First scan</option></select>
+            </div>
+            <ul id="saved-list" class="saved-list" aria-label="Saved scans"></ul>
+            <button id="btn-save-scan" class="btn ghost" type="button" data-icon="save">Save scan…</button>
+          </fieldset>
 
           <fieldset class="group">
             <legend>Memory scan options</legend>
@@ -403,19 +439,75 @@
 <dialog id="dlg-proc" class="dlg dlg-proc" aria-labelledby="proc-title">
   <div class="dlg-head">
     <h2 id="proc-title">Open process</h2>
-    <button id="proc-refresh" class="btn ghost icon" type="button" aria-label="Refresh list" title="Refresh list" data-icon="refresh"></button>
+    <span class="toolbar">
+      <button id="proc-local" class="btn ghost" type="button" data-icon="back" hidden>Local processes</button>
+      <button id="proc-disconnect" class="btn ghost" type="button" data-icon="x" hidden>Disconnect</button>
+      <button id="proc-remote" class="btn ghost" type="button" data-icon="server">Connect to server…</button>
+      <button id="proc-refresh" class="btn ghost icon" type="button" aria-label="Refresh list" title="Refresh list" data-icon="refresh"></button>
+    </span>
   </div>
   <div class="search" data-icon="search">
     <input id="proc-search" type="text" placeholder="Filter by name, PID or path" autocomplete="off" spellcheck="false"
       role="combobox" aria-expanded="true" aria-controls="proc-list" aria-autocomplete="list" aria-label="Filter processes">
   </div>
   <div id="proc-list" class="proc-list" role="listbox" aria-label="Processes"></div>
-  <p id="proc-empty" class="empty" hidden>No matching process.</p>
+  <p id="proc-empty" class="empty" role="status" hidden>No matching process.</p>
   <div class="proc-actions">
     <p class="hint"><kbd>↑</kbd> <kbd>↓</kbd> select · <kbd>Enter</kbd> open · <kbd>Esc</kbd> close</p>
     <button id="proc-create" class="btn" type="button" data-icon="play">Create process… <kbd>Ctrl N</kbd></button>
     <button id="proc-close" class="btn" type="button" data-icon="x" hidden>Close process <kbd>Ctrl W</kbd></button>
   </div>
+</dialog>
+
+<dialog id="dlg-remote" class="dlg" aria-labelledby="rm-title">
+  <form method="dialog">
+    <h2 id="rm-title">Connect to a HeapHook server</h2>
+    <p class="hint">Run <code>hh-server</code> on the other machine; it prints or takes the token.</p>
+    <div class="field"><label for="rm-addr">Server address</label><input id="rm-addr" name="addr" class="mono" autocomplete="off" spellcheck="false" required placeholder="192.168.1.20:52736 (port 52736 if left out)"></div>
+    <div class="field"><label for="rm-token">Token</label><input id="rm-token" name="token" class="mono" type="password" autocomplete="off" spellcheck="false"></div>
+    <label class="check"><input name="remember" type="checkbox"> Remember the token on this device</label>
+    <p class="hint">A remembered token is stored in HeapHook's config file, readable only by you (mode 0600).</p>
+    <p class="warn">Authentication never sends the token, but the traffic is <b>not encrypted</b> after the handshake: memory contents and values cross the network in the clear. Use a trusted network or an SSH tunnel, e.g. <code>ssh -L 52736:127.0.0.1:52736 host</code>, then connect to <code>127.0.0.1</code>.</p>
+    <p id="rm-error" class="preview err" role="alert"></p>
+    <div class="dlg-actions">
+      <button class="btn primary" value="ok">Connect <kbd>Enter</kbd></button>
+      <button class="btn" value="cancel" formnovalidate>Cancel <kbd>Esc</kbd></button>
+      <button id="rm-forget" class="btn ghost" type="button" hidden>Forget the saved server</button>
+    </div>
+  </form>
+</dialog>
+
+<dialog id="dlg-ptrace" class="dlg" aria-labelledby="pt-title">
+  <form method="dialog">
+    <h2 id="pt-title">HeapHook may not trace this process</h2>
+    <p id="pt-error" class="hint mono"></p>
+    <p class="modal-text">Linux's Yama setting <code>kernel.yama.ptrace_scope=1</code> (the default on most distributions) only lets a process trace its own children, so HeapHook cannot open a process it did not start. Two ways around it:</p>
+    <fieldset class="group">
+      <legend>a) Give HeapHook the ptrace capability</legend>
+      <div class="inline"><code id="pt-cmd" class="pt-cmd">sudo setcap cap_sys_ptrace=eip "$(command -v heaphook)"</code><button id="pt-copy" class="btn" type="button">Copy</button></div>
+      <p class="hint">Use the full path of the HeapHook binary if it is not on your PATH, then restart HeapHook. Trade-off: the binary can then read and write the memory of every process of your user (and of others), whoever runs it, so only do this for a binary you trust and that others cannot replace. Updating the binary drops the capability; run the command again after an update.</p>
+    </fieldset>
+    <fieldset class="group">
+      <legend>b) Start the target from HeapHook</legend>
+      <p class="hint">A process HeapHook starts is its child and can always be traced. No system changes needed.</p>
+      <button id="pt-create" class="btn" type="button" data-icon="play">Create process…</button>
+    </fieldset>
+    <div class="dlg-actions"><button class="btn primary" value="ok">Close <kbd>Esc</kbd></button></div>
+  </form>
+</dialog>
+
+<dialog id="dlg-about" class="dlg dlg-sm" aria-labelledby="ab-title">
+  <form method="dialog">
+    <h2 id="ab-title">HeapHook</h2>
+    <p class="hint">Open-source memory scanner, debugger and cheat-table editor.</p>
+    <dl class="about-list">
+      <dt>Version</dt><dd id="ab-version" class="mono">…</dd>
+      <dt>License</dt><dd id="ab-license">Apache-2.0</dd>
+      <dt>Platform</dt><dd id="ab-platform" class="mono">…</dd>
+    </dl>
+    <p class="modal-text">Use HeapHook on single-player games and on software you own or are permitted to modify. Do not use it to cheat in online multiplayer games or against software you are not permitted to modify.</p>
+    <div class="dlg-actions"><button class="btn primary" value="ok">Close <kbd>Esc</kbd></button></div>
+  </form>
 </dialog>
 
 <dialog id="dlg-create" class="dlg" aria-labelledby="cr-title">
@@ -681,7 +773,13 @@
         <div class="field"><label for="st-x">Executable</label><select id="st-x" name="scan_executable"><option>yes</option><option>no</option><option>any</option></select></div>
         <div class="field"><label for="st-c">Copy-on-write</label><select id="st-c" name="scan_copy_on_write"><option>yes</option><option>no</option><option>any</option></select></div>
       </div>
-      <div class="field"><label for="st-threads">Scan threads (0 = one per core)</label><input id="st-threads" name="scan_threads" class="mono num" type="number" min="0" max="256"></div>
+      <div class="row2 row2-even">
+        <div class="field"><label for="st-threads">Scan threads (0 = one per core)</label><input id="st-threads" name="scan_threads" class="mono" type="number" min="0" max="256"></div>
+        <div class="field"><label for="st-prio">Scan priority</label>
+          <select id="st-prio" name="scan_priority"><option value="normal">Normal</option><option value="low">Low (the game stays smooth)</option><option value="idle">Idle (only spare CPU time)</option></select></div>
+      </div>
+      <div class="field"><label for="st-spill">Directory for large scan results (empty = default)</label><input id="st-spill" name="scan_spill_dir" class="mono" autocomplete="off" spellcheck="false" placeholder="default"></div>
+      <p id="st-spill-hint" class="hint mono"></p>
     </fieldset>
     <fieldset class="group">
       <legend>Lua</legend>
@@ -699,6 +797,7 @@
           <select id="st-bp" name="bp_method"><option value="software">Software (int3)</option><option value="hardware">Hardware (debug registers)</option></select></div>
         <label class="check st-sound"><input name="hotkey_sound" type="checkbox"> Beep when a hotkey fires</label>
       </div>
+      <div class="field"><label for="st-hkdelay">Hotkey repeat delay (ms): a hotkey cannot fire again sooner</label><input id="st-hkdelay" name="hotkey_delay_ms" class="mono num" type="number" min="0" max="10000"></div>
     </fieldset>
     <p id="st-path" class="hint mono"></p>
     <div class="dlg-actions">
@@ -759,10 +858,13 @@
         <dd><kbd>Shift F10</kbd> Tools: fill, copy, snapshots, pointers to here</dd>
         <dd><kbd>Shift ←→↑↓</kbd> Select bytes (hex view) · <kbd>Ctrl Shift R</kbd> Watch the selection</dd>
         <dd><kbd>X</kbd> What references this (disassembler)</dd>
+        <dd><kbd>;</kbd> Comment · <kbd>:</kbd> Label · <kbd>T</kbd> Call / jump targets · <kbd>Ctrl Home</kbd> Function start (disassembler)</dd>
+        <dd><kbd>F5</kbd> Breakpoint here (hex view)</dd>
         <dt>Structures</dt>
         <dd><kbd>→ ←</kbd> Expand / collapse · <kbd>Enter</kbd> / <kbd>1-9</kbd> Edit value</dd>
         <dd><kbd>F2</kbd> Description · <kbd>T</kbd> Type · <kbd>S</kbd> Size · <kbd>Ins</kbd> <kbd>Del</kbd> Element</dd>
         <dd><kbd>A</kbd> Address column · <kbd>G</kbd> Dissect at · <kbd>Ctrl Enter</kbd> Add to table</dd>
+        <dd><kbd>L</kbd> Lock column · <kbd>H</kbd> Highlight changes · <kbd>Ctrl I</kbd> / <kbd>Ctrl Shift E</kbd> Import / export</dd>
         <dt>Debugger</dt>
         <dd><kbd>F5</kbd> Toggle breakpoint · <kbd>F4</kbd> Run to cursor · <kbd>Shift F4</kbd> this thread only</dd>
         <dd><kbd>F9</kbd> Continue · <kbd>Shift F9</kbd> Break</dd>
@@ -773,7 +875,7 @@
         <dd><kbd>Ctrl Shift L</kbd> focus the next form · <kbd>Esc</kbd> close it · <kbd>F10</kbd> its menu bar · <kbd>Alt ←→↑↓</kbd> move it</dd>
       </dl>
     </div>
-    <div class="dlg-actions"><button class="btn primary" value="ok">Close <kbd>Esc</kbd></button></div>
+    <div class="dlg-actions"><button class="btn primary" value="ok">Close <kbd>Esc</kbd></button><button id="help-about" class="btn" type="button" data-icon="info">About HeapHook</button></div>
   </form>
 </dialog>
 </body>

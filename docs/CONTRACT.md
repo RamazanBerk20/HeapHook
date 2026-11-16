@@ -149,6 +149,29 @@ decreased decreased_by changed unchanged same_as_first`, plus `not: bool` to inv
 | `debug_backtrace` | `tid, max` | `[{addr, module, symbol}]` (frame-pointer walk of a stopped thread) |
 | `debug_log` | `since` | `{lines: [{seq, text}], next}` (exec, fork, breakpoints the debugger switched off, exit) |
 | `ptr_sort` | `key: base/offset/value, column, desc, vtype, fmt?` | `{count, max_level, target}`; `ptr_results`/`ptr_entry` follow the order |
+| `scan_next` (compare) | `req.compare_to`: `"first"` or a saved scan's name | `{count}` (increased/decreased/changed/unchanged/by/percent compare against that scan's value; entries it lacks drop out) |
+| `scan_save` / `scan_saved` / `scan_delete_saved` | `name` / – / `name` | – / `[{name, count, kept}]` / – (saved scans live until a new scan or first scan; `first` is reserved; `kept` = rows of it the results' `saved` column can show, at most 200000) |
+| `scan_results` (saved) | also `saved?` (a saved scan's name) | rows also carry `saved`: that scan's value at the address, or `null` |
+| `scan_results` (rows) | | rows carry `vtype` (per row in "all" scans) and `bit` (binary scans: bit offset in the byte at `addr`) |
+| `scan_pause` / `scan_resume` | – | – (`scan_progress` has `paused`; cancel also ends a paused scan) |
+| `scan_progress` (spill) | | also `spilled` (result bytes on disk), `spill_dir` (where they go: Settings, `$HEAPHOOK_TMPDIR`, or the default) |
+| `scan_first.opts` (more) | `all_types: [vtype]`, `custom: CustomType`, `binary_decimal`, `bit_len`, `bit_start` (0..7), `codepage` (65001/1252/28591), `priority: normal/low/idle` | – |
+| custom types | `custom: {size, big_endian, float, signed, scale, offset, bit_start, bit_len, binary}` on `read_values` items, `write_value`, `set_frozen` entries and table entries (`custom` overrides `vtype`) | – |
+| `custom_presets` / `custom_validate` | – / `custom` | `[{name, ...CustomType}]` (Cheat Engine's stock types) / `null` or the error |
+| `resolve_many` | `exprs: [expr]` | `[addr or null]` |
+| `remote_saved` / `remote_forget` | – | `{addr, has_token}` / – (remembered server; the token only when the user asked; `remote.json` in the config dir, mode 0600) |
+| `remote_connect` | `addr, token, remember` (`token` empty = the remembered one) | `{addr}` (hh-net challenge-response; traffic is not encrypted after it) |
+| `remote_status` / `remote_processes` | – | `{addr, connected}` or `null` / `[{pid, name, exe}]` |
+| `remote_open` | `pid` | `{pid, name, is_64bit, remote}` (scanner, table, memory view, pointer scan, structures and tools work through it; debugger, `module_header` and speedhack are local only and refuse with a message) |
+| `remote_disconnect` | – | – (closes the remote target first) |
+| `open_process` / `lua_poll.process` (remote) | | `remote: addr` on a remote target; `lua_poll.process.lost`: why the connection dropped (`alive` is false then) |
+| `code_function` | `addr` | `{start, name, source: dissection/heuristic}` |
+| `code_targets` | `addr` | `{start, end, source, rows: [{from, to, kind: call/jump/cond_jump, text, name}]}` (direct branches of the function holding `addr`) |
+| `mem_compare` | `path` (`.hhmem`), `max` | `[{addr, len, old, new}]` (file contents against live memory) |
+| `struct_export` / `struct_import` | `path, names` (empty = all) / `path` | – / `[name]` (`.json` `{structures}` or `.xml`/`.ct` CE `<Structures>`) |
+| `app_info` | – | `{version, license, platform}` |
+| settings (more) | | `scan_priority: normal/low/idle`, `scan_spill_dir` (empty = default), `hotkey_delay_ms` (a hotkey cannot fire again sooner) |
+| table (more) | | entry `custom` (CustomType) and `custom_name` (CE `<CustomType>` name; a name without a definition is kept as unsupported and written back unchanged); table `custom_types: [{name, ...CustomType}]`, `symbols: [{name, address}]` (CE `<UserdefinedSymbols>`, registered for address expressions while the table is loaded), `disasm_comments: [{address, comment}]` (CE `<DisassemblerComments>`) |
 
 `scan_first.opts`: `{start, stop, writable, executable, copy_on_write` (each `yes`/`no`/`any`)`,
 alignment, hex, case_sensitive, utf16, rounding` (`rounded`/`extreme`/`truncated`)`,

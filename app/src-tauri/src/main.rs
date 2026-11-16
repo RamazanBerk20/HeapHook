@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use heaphook::cheat::TableState;
-use heaphook::commands::{App, DisasmOut, ModuleOut, Opened, R, RegionOut};
+use heaphook::commands::{App, DisasmOut, ModuleOut, Opened, ProgressOut, R, RegionOut, ResultOut, SavedScan};
 use heaphook::lua::{DialogReply, LuaPoll, UiPoll};
 use heaphook::settings::Settings;
 use heaphook::debug::{BpOut, BpReq, DebugLog, DebugStatus, FrameOut, RangeReq, RecordOut, StackOut, TraceOut};
@@ -13,7 +13,7 @@ use heaphook::table::{Table, TableIn};
 use hh_asm::{AaError, AaState};
 use hh_core::ProcessInfo;
 use hh_debug::ThreadInfo;
-use hh_scan::{FirstScan, Fmt, FrozenEntry, NextScan, ResultRow, ScanCount, ScanProgress, VType, ValueRef};
+use hh_scan::{CustomType, FirstScan, Fmt, FrozenEntryEx, NextScanEx, ScanCount, VType, ValueRefEx};
 use serde_json::Value;
 use tauri::{Manager, State};
 
@@ -86,17 +86,17 @@ commands! {
     run modules() -> Vec<ModuleOut> = |a| a.modules();
     run read_memory(addr: String, len: usize) -> String = |a| a.read_memory(&addr, len);
     run write_bytes(addr: String, hex: String) -> () = |a| a.write_bytes(&addr, &hex);
-    run read_values(reqs: Vec<ValueRef>) -> Vec<Option<String>> = |a| a.read_values(reqs);
-    run write_value(addr: String, vtype: VType, value: String, len: Option<usize>, utf16: Option<bool>, signed: Option<bool>, hex: Option<bool>) -> () = |a| { let fmt = Fmt { len: len.filter(|&l| l > 0), utf16: utf16.unwrap_or(false), signed: signed.unwrap_or(false), hex: hex.unwrap_or(false) }; a.write_value(&addr, vtype, &value, &fmt) };
+    run read_values(reqs: Vec<ValueRefEx>) -> Vec<Option<String>> = |a| a.read_values(reqs);
+    run write_value(addr: String, vtype: VType, value: String, len: Option<usize>, utf16: Option<bool>, signed: Option<bool>, hex: Option<bool>, custom: Option<CustomType>) -> () = |a| { let fmt = Fmt { len: len.filter(|&l| l > 0), utf16: utf16.unwrap_or(false), signed: signed.unwrap_or(false), hex: hex.unwrap_or(false) }; a.write_value(&addr, vtype, &value, &fmt, custom.as_ref()) };
     run resolve_address(expr: String) -> String = |a| a.resolve_address(&expr);
     run scan_first(req: FirstScan) -> ScanCount = |a| a.scan_first(&req);
-    run scan_next(req: NextScan) -> ScanCount = |a| a.scan_next(&req);
+    run scan_next(req: NextScanEx) -> ScanCount = |a| a.scan_next(&req);
     run scan_undo() -> () = |a| a.scan_undo();
     run scan_new() -> () = |a| a.scan_new();
     now scan_cancel() -> () = |a| a.scan_cancel();
-    now scan_progress() -> ScanProgress = |a| a.scan_progress();
-    run scan_results(offset: u64, limit: usize) -> Vec<ResultRow> = |a| a.scan_results(offset, limit);
-    run set_frozen(entries: Vec<FrozenEntry>) -> () = |a| a.set_frozen(&entries);
+    now scan_progress() -> ProgressOut = |a| a.scan_progress();
+    run scan_results(offset: u64, limit: usize, saved: Option<String>) -> Vec<ResultOut> = |a| a.scan_results(offset, limit, saved.as_deref());
+    run set_frozen(entries: Vec<FrozenEntryEx>) -> () = |a| a.set_frozen(&entries);
     run disassemble(addr: String, count: usize) -> Vec<DisasmOut> = |a| a.disassemble(&addr, count);
     run assemble(addr: String, text: String) -> String = |a| a.assemble(&addr, &text);
     run aa_check(script: String) -> Option<AaError> = |a| a.aa_check(&script);
@@ -200,6 +200,27 @@ commands! {
     run process_create(req: heaphook::inject::CreateReq) -> Opened = |a| a.process_create(&req);
     run speed_get() -> Option<hh_inject::SpeedhackStatus> = |a| a.speed_get();
     run speed_set(speed: f64) -> hh_inject::SpeedhackStatus = |a| a.speed_set(speed);
+    run scan_save(name: String) -> () = |a| a.scan_save(&name);
+    run scan_saved() -> Vec<SavedScan> = |a| a.scan_saved();
+    run scan_delete_saved(name: String) -> () = |a| a.scan_delete_saved(&name);
+    now scan_pause() -> () = |a| a.scan_pause(true);
+    now scan_resume() -> () = |a| a.scan_pause(false);
+    now custom_presets() -> Vec<Value> = |a| a.custom_presets();
+    now custom_validate(custom: CustomType) -> Option<String> = |a| a.custom_validate(&custom);
+    run resolve_many(exprs: Vec<String>) -> Vec<Option<String>> = |a| a.resolve_many(&exprs);
+    run remote_saved() -> heaphook::remote::SavedOut = |a| a.remote_saved();
+    run remote_forget() -> () = |a| a.remote_forget();
+    run remote_connect(addr: String, token: String, remember: bool) -> heaphook::remote::Status = |a| a.remote_connect(&addr, &token, remember);
+    run remote_status() -> Option<heaphook::remote::Status> = |a| a.remote_status();
+    run remote_processes() -> Vec<ProcessInfo> = |a| a.remote_processes();
+    run remote_open(pid: u32) -> Opened = |a| a.remote_open(pid);
+    run remote_disconnect() -> () = |a| a.remote_disconnect();
+    run code_function(addr: String) -> heaphook::tools::FuncOut = |a| a.code_function(&addr);
+    run code_targets(addr: String) -> heaphook::tools::Targets = |a| a.code_targets(&addr);
+    run mem_compare(path: String, max: usize) -> Vec<DiffRange> = |a| a.mem_compare(&path, max);
+    run struct_export(path: String, names: Vec<String>) -> () = |a| a.struct_export(&path, &names);
+    run struct_import(path: String) -> Vec<String> = |a| a.struct_import(&path);
+    now app_info() -> Value = |a| a.app_info();
 }
 
 /// CE virtual-key code -> the key's `Code` name (modifiers excluded).
@@ -262,6 +283,46 @@ async fn pick_path(handle: tauri::AppHandle, save: bool, title: String, filters:
     .map_err(|e| format!("dialog failed: {e}"))?
 }
 
+/// Window size and position from the last run (`window.json` in the config dir).
+#[derive(serde::Serialize, serde::Deserialize)]
+struct WinState {
+    x: i32,
+    y: i32,
+    w: u32,
+    h: u32,
+    maximized: bool,
+}
+
+fn restore_window(w: &tauri::WebviewWindow, path: &std::path::Path) {
+    let Some(s) = std::fs::read_to_string(path).ok().and_then(|t| serde_json::from_str::<WinState>(&t).ok()) else { return };
+    // Never restore a size below the window's minimum or one too big to be sane.
+    if !(900..=16384).contains(&s.w) || !(600..=16384).contains(&s.h) {
+        return;
+    }
+    let _ = w.set_size(tauri::PhysicalSize::new(s.w, s.h));
+    // Only a position that lands on a monitor that exists now.
+    let on_screen = w.available_monitors().unwrap_or_default().iter().any(|m| {
+        let (p, z) = (m.position(), m.size());
+        s.x + 100 >= p.x && s.y >= p.y && s.x + 100 <= p.x + z.width as i32 && s.y + 40 <= p.y + z.height as i32
+    });
+    if on_screen {
+        let _ = w.set_position(tauri::PhysicalPosition::new(s.x, s.y));
+    }
+    if s.maximized {
+        let _ = w.maximize();
+    }
+}
+
+fn save_window(w: &tauri::Window, path: &std::path::Path) {
+    let maximized = w.is_maximized().unwrap_or(false);
+    let (Ok(p), Ok(z)) = (w.outer_position(), w.inner_size()) else { return };
+    let s = WinState { x: p.x, y: p.y, w: z.width, h: z.height, maximized };
+    if let Some(d) = path.parent() {
+        let _ = std::fs::create_dir_all(d);
+    }
+    let _ = serde_json::to_string(&s).map(|t| std::fs::write(path, t));
+}
+
 fn main() {
     #[cfg(feature = "dev-bridge")]
     if let Some(port) = bridge::port_arg() {
@@ -292,6 +353,9 @@ fn main() {
             let app = tapp.state::<App>().inner().clone();
             if let Ok(dir) = tapp.path().app_config_dir() {
                 app.set_config_dir(&dir);
+                if let Some(w) = tapp.get_webview_window("main") {
+                    restore_window(&w, &dir.join("window.json"));
+                }
             }
             let h = tapp.handle().clone();
             app.set_hotkey_registrar(Box::new(move |list: &[Vec<u32>]| {
@@ -311,6 +375,13 @@ fn main() {
             }));
             app.start_driver();
             Ok(())
+        })
+        .on_window_event(|w, ev| {
+            if let tauri::WindowEvent::CloseRequested { .. } = ev
+                && let Ok(dir) = w.app_handle().path().app_config_dir()
+            {
+                save_window(w, &dir.join("window.json"));
+            }
         })
         .invoke_handler(handler())
         .build(tauri::generate_context!())

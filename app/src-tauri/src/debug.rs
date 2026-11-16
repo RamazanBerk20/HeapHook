@@ -446,8 +446,16 @@ impl App {
 
     /// Attaches the debugger to the opened process; from now on all memory access goes
     /// through it.
+    /// hh-debug's recent events, commands and stolen-stop recoveries (diagnostics).
+    pub fn debug_history(&self) -> R<Vec<String>> {
+        let sess = self.session()?;
+        let g = lock(&sess.dbg);
+        g.as_ref().ok_or("the debugger is not attached")?.d.history().map_err(s)
+    }
+
     pub fn debug_attach(&self) -> R<DebugStatus> {
         let sess = self.session()?;
+        self.local_only("The debugger")?;
         {
             let mut g = lock(&sess.dbg);
             if g.is_none() {
@@ -464,13 +472,18 @@ impl App {
     /// access back to the plain process.
     pub fn debug_detach(&self) -> R<()> {
         let sess = self.session()?;
-        let d = lock(&sess.dbg).take();
+        // Detach while holding the lock: `reap_children` must not wait on a pid that is
+        // still traced.
+        let mut g = lock(&sess.dbg);
+        let d = g.take();
         sess.switch.set(sess.raw.clone());
-        self.x.lua.engine.debug_resumed();
-        match d {
+        let r = match d {
             Some(d) => d.d.detach().map_err(s),
             None => Ok(()),
-        }
+        };
+        drop(g);
+        self.x.lua.engine.debug_resumed();
+        r
     }
 
     /// Current state; drains debugger events (break reasons, exit, notices).

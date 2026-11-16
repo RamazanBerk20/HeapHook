@@ -2,7 +2,7 @@
 //! No Tauri types here; `load`/`save` pick the format by file extension.
 use std::path::Path;
 
-use hh_scan::{FreezeMode, VType};
+use hh_scan::{CustomType, FreezeMode, VType};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -18,9 +18,41 @@ pub struct Table {
     /// Structure dissector definitions (CE `<Structures>`).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub structures: Vec<hh_tools::structure::Structure>,
+    /// Named custom value types (the editor's list; entries carry their own copy).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub custom_types: Vec<NamedCustom>,
+    /// User-defined symbols (CE `<UserdefinedSymbols>`), usable in address expressions.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub symbols: Vec<UserSymbol>,
+    /// Disassembler comments (CE `<DisassemblerComments>`).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub disasm_comments: Vec<DisasmComment>,
     /// `<CheatTable>` children HeapHook does not understand, as raw XML, re-emitted on export.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub ct_extra: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NamedCustom {
+    pub name: String,
+    #[serde(flatten)]
+    pub ct: CustomType,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct UserSymbol {
+    pub name: String,
+    /// Address expression.
+    pub address: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DisasmComment {
+    /// Address expression.
+    pub address: String,
+    pub comment: String,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -82,6 +114,13 @@ pub struct Entry {
     /// `<CheatEntry>` children HeapHook does not understand, as raw XML.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub ct_extra: Vec<String>,
+    /// Custom value type; overrides `vtype`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub custom: Option<CustomType>,
+    /// CE `<CustomType>` name. Set without `custom`: a type HeapHook cannot decode (shown as
+    /// unsupported, written back unchanged).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub custom_name: Option<String>,
 }
 
 impl Default for Entry {
@@ -105,6 +144,8 @@ impl Default for Entry {
             children: Vec::new(),
             options: Vec::new(),
             ct_extra: Vec::new(),
+            custom: None,
+            custom_name: None,
         }
     }
 }
@@ -201,7 +242,7 @@ pub fn from_ct(xml: &str) -> Result<Table, String> {
     if root.tag_name().name() != "CheatTable" {
         return Err("not a Cheat Engine table (no <CheatTable>)".into());
     }
-    let known = ["CheatEntries", "LuaScript", "Comments", "CheatCodes", "Structures"];
+    let known = ["CheatEntries", "LuaScript", "Comments", "CheatCodes", "Structures", "UserdefinedSymbols", "DisassemblerComments"];
     // Bound the recursive conversion below before it starts.
     let mut n = 0usize;
     for e in root.descendants().filter(|c| c.has_tag_name("CheatEntry")) {
@@ -223,6 +264,24 @@ pub fn from_ct(xml: &str) -> Result<Table, String> {
         lua_script: text(root, "LuaScript").unwrap_or_default(),
         comments: text(root, "Comments").unwrap_or_default(),
         codes: child(root, "CheatCodes").map(codes).unwrap_or_default(),
+        symbols: child(root, "UserdefinedSymbols")
+            .map(|l| {
+                l.children()
+                    .filter(|c| c.has_tag_name("SymbolEntry"))
+                    .map(|c| UserSymbol { name: text(c, "Name").unwrap_or_default().trim().into(), address: text(c, "Address").unwrap_or_default().trim().into() })
+                    .filter(|u| !u.name.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default(),
+        disasm_comments: child(root, "DisassemblerComments")
+            .map(|l| {
+                l.children()
+                    .filter(|c| c.has_tag_name("DisassemblerComment"))
+                    .map(|c| DisasmComment { address: text(c, "Address").unwrap_or_default().trim().into(), comment: text(c, "Comment").unwrap_or_default() })
+                    .collect()
+            })
+            .unwrap_or_default(),
+        custom_types: Vec::new(),
         ct_extra: unknown(root, &known),
     })
 }
@@ -255,7 +314,7 @@ fn codes(list: Node) -> Vec<CodeEntry> {
 const ENTRY_TAGS: &[&str] = &[
     "ID", "Description", "Options", "Color", "VariableType", "AssemblerScript", "GroupHeader", "ShowAsHex",
     "ShowAsSigned", "Length", "Unicode", "CodePage", "ZeroTerminate", "ByteLength", "AllowIncrease",
-    "AllowDecrease", "Address", "Offsets", "DropDownList", "Hotkeys", "CheatEntries",
+    "AllowDecrease", "Address", "Offsets", "DropDownList", "Hotkeys", "CheatEntries", "CustomType", "HeapHookCustomType",
 ];
 
 fn child<'a, 'i>(n: Node<'a, 'i>, name: &str) -> Option<Node<'a, 'i>> {
@@ -308,9 +367,13 @@ fn entry(n: Node) -> Entry {
         "String" => VType::String,
         "Array of byte" => VType::Aob,
         "Grouped" => VType::Grouped,
-        // shortcut: CE custom types ("Custom") become 4 bytes; upgrade when HeapHook has custom types.
         _ => VType::Bytes4,
     };
+    if vt.trim() == "Custom" {
+        let name = text(n, "CustomType").unwrap_or_default().trim().to_string();
+        e.custom = child(n, "HeapHookCustomType").and_then(ct_from_attrs).or_else(|| CustomType::preset(&name));
+        e.custom_name = Some(name);
+    }
     match e.vtype {
         VType::String => {
             e.len = text(n, "Length").and_then(|t| t.trim().parse().ok()).unwrap_or(0);
@@ -405,6 +468,20 @@ pub fn to_ct(t: &Table) -> String {
             o.push_str(&format!("  {l}\n"));
         }
     }
+    if !t.symbols.is_empty() {
+        o.push_str("  <UserdefinedSymbols>\n");
+        for u in &t.symbols {
+            o.push_str(&format!("    <SymbolEntry>\n      <Name>{}</Name>\n      <Address>{}</Address>\n    </SymbolEntry>\n", esc(&u.name), esc(&u.address)));
+        }
+        o.push_str("  </UserdefinedSymbols>\n");
+    }
+    if !t.disasm_comments.is_empty() {
+        o.push_str("  <DisassemblerComments>\n");
+        for c in &t.disasm_comments {
+            o.push_str(&format!("    <DisassemblerComment>\n      <Address>{}</Address>\n      <Comment>{}</Comment>\n    </DisassemblerComment>\n", esc(&c.address), esc(&c.comment)));
+        }
+        o.push_str("  </DisassemblerComments>\n");
+    }
     for x in &t.ct_extra {
         o.push_str(&format!("  {x}\n"));
     }
@@ -416,6 +493,32 @@ pub fn to_ct(t: &Table) -> String {
     }
     o.push_str("</CheatTable>\n");
     o
+}
+
+/// `<HeapHookCustomType size="4" big_endian="1" .../>`: a custom type CE's name alone does not define.
+fn ct_to_attrs(ct: &CustomType) -> String {
+    let b = |v: bool| if v { "1" } else { "0" };
+    format!(
+        "<HeapHookCustomType size=\"{}\" big_endian=\"{}\" float=\"{}\" signed=\"{}\" scale=\"{}\" offset=\"{}\" bit_start=\"{}\" bit_len=\"{}\" binary=\"{}\"/>",
+        ct.size, b(ct.big_endian), b(ct.float), b(ct.signed), ct.scale, ct.offset, ct.bit_start, ct.bit_len, b(ct.binary)
+    )
+}
+
+fn ct_from_attrs(n: Node) -> Option<CustomType> {
+    let f = |k: &str| n.attribute(k) == Some("1");
+    let num = |k: &str, d: f64| n.attribute(k).and_then(|v| v.trim().parse().ok()).unwrap_or(d);
+    let ct = CustomType {
+        size: n.attribute("size")?.trim().parse().ok()?,
+        big_endian: f("big_endian"),
+        float: f("float"),
+        signed: f("signed"),
+        scale: num("scale", 1.0),
+        offset: num("offset", 0.0),
+        bit_start: num("bit_start", 0.0) as u8,
+        bit_len: num("bit_len", 0.0) as u8,
+        binary: f("binary"),
+    };
+    ct.validate().ok().map(|_| ct)
 }
 
 fn esc(s: &str) -> String {
@@ -462,7 +565,16 @@ fn write_entries(o: &mut String, list: &[Entry], d: usize) {
                 VType::Grouped => "Grouped",
                 VType::Bytes4 | VType::All => "4 Bytes",
             };
-            tag(o, "VariableType", vt);
+            match &e.custom_name {
+                Some(name) => {
+                    tag(o, "VariableType", "Custom");
+                    tag(o, "CustomType", name);
+                    if let Some(ct) = e.custom.filter(|ct| CustomType::preset(name).as_ref() != Some(ct)) {
+                        o.push_str(&format!("{p}  {}\n", ct_to_attrs(&ct)));
+                    }
+                }
+                None => tag(o, "VariableType", vt),
+            }
             match e.vtype {
                 VType::String => {
                     tag(o, "Length", &(if e.len == 0 { 16 } else { e.len }).to_string());
@@ -674,7 +786,7 @@ if hp and 1 &lt; 2 then print("loaded") end
         assert!(t.lua_script.contains("1 < 2 then print(\"loaded\")"));
         assert_eq!(t.comments, "Info about this table:\nworks on v1.2");
         assert_eq!(t.codes, [CodeEntry { description: "Change of mov [rbx+58],eax".into(), address: "game.exe+3A10".into(), bytes: "89 43 58".into(), before: "48 8B".into(), after: "C3".into() }]);
-        assert_eq!(t.ct_extra, ["<UserdefinedSymbols/>"]);
+        assert!(t.ct_extra.is_empty() && t.symbols.is_empty(), "UserdefinedSymbols is parsed: {:?}", t.ct_extra);
         let st = &t.structures;
         assert_eq!((st.len(), st[0].name.as_str(), st[0].elements.len(), st[1].name.as_str()), (2, "player", 3, "inv"));
         let el = &st[0].elements;

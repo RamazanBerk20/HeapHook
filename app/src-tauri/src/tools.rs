@@ -105,6 +105,37 @@ pub struct XRefCounts {
     pub data: usize,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct FuncOut {
+    pub start: String,
+    pub name: Option<String>,
+    /// `dissection` or `heuristic`.
+    pub source: &'static str,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TargetRow {
+    pub from: String,
+    pub to: String,
+    /// `call`, `jump` or `cond_jump`.
+    pub kind: &'static str,
+    pub text: String,
+    pub name: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct Targets {
+    pub start: String,
+    pub end: String,
+    pub source: &'static str,
+    pub rows: Vec<TargetRow>,
+}
+
+fn is_xml(path: &str) -> bool {
+    let p = path.to_ascii_lowercase();
+    p.ends_with(".xml") || p.ends_with(".ct")
+}
+
 const MAX_PAGE: usize = 10_000;
 
 fn guard<T>(r: hh_core::Result<T>) -> R<T> {
@@ -161,6 +192,54 @@ impl App {
     }
 
     // ------------------------------------------------------------------ structures
+
+    /// Writes structures (`names` empty = all) to their own file: JSON `{structures}`, or
+    /// CE `<Structures>` XML for `.xml`/`.ct`.
+    pub fn struct_export(&self, path: &str, names: &[String]) -> R<()> {
+        let all = self.x.live.state().table.structures;
+        let list: Vec<Structure> = all.into_iter().filter(|st| names.is_empty() || names.contains(&st.name)).collect();
+        if list.is_empty() {
+            return Err("no structure to export".into());
+        }
+        let text = if is_xml(path) {
+            let ps = self.session().map_or(8, |s| s.proc.pointer_size());
+            structure::to_ct_xml(&list, ps)
+        } else {
+            serde_json::to_string_pretty(&serde_json::json!({ "structures": list })).map_err(s)?
+        };
+        std::fs::write(path, text).map_err(|e| format!("{path}: {e}"))
+    }
+
+    /// Adds the file's structures, replacing those of the same name; returns their names.
+    pub fn struct_import(&self, path: &str) -> R<Vec<String>> {
+        let len = std::fs::metadata(path).map_err(|e| format!("{path}: {e}"))?.len();
+        if len > crate::table::MAX_FILE {
+            return Err(format!("{path}: too big for a structure file"));
+        }
+        let text = std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?;
+        let add: Vec<Structure> = if is_xml(path) || text.trim_start().starts_with('<') {
+            guard(structure::from_ct_xml(text.trim_start_matches('\u{feff}')))?
+        } else {
+            #[derive(Deserialize)]
+            #[serde(untagged)]
+            enum F {
+                Wrapped { structures: Vec<Structure> },
+                Bare(Vec<Structure>),
+            }
+            match serde_json::from_str::<F>(&text).map_err(|e| format!("{path}: {e}"))? {
+                F::Wrapped { structures } | F::Bare(structures) => structures,
+            }
+        };
+        if add.is_empty() {
+            return Err(format!("{path}: no structures in the file"));
+        }
+        let mut cur = self.x.live.state().table.structures;
+        cur.retain(|c| !add.iter().any(|a| a.name == c.name));
+        let names = add.iter().map(|a| a.name.clone()).collect();
+        cur.extend(add);
+        self.struct_set(cur)?;
+        Ok(names)
+    }
 
     pub fn struct_get(&self) -> R<Vec<Structure>> {
         Ok(self.x.live.state().table.structures)
@@ -390,11 +469,111 @@ impl App {
         self.job("diff", |p, prog| memory::diff_live(p, &snap, max.clamp(1, 100_000), prog))
     }
 
+    /// A saved `.hhmem` file against live memory.
+    pub fn mem_compare(&self, path: &str, max: usize) -> R<Vec<DiffRange>> {
+        let snap = guard(memory::load_snapshot(Path::new(path)))?;
+        self.job("diff", |p, prog| memory::diff_live(p, &snap, max.clamp(1, 100_000), prog))
+    }
+
+    /// Start of the function holding `addr`: the dissection's when there is one, else the
+    /// nearest prologue / padding boundary at or below it.
+    pub fn code_function(&self, addr: &str) -> R<FuncOut> {
+        let a = parse_addr(addr)?;
+        let sess = self.session()?;
+        if let Some(d) = lock(&sess.tools.dissection).clone()
+            && let Some(f) = d.function_at(a)
+        {
+            return Ok(FuncOut { start: hex_addr(f.addr), name: f.name.clone(), source: "dissection" });
+        }
+        const BACK: u64 = 0x4000;
+        let lo = a.saturating_sub(BACK);
+        let mut buf = vec![0u8; (a - lo) as usize + 4];
+        let n = sess.proc.read(lo, &mut buf).unwrap_or(0);
+        buf.truncate(n);
+        // shortcut: byte patterns only (endbr64, push rbp/mov rbp,rsp, sub rsp after pushes,
+        // padding before a 16-aligned start); a dissection gives exact starts.
+        let start = (0..=(a - lo) as usize)
+            .rev()
+            .filter(|&i| i + 4 <= buf.len())
+            .find_map(|i| {
+                let b = &buf[i..];
+                let padded = i > 0 && matches!(buf[i - 1], 0xCC | 0x90 | 0xC3) && b[0] != buf[i - 1];
+                if b.starts_with(&[0xF3, 0x0F, 0x1E, 0xFA]) || b.starts_with(&[0x55, 0x48, 0x89, 0xE5]) || (padded && (lo + i as u64).is_multiple_of(16)) {
+                    return Some(i);
+                }
+                if !(b.starts_with(&[0x48, 0x83, 0xEC]) || b.starts_with(&[0x48, 0x81, 0xEC])) {
+                    return None;
+                }
+                // Pushes of callee-saved registers right before `sub rsp` belong to the prologue.
+                let mut j = i;
+                loop {
+                    if j >= 1 && (0x50..=0x57).contains(&buf[j - 1]) && !(j >= 2 && buf[j - 2] == 0x41) {
+                        j -= 1;
+                    } else if j >= 2 && buf[j - 2] == 0x41 && (0x50..=0x57).contains(&buf[j - 1]) {
+                        j -= 2;
+                    } else {
+                        break Some(j);
+                    }
+                }
+            })
+            .map_or(a, |i| lo + i as u64);
+        Ok(FuncOut { start: hex_addr(start), name: None, source: "heuristic" })
+    }
+
+    /// Direct call/jump targets of the function holding `addr`.
+    pub fn code_targets(&self, addr: &str) -> R<Targets> {
+        use iced_x86::{Decoder, DecoderOptions, Formatter, IntelFormatter};
+        let f = self.code_function(addr)?;
+        let start = parse_addr(&f.start)?;
+        let sess = self.session()?;
+        const MAX: usize = 0x10000;
+        let mut buf = vec![0u8; MAX];
+        let n = sess.proc.read(start, &mut buf).map_err(s)?;
+        buf.truncate(n);
+        let bits = if sess.proc.pointer_size() == 8 { 64 } else { 32 };
+        let mut dec = Decoder::with_ip(bits, &buf, start, DecoderOptions::NONE);
+        let mut fmt = IntelFormatter::new();
+        let (mut rows, mut reach, mut end) = (Vec::new(), start, start);
+        let syms = lock(&sess.syms).clone();
+        for ins in dec.iter() {
+            end = ins.next_ip();
+            if ins.is_invalid() {
+                break;
+            }
+            let kind = if ins.is_call_near() {
+                "call"
+            } else if ins.is_jmp_short_or_near() {
+                "jump"
+            } else if ins.is_jcc_short_or_near() {
+                "cond_jump"
+            } else {
+                ""
+            };
+            if !kind.is_empty() {
+                let to = ins.near_branch_target();
+                if kind != "call" && to > reach && to < start + MAX as u64 {
+                    reach = to;
+                }
+                let mut text = String::new();
+                fmt.format(&ins, &mut text);
+                rows.push(TargetRow { from: hex_addr(ins.ip()), to: hex_addr(to), kind, text, name: hh_asm::symbol_at(&*sess.proc, &syms, to) });
+            }
+            // The function ends at a return or unconditional jump that no earlier branch jumps past.
+            let stop = matches!(ins.mnemonic(), iced_x86::Mnemonic::Ret | iced_x86::Mnemonic::Int3) || ins.is_jmp_short_or_near() || ins.is_jmp_far();
+            if stop && ins.next_ip() > reach {
+                break;
+            }
+        }
+        Ok(Targets { start: f.start, end: hex_addr(end), source: f.source, rows })
+    }
+
     pub fn find_pointers(&self, q: &PointerQuery) -> R<Vec<PointerHit>> {
         self.job("pointers", |p, prog| memory::find_pointers(p, q, prog))
     }
 
     pub fn module_header(&self, name: &str) -> R<HeaderSummary> {
+        // The header parser reads the module's file from this machine's disk.
+        self.local_only("Module headers")?;
         let p = self.session()?.proc.clone();
         let m = p.modules().map_err(s)?.into_iter().find(|m| m.name == name).ok_or_else(|| format!("no module {name:?}"))?;
         guard(hh_tools::headers::summary(&*p, &m))

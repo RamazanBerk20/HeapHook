@@ -135,14 +135,14 @@ fn commands_against_live_target() {
     assert_eq!(t.cmd("inc")["i32"], 123457);
     let next = app.scan_next(&de(json!({"scan_type": "increased", "value": "", "value2": null, "not": false}))).unwrap();
     assert!(next.count >= 1 && next.count <= first.count);
-    let rows = app.scan_results(0, 10_000).unwrap();
+    let rows = app.scan_results(0, 10_000, None).unwrap();
     let row = rows.iter().find(|r| r.addr == parse_addr(&i32_addr).unwrap()).expect("i32 survived next scan");
     assert_eq!((row.value.as_deref(), row.previous.as_str(), row.first.as_str()), (Some("123457"), "123457", "123456"));
     app.scan_undo().unwrap();
-    assert_eq!(app.scan_results(0, 10_000).unwrap().len() as u64, first.count);
+    assert_eq!(app.scan_results(0, 10_000, None).unwrap().len() as u64, first.count);
 
     // Write (with a 0x prefix, as the UI sends hex-displayed entries) and confirm via hh-target.
-    app.write_value(&i32_addr, de(json!("4bytes")), "0x3E8", &Fmt::default()).unwrap();
+    app.write_value(&i32_addr, de(json!("4bytes")), "0x3E8", &Fmt::default(), None).unwrap();
     assert_eq!(t.cmd("get")["i32"], 1000);
     let vals = app
         .read_values(de(json!([{"addr": i32_addr, "vtype": "4bytes", "len": 0, "signed": true},
@@ -205,7 +205,7 @@ fn commands_against_live_target() {
     // Switching process resets everything.
     let mut t2 = Target::spawn();
     app.open_process(t2.child.id()).unwrap();
-    assert!(app.scan_results(0, 10).unwrap().is_empty());
+    assert!(app.scan_results(0, 10, None).unwrap().is_empty());
     t2.cmd("get");
 }
 
@@ -285,8 +285,8 @@ fn find_what_writes_while_scans_and_freeze_keep_working() {
     // Everything else keeps working through the debugger: scan, next scan, write, freeze.
     let n = scan_exact_i32(&app, "123457");
     assert!(n >= 1);
-    assert!(app.scan_results(0, 10_000).unwrap().iter().any(|x| x.addr == parse_addr(&i32_addr).unwrap()));
-    app.write_value(&i32_addr, de(json!("4bytes")), "500", &Fmt::default()).unwrap();
+    assert!(app.scan_results(0, 10_000, None).unwrap().iter().any(|x| x.addr == parse_addr(&i32_addr).unwrap()));
+    app.write_value(&i32_addr, de(json!("4bytes")), "500", &Fmt::default(), None).unwrap();
     assert_eq!(t.cmd("get")["i32"], 500);
     app.set_frozen(&de::<Vec<_>>(json!([{"addr": i32_addr, "vtype": "4bytes", "value": "777", "mode": "exact"}]))).unwrap();
     std::thread::sleep(Duration::from_millis(300));
@@ -300,7 +300,7 @@ fn find_what_writes_while_scans_and_freeze_keep_working() {
     // UTF-16 strings are written and frozen as UTF-16.
     let s16 = t.addr("str16");
     let utf16 = Fmt { utf16: true, ..Fmt::default() };
-    app.write_value(&s16, de(json!("string")), "Hook", &utf16).unwrap();
+    app.write_value(&s16, de(json!("string")), "Hook", &utf16, None).unwrap();
     let read = |app: &App| app.read_values(de(json!([{"addr": s16, "vtype": "string", "len": 8, "utf16": true}]))).unwrap();
     assert_eq!(read(&app), [Some("HookHook".into())]);
     app.set_frozen(&de::<Vec<_>>(json!([{"addr": s16, "vtype": "string", "value": "Heap", "mode": "exact", "utf16": true, "len": 4}]))).unwrap();
@@ -315,7 +315,7 @@ fn find_what_writes_while_scans_and_freeze_keep_working() {
     assert!(app.debug_records(id).is_err());
     assert_eq!(t.cmd("inc")["i32"], 778);
     assert!(scan_exact_i32(&app, "778") >= 1);
-    app.write_value(&i32_addr, de(json!("4bytes")), "5", &Fmt::default()).unwrap();
+    app.write_value(&i32_addr, de(json!("4bytes")), "5", &Fmt::default(), None).unwrap();
     assert_eq!(t.cmd("get")["i32"], 5);
 }
 
@@ -703,6 +703,7 @@ fn ct_round_trip_of_the_live_table() {
         codes: vec![heaphook::table::CodeEntry { description: "mov".into(), address: "game.exe+10".into(), bytes: "89 43 58".into(), ..Default::default() }],
         ct_extra: vec![],
         structures: hh_tools::structure::from_json(r#"[{"name":"player","elements":[{"offset":0,"vtype":"pointer","description":"inv","child":"inv"},{"offset":16,"vtype":"4bytes","signed":true},{"offset":24,"vtype":"string","size":12,"utf16":true}]},{"name":"inv","elements":[{"offset":8,"vtype":"float","description":"weight"}]}]"#).unwrap(),
+        ..Table::default()
     };
     app.table_put(t.clone(), 0).unwrap();
     let tmp = tempfile::tempdir().unwrap();
@@ -803,7 +804,7 @@ fn memory_tools_save_load_snapshot_pointers() {
     let file = tmp.path().join("t.hhmem");
     let sum = app.mem_save(&range, file.to_str().unwrap()).unwrap();
     assert_eq!(sum.bytes, 64);
-    app.write_value(&i32a, de(json!("4bytes")), "999", &Fmt::default()).unwrap();
+    app.write_value(&i32a, de(json!("4bytes")), "999", &Fmt::default(), None).unwrap();
     assert_eq!(t.cmd("get")["i32"], 999);
     let r = app.mem_load(file.to_str().unwrap(), None).unwrap();
     assert!(r.failed.is_empty());
@@ -1483,4 +1484,311 @@ fn exec_and_fork_show_in_the_debugger_log_and_breakpoints() {
     assert!(b.note.as_deref().is_some_and(|n| n.contains("exec")), "{:?}", b.note);
     assert!(app.debug_log(0).unwrap().lines.iter().any(|l| l.text.contains("ran exec")));
     app.debug_detach().unwrap();
+}
+
+// ---------- 1.0 RC: saved scans, custom types, binary, pause, remote, labels, big tables ----------
+
+fn first_scan(app: &App, v: Value) -> u64 {
+    app.scan_first(&de(v)).unwrap().count
+}
+
+fn has_addr(app: &App, addr: &str) -> bool {
+    let a = parse_addr(addr).unwrap();
+    app.scan_results(0, 100_000, None).unwrap().iter().any(|r| r.addr == a)
+}
+
+#[test]
+fn saved_scan_and_compare_to_saved() {
+    let mut t = Target::spawn();
+    let app = App::default();
+    app.open_process(t.child.id()).unwrap();
+    assert!(scan_exact_i32(&app, "123456") >= 1);
+    app.scan_save("before").unwrap();
+    assert!(app.scan_save("first").is_err(), "reserved name");
+    t.cmd("inc");
+    // Unchanged against the previous scan would drop i32; against the saved scan it increased.
+    let n = app.scan_next(&de(json!({"scan_type": "increased", "not": false, "compare_to": "before"}))).unwrap().count;
+    assert!(n >= 1 && has_addr(&app, &t.addr("i32")));
+    let saved = app.scan_saved().unwrap();
+    assert_eq!(saved.len(), 1);
+    assert_eq!(saved[0].name, "before");
+    assert!(saved[0].kept >= 1);
+    let a = parse_addr(&t.addr("i32")).unwrap();
+    let row = app.scan_results(0, 1000, Some("before")).unwrap().into_iter().find(|r| r.addr == a).unwrap();
+    assert_eq!((row.value.as_deref(), row.saved.clone()), (Some("123457"), Some(Some("123456".into()))));
+    // "first" compares with the first scan.
+    t.cmd("inc");
+    let n = app.scan_next(&de(json!({"scan_type": "increased_by", "value": "2", "not": false, "compare_to": "first"}))).unwrap().count;
+    assert!(n >= 1 && has_addr(&app, &t.addr("i32")));
+    assert!(app.scan_next(&de(json!({"scan_type": "changed", "not": false, "compare_to": "nope"}))).is_err());
+    app.scan_delete_saved("before").unwrap();
+    assert!(app.scan_saved().unwrap().is_empty());
+    assert!(app.scan_results(0, 10, Some("before")).is_err());
+}
+
+#[test]
+fn big_endian_custom_type_scan_read_write_freeze_and_round_trip() {
+    let mut t = Target::spawn();
+    let app = App::default();
+    app.start_driver();
+    app.open_process(t.child.id()).unwrap();
+    let be4 = hh_scan::CustomType::preset("4 Byte Big Endian").unwrap();
+    let ct = serde_json::to_value(be4).unwrap();
+    // i32 = 123456 = bytes 40 E2 01 00 -> big endian 0x40E20100.
+    let n = first_scan(&app, json!({"vtype": "4bytes", "scan_type": "exact", "value": "1088553216", "not": false,
+        "opts": {"writable": "yes", "alignment": 4, "custom": ct}}));
+    assert!(n >= 1 && has_addr(&app, &t.addr("i32")));
+    let i32a = t.addr("i32");
+    let read = |app: &App| app.read_values(de(json!([{"addr": i32a, "vtype": "4bytes", "custom": ct}]))).unwrap()[0].clone();
+    assert_eq!(read(&app).as_deref(), Some("1088553216"));
+    app.write_value(&i32a, de(json!("4bytes")), "16909060", &Fmt::default(), Some(&be4)).unwrap();
+    assert_eq!(t.cmd("get")["i32"], 0x0403_0201);
+    // A frozen custom entry holds its big-endian value.
+    let e = Entry { id: 1, description: "be".into(), addr: i32a.clone(), custom: Some(be4), custom_name: Some("4 Byte Big Endian".into()), ..Entry::default() };
+    put(&app, vec![e]);
+    app.table_set_active(&[1], true).unwrap();
+    assert!(entry(&app, 1).frozen, "{}", log_text(&app));
+    app.write_value(&i32a, de(json!("4bytes")), "5", &Fmt::default(), None).unwrap();
+    wait("freezer restores the custom value", || (t.cmd("get")["i32"] == 0x0403_0201).then_some(()));
+    app.table_set_value(&[1], "1").unwrap();
+    wait("freezes to the new value", || (t.cmd("get")["i32"] == 0x0100_0000).then_some(()));
+    app.table_set_active(&[1], false).unwrap();
+    // A non-preset custom type and an unknown CE custom type survive JSON and .CT.
+    let fixed = hh_scan::CustomType { scale: 0.01, signed: true, ..hh_scan::CustomType::int(2, true) };
+    let base = app.table_get().unwrap().version;
+    let mut tb = app.table_get().unwrap().table;
+    tb.entries.push(Entry { id: 2, description: "fixed".into(), addr: i32a.clone(), custom: Some(fixed), custom_name: Some("fixed".into()), ..Entry::default() });
+    tb.custom_types.push(heaphook::table::NamedCustom { name: "fixed".into(), ct: fixed });
+    app.table_put(tb, base).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    for name in ["c.json", "c.CT"] {
+        let p = dir.path().join(name);
+        app.table_export(p.to_str().unwrap()).unwrap();
+        let back = app.table_open(p.to_str().unwrap(), false).unwrap().table;
+        assert_eq!((back.entries[0].custom, back.entries[0].custom_name.as_deref()), (Some(be4), Some("4 Byte Big Endian")), "{name}");
+        assert_eq!((back.entries[1].custom, back.entries[1].custom_name.as_deref()), (Some(fixed), Some("fixed")), "{name}");
+    }
+    let ct_text = r#"<?xml version="1.0" encoding="utf-8"?>
+<CheatTable CheatEngineTableVersion="45"><CheatEntries><CheatEntry><ID>7</ID><Description>"odd"</Description>
+<VariableType>Custom</VariableType><CustomType>Mystery Type</CustomType><Address>1000</Address></CheatEntry></CheatEntries>
+<CustomTypes><CustomType><Name>Mystery Type</Name><Script>alloc(x,4)</Script></CustomType></CustomTypes></CheatTable>"#;
+    let p = dir.path().join("odd.CT");
+    std::fs::write(&p, ct_text).unwrap();
+    let back = app.table_open(p.to_str().unwrap(), false).unwrap().table;
+    assert_eq!((back.entries[0].custom, back.entries[0].custom_name.as_deref()), (None, Some("Mystery Type")));
+    assert!(app.table_set_value(&[7], "1").unwrap_err().contains("not supported"));
+    let out = dir.path().join("odd2.CT");
+    app.table_export(out.to_str().unwrap()).unwrap();
+    let text = std::fs::read_to_string(&out).unwrap();
+    assert!(text.contains("<VariableType>Custom</VariableType>") && text.contains("<CustomType>Mystery Type</CustomType>"), "{text}");
+    assert!(text.contains("<Script>alloc(x,4)</Script>"), "table-level <CustomTypes> kept: {text}");
+}
+
+#[test]
+fn binary_scan_with_a_bit_offset() {
+    let t = Target::spawn();
+    let app = App::default();
+    app.open_process(t.child.id()).unwrap();
+    // aob = DE AD BE EF ...: byte 0xAD = 1010_1101; bits 2..5 (from bit 2, 4 bits) = 1011 = 11.
+    let n = first_scan(&app, json!({"vtype": "binary", "scan_type": "exact", "value": "11", "not": false,
+        "opts": {"writable": "yes", "binary_decimal": true, "bit_len": 4, "bit_start": 2}}));
+    assert!(n >= 1);
+    let a = parse_addr(&t.addr("aob")).unwrap() + 1;
+    let row = app.scan_results(0, 100_000, None).unwrap().into_iter().find(|r| r.addr == a).expect("0xAD matched");
+    assert_eq!(row.bit, Some(2));
+}
+
+#[test]
+fn pause_and_resume_a_running_scan() {
+    let t = Target::spawn();
+    let app = App::default();
+    app.open_process(t.child.id()).unwrap();
+    let a2 = app.clone();
+    let h = std::thread::spawn(move || {
+        a2.scan_first(&de(json!({"vtype": "byte", "scan_type": "unknown", "opts": {"alignment": 1, "threads": 1, "priority": "idle", "writable": "any"}})))
+    });
+    let mut paused = false;
+    for _ in 0..2000 {
+        if app.scan_progress().unwrap().running {
+            app.scan_pause(true).unwrap();
+            paused = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    if paused {
+        std::thread::sleep(Duration::from_millis(100));
+        let p1 = app.scan_progress().unwrap();
+        std::thread::sleep(Duration::from_millis(200));
+        let p2 = app.scan_progress().unwrap();
+        assert!(p2.paused && p2.running && p1.done == p2.done, "{p1:?} {p2:?}");
+        app.scan_pause(false).unwrap();
+    } else {
+        eprintln!("scan finished before it could be paused");
+    }
+    assert!(h.join().unwrap().unwrap().count > 0);
+    let p = app.scan_progress().unwrap();
+    assert!(!p.running && !p.paused && !p.spill_dir.is_empty());
+}
+
+#[test]
+fn remote_session_end_to_end_and_connection_drop() {
+    let mut t = Target::spawn();
+    let token = "test-token-0123456789";
+    let server = hh_net::Server::bind("127.0.0.1:0", hh_net::ServerConfig::new(token), std::sync::Arc::new(hh_net::LocalBackend)).unwrap().spawn().unwrap();
+    let addr = server.addr().to_string();
+    let app = App::default();
+    app.start_driver();
+    let cfg = tempfile::tempdir().unwrap();
+    app.set_config_dir(cfg.path());
+    assert!(app.remote_connect(&addr, "wrong-token-0123456789", false).is_err());
+    app.remote_connect(&addr, token, true).unwrap();
+    let file = cfg.path().join("remote.json");
+    use std::os::unix::fs::PermissionsExt;
+    assert_eq!(std::fs::metadata(&file).unwrap().permissions().mode() & 0o777, 0o600);
+    let saved = app.remote_saved().unwrap();
+    assert!(saved.has_token && saved.addr == addr);
+    // Reconnecting with an empty token uses the remembered one; not ticking "remember" drops it.
+    app.remote_connect(&addr, "", false).unwrap();
+    assert!(!app.remote_saved().unwrap().has_token);
+    assert!(!std::fs::read_to_string(&file).unwrap().contains(token));
+
+    let pid = t.child.id();
+    assert!(app.remote_processes().unwrap().iter().any(|p| p.pid == pid));
+    let info = app.remote_open(pid).unwrap();
+    assert_eq!((info.name.as_str(), info.remote.as_deref()), ("hh-target", Some(addr.as_str())));
+    assert!(scan_exact_i32(&app, "123456") >= 1 && has_addr(&app, &t.addr("i32")));
+    app.write_value(&t.addr("i32"), de(json!("4bytes")), "777", &Fmt::default(), None).unwrap();
+    assert_eq!(t.cmd("get")["i32"], 777);
+    assert_eq!(app.read_memory(&t.addr("i32"), 4).unwrap(), "09030000");
+    let offs: Vec<String> = t.info["chain_offsets"].as_array().unwrap().iter().map(|o| o.as_str().unwrap().to_string()).collect();
+    let expr = offs.iter().fold(t.addr("chain"), |x, o| format!("[{x}]+{o}"));
+    assert_eq!(parse_addr(&app.resolve_address(&expr).unwrap()).unwrap(), parse_addr(&t.addr("chain_value")).unwrap());
+    let e = app.debug_attach().unwrap_err();
+    assert!(e.contains("local processes only"), "{e}");
+    assert!(app.module_header("hh-target").unwrap_err().contains("local processes only"));
+    let p = serde_json::to_value(app.lua_poll(0).unwrap()).unwrap();
+    assert_eq!((p["process"]["remote"].as_str(), p["process"]["alive"].as_bool()), (Some(addr.as_str()), Some(true)));
+
+    drop(server);
+    let lost = wait("lost connection seen", || app.lua_poll(0).unwrap().process.and_then(|p| p.lost));
+    assert!(lost.contains("connection to server lost"), "{lost}");
+    let e = app.read_memory(&t.addr("i32"), 4).unwrap_err();
+    assert!(e.contains("connection to server lost"), "{e}");
+    app.close_process().unwrap();
+    assert!(app.lua_poll(0).unwrap().process.is_none());
+    assert!(!app.remote_status().unwrap().unwrap().connected);
+    app.remote_disconnect().unwrap();
+    assert!(app.remote_status().unwrap().is_none());
+    // The local target was never touched by the drop.
+    assert_eq!(t.cmd("get")["i32"], 777);
+}
+
+#[test]
+fn user_labels_resolve_and_survive_a_table_round_trip() {
+    let t = Target::spawn();
+    let app = App::default();
+    app.open_process(t.child.id()).unwrap();
+    let i32a = parse_addr(&t.addr("i32")).unwrap();
+    let base = app.table_get().unwrap().version;
+    let sym = |n: &str, a: &str| heaphook::table::UserSymbol { name: n.into(), address: a.into() };
+    let tb = Table {
+        symbols: vec![sym("hpvar", &t.addr("i32")), sym("after_hp", "hpvar+4")],
+        disasm_comments: vec![heaphook::table::DisasmComment { address: "hpvar".into(), comment: "player health".into() }],
+        ..Table::default()
+    };
+    app.table_put(tb, base).unwrap();
+    assert_eq!(parse_addr(&app.resolve_address("hpvar").unwrap()).unwrap(), i32a);
+    assert_eq!(parse_addr(&app.resolve_address("[after_hp-4]").unwrap()).unwrap(), 123456);
+    assert_eq!(app.resolve_many(&["after_hp".into(), "nosuchlabel".into()]).unwrap(), [Some(format!("{:#x}", i32a + 4)), None]);
+    let dir = tempfile::tempdir().unwrap();
+    for name in ["l.json", "l.CT"] {
+        let p = dir.path().join(name);
+        app.table_export(p.to_str().unwrap()).unwrap();
+        app.table_put(Table::default(), app.table_get().unwrap().version).unwrap();
+        assert!(app.resolve_address("hpvar").is_err(), "dropped with the table");
+        let back = app.table_open(p.to_str().unwrap(), false).unwrap().table;
+        assert_eq!(back.symbols.len(), 2, "{name}");
+        assert_eq!(back.disasm_comments[0].comment, "player health", "{name}");
+        assert_eq!(parse_addr(&app.resolve_address("after_hp").unwrap()).unwrap(), i32a + 4, "{name}");
+    }
+    // A reopened process gets the labels again.
+    app.open_process(t.child.id()).unwrap();
+    assert_eq!(parse_addr(&app.resolve_address("hpvar").unwrap()).unwrap(), i32a);
+}
+
+#[test]
+fn table_with_50k_entries_loads_and_pages() {
+    let t = Target::spawn();
+    let app = App::default();
+    app.open_process(t.child.id()).unwrap();
+    let i32a = parse_addr(&t.addr("i32")).unwrap();
+    let entries: Vec<Entry> = (0..50_000)
+        .map(|i| Entry { id: i + 1, description: format!("entry {i}"), addr: format!("{:#x}", i32a + (i as u64 % 64) * 4), ..Entry::default() })
+        .collect();
+    let dir = tempfile::tempdir().unwrap();
+    let p = dir.path().join("big.json");
+    std::fs::write(&p, serde_json::to_string(&Table { entries, ..Table::default() }).unwrap()).unwrap();
+    let t0 = Instant::now();
+    let st = app.table_open(p.to_str().unwrap(), false).unwrap();
+    let open = t0.elapsed();
+    assert_eq!(st.table.entries.len(), 50_000);
+    let t0 = Instant::now();
+    let got = app.table_get().unwrap();
+    let get = t0.elapsed();
+    let t0 = Instant::now();
+    // The UI resolves and reads one visible page at a time.
+    for page in 0..20 {
+        let rows = &got.table.entries[page * 40..page * 40 + 40];
+        let addrs = app.resolve_many(&rows.iter().map(|e| e.addr.clone()).collect::<Vec<_>>()).unwrap();
+        let vals = app.read_values(de(json!(addrs.iter().map(|a| json!({"addr": a, "vtype": "4bytes"})).collect::<Vec<_>>()))).unwrap();
+        assert!(vals.iter().all(Option::is_some));
+    }
+    let paging = t0.elapsed() / 20;
+    eprintln!("50k table: open {open:?}, table_get {get:?}, one 40-row page (resolve + read) {paging:?}");
+    assert!(open < Duration::from_secs(10) && paging < Duration::from_millis(500));
+}
+
+#[test]
+fn created_and_debugged_process_is_never_reaped_from_under_the_debugger() {
+    let ok = Command::new(env!("CARGO"))
+        .args(["build", "-q", "-p", "heaphook", "--example", "ticker"])
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .status()
+        .unwrap()
+        .success();
+    assert!(ok);
+    let ticker = std::env::current_exe().unwrap().parent().unwrap().parent().unwrap().join("examples/ticker");
+    let dir = tempfile::tempdir().unwrap();
+    let info_file = dir.path().join("info.json");
+    let app = App::default();
+    app.start_driver();
+    let info = app.process_create(&de(json!({"program": ticker.to_str().unwrap(), "args": info_file.to_str().unwrap()}))).unwrap();
+    let tinfo: Value = wait("ticker info", || std::fs::read_to_string(&info_file).ok().and_then(|t| serde_json::from_str(&t).ok()));
+    app.debug_attach().unwrap();
+    let id = app.debug_add_breakpoint(&bp(json!({"addr": tinfo["tick"], "action": "record"}))).unwrap();
+    // Reap as hard as the driver could: every call used to steal the tracee's stops.
+    let t0 = Instant::now();
+    while t0.elapsed() < Duration::from_secs(3) {
+        app.reap_children();
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    let hits = bp_row(&app, id).hits;
+    assert!(hits >= 3, "breakpoint hits {hits}");
+    let hist = app.debug_history().unwrap().join("\n");
+    assert!(!hist.contains("taken by another waitpid") && hist.contains("recoveries=0"), "{hist}");
+    app.debug_detach().unwrap();
+    let ticks = || app.read_values(de(json!([{"addr": tinfo["ticks"], "vtype": "4bytes"}]))).unwrap()[0].clone().unwrap().parse::<i64>().unwrap();
+    let a = ticks();
+    std::thread::sleep(Duration::from_millis(1200));
+    assert!(ticks() > a, "the target runs after detach");
+    let stat = std::fs::read_to_string(format!("/proc/{}/stat", info.pid)).unwrap();
+    assert!(!stat.contains(") Z") && !stat.contains(") t"), "{stat}");
+    app.close_process().unwrap();
+    let _ = Command::new("kill").arg(info.pid.to_string()).status();
+    // Once exited and untraced, the child is reaped.
+    wait("reaped", || {
+        app.reap_children();
+        std::fs::read_to_string(format!("/proc/{}/stat", info.pid)).is_err().then_some(())
+    });
 }

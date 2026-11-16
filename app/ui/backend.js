@@ -34,7 +34,7 @@ export const api = {
   resolveAddress: (expr) => call('resolve_address', { expr }),
   /** req: {vtype, scan_type, value, value2, not, opts} -> {count} */
   scanFirst: (req) => call('scan_first', { req }),
-  /** req: {scan_type, value, value2, not} -> {count} */
+  /** req: {scan_type, value, value2, not, compare_to?: 'first' | saved scan name} -> {count} */
   scanNext: (req) => call('scan_next', { req }),
   scanUndo: () => call('scan_undo', {}),
   scanNew: () => call('scan_new', {}),
@@ -205,6 +205,52 @@ export const api = {
   tableSelect: (ids) => call('table_select', { ids }),
   /** req: {title, about, beep, show_keys, entries: [{id, label, keys}]} -> Lua trainer script */
   trainerScript: (req) => call('trainer_script', { req }),
+
+  // ---------- scanner: saved scans, custom types, pause ----------
+  /** Saves the current results under `name` (also kept for the results' "saved" column) */
+  scanSave: (name) => call('scan_save', { name }),
+  /** -> [{name, count, kept}] (kept = rows whose saved value the results can show) */
+  scanSaved: () => call('scan_saved', {}),
+  scanDeleteSaved: (name) => call('scan_delete_saved', { name }),
+  scanPause: () => call('scan_pause', {}),
+  scanResume: () => call('scan_resume', {}),
+  /** Like scanResults; rows carry `saved` (that saved scan's value at the address, or null) */
+  scanResultsSaved: (offset, limit, saved) => call('scan_results', { offset, limit, saved }),
+  /** -> [{name, size, big_endian, float, signed, scale, offset, bit_start, bit_len, binary}] (Cheat Engine's stock custom types) */
+  customPresets: () => call('custom_presets', {}),
+  /** -> null or the error text of an invalid custom type */
+  customValidate: (custom) => call('custom_validate', { custom }),
+  /** exprs: [address expression] -> [hex addr | null] (one call for many table rows) */
+  resolveMany: (exprs) => call('resolve_many', { exprs }),
+
+  // ---------- remote targets (hh-net) ----------
+  /** -> {addr, has_token} of the remembered server ("" when none) */
+  remoteSaved: () => call('remote_saved', {}),
+  /** token: "" = use the remembered token; remember: store the token (config file, 0600) -> {addr} */
+  remoteConnect: (addr, token, remember) => call('remote_connect', { addr, token, remember }),
+  /** -> {addr, connected} or null when no server is connected */
+  remoteStatus: () => call('remote_status', {}),
+  remoteProcesses: () => call('remote_processes', {}),
+  /** -> {pid, name, is_64bit, remote: addr} */
+  remoteOpen: (pid) => call('remote_open', { pid }),
+  /** Closes the remote process (if it is the target) and the connection */
+  remoteDisconnect: () => call('remote_disconnect', {}),
+  /** Forgets the remembered address and token */
+  remoteForget: () => call('remote_forget', {}),
+
+  // ---------- code, memory, structures, app ----------
+  /** -> {start, name, source: dissection|heuristic} of the function holding addr */
+  codeFunction: (addr) => call('code_function', { addr }),
+  /** -> {start, end, source, rows: [{from, to, kind: call|jump|cond_jump, text, name}]} branch targets of that function */
+  codeTargets: (addr) => call('code_targets', { addr }),
+  /** Live memory against a saved .hhmem file -> [{addr, len, old, new}] */
+  memCompare: (path, max = 10000) => call('mem_compare', { path, max }),
+  /** names: [] = all; .json or .xml/.ct (CE <Structures>) by extension */
+  structExport: (path, names) => call('struct_export', { path, names }),
+  /** -> names of the structures added or replaced */
+  structImport: (path) => call('struct_import', { path }),
+  /** -> {version, license, remote_ok, platform} */
+  appInfo: () => call('app_info', {}),
 };
 
 /** Ask for a file path: native dialog in the app, a text prompt in a browser (mock or bridge). */

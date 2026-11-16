@@ -1,5 +1,6 @@
 //! Command logic behind every IPC command, as plain functions over [`App`]. No Tauri types:
 //! `main.rs` wraps each in a one-line `#[tauri::command]`.
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex, MutexGuard, RwLock, Weak};
@@ -7,7 +8,7 @@ use std::time::Duration;
 
 use hh_asm::{AaError, AaState, SymbolTable};
 use hh_core::{Addr, Memory, Module, Pid, Process, ProcessInfo, Prot, Region, RegionKind};
-use hh_scan::{FirstScan, Fmt, Freezer, FrozenEntry, NextScan, ResultRow, ScanCount, ScanProgress, Scanner, VType, ValueRef};
+use hh_scan::{CustomType, FirstScan, Fmt, Freezer, FrozenEntryEx, NextScanEx, ResultRow, ScanCount, ScanProgress, Scanner, VType, ValueRefEx};
 use serde::{Deserialize, Serialize};
 
 use crate::cheat::Live;
@@ -49,6 +50,8 @@ pub struct Session {
     pub(crate) dbg: Mutex<Option<crate::debug::Dbg>>,
     pub(crate) ptr: crate::ptr::Ptr,
     pub(crate) tools: crate::tools::Tools,
+    /// Saved scan name -> (address -> its value then), for the results' `saved` column.
+    pub(crate) saved: Mutex<HashMap<String, HashMap<Addr, String>>>,
 }
 
 /// A `Process` whose backend can be swapped while scanner, freezer and friends hold it.
@@ -136,6 +139,12 @@ pub struct Shared {
     pub(crate) children: Mutex<Vec<std::process::Child>>,
     /// Whether `{$lua}` in the table's scripts may run (a loaded table must be agreed to).
     pub(crate) trust: Mutex<crate::cheat::Trust>,
+    /// The connected hh-server, if any.
+    pub(crate) remote: Mutex<Option<crate::remote::Conn>>,
+    /// User-defined symbols registered from the table: (table version, session, names).
+    pub(crate) user_syms: Mutex<(u64, usize, Vec<String>)>,
+    /// Frozen values of active custom-typed entries, by entry id.
+    pub(crate) custom_frozen: Mutex<HashMap<i64, String>>,
 }
 
 impl Default for Shared {
@@ -150,6 +159,9 @@ impl Default for Shared {
             driver: AtomicBool::new(false),
             children: Mutex::default(),
             trust: Mutex::default(),
+            remote: Mutex::default(),
+            user_syms: Mutex::default(),
+            custom_frozen: Mutex::default(),
         }
     }
 }
@@ -161,7 +173,56 @@ pub struct Opened {
     pub pid: u32,
     pub name: String,
     pub is_64bit: bool,
+    /// Server address when the process is on an hh-server.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote: Option<String>,
 }
+
+/// A saved scan as the UI lists it.
+#[derive(Debug, Clone, Serialize)]
+pub struct SavedScan {
+    pub name: String,
+    pub count: u64,
+    /// Rows of it the results' `saved` column can show.
+    pub kept: usize,
+}
+
+/// A result row plus the value of a saved scan at its address.
+#[derive(Debug, Clone, Serialize)]
+pub struct ResultOut {
+    #[serde(flatten)]
+    pub row: ResultRow,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub saved: Option<Option<String>>,
+}
+
+/// `scan_progress` plus where result data spills to.
+#[derive(Debug, Clone, Serialize)]
+pub struct ProgressOut {
+    #[serde(flatten)]
+    pub p: ScanProgress,
+    pub spilled: u64,
+    pub spill_dir: String,
+}
+
+impl std::ops::Deref for ResultOut {
+    type Target = ResultRow;
+    fn deref(&self) -> &ResultRow {
+        &self.row
+    }
+}
+
+impl std::ops::Deref for ProgressOut {
+    type Target = ScanProgress;
+    fn deref(&self) -> &ScanProgress {
+        &self.p
+    }
+}
+
+/// Rows of a saved scan whose value is kept for the results' `saved` column.
+/// shortcut: hh-scan cannot read a saved scan's value by address, so the app copies up to
+/// this many rows when saving; upgrade when the scanner exposes saved values.
+const SAVED_KEEP: usize = 200_000;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct RegionOut {
@@ -221,6 +282,10 @@ impl App {
         *lock(&self.x.settings) = s;
     }
 
+    pub(crate) fn config_dir(&self) -> Option<PathBuf> {
+        lock(&self.x.config).clone()
+    }
+
     pub fn settings_get(&self) -> R<Settings> {
         Ok(lock(&self.x.settings).clone())
     }
@@ -247,6 +312,7 @@ impl App {
         }
         if let Ok(sess) = self.session() {
             sess.freezer.set_interval(Duration::from_millis(s.freeze_interval_ms));
+            sess.scanner.set_spill_dir(spill_dir(s));
         }
     }
 
@@ -257,20 +323,28 @@ impl App {
     /// Attaches to `pid`; the previous process's scan, frozen set and symbols are dropped.
     pub fn open_process(&self, pid: u32) -> R<Opened> {
         let raw = hh_core::open(pid).map_err(s)?;
-        let switch = Arc::new(Switch(RwLock::new(raw.clone())));
-        let proc: Arc<dyn Process> = switch.clone();
         let name = hh_core::list_processes()
             .ok()
             .and_then(|l| l.into_iter().find(|p| p.pid == pid))
             .map_or_else(|| pid.to_string(), |p| p.name);
-        let info = Opened { pid, name, is_64bit: proc.pointer_size() == 8 };
+        self.install_process(raw, pid, name, None)
+    }
+
+    /// Makes `raw` the target (local or remote).
+    pub(crate) fn install_process(&self, raw: Arc<dyn Process>, pid: u32, name: String, remote: Option<String>) -> R<Opened> {
+        let switch = Arc::new(Switch(RwLock::new(raw.clone())));
+        let proc: Arc<dyn Process> = switch.clone();
+        let info = Opened { pid, name, is_64bit: proc.pointer_size() == 8, remote };
         let mem: Arc<dyn Memory> = proc.clone();
         let freezer = Freezer::new(mem).map_err(s)?;
         freezer.set_interval(Duration::from_millis(lock(&self.x.settings).freeze_interval_ms));
         let syms = self.x.lua.engine.symbols();
         *lock(&syms) = SymbolTable::default();
+        let scanner = Arc::new(Scanner::new(proc.clone()));
+        scanner.set_spill_dir(spill_dir(&lock(&self.x.settings)));
         let sess = Session {
-            scanner: Arc::new(Scanner::new(proc.clone())),
+            saved: Mutex::default(),
+            scanner,
             freezer,
             proc: proc.clone(),
             switch,
@@ -345,6 +419,7 @@ impl App {
                     buf[pos..pos + n].iter().for_each(|b| out.push_str(&format!("{b:02x}")));
                     pos += n;
                 }
+                Err(hh_core::Error::Io(e)) if e.kind() == std::io::ErrorKind::ConnectionAborted => return Err(s(e)),
                 _ => {
                     let skip = ((4096 - at % 4096) as usize).min(len - pos);
                     out.push_str(&"??".repeat(skip));
@@ -364,20 +439,52 @@ impl App {
         hh_asm::write_code(&*self.session()?.proc, parse_addr(addr)?, &data).map_err(s)
     }
 
-    pub fn read_values(&self, mut reqs: Vec<ValueRef>) -> R<Vec<Option<String>>> {
+    pub fn read_values(&self, mut reqs: Vec<ValueRefEx>) -> R<Vec<Option<String>>> {
         // The UI sends len 0 for "default length".
-        reqs.iter_mut().filter(|r| r.fmt.len == Some(0)).for_each(|r| r.fmt.len = None);
-        Ok(hh_scan::read_values(&*self.session()?.proc, &reqs))
+        reqs.iter_mut().filter(|r| r.r.fmt.len == Some(0)).for_each(|r| r.r.fmt.len = None);
+        Ok(hh_scan::read_values_ex(&*self.session()?.proc, &reqs))
     }
 
     /// Integers accept a `0x` prefix (hex-displayed entries); `fmt` carries the entry's
-    /// `utf16` / `hex` / `signed` / `len` flags; see `hh_scan::parse_value`.
-    pub fn write_value(&self, addr: &str, vtype: VType, value: &str, fmt: &Fmt) -> R<()> {
-        hh_scan::write_value(&*self.session()?.proc, parse_addr(addr)?, vtype, value, fmt).map_err(s)
+    /// `utf16` / `hex` / `signed` / `len` flags; see `hh_scan::parse_value`. `custom`
+    /// overrides `vtype`.
+    pub fn write_value(&self, addr: &str, vtype: VType, value: &str, fmt: &Fmt, custom: Option<&CustomType>) -> R<()> {
+        let p = self.session()?.proc.clone();
+        match custom {
+            Some(ct) => hh_scan::write_custom(&*p, parse_addr(addr)?, ct, value, fmt),
+            None => hh_scan::write_value(&*p, parse_addr(addr)?, vtype, value, fmt),
+        }
+        .map_err(s)
+    }
+
+    /// One call for many expressions (table rows); `None` where one does not resolve.
+    pub fn resolve_many(&self, exprs: &[String]) -> R<Vec<Option<String>>> {
+        self.session()?;
+        Ok(exprs.iter().map(|e| self.resolve_address(e).ok()).collect())
+    }
+
+    pub fn custom_presets(&self) -> R<Vec<serde_json::Value>> {
+        Ok(CUSTOM_PRESETS
+            .iter()
+            .filter_map(|n| {
+                let mut v = serde_json::to_value(CustomType::preset(n)?).ok()?;
+                v["name"] = (*n).into();
+                Some(v)
+            })
+            .collect())
+    }
+
+    pub fn custom_validate(&self, ct: &CustomType) -> R<Option<String>> {
+        Ok(ct.validate().err().map(s))
+    }
+
+    pub fn app_info(&self) -> R<serde_json::Value> {
+        Ok(serde_json::json!({"version": env!("CARGO_PKG_VERSION"), "license": "Apache-2.0", "platform": std::env::consts::OS}))
     }
 
     pub fn resolve_address(&self, expr: &str) -> R<String> {
         let sess = self.session()?;
+        self.sync_user_symbols(&sess);
         let syms = lock(&sess.syms).clone();
         match hh_asm::resolve_address(&*sess.proc, &syms, expr) {
             Ok(a) => Ok(hex_addr(a)),
@@ -398,8 +505,47 @@ impl App {
         self.session()?.scanner.first_scan(req).map_err(s)
     }
 
-    pub fn scan_next(&self, req: &NextScan) -> R<ScanCount> {
-        self.session()?.scanner.next_scan(req).map_err(s)
+    pub fn scan_next(&self, req: &NextScanEx) -> R<ScanCount> {
+        self.session()?.scanner.next_scan_ex(req).map_err(s)
+    }
+
+    pub fn scan_save(&self, name: &str) -> R<()> {
+        let sess = self.session()?;
+        sess.scanner.save_scan(name).map_err(s)?;
+        let n = (sess.scanner.count() as usize).min(SAVED_KEEP);
+        let mut kept = HashMap::with_capacity(n);
+        let mut off = 0;
+        while off < n {
+            let rows = sess.scanner.results(off as u64, 4096.min(n - off)).map_err(s)?;
+            if rows.is_empty() {
+                break;
+            }
+            off += rows.len();
+            kept.extend(rows.into_iter().map(|r| (r.addr, r.value.unwrap_or(r.previous))));
+        }
+        lock(&sess.saved).insert(name.trim().to_string(), kept);
+        Ok(())
+    }
+
+    pub fn scan_saved(&self) -> R<Vec<SavedScan>> {
+        let sess = self.session()?;
+        let mut kept = lock(&sess.saved);
+        let names = sess.scanner.saved_scans();
+        // The scanner drops saved scans on a new or first scan; follow it.
+        kept.retain(|k, _| names.contains(k));
+        Ok(names.into_iter().map(|n| SavedScan { count: kept.get(&n).map_or(0, |m| m.len() as u64), kept: kept.get(&n).map_or(0, HashMap::len), name: n }).collect())
+    }
+
+    pub fn scan_delete_saved(&self, name: &str) -> R<()> {
+        let sess = self.session()?;
+        lock(&sess.saved).remove(name.trim());
+        sess.scanner.delete_saved_scan(name).map_err(s)
+    }
+
+    pub fn scan_pause(&self, pause: bool) -> R<()> {
+        let sess = self.session()?;
+        if pause { sess.scanner.pause() } else { sess.scanner.resume() }
+        Ok(())
     }
 
     pub fn scan_undo(&self) -> R<()> {
@@ -418,20 +564,30 @@ impl App {
         Ok(())
     }
 
-    pub fn scan_progress(&self) -> R<ScanProgress> {
-        Ok(self.session().map(|s| s.scanner.progress()).unwrap_or_default())
+    pub fn scan_progress(&self) -> R<ProgressOut> {
+        let sess = self.session().ok();
+        Ok(ProgressOut {
+            p: sess.as_ref().map(|s| s.scanner.progress()).unwrap_or_default(),
+            spilled: sess.as_ref().map_or(0, |s| s.scanner.spilled_bytes()),
+            spill_dir: spill_dir_text(&lock(&self.x.settings)),
+        })
     }
 
-    pub fn scan_results(&self, offset: u64, limit: usize) -> R<Vec<ResultRow>> {
-        self.session()?.scanner.results(offset, limit).map_err(s)
+    pub fn scan_results(&self, offset: u64, limit: usize, saved: Option<&str>) -> R<Vec<ResultOut>> {
+        let sess = self.session()?;
+        let rows = sess.scanner.results(offset, limit).map_err(s)?;
+        let kept = lock(&sess.saved);
+        let m = saved.filter(|n| !n.is_empty()).map(|n| kept.get(n.trim()).ok_or_else(|| format!("no saved scan {n:?}"))).transpose()?;
+        Ok(rows.into_iter().map(|row| ResultOut { saved: m.map(|m| m.get(&row.addr).cloned()), row }).collect())
     }
 
-    pub fn set_frozen(&self, entries: &[FrozenEntry]) -> R<()> {
-        self.session()?.freezer.set(entries).map_err(s)
+    pub fn set_frozen(&self, entries: &[FrozenEntryEx]) -> R<()> {
+        self.session()?.freezer.set_ex(entries).map_err(s)
     }
 
     pub fn disassemble(&self, addr: &str, count: usize) -> R<Vec<DisasmOut>> {
         let sess = self.session()?;
+        self.sync_user_symbols(&sess);
         let syms = lock(&sess.syms).clone();
         let lines = hh_asm::disassemble(&*sess.proc, &syms, parse_addr(addr)?, count.min(MAX_DISASM)).map_err(s)?;
         let mut xr = self.xref_counts(&lines.iter().map(|l| l.addr).collect::<Vec<_>>()).map(Vec::into_iter);
@@ -485,11 +641,59 @@ impl App {
         r.map_err(s)
     }
 
+    /// Registers the table's user-defined symbols (CE `UserdefinedSymbols`) in the session's
+    /// symbol table when the table or the process changed; names it registered before and
+    /// the table dropped are unregistered.
+    pub(crate) fn sync_user_symbols(&self, sess: &Arc<Session>) {
+        let ver = self.x.live.version();
+        let key = Arc::as_ptr(sess) as usize;
+        let mut g = lock(&self.x.user_syms);
+        if g.0 == ver && g.1 == key {
+            return;
+        }
+        let syms = self.x.live.state().table.symbols;
+        let mut work = lock(&sess.syms).clone();
+        if g.1 == key {
+            for n in &g.2 {
+                work.unregister(n);
+            }
+        }
+        let mut names = Vec::new();
+        // Later symbols may use earlier ones.
+        for u in syms {
+            if let Ok(a) = hh_asm::resolve_address(&*sess.proc, &work, &u.address) {
+                work.register(&u.name, a);
+                names.push(u.name);
+            }
+        }
+        *lock(&sess.syms) = work;
+        *g = (ver, key, names);
+    }
+
     pub fn table_load(&self, path: &str) -> R<Table> {
         table::load(Path::new(path))
     }
 
     pub fn table_save(&self, path: &str, table: TableIn) -> R<()> {
         table::save(Path::new(path), &table.into())
+    }
+}
+
+/// Cheat Engine's stock custom type names, as `CustomType::preset` knows them.
+const CUSTOM_PRESETS: &[&str] = &["2 Byte Big Endian", "4 Byte Big Endian", "8 Byte Big Endian", "Float Big Endian", "Double Big Endian", "3 Byte", "3 Byte Big Endian"];
+
+fn spill_dir(s: &Settings) -> Option<PathBuf> {
+    (!s.scan_spill_dir.is_empty()).then(|| PathBuf::from(&s.scan_spill_dir))
+}
+
+/// Where spill files go, as the UI shows it.
+/// shortcut: mirrors hh-scan's private `spill_dir` choice in words; upgrade when it is public.
+fn spill_dir_text(s: &Settings) -> String {
+    match spill_dir(s) {
+        Some(d) => d.display().to_string(),
+        None => match std::env::var_os("HEAPHOOK_TMPDIR").filter(|d| !d.is_empty()) {
+            Some(d) => PathBuf::from(d).display().to_string(),
+            None => format!("{} (or /var/tmp, ~/.cache/heaphook when that is in RAM)", std::env::temp_dir().display()),
+        },
     }
 }

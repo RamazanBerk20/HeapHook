@@ -13,6 +13,7 @@ hh-ptr.workspace = true
 hh-lua.workspace = true
 hh-tools.workspace = true
 hh-inject.workspace = true
+hh-net.workspace = true
 # Same version and features as hh-lua (already in the tree): host code reads Lua globals.
 mlua = { version = "0.12", features = ["lua53", "vendored", "send"] }
 iced-x86 = { version = "1.21", default-features = false, features = ["std", "decoder", "encoder", "intel", "op_code_info"] }

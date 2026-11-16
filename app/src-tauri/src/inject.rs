@@ -88,15 +88,33 @@ impl App {
 
     /// Children we launched are reaped here so they do not linger as zombies.
     fn keep_child(&self, c: Child) {
-        let mut g = lock(&self.x.children);
-        g.retain_mut(|c| !matches!(c.try_wait(), Ok(Some(_))));
-        g.push(c);
+        self.reap_children();
+        lock(&self.x.children).push(c);
     }
 
+    /// Reaps launched children that exited. A child the debugger traces is never waited on:
+    /// `waitpid` on a tracee takes the ptrace stops the debugger thread must see. The
+    /// session's debugger lock is held throughout, so no attach can start in between; the
+    /// traced child is reaped on a later call, after detach. Only a real exit drops a
+    /// `Child` (`try_wait` on an untraced child reports nothing else).
+    pub fn reap_children(&self) {
+        let sess = self.session().ok();
+        let dbg = sess.as_ref().map(|s| lock(&s.dbg));
+        let traced = sess.as_ref().filter(|_| dbg.as_ref().is_some_and(|d| d.is_some())).map(|s| s.info.pid);
+        lock(&self.x.children).retain_mut(|c| Some(c.id()) == traced || !matches!(c.try_wait(), Ok(Some(_))));
+        drop(dbg);
+    }
+
+    /// Kills a launched child that is not (or no longer) the debugged target and reaps it.
     fn kill_child(&self, pid: u32) {
-        let mut g = lock(&self.x.children);
-        if let Some(i) = g.iter().position(|c| c.id() == pid) {
-            let mut c = g.remove(i);
+        if self.session().is_ok_and(|s| s.info.pid == pid && lock(&s.dbg).is_some()) {
+            let _ = self.debug_detach();
+        }
+        let c = {
+            let mut g = lock(&self.x.children);
+            g.iter().position(|c| c.id() == pid).map(|i| g.remove(i))
+        };
+        if let Some(mut c) = c {
             let _ = c.kill();
             let _ = c.wait();
         }

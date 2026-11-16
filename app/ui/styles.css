@@ -126,7 +126,7 @@ input[type=checkbox] { accent-color: var(--text); margin: 0; width: 14px; height
 .check { display: inline-flex; align-items: center; gap: 6px; font-size: var(--fs-sm); color: var(--text-2); cursor: pointer; }
 
 .badge {
-  display: inline-block; padding: 2px 7px; border-radius: 999px; font-size: 10px; font-weight: 600;
+  display: inline-block; padding: 2px var(--s2); border-radius: 999px; font-size: 10px; font-weight: 600;
   letter-spacing: 0.06em; text-transform: uppercase; line-height: 14px; white-space: nowrap;
 }
 .badge.yellow { background: var(--yellow-bg); color: var(--yellow); }
@@ -194,7 +194,7 @@ main { min-height: 0; min-width: 0; padding: var(--gap); }
 .dv-y::after { left: 40%; right: 40%; top: 2px; height: 2px; }
 
 /* ---------- virtual list (results) ---------- */
-.cols-res { display: grid; grid-template-columns: minmax(124px, 1.15fr) 1fr 1fr 1fr; }
+.cols-res { display: grid; grid-template-columns: var(--res-cols, minmax(124px, 1.15fr) 1fr 1fr 1fr); }
 .vl-head, .tbl-head {
   flex: none; height: 26px; align-items: center; padding: 0 var(--s3); gap: var(--s2);
   font-size: var(--fs-xs); color: var(--muted); border-bottom: var(--line); background: var(--canvas-2);
@@ -207,7 +207,7 @@ main { min-height: 0; min-width: 0; padding: var(--gap); }
   padding: 0 var(--s3); font: var(--fs-sm)/1 var(--font-mono); font-variant-numeric: tabular-nums; color: var(--text-2);
   cursor: default; white-space: nowrap;
 }
-.vl-rows.cols-res > .vl-row { grid-template-columns: minmax(124px, 1.15fr) 1fr 1fr 1fr; }
+.vl-rows.cols-res > .vl-row { grid-template-columns: var(--res-cols, minmax(124px, 1.15fr) 1fr 1fr 1fr); }
 .vl-row > span, .trow > span { overflow: hidden; text-overflow: ellipsis; }
 .vl-row:hover { background: var(--hover); }
 .vl-row[aria-selected=true] { background: var(--blue-bg); }
@@ -724,3 +724,95 @@ textarea.lf-memo { padding: 4px 6px; resize: none; line-height: 17px; font-famil
 .lf-pages { position: absolute; left: 0; right: 0; top: 28px; bottom: 0; }
 .lf-sheet { position: absolute; inset: 0; }
 .lf-unknown { border: 1px dashed var(--border); border-radius: var(--r); }
+
+/* ---------- busy indicator (util.js busy()) ---------- */
+.busy { display: inline-flex; align-items: center; gap: var(--s2); font-size: var(--fs-sm); color: var(--muted); white-space: nowrap; }
+.busy .btn { height: 24px; }
+.spin { width: 12px; height: 12px; border-radius: 50%; border: 2px solid var(--border); border-top-color: var(--text); animation: spin 0.8s linear infinite; }
+@keyframes spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) { .spin { border-top-color: var(--muted); } }
+
+/* ---------- scanner 1.0: custom/binary/all options, saved scans, results diff ---------- */
+.field-inline { display: inline-flex; align-items: center; gap: 6px; font-size: var(--fs-sm); color: var(--text-2); white-space: nowrap; }
+.field-inline input.num { height: 26px; width: 64px; }
+.opt-row { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 14px; }
+#opt-string select:disabled { opacity: 0.6; }
+.saved-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 1px; font-size: var(--fs-sm); }
+.saved-list li { display: grid; grid-template-columns: minmax(0, 1fr) auto 28px; align-items: center; gap: var(--s2); min-height: 28px; }
+.saved-list li.muted { display: block; font-size: var(--fs-xs); }
+.saved-list .name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text); }
+.saved-list .mono { font-size: var(--fs-xs); }
+#scan-spill { word-break: break-all; }
+.res-saved { margin-left: var(--s2); font-size: var(--fs-xs); color: var(--muted); }
+.res-saved select { max-width: 180px; }
+#results { position: relative; }
+#res-empty { position: absolute; top: 72px; left: 0; right: 0; pointer-events: none; padding: var(--s5) var(--s4); }
+.c-bit { text-align: right; color: var(--muted); }
+.vl-row .c-saved { color: var(--muted); }
+.vl-row .c-saved.chg { color: var(--yellow); background: var(--yellow-bg); margin: 0 -4px; padding: 0 4px; border-radius: var(--r-sm); line-height: 18px; }
+
+/* ---------- remote targets, picker, ptrace help, About ---------- */
+.remote-badge { border: 0; cursor: pointer; font-family: var(--font-mono); text-transform: none; letter-spacing: 0; max-width: 220px; overflow: hidden; text-overflow: ellipsis; }
+.remote-badge:hover { box-shadow: inset 0 0 0 1px var(--blue); }
+.dbg-btn:disabled { opacity: 0.55; cursor: not-allowed; }
+.dlg-head .toolbar { display: flex; align-items: center; gap: 2px; }
+.proc-list.has-title .proc { grid-template-columns: 64px minmax(120px, 0.7fr) minmax(0, 1fr) minmax(0, 1fr) auto; }
+.proc .title { color: var(--text-2); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+#proc-empty.err { color: var(--red); }
+.pt-cmd { flex: 1; min-width: 0; padding: 6px 8px; font-size: var(--fs-xs); background: var(--canvas-2); border: var(--line); border-radius: var(--r); overflow-x: auto; white-space: nowrap; }
+.about-list { display: grid; grid-template-columns: auto 1fr; gap: 4px var(--s3); margin: 0; font-size: var(--fs-sm); }
+.about-list dt { color: var(--muted); }
+.about-list dd { margin: 0; color: var(--text); }
+.remote-badge { flex: none; }
+@media (max-width: 1100px) { .remote-badge .ra { display: none; } .proc-btn { min-width: 110px; } }
+@media (max-width: 1000px) { .topbar { gap: var(--s1); padding: 0 var(--s2); } }
+
+/* F2 additions: merge into styles.css (then drop the runtime <link> in memview.js). */
+
+/* ---------- cheat table: virtualized body ---------- */
+.tbl-body { position: relative; contain: strict; }
+.tbl-spacer { width: 1px; }
+.tbl-layer { position: absolute; top: 0; left: 0; right: 0; will-change: transform; }
+.hk-warn { margin: -2px 0 4px; font-size: var(--fs-xs); color: var(--yellow); }
+.lb-head, .lb-row { display: grid; grid-template-columns: minmax(120px, 1fr) minmax(160px, 1.4fr) 128px 28px; gap: var(--s2); align-items: center; }
+.lb-head { font-size: var(--fs-xs); color: var(--muted); margin-top: var(--s2); }
+.lb-rows { display: flex; flex-direction: column; gap: 4px; margin: 4px 0 var(--s2); max-height: 50vh; overflow: auto; }
+.lb-res { font-size: var(--fs-xs); overflow: hidden; text-overflow: ellipsis; }
+.hint.err { color: var(--red); }
+
+/* ---------- memory viewer ---------- */
+.da-row .tk-imm { color: var(--green); }
+.da-row .tk-kw { color: var(--muted); }
+.da-row .tk-mem { color: var(--text); }
+.da-row .tk-reg { color: inherit; }
+.da-row.da-label > .c-addr, .da-row.da-label > .c-bytes, .da-row.da-label > .c-cmt { display: none; }
+.da-row.da-label > .c-text { grid-column: 1 / -1; font-weight: 600; color: var(--text); }
+.da-row.da-label:hover { background: transparent; }
+.da-row .da-ucmt { color: var(--text-2); font-style: italic; }
+.da-list.mv-dim { display: none; }
+.mv-msg { flex: 1; line-height: 1.7; }
+.mv-msg b { color: var(--text); }
+.mv-msg.mv-strip { flex: none; padding: var(--s2) var(--s3); border-top: 1px solid var(--hairline); text-align: left; }
+.hx-status {
+  flex: none; height: 22px; line-height: 22px; padding: 0 var(--s3); border-top: 1px solid var(--hairline);
+  font-size: var(--fs-xs); color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.hx-status.err { color: var(--red); }
+.hx-bytes[data-u="1"] .hb:nth-child(8n):not(:last-child) { margin-right: 0.8ch; }
+
+/* ---------- structure dissector ---------- */
+.st-lock {
+  height: 18px; padding: 0 6px; margin-left: 4px; border: var(--line); border-radius: 999px; background: transparent;
+  font: 500 10px var(--font-ui); color: var(--muted); cursor: pointer;
+}
+.st-lock:hover { color: var(--text); background: var(--hover); }
+.st-lock[aria-pressed=true] { background: var(--blue-bg); color: var(--blue); border-color: transparent; }
+.st-val.chg { color: var(--red); background: var(--red-bg); border-radius: var(--r-sm); padding: 0 4px; margin: 0 -4px; line-height: 18px; }
+#st-hilite[aria-pressed=true] { background: var(--surface); color: var(--text); box-shadow: inset 0 0 0 1px var(--border); }
+.vl-viewport + .empty kbd, .empty kbd { margin: 0 1px; }
+/* the hex toolbar gained two selects: drop key hints first when narrow */
+@media (max-width: 1180px) { #hex-pane .panel-head .toolbar kbd, #hex-pane .panel-head .hints { display: none; } }
+/* A remote target's badge needs room: the view tabs keep their names, their key hints go to the tooltips (and F1). */
+@media (max-width: 2200px) {
+  .topbar:has(#remote-badge:not([hidden])) .tabs kbd { display: none; }
+}
