@@ -307,8 +307,15 @@ Trust is decided by origin, never by content, and the engine fails closed.
   principal is consented, or after `table_trust_entries` for the record itself. The user's own
   code adds nothing; in a clean interpreter what Lua creates is the user's own. When any
   principal in the set loses consent (or its entry is deleted), the interpreter is reset.
-- **Finalizers.** Scripts cannot install `__gc`. A discarded interpreter in which only the user's
-  own Lua ran is closed; any other is parked unclosed (its host functions refuse, it cannot run
+- **Finalizers.** Scripts cannot install `__gc`: the prelude's `setmetatable` refuses it, and
+  every metatable a script can reach from a library value (files, strings, host userdata) is
+  locked when the interpreter is created (`getmetatable` returns false, `setmetatable` on it
+  errors, and the files' `__index` is a table of their methods, not the metatable). Scripts can
+  still replace functions in the `string` or `io` tables (and so change string methods), which
+  lasts until Lua restarts. A state found at a reset with a Lua function as a library
+  finalizer is never closed. A discarded interpreter in which only the user's own Lua ran is
+  closed on the reaper thread (files flushed and closed; `io.popen` children not waited for);
+  any other is parked unclosed (its host functions refuse, it cannot run
   again). At most `max_parked` (16) are parked, `max_parked_bytes` (512 MiB) in all; beyond that
   the oldest is closed after the `__gc` / `__close` of its `FILE*` metatable are removed (open
   files and `io.popen` pipes are leaked, never flushed, closed or waited for) and its allocator

@@ -78,7 +78,9 @@ local rawprint = print
 local function mark() marks = marks + 1 rawprint('poison') end
 local raw_tostring = tostring
 tostring = function(...) mark() return raw_tostring(...) end
-getmetatable('').__index = function(s, k) mark() return string[k] end
+-- The string metatable is locked: replacing its __index is refused.
+assert(not pcall(function() getmetatable('').__index = function(s, k) mark() return string[k] end end))
+string.upper = function(s) mark() return s end
 function debugger_onBreakpoint() mark() return 1 end
 function onOpenProcess() mark() end
 package.loaded.string = { format = function() mark() return '' end }
@@ -262,4 +264,81 @@ fn the_cap_closes_the_oldest_and_its_host_functions_refuse() {
     // Closes run on the reaper thread: give them time before looking.
     std::thread::sleep(std::time::Duration::from_millis(300));
     assert!(rec.out.lock().unwrap().is_empty(), "a closed state's finalizer reached the host: {:?}", rec.out.lock().unwrap());
+}
+
+/// No metatable a script can reach is handed out: library values (files, strings, every
+/// other type, host userdata and errors) give false or nil from `getmetatable`, the `FILE*`
+/// metatable is not reachable through `__index` either, and a finalizer cannot be put on it.
+#[test]
+fn library_metatables_are_locked() {
+    let (e, _p, _rec, _ui, _dbg) = setup();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("f.txt");
+    let marker = dir.path().join("fin");
+    let code = format!(
+        r#"
+        local f = io.open({path:?}, 'w')
+        local p = io.popen('true')
+        local okaa, aa = autoAssemble('[ENABLE]\n[DISABLE]\n')
+        local _, herr = pcall(readInteger, {{}})
+        local vals = {{ io.stdout, io.stdin, io.stderr, f, p, '', 'x', 1, 1.5, true, false, nil, print, readInteger,
+          coroutine.create(function() end), coroutine.running(), string, io, os, table, math, coroutine, package, utf8,
+          package.loaded, type(aa) == 'table' and rawget(aa, '__state') or nil, herr, io.lines }}
+        local bad = {{}}
+        for i = 1, 28 do
+          local m = getmetatable(vals[i])
+          if type(m) == 'table' then bad[#bad + 1] = i .. ':' .. type(vals[i]) end
+        end
+        -- The FILE* metatable is not the files' __index any more; nothing to write a __gc into.
+        local idx = {{ type(io.stdout.__index), type(f.__index), type(f.__gc), type(f.__metatable), type(('').__index) }}
+        local w = function() local h = io.open({marker:?}, 'a') h:write('ran') h:close() end
+        local r = {{}}
+        r[#r + 1] = tostring(pcall(function() getmetatable(io.stdout).__gc = w end))
+        r[#r + 1] = tostring(pcall(function() rawset(getmetatable(io.stdout), '__gc', w) end))
+        r[#r + 1] = tostring(pcall(function() io.stdout.__index.__gc = w end))
+        r[#r + 1] = tostring(pcall(function() io.stdout.__gc = w end))
+        r[#r + 1] = tostring(pcall(function() getmetatable('').__index = {{}} end))
+        r[#r + 1] = tostring(pcall(function() getmetatable('').__gc = w end))
+        r[#r + 1] = tostring(pcall(setmetatable, io.stdout, {{}}))
+        r[#r + 1] = tostring(pcall(setmetatable, '', {{}}))
+        r[#r + 1] = tostring(debug.setmetatable) .. tostring(debug.getmetatable) .. tostring(debug.getregistry) .. tostring(debug.getuservalue)
+        f:close() p:close()
+        for _ = 1, 3 do io.open({path:?}, 'r') end
+        collectgarbage('collect') collectgarbage('collect')
+        return table.concat(bad, ','), table.concat(idx, ','), table.concat(r, ','), okaa
+        "#
+    );
+    let out = e.exec(&code, "probe").unwrap();
+    assert_eq!(out[0], "", "values with a reachable metatable: {}", out[0]);
+    assert_eq!(out[1], "nil,nil,nil,nil,nil", "__index / __gc / __metatable reachable through a value");
+    assert_eq!(out[2], "false,false,false,false,false,false,false,false,nilnilnilnil", "{out:?}");
+    assert_eq!(out[3], "true");
+    assert!(!marker.exists(), "a Lua finalizer ran");
+    // And across a reset (the old state's files are closed then).
+    e.add_owners(&[hh_lua::Owner::Table(77)]);
+    e.reset().unwrap();
+    e.reset().unwrap();
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(!marker.exists(), "a Lua finalizer ran at the reset");
+}
+
+/// Locking changes nothing for scripts: string methods and file I/O work as before.
+#[test]
+fn string_methods_and_file_io_still_work() {
+    let (e, _p, _rec, _ui, _dbg) = setup();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("io.txt");
+    let code = format!(
+        r#"
+        local f = assert(io.open({path:?}, 'w')) f:write('a\nb\n') f:close()
+        local g = assert(io.open({path:?}, 'r')) local all = g:read('a') g:close()
+        local n = 0 local h = io.open({path:?}) for l in h:lines() do n = n + 1 end h:close()
+        local m = 0 for l in io.lines({path:?}) do m = m + #l end
+        local p = io.popen('echo hi') local o = p:read('l') local st = p:close()
+        local s = ('x'):upper() .. ('%d'):format(7) .. ('abc'):sub(2) .. #('xyz'):rep(2) .. string.format('%s', 'q')
+        return s, all, n, m, o, tostring(st), io.type(f), io.type(io.stdout), tostring(io.stdout):sub(1, 4)
+        "#
+    );
+    let out = e.exec(&code, "io").unwrap();
+    assert_eq!(out, ["X7bc6q", "a\nb\n", "2", "2", "hi", "true", "closed file", "file", "file"]);
 }

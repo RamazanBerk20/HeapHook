@@ -3299,7 +3299,24 @@ fn fuzz_maker(marker: &std::path::Path) -> String {
 
 /// A table script that leaves a global behind: `tostring` writing `T` to the marker.
 fn fuzz_table_script(marker: &std::path::Path) -> String {
-    format!("local t, o = tostring, io.open\ntostring = function(...) local f = o({:?}, 'a') f:write('T\\n') f:close() return t(...) end", marker.to_str().unwrap())
+    format!(
+        "{}local t, o = tostring, io.open\ntostring = function(...) local f = o({:?}, 'a') f:write('T\\n') f:close() return t(...) end",
+        fuzz_tamper(marker),
+        marker.to_str().unwrap()
+    )
+}
+
+/// Tries to put a Lua finalizer on library metatables (each attempt must fail); a finalizer
+/// that ran would write the `fin` file next to the marker.
+fn fuzz_tamper(marker: &std::path::Path) -> String {
+    let fin = marker.with_file_name("fin");
+    format!(
+        "do local o, p = io.open, {:?} local w = function() local f = o(p, 'a') f:write('fin') f:close() end\n\
+         pcall(function() getmetatable(io.stdout).__gc = w end) pcall(function() io.stdout.__index.__gc = w end)\n\
+         pcall(function() rawset(getmetatable(''), '__gc', w) end) pcall(function() getmetatable('').__index = {{}} end)\n\
+         local h = io.open(p .. 'x', 'w') h = nil collectgarbage('collect') end\n",
+        fin.to_str().unwrap()
+    )
 }
 
 fn fuzz_entries(r: &mut Rng, tag: &str, marker: &std::path::Path) -> Vec<Entry> {
@@ -3349,6 +3366,9 @@ fn fuzz_run(env: &FuzzEnv, ops: &[(FuzzOp, u64)]) -> Result<(), (usize, String)>
     let mut m = Model::default();
     let (mut ran, mut ran_t) = (0usize, 0usize);
     for (step, &(op, word)) in ops.iter().enumerate() {
+        if marker.with_file_name("fin").exists() {
+            return Err((step, "a Lua finalizer put on a library metatable ran".into()));
+        }
         let mut r = Rng(word | 1);
         let before = live_ids(&app);
         let file = |r: &mut Rng, name: &str, script: bool| {
@@ -3681,7 +3701,8 @@ fn fuzz_run(env: &FuzzEnv, ops: &[(FuzzOp, u64)]) -> Result<(), (usize, String)>
                         fuzz_script(&marker)
                     ),
                     _ => format!(
-                        "function mk() local r = getAddressList().createMemoryRecord() r.Type = vtAutoAssembler r.Script = {s:?} end\nlocal m = getAddressList().createMemoryRecord() m.Type = vtAutoAssembler m.Script = {s:?}",
+                        "{t}function mk() local r = getAddressList().createMemoryRecord() r.Type = vtAutoAssembler r.Script = {s:?} end\nlocal m = getAddressList().createMemoryRecord() m.Type = vtAutoAssembler m.Script = {s:?}",
+                        t = fuzz_tamper(&marker),
                         s = fuzz_script(&marker)
                     ),
                 };
@@ -3763,6 +3784,12 @@ fn fuzz_run(env: &FuzzEnv, ops: &[(FuzzOp, u64)]) -> Result<(), (usize, String)>
         let full = ids.iter().filter(|&&i| app.table_caps(i) == hh_lua::Caps::Full).count();
         eprintln!("end: {} live entries, {full} with capabilities, {} ids issued, never {}; {ran} entry runs and {ran_t} table-global runs seen", ids.len(), m.kind.len(), m.never);
     }
+    // Closing the app's interpreters (in the background) must not run one either.
+    drop(app);
+    std::thread::sleep(Duration::from_millis(50));
+    if marker.with_file_name("fin").exists() {
+        return Err((ops.len(), "a Lua finalizer put on a library metatable ran".into()));
+    }
     Ok(())
 }
 
@@ -3830,7 +3857,8 @@ fn trust_model_fuzz() {
 fn poison_payloads() -> Vec<(&'static str, &'static str)> {
     vec![
         ("replaced tostring", "local t = tostring tostring = function(...) mark('tostring') return t(...) end"),
-        ("string metatable __index", "getmetatable('').__index = function(s, k) mark('strmeta') return string[k] end"),
+        // (the string metatable itself is locked; the functions in `string` are not)
+        ("string methods", "local up = string.upper string.upper = function(s) mark('strmeta') return up(s) end"),
         ("debugger_onBreakpoint", "function debugger_onBreakpoint() mark('onbp') return 1 end"),
         ("onOpenProcess", "function onOpenProcess() mark('onopen') end"),
         ("package.loaded poisoning", "package.loaded.string = setmetatable({}, { __index = function(_, k) mark('pkg') return string[k] end })"),
@@ -4247,4 +4275,48 @@ fn entry_consent_grants_exactly_the_listed_entries() {
     app.table_trust_listed(&[a, b], &[a, b], now).unwrap();
     assert!(!waiting(&app).contains(&a) && !waiting(&app).contains(&b));
     assert!(waiting(&app).contains(&c), "an entry that was not listed was granted");
+}
+
+/// The audit's F1: a trusted table puts a Lua function on the `FILE*` metatable as `__gc`
+/// (it would run, hooks off, whenever a file handle is collected or the state closed). Every
+/// route to that metatable is refused, nothing of it runs, and interrupting or withdrawing
+/// returns at once, on a live state, across revocation and across eviction.
+#[test]
+fn a_table_cannot_put_a_finalizer_on_library_metatables() {
+    let dir = tempfile::tempdir().unwrap();
+    let marker = dir.path().join("fin");
+    let m = format!("{:?}", marker.to_str().unwrap());
+    let attack = format!(
+        "local open, clock = io.open, os.time\n\
+         local w = function() local stop = clock() + 15 while clock() < stop do local f = open({m}, 'a') f:write('x\\n') f:close() end end\n\
+         refused = 0\n\
+         for _, f in ipairs({{ function() getmetatable(io.stdout).__gc = w end, function() rawset(getmetatable(io.stdout), '__gc', w) end,\n\
+           function() io.stdout.__index.__gc = w end, function() io.stdout.__gc = w end, function() getmetatable('').__gc = w end,\n\
+           function() setmetatable(io.stdout, {{ __gc = w }}) end }}) do if not pcall(f) then refused = refused + 1 end end\n\
+         local h = io.open({m} .. '.dummy', 'w') h = nil collectgarbage('collect')\n"
+    );
+    let file = dir.path().join("fin.json");
+    heaphook::table::save(&file, &Table { lua_script: attack, ..Table::default() }).unwrap();
+    let other = dir.path().join("other.json");
+    heaphook::table::save(&other, &Table { lua_script: "x = 1".into(), ..Table::default() }).unwrap();
+    let app = App::default();
+    for round in 0..=hh_lua::EngineOptions::default().max_parked + 2 {
+        app.table_open(if round == 0 { file.to_str().unwrap() } else { other.to_str().unwrap() }, false).unwrap();
+        app.table_trust(true).unwrap();
+        let t = Instant::now();
+        app.table_run_script().unwrap();
+        assert!(t.elapsed() < Duration::from_secs(2), "the table script ran {:?}", t.elapsed());
+        if round == 0 {
+            app.lua_exec("print('refused=' .. refused)").unwrap();
+            assert!(log_text(&app).contains("refused=6"), "an attempt was not refused:\n{}", log_text(&app));
+            let t = Instant::now();
+            let _ = app.lua_interrupt();
+            app.table_trust(false).unwrap();
+            assert!(t.elapsed() < Duration::from_secs(1), "interrupting / withdrawing took {:?}", t.elapsed());
+        }
+        assert!(!marker.exists(), "round {round}: the finalizer ran");
+    }
+    drop(app);
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(!marker.exists(), "the finalizer ran when the interpreter closed");
 }

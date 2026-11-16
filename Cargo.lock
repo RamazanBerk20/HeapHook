@@ -1377,6 +1377,7 @@ dependencies = [
  "hh-ptr",
  "hh-scan",
  "hh-tools",
+ "libc",
  "mlua",
  "serde",
  "serde_json",

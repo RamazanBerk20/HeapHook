@@ -49,6 +49,7 @@ mod api;
 mod debug;
 mod ext;
 mod hooks;
+mod meta;
 mod ptrscan;
 mod table;
 mod ui;
@@ -436,7 +437,9 @@ struct Parked {
 /// Bounded ([`EngineOptions::max_parked`], [`EngineOptions::max_parked_bytes`]): beyond the
 /// cap the oldest kept state is closed, by [`reap`], after [`neutralize`]. What closing can
 /// still run, stated: Lua code cannot have a finalizer (the prelude's `setmetatable` refuses
-/// `__gc`, host userdata metatables are locked, there is no `debug.setmetatable`); the C
+/// `__gc`, every library metatable a script can reach is locked at creation (`meta::lock`),
+/// there is no `debug.setmetatable`, and a state found with one anyway is never closed:
+/// `meta::finalizers_intact`); the C
 /// finalizers left are mlua's for Rust values (closures holding a `Weak` of the engine, a
 /// discard flag and copies of small values; Auto Assembler states, plain data), whose drops
 /// neither block nor reach the host. Open files and `io.popen` pipes are not closed (their
@@ -470,6 +473,10 @@ fn park(lua: Lua, max: usize, max_bytes: usize) -> bool {
     }
     let mut gave_up = false;
     for old in gone {
+        if !meta::finalizers_intact(&old.lua) {
+            keep_forever(old.lua);
+            continue;
+        }
         neutralize(&old.lua);
         // Nothing may grow: a finalizer that slipped through cannot allocate.
         let _ = old.lua.set_memory_limit(old.lua.used_memory().max(1));
@@ -509,6 +516,15 @@ pub(crate) fn neutralize(lua: &Lua) {
             ffi::lua_pop(l, 1);
         })
     };
+}
+
+/// Interpreters with a Lua function as a library finalizer (a metatable lock failed): never
+/// closed, never collected (their collector is stopped), kept until HeapHook exits.
+static HOSTILE: Mutex<Vec<Lua>> = Mutex::new(Vec::new());
+
+fn keep_forever(lua: Lua) {
+    lua.gc_stop();
+    HOSTILE.lock().unwrap().push(lua);
 }
 
 /// Interpreters waiting to be closed, closed one at a time on a reaper thread so that no
@@ -600,10 +616,12 @@ fn do_reset(st: &Arc<State>, slot: &Arc<Mutex<Core>>) -> Result<()> {
     // From now on nothing of the old interpreter runs: its host functions refuse, every call
     // and instruction errors, and its collector never runs (no finalizer, ever).
     old.dead.store(true, Ordering::SeqCst);
+    old.lua.gc_stop();
+    // Checked before anything could collect: a Lua finalizer means the state is never closed.
+    let hostile = !meta::finalizers_intact(&old.lua);
     let _ = old.lua.set_global_hook(HookTriggers { on_calls: true, every_nth_instruction: Some(1), ..Default::default() }, |_, _| {
         Err(mlua::Error::runtime("this Lua state was discarded"))
     });
-    old.lua.gc_stop();
     for id in std::mem::take(&mut *st.lua_hotkeys.lock().unwrap()) {
         st.host().unregister_hotkey(id);
     }
@@ -629,9 +647,15 @@ fn do_reset(st: &Arc<State>, slot: &Arc<Mutex<Core>>) -> Result<()> {
     // Only the Lua handle is kept: the prelude's functions and every Rust-side handle go now.
     let Core { lua, i, dead: _ } = old;
     drop(i);
-    let gave_up = if clean {
-        // Only the user's own code ran in it: closed like any state (off this path: closing a
-        // file the user's code opened with `io.popen` waits for its child).
+    // Wherever the last handle of the old state drops (the reaper, or a caller still holding
+    // a clone), closing it cannot block: its finalizers are made non-waiting before release.
+    let gave_up = if hostile {
+        keep_forever(lua);
+        false
+    } else if clean {
+        // Only the user's own code ran in it: closed like any state, on the reaper; the user's
+        // files are flushed and closed, `io.popen` children are not waited for.
+        meta::no_wait(&lua);
         reap(lua)
     } else {
         // Kept, not closed: closing would run its finalizers.
@@ -660,6 +684,8 @@ fn build_core(st: &Arc<State>) -> Result<Core> {
         .map_err(lua_err)?;
     let dead = Arc::new(AtomicBool::new(false));
     let i = api::install(&lua, st, st.allow_os, &dead).map_err(lua_err)?;
+    // Before any script: every library metatable a script can reach is locked.
+    meta::lock(&lua).map_err(lua_err)?;
     let name = st.proc().and_then(|p| {
         let pid = p.pid();
         hh_core::list_processes().ok()?.into_iter().find(|i| i.pid == pid).map(|i| i.name)
@@ -1114,4 +1140,33 @@ mod tests {
         drop(lua);
         assert!(t.elapsed() >= Duration::from_millis(500), "{:?}", t.elapsed());
     }
+    /// A Lua function as a library finalizer is detected (the state is then never closed);
+    /// liolib's closer and the non-waiting one are not.
+    #[test]
+    fn a_lua_finalizer_on_a_library_metatable_is_detected() {
+        let lua = Lua::new();
+        meta::lock(&lua).unwrap();
+        assert!(meta::finalizers_intact(&lua));
+        meta::no_wait(&lua);
+        assert!(meta::finalizers_intact(&lua));
+        let mt: mlua::Table = lua.named_registry_value("FILE*").unwrap();
+        mt.raw_set("__gc", lua.load("return function() end").eval::<mlua::Function>().unwrap()).unwrap();
+        assert!(!meta::finalizers_intact(&lua));
+    }
+
+    /// A clean state's close flushes its files but does not wait for an `io.popen` child.
+    #[test]
+    fn no_wait_flushes_files_and_leaves_pipes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("flushed");
+        let lua = Lua::new();
+        meta::lock(&lua).unwrap();
+        lua.load(format!("keep = io.popen('sleep 3') f = io.open({:?}, 'w') f:write('kept')", path.to_str().unwrap())).exec().unwrap();
+        meta::no_wait(&lua);
+        let t = Instant::now();
+        drop(lua);
+        assert!(t.elapsed() < Duration::from_secs(2), "closing waited for the child: {:?}", t.elapsed());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "kept", "the file was not flushed");
+    }
+
 }
