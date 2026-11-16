@@ -1044,9 +1044,14 @@ fn threads_priority_pause_and_fine_cancel() {
     assert_eq!(addrs(&s), [B + 0x123458], "results show the previous set meanwhile");
     s.pause();
     assert!(s.progress().paused && s.progress().running);
-    std::thread::sleep(Duration::from_millis(400)); // lets the in-flight block finish
+    // The one in-flight unit may still finish (well over 400 ms on a loaded CI runner).
+    let d0 = s.progress().done;
+    let t0 = Instant::now();
+    while s.progress().done == d0 && t0.elapsed() < Duration::from_secs(3) {
+        std::thread::sleep(Duration::from_millis(5));
+    }
     let d = s.progress().done;
-    std::thread::sleep(Duration::from_millis(200));
+    std::thread::sleep(Duration::from_millis(300));
     assert_eq!(s.progress().done, d, "paused");
     s.resume();
     let t0 = Instant::now();

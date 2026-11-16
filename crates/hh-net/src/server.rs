@@ -268,6 +268,25 @@ impl Read for Deadline<'_> {
     }
 }
 
+/// A connection's reader: a read timeout is retried (nothing was consumed) until the server stops.
+struct Stoppable<'a> {
+    s: TcpStream,
+    stop: &'a AtomicBool,
+}
+
+impl Read for Stoppable<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        // How a read timeout is reported; on Unix `TimedOut` is a dead peer (keepalive).
+        let timeout = if cfg!(windows) { ErrorKind::TimedOut } else { ErrorKind::WouldBlock };
+        loop {
+            match self.s.read(buf) {
+                Err(e) if e.kind() == timeout && !self.stop.load(Relaxed) => {}
+                r => return r,
+            }
+        }
+    }
+}
+
 impl Shared {
     /// Checks one AUTH. Checks are serialized and each failure pushes the next one back by
     /// `auth_delay`, so parallel connections together get no more guesses than one.
@@ -378,13 +397,14 @@ fn connection(sh: &Shared, id: u64, s: TcpStream) -> std::io::Result<()> {
     if !handshake(sh, id, &s)? {
         return Ok(());
     }
-    s.set_read_timeout(None)?;
+    // Reads wake up to see `stop`: Windows does not end a blocked `recv` on `shutdown`.
+    s.set_read_timeout(Some(Duration::from_millis(250)))?;
     // Idle clients are fine, but a vanished peer (crash, cable, sleep) must not hold its
     // slot forever: keepalive probes after 60 s of silence find it within a few minutes.
     let ka = socket2::TcpKeepalive::new().with_time(Duration::from_secs(60)).with_interval(Duration::from_secs(10));
     let _ = socket2::SockRef::from(&s).set_tcp_keepalive(&ka);
     let w = s.try_clone()?;
-    let mut r = BufReader::with_capacity(64 << 10, s);
+    let mut r = BufReader::with_capacity(64 << 10, Stoppable { s, stop: &sh.stop });
 
     let conn = Conn {
         sh,
@@ -408,7 +428,7 @@ fn connection(sh: &Shared, id: u64, s: TcpStream) -> std::io::Result<()> {
         }
         drop(tx);
         // Drops the peer and unblocks workers stuck writing to it.
-        let _ = r.get_ref().shutdown(Shutdown::Both);
+        let _ = r.get_ref().s.shutdown(Shutdown::Both);
     });
     Ok(())
 }
