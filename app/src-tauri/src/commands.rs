@@ -52,6 +52,8 @@ pub struct Session {
     pub(crate) tools: crate::tools::Tools,
     /// Saved scan name -> (address -> its value then), for the results' `saved` column.
     pub(crate) saved: Mutex<HashMap<String, HashMap<Addr, String>>>,
+    /// Suspended with `process_pause`.
+    pub(crate) paused: std::sync::atomic::AtomicBool,
 }
 
 /// A `Process` whose backend can be swapped while scanner, freezer and friends hold it.
@@ -145,6 +147,23 @@ pub struct Shared {
     pub(crate) user_syms: Mutex<(u64, usize, Vec<String>)>,
     /// Frozen values of active custom-typed entries, by entry id.
     pub(crate) custom_frozen: Mutex<HashMap<i64, String>>,
+    /// Command-line arguments, until the UI took them (`app_args`).
+    pub(crate) args: Mutex<Option<crate::cli::StartArgs>>,
+    /// Window events the UI picks up with `lua_poll`.
+    pub(crate) win: Mutex<WinEvents>,
+}
+
+/// Close requests and dropped files of the window, for the UI's poll.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct WinEvents {
+    /// Moves when the user closes the window with unsaved table changes (the UI asks).
+    pub close_seq: u64,
+    /// A close request is waiting for the UI's answer.
+    #[serde(skip)]
+    pub close_pending: bool,
+    /// Moves when files are dropped on the window; `drops` are the latest ones.
+    pub drop_seq: u64,
+    pub drops: Vec<String>,
 }
 
 impl Default for Shared {
@@ -162,6 +181,8 @@ impl Default for Shared {
             remote: Mutex::default(),
             user_syms: Mutex::default(),
             custom_frozen: Mutex::default(),
+            args: Mutex::default(),
+            win: Mutex::default(),
         }
     }
 }
@@ -288,6 +309,40 @@ impl App {
         lock(&self.x.config).clone()
     }
 
+    pub fn set_args(&self, a: crate::cli::StartArgs) {
+        *lock(&self.x.args) = Some(a);
+    }
+
+    /// The command-line arguments, once (a reload of the UI does not act on them again).
+    pub fn app_args(&self) -> R<Option<crate::cli::StartArgs>> {
+        Ok(lock(&self.x.args).take())
+    }
+
+    /// The window is being closed: `true` when it may close now. With unsaved table changes the
+    /// UI is asked first (`close_seq`); closing again while that question is open closes.
+    pub fn window_close_requested(&self) -> bool {
+        let mut w = lock(&self.x.win);
+        if !self.x.live.dirty() || w.close_pending {
+            return true;
+        }
+        w.close_pending = true;
+        w.close_seq += 1;
+        false
+    }
+
+    /// The UI's answer to a close request: `quit` false keeps the window open.
+    pub fn app_close_answer(&self, quit: bool) -> bool {
+        let mut w = lock(&self.x.win);
+        w.close_pending = false;
+        quit
+    }
+
+    pub fn window_dropped(&self, paths: Vec<String>) {
+        let mut w = lock(&self.x.win);
+        w.drop_seq += 1;
+        w.drops = paths;
+    }
+
     pub fn settings_get(&self) -> R<Settings> {
         Ok(lock(&self.x.settings).clone())
     }
@@ -348,6 +403,7 @@ impl App {
         let scanner = Arc::new(Scanner::new(proc.clone()));
         scanner.set_spill_dir(spill_dir(&lock(&self.x.settings)));
         let sess = Session {
+            paused: Default::default(),
             saved: Mutex::default(),
             scanner,
             freezer,
@@ -384,6 +440,10 @@ impl App {
         }
         let _ = self.debug_detach();
         let Some(sess) = lock(&self.sess).take() else { return Ok(()) };
+        // Never leave the target stopped behind.
+        if sess.paused.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            let _ = sess.raw.resume();
+        }
         sess.scanner.cancel();
         let _ = sess.freezer.set(&[]);
         *lock(&self.x.lua.console.speedhack) = None;
@@ -629,8 +689,9 @@ impl App {
     /// Symbols the script registers stay registered for later expressions. `{$lua}` blocks
     /// run in the app's engine (so they cannot hold the symbol lock: work on a copy, merge).
     pub fn aa_execute(&self, script: &str, enable: bool, state: Option<&AaState>) -> R<AaState> {
-        // Same gate as table entries: no `{$lua}` while a loaded table is not agreed to.
-        if crate::cheat::script_runs_lua(script) && !self.x.live.trust().allows() {
+        // Same gate as table entries: `{$lua}` from an untrusted source (a loaded table not
+        // agreed to, a pasted entry, a script file) asks first; what the user typed runs.
+        if crate::cheat::script_runs_lua(script) && self.x.live.is_tainted(script) {
             return Err(self.consent_error("this script"));
         }
         let sess = self.session()?;
@@ -650,6 +711,25 @@ impl App {
             cur.unregister(n);
         }
         r.map_err(s)
+    }
+
+    /// An Auto Assembler script file for the Auto Assemble window: its Lua asks before it runs.
+    pub fn aa_load_file(&self, path: &str) -> R<String> {
+        let b = table::read_capped(Path::new(path), table::MAX_FILE)?;
+        let t = String::from_utf8(b).map_err(|e| format!("{path}: {e}"))?;
+        if crate::cheat::script_runs_lua(&t) {
+            self.x.live.taint_script(&t);
+        }
+        Ok(t)
+    }
+
+    /// The user's yes for the `{$lua}` of this exact script (refused while Settings say never).
+    pub fn aa_trust(&self, script: &str) -> R<()> {
+        if lock(&self.x.settings).table_script == "never" {
+            return Err("Settings say never to run a table's Lua: change \"Lua script in a loaded table\" first".into());
+        }
+        self.x.live.untaint_script(script);
+        Ok(())
     }
 
     /// Registers the table's user-defined symbols (CE `UserdefinedSymbols`) in the session's

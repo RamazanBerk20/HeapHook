@@ -40,6 +40,9 @@ pub struct Status {
 }
 
 /// Words for an hh-net error; a dropped connection says so plainly.
+/// How long a liveness check waits for the server.
+const PING: std::time::Duration = std::time::Duration::from_secs(3);
+
 fn why(e: &Error) -> String {
     match e {
         Error::Io(io) if io.kind() == ErrorKind::ConnectionAborted => io.to_string().trim_start_matches("hh-net: ").to_string(),
@@ -116,7 +119,7 @@ impl App {
 
     pub fn remote_status(&self) -> R<Option<Status>> {
         let Ok((host, addr)) = self.host() else { return Ok(None) };
-        let connected = !matches!(host.list_processes(), Err(ref e) if is_lost(e));
+        let connected = host.is_connected() && host.ping(PING).is_ok();
         Ok(Some(Status { addr, connected }))
     }
 
@@ -145,10 +148,13 @@ impl App {
     pub(crate) fn remote_lost(&self) -> Option<String> {
         self.session().ok()?.info.remote.as_ref()?;
         let (host, _) = self.host().ok()?;
-        match host.list_processes() {
-            // The UI names the server itself.
+        // A dead connection answers the ping at once with why it died; a live one within PING.
+        // The UI names the server itself.
+        match host.ping(PING) {
+            Ok(()) if host.is_connected() => None,
+            Ok(()) => Some("the connection was closed".into()),
             Err(e) if is_lost(&e) => Some(why(&e)),
-            _ => None,
+            Err(e) => Some(format!("the server does not answer: {}", why(&e))),
         }
     }
 

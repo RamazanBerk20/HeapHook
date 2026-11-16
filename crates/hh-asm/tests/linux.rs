@@ -187,6 +187,70 @@ fn live_symbols_disassembly_and_script() {
     assert!(p.read_exact(newmem, &mut b).is_err(), "allocation freed");
 }
 
+impl Target {
+    /// Sends one command line and returns the target's answer line.
+    fn ask(&mut self, cmd: &str) -> String {
+        use std::io::Write;
+        let stdin = self.0.stdin.as_mut().unwrap();
+        stdin.write_all(format!("{cmd}\n").as_bytes()).unwrap();
+        stdin.flush().unwrap();
+        let mut line = String::new();
+        std::io::BufReader::new(self.0.stdout.as_mut().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        line
+    }
+}
+
+#[test]
+fn live_api_hook_ifdef_and_align() {
+    let mut t = Target::spawn();
+    let p = hh_core::open(t.0.id()).unwrap();
+    let p: &dyn Process = &*p;
+    let mut syms = SymbolTable::default();
+    let write = resolve_address(p, &syms, "write").unwrap();
+    let mut before = vec![0u8; 32];
+    p.read_exact(write, &mut before).unwrap();
+
+    // The API hook template on libc's write(), plus a counter the replacement increments.
+    let tpl = injection_template(p, write, Template::ApiHook).unwrap();
+    let script = tpl
+        .replacen(
+            "[ENABLE]\n",
+            "[ENABLE]\n{$ifdef CPU64}\nalloc(extra,$100,address)\nlabel(count)\nregistersymbol(count)\nextra:\n  db 1\n  align 10 CC\ncount:\n  dd 0\n{$else}\nnot assembled on 64-bit\n{$endif}\n",
+            1,
+        )
+        .replace(
+            "newfunction:\n",
+            "newfunction:\n  lock inc dword ptr [count]\n",
+        )
+        .replace("[DISABLE]\n", "[DISABLE]\nunregistersymbol(count)\ndealloc(extra)\n");
+    assert_eq!(aa_check(p, &syms, &script, &mut AaHooks::default()), None, "{script}");
+    let st = aa_execute(p, &mut syms, &script, true, None, &mut AaHooks::default())
+        .unwrap_or_else(|e| panic!("{e}\n{script}"));
+    let count = syms.get("count").unwrap();
+    assert_eq!(count % 16, 0, "align 10");
+    let jmp = disassemble(p, &syms, write, 1).unwrap();
+    assert!(jmp[0].text.starts_with("jmp "), "{jmp:?}");
+
+    // Every answer goes through write(): the hook runs and the original still works.
+    for _ in 0..3 {
+        assert!(t.ask("get").contains("\"i32\":123456"));
+    }
+    let mut n = [0u8; 4];
+    p.read_exact(count, &mut n).unwrap();
+    assert!(u32::from_le_bytes(n) >= 3, "hook ran {} times", u32::from_le_bytes(n));
+
+    aa_execute(p, &mut syms, &script, false, Some(&st), &mut AaHooks::default()).unwrap();
+    let mut after = vec![0u8; 32];
+    p.read_exact(write, &mut after).unwrap();
+    assert_eq!(after, before, "write() restored");
+    assert_eq!(syms.get("count"), None);
+    assert_eq!(syms.get("originalcall"), None);
+    assert!(t.ask("inc").contains("\"i32\":123457"), "target healthy after unhook");
+    assert!(p.is_alive());
+}
+
 fn hexs(b: &[u8]) -> String {
     b.iter()
         .map(|x| format!("{x:02X}"))

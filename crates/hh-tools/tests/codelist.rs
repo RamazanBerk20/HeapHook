@@ -47,3 +47,23 @@ fn nop_restore_verify() {
     assert!(CodeList::from_ct_xml("<CheatCodes><CodeEntry><Actual><Byte>ZZ</Byte></Actual></CodeEntry></CheatCodes>").is_err());
     assert_eq!(cl.remove(1).unwrap().description, "gone");
 }
+
+#[test]
+fn cheat_codes_xml_survives_hostile_text() {
+    let list = CodeList {
+        entries: vec![
+            CodeEntry { description: "ctl\u{1}\u{7f}x \"q\" <&> 'a'\ttab\r\n".into(), addr: "game.exe+10".into(), original: vec![0x90, 0xC3] },
+            CodeEntry { description: "\u{0}\u{fffe}".into(), addr: "\u{1b}[31m".into(), original: vec![] },
+        ],
+    };
+    let back = CodeList::from_ct_xml(&list.to_ct_xml()).expect("export must parse back");
+    assert_eq!(back.entries.len(), 2);
+    // Element text is trimmed on import; invalid characters became U+FFFD.
+    assert_eq!(back.entries[0].description, "ctl\u{fffd}\u{7f}x \"q\" <&> 'a'\ttab");
+    assert_eq!(back.entries[0].original, [0x90, 0xC3]);
+    assert_eq!(back.entries[1].description, "\u{fffd}\u{fffd}");
+    assert_eq!(back.entries[1].addr, "\u{fffd}[31m");
+    // Import caps.
+    let many = format!("<CheatCodes><CodeEntry><Actual>{}</Actual></CodeEntry></CheatCodes>", "<Byte>90</Byte>".repeat(MAX_CODE_BYTES + 1));
+    assert!(CodeList::from_ct_xml(&many).is_err());
+}

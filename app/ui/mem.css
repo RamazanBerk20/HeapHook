@@ -1,0 +1,57 @@
+/* mem additions. Tokens live in styles.css: --canvas --canvas-2 --surface --text --text-2 --muted --border --hairline --hover, pastel --red/--blue/--green/--yellow with -bg variants, --font-mono, --fs/--fs-sm/--fs-xs, --s1..--s5, --r-sm/--r, --line, --dur. Both themes come from the tokens. */
+
+/* Text size (Ctrl = / Ctrl -): memview.js sets --mem-fs and --row-mem on #view-mem together. */
+#view-mem { position: relative; }
+#view-mem .da-list, #view-mem .hx-list { font-size: var(--mem-fs, var(--fs-sm)); }
+#view-mem .hx-row .c-addr { width: max(112px, 13ch); }
+
+/* Disassembler columns; the left gutter holds breakpoint dots and jump lines. */
+.da-list { position: relative; --da-addr: max(112px, 13ch); --da-rest: minmax(80px, 170px) minmax(160px, 1fr) minmax(0, 0.8fr); }
+.da-list.modrel { --da-addr: minmax(150px, 26ch); }
+.da-list.nobytes { --da-rest: minmax(160px, 1fr) minmax(0, 0.8fr); }
+.da-list.nobytes .da-row > .c-bytes { display: none; }
+.da-list .da-row { grid-template-columns: var(--da-addr) var(--da-rest); padding-left: 40px; }
+.da-row.bp::before { top: calc(50% - 4px); }
+.da-row.in-sel { background: var(--blue-bg); }
+.da-row.da-fn { border-top: 1px solid var(--border); }
+.da-row.da-fn > .c-text { color: var(--text); }
+.da-row.da-fn > .c-text::after { content: '  function'; color: var(--muted); font-weight: 400; }
+
+.da-jumps { position: absolute; left: 0; top: 0; width: 38px; pointer-events: none; overflow: visible; z-index: 1; }
+.da-jumps .jl { fill: none; stroke: var(--muted); stroke-width: 1; stroke-linejoin: round; opacity: 0.75; }
+.da-jumps .jl.cond { stroke-dasharray: 3 2; }
+.da-jumps .jl.hot { stroke: var(--blue); stroke-width: 1.6; opacity: 1; }
+
+/* Hover / I info tip. */
+.da-tip {
+  position: fixed; z-index: 50; max-width: min(560px, calc(100vw - 16px)); padding: 6px var(--s2);
+  background: var(--surface); border: var(--line); border-radius: var(--r); box-shadow: var(--shadow-pop);
+  font-size: var(--fs-xs); line-height: 1.6; color: var(--text-2); pointer-events: none; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.da-tip > div { overflow: hidden; text-overflow: ellipsis; }
+.da-tip b { font-weight: 600; color: var(--text); }
+
+/* Hex: bookmarked cells, data inspector. */
+.hb.bm { text-decoration: underline; text-decoration-color: var(--yellow); text-decoration-thickness: 2px; text-underline-offset: 2px; }
+.hx-insp {
+  flex: none; display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); column-gap: var(--s4);
+  max-height: 45%; overflow: auto; padding: var(--s1) var(--s3); border-top: 1px solid var(--hairline); font-size: var(--fs-xs); line-height: 18px;
+}
+.hx-insp .cv-legend { grid-column: 1 / -1; font-family: var(--font-ui); }
+.hx-insp .cv-legend .cv-be::before { content: ' · '; }
+.hx-insp .cv-item { display: grid; grid-template-columns: 6ch minmax(0, 1fr) minmax(0, 1fr); gap: var(--s2); white-space: nowrap; }
+.hx-insp .cv-k { color: var(--muted); }
+.hx-insp .cv-v { overflow: hidden; text-overflow: ellipsis; color: var(--text); }
+.hx-insp .cv-be { color: var(--muted); }
+
+/* Second viewer: a floating panel over the memory view; drag its corner to resize. */
+.mv2 {
+  position: absolute; top: 48px; left: max(16px, calc(100% - 476px)); width: min(460px, calc(100% - 32px)); height: 250px;
+  min-width: 300px; min-height: 140px; z-index: 5; resize: both; box-shadow: var(--shadow-pop);
+}
+.mv2 .panel-head h2 { flex: 1; }
+.mv2 .panel-head .toolbar { margin-left: 0; }
+
+@media (max-width: 1180px) { #da-view .bl { display: none; } }
+/* Narrow: the cursor and selection size move to the status line under the dump. */
+@media (max-width: 1180px) { #hx-pos { display: none; } }

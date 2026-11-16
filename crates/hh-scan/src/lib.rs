@@ -11,12 +11,13 @@ mod store;
 mod value;
 
 pub use freeze::{FreezeMode, FrozenEntry, Freezer};
-pub use freeze::FrozenEntryEx;
-pub use plan::{FirstScan, NextScan, NextScanEx, Priority, ScanOptions, ScanType, Tri};
-pub use scanner::{ResultRow, ScanCount, ScanProgress, Scanner};
+pub use freeze::{FreezeFailure, FrozenEntryEx};
+pub use plan::{AddrRange, FirstScan, NextScan, NextScanEx, PointerScan, Priority, ScanOptions, ScanType, Tri};
+pub use scanner::{MAX_SORT, ResultRow, ResultStat, ScanCount, ScanProgress, Scanner, SortKey};
+pub use store::spill_dir;
 pub use value::{
-    CustomType, Fmt, MAX_VALUE_LEN, Rounding, VType, ValueRef, ValueRefEx, format_value, parse_value, read_values, read_values_ex, value_size,
-    write_custom, write_value,
+    CustomNumber, CustomType, Fmt, MAX_VALUE_LEN, Rounding, VType, ValueRef, ValueRefEx, add_custom, format_value, parse_value, read_custom,
+    read_values, read_values_ex, value_size, write_custom, write_custom_number, write_value,
 };
 
 /// Serde helpers: addresses travel as `"0x..."` strings (JS numbers lose precision).

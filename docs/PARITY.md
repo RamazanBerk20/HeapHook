@@ -4,10 +4,10 @@ Statuses are `done`, `engine only`, `partial`, `planned`, `needs decision`.
 
 | Status | Rows |
 |---|---|
-| done | 344 |
-| engine only | 7 |
-| partial | 67 |
-| planned | 261 |
+| done | 393 |
+| engine only | 2 |
+| partial | 71 |
+| planned | 213 |
 | needs decision | 33 |
 
 Row counts per section:
@@ -49,7 +49,7 @@ Total: 712
 | 32-bit / 64-bit target detection | Detects target bitness and adapts pointer size | hh-core | done | linux+windows |
 | Process watcher | Shows process create/exit events | hh-core | planned | windows |
 | Open process via Lua | openProcess/getOpenedProcessID switch the target from scripts | hh-lua | done | linux+windows |
-| Pause/resume process | Suspends or resumes all target threads | hh-core | engine only | linux+windows |
+| Pause/resume process | Suspends or resumes all target threads | hh-core | done | linux+windows |
 | Auto attach to process name | Lua/table can attach automatically when a named process starts | hh-lua | planned | linux+windows |
 | Handle list | Enumerates open handles of the target | hh-core | planned | windows |
 | Run as admin / elevation | Requests privileges needed to open protected processes | hh-core | planned | linux+windows |
@@ -152,7 +152,7 @@ Total: 712
 | Entry color | Set text color per entry | app | done | linux+windows |
 | Show as hexadecimal | Display value in hex | app | done | linux+windows |
 | Show as signed | Display integer as signed | app | done | linux+windows |
-| Show as binary | Display value as bits | app | planned | linux+windows |
+| Show as binary | Display value as bits | app | done | linux+windows |
 | Show as decimal override | Force decimal for a hex-set entry | app | done | linux+windows |
 | Bit entries (start bit, length) | Entries covering part of a byte range | hh-scan | done | linux+windows |
 | String entries (length, unicode) | Fixed-length string records | hh-scan | done | linux+windows |
@@ -169,13 +169,13 @@ Total: 712
 | Hotkey action: decrease value | Subtracts a number from the value | app | done | linux+windows |
 | Hotkey sound feedback | Plays a sound when a hotkey fires | app | done | linux+windows |
 | Hotkey activation delay | Delay before a hotkey repeats | app | done | linux+windows |
-| Global hotkey capture | Hotkeys work when the target window has focus | app | planned | linux+windows |
+| Global hotkey capture | Hotkeys work when the target window has focus (HeapHook: registered through XGrabKey on X11/XWayland; delivery to other windows under Wayland depends on the compositor and is not verified) | app | partial | linux+windows |
 | Hotkey conflict handling | Keys with modifiers and chords | app | partial | linux+windows |
 | Memory record Lua events (OnActivate/OnDeactivate/OnChange) | Scripts react to record state changes | hh-lua | done | linux+windows |
 | Memory record OnGetDisplayValue | Lua can rewrite displayed value | hh-lua | planned | linux+windows |
 | Collapsed/expanded groups with options | Groups can be saved collapsed or expanded | app | done | linux+windows |
-| Manual expand with children | Expand all/collapse all commands | app | planned | linux+windows |
-| Show/hide column options | Toggle which address list columns appear | app | planned | linux+windows |
+| Manual expand with children | Expand all/collapse all commands | app | done | linux+windows |
+| Show/hide column options | Toggle which address list columns appear | app | done | linux+windows |
 | Description column wide text | Long text and multi-line comments | app | planned | linux+windows |
 | Address list context menu | Right-click operations on entries | app | done | linux+windows |
 | Browse this memory region | Jump from an entry to the memory viewer | app | done | linux+windows |
@@ -189,8 +189,8 @@ Total: 712
 | Set/change hotkey dialog | Edit hotkey list for an entry | app | done | linux+windows |
 | Delete / cut / copy / paste records | Clipboard operations on entries as text | app | done | linux+windows |
 | Select all / invert selection | Selection helpers | app | partial | linux+windows |
-| Sort by column | Sort address list | app | planned | linux+windows |
-| Search address list | Find entries by description | app | planned | linux+windows |
+| Sort by column | Sort address list | app | done | linux+windows |
+| Search address list | Find entries by description | app | done | linux+windows |
 | Cheat table file format (.CT XML) | Cheat table stored as XML | hh-core | done | linux+windows |
 | .CT load: entries and groups | Reads CheatEntries, nested entries | hh-core | done | linux+windows |
 | .CT load: scripts | Reads AssemblerScript entries | hh-core | done | linux+windows |
@@ -207,10 +207,10 @@ Total: 712
 | CT file version compatibility | Reads old and new CheatTable versions | hh-core | planned | linux+windows |
 | HeapHook JSON table format | Native JSON table alongside CT | hh-core | done | linux+windows |
 | Table open/save/save as menu | File menu operations | app | done | linux+windows |
-| Merge table | Append another table to the current one | app | planned | linux+windows |
-| Recent tables list | Re-open recent files | app | planned | linux+windows |
-| Drag and drop table file | Drop a table onto the window to load | app | planned | linux+windows |
-| Unsaved changes prompt | Warn on close with unsaved table | app | planned | linux+windows |
+| Merge table | Append another table to the current one | app | done | linux+windows |
+| Recent tables list | Re-open recent files | app | done | linux+windows |
+| Drag and drop table file | Drop a table onto the window to load | app | done | linux+windows |
+| Unsaved changes prompt | Warn on close with unsaved table | app | done | linux+windows |
 | Table comments window | Show per-table comment text | app | done | linux+windows |
 | Table Lua script window | Edit the script run on table load | app | done | linux+windows |
 | Ask to run table script on load | Prompt when loading a table with Lua | app | done | linux+windows |
@@ -218,7 +218,7 @@ Total: 712
 | Table extras: show on load as form | Table can display custom forms | hh-lua | planned | linux+windows |
 | Address list from Lua | getAddressList and MemoryRecord API | hh-lua | done | linux+windows |
 | Address expression editor | Evaluate symbols, modules, and brackets | hh-asm | done | linux+windows |
-| Save address list as text | Export entries in text form | app | planned | linux+windows |
+| Save address list as text | Export entries in text form | app | done | linux+windows |
 
 ## Memory viewer / hex editor
 
@@ -229,26 +229,26 @@ Total: 712
 | Hex view display types | Byte, word, dword, qword, float, double, text | app | done | linux+windows |
 | Hex view: edit bytes | Type over bytes to write memory | app | done | linux+windows |
 | Hex view: goto address | Jump to address/expression | app | done | linux+windows |
-| Hex view: search memory | Find text/bytes/values in memory | hh-scan | planned | linux+windows |
-| Hex view: back/forward navigation | History of visited addresses | app | planned | linux+windows |
+| Hex view: search memory | Find text/bytes/values in memory | hh-scan | done | linux+windows |
+| Hex view: back/forward navigation | History of visited addresses | app | done | linux+windows |
 | Hex view: highlight changes | Colors recently changed bytes | app | done | linux+windows |
-| Hex view: data type conversion panel | Interprets selection as several types | app | planned | linux+windows |
-| Hex view: copy selection | Copy as hex, text, or address | app | planned | linux+windows |
-| Hex view: paste | Paste bytes into memory | app | planned | linux+windows |
+| Hex view: data type conversion panel | Interprets selection as several types | app | done | linux+windows |
+| Hex view: copy selection | Copy as hex, text, or address | app | done | linux+windows |
+| Hex view: paste | Paste bytes into memory | app | done | linux+windows |
 | Hex view: set breakpoint on address | Set data breakpoint from hex view | hh-debug | done | linux+windows |
 | Hex view: find what accesses this address | Open access tracer for a byte | hh-debug | done | linux+windows |
-| Hex view: add to address list | Add selected address to the table | app | planned | linux+windows |
+| Hex view: add to address list | Add selected address to the table | app | done | linux+windows |
 | Hex view: structure view | Open structure dissector at address | app | done | linux+windows |
-| Hex view: lock/unlock editing | Safety toggle for edit mode | app | planned | linux+windows |
+| Hex view: lock/unlock editing | Safety toggle for edit mode | app | done | linux+windows |
 | Hex view: text encoding selection | ASCII, UTF-8, UTF-16 | app | done | linux+windows |
 | Hex view: bytes per row setting | Adjusts column count | app | done | linux+windows |
-| Hex view: font and colors | Appearance options | app | planned | linux+windows |
-| Multiple memory viewers | Open several viewer windows | app | planned | linux+windows |
+| Hex view: font and colors | Appearance options (HeapHook: font size 11-16 px; colors follow the theme) | app | partial | linux+windows |
+| Multiple memory viewers | Open several viewer windows (HeapHook: one extra floating hex viewer) | app | partial | linux+windows |
 | Memory view: scroll/page keys | Navigation with arrow, PgUp/PgDn | app | done | linux+windows |
 | Memory view: show protection of region | Displays region protection info | app | done | linux+windows |
-| Memory view: bookmarks | Up to 10 bookmarked addresses with hotkeys | app | planned | linux+windows |
-| Memory view: set and delete bookmark | Manage bookmarks | app | planned | linux+windows |
-| Memory view: goto bookmark | Jump to a stored bookmark | app | planned | linux+windows |
+| Memory view: bookmarks | Up to 10 bookmarked addresses with hotkeys | app | done | linux+windows |
+| Memory view: set and delete bookmark | Manage bookmarks | app | done | linux+windows |
+| Memory view: goto bookmark | Jump to a stored bookmark | app | done | linux+windows |
 | Memory view: symbol handler | Resolves module+offset labels | hh-asm | done | linux+windows |
 | Memory view: add/define user symbol | Name an address | hh-asm | done | linux+windows |
 | Memory view: show symbols window | List and edit user-defined symbols | app | done | linux+windows |
@@ -259,9 +259,9 @@ Total: 712
 | Memory view: save memory region to file | Dump a range to a file | hh-core | done | linux+windows |
 | Memory view: load memory from file | Write file contents to memory | hh-core | done | linux+windows |
 | Memory view: compare memory with file | Diff memory and file | hh-core | done | linux+windows |
-| Memory view: allocate memory | Allocates a block in the target | hh-core | engine only | linux+windows |
+| Memory view: allocate memory | Allocates a block in the target | hh-core | done | linux+windows |
 | Memory view: change protection | Changes page protection | hh-core | done | linux+windows |
-| Memory view: free memory | Releases an allocation | hh-core | engine only | linux+windows |
+| Memory view: free memory | Releases an allocation | hh-core | done | linux+windows |
 | Memory view: show writable/ex flags | Shows page permission flags | app | done | linux+windows |
 | Memory view: refresh interval | Control the refresh rate | app | done | linux+windows |
 | Memory view: hotkeys list | Documented hotkeys such as Ctrl+G | app | done | linux+windows |
@@ -277,12 +277,12 @@ Total: 712
 | ARM / AArch64 disassembly | Decodes ARM for Android targets | hh-asm | planned | linux |
 | Disassembler view | Scrollable listing with bytes and opcodes | app | done | linux+windows |
 | Disassembler: symbolic addresses | Shows module+offset and names | hh-asm | done | linux+windows |
-| Disassembler: show module addresses | Toggle address formatting | app | planned | linux+windows |
+| Disassembler: show module addresses | Toggle address formatting | app | done | linux+windows |
 | Disassembler: show symbols | Toggle symbol display | app | partial | linux+windows |
 | Disassembler: opcode bytes column | Raw bytes column | app | done | linux+windows |
-| Disassembler: jump lines | Draws arrows between jump source and target | app | planned | linux+windows |
+| Disassembler: jump lines | Draws arrows between jump source and target | app | done | linux+windows |
 | Disassembler: comments | Per-address user comments | app | done | linux+windows |
-| Disassembler: header lines | User-defined headers | app | planned | linux+windows |
+| Disassembler: header lines | User-defined headers (HeapHook: function-start separators from labels and code analysis; no free-text headers) | app | partial | linux+windows |
 | Disassembler: syntax (Intel/AT&T) | Intel syntax display, AT&T option | hh-asm | partial | linux+windows |
 | Disassembler: color highlighting | Colors for jumps, calls, registers | app | done | linux+windows |
 | Disassembler: goto address | Jump to address/expression | app | done | linux+windows |
@@ -294,14 +294,14 @@ Total: 712
 | Disassembler: find what addresses this code accesses | Trace memory accessed by instruction | hh-debug | done | linux+windows |
 | Disassembler: replace with NOPs | Overwrites selection with NOP | hh-asm | done | linux+windows |
 | Disassembler: assemble/edit instruction | Type asm to patch bytes | hh-asm | done | linux+windows |
-| Disassembler: copy to clipboard | Copy address/bytes/opcodes | app | planned | linux+windows |
-| Disassembler: search for assembly | Search text in disassembly | hh-asm | planned | linux+windows |
+| Disassembler: copy to clipboard | Copy address/bytes/opcodes | app | done | linux+windows |
+| Disassembler: search for assembly | Search text in disassembly | hh-asm | done | linux+windows |
 | Disassembler: previous/next function | Navigate by function boundary | hh-asm | partial | linux+windows |
 | Disassembler: show register state | Displays registers next to code when broken | app | planned | linux+windows |
-| Disassembler: tooltips | Hover shows pointed data | app | planned | linux+windows |
+| Disassembler: tooltips | Hover shows pointed data | app | done | linux+windows |
 | Disassembler: find call / jump targets | Reference finder for branches | hh-asm | done | linux+windows |
 | Disassembler: go to function start | Detects function start heuristic | hh-asm | done | linux+windows |
-| Disassembler: sync with hex view | Selection mirrors in hex view | app | planned | linux+windows |
+| Disassembler: sync with hex view | Selection mirrors in hex view | app | done | linux+windows |
 | Disassembler: add to code list | Record the address in the code list | app | done | linux+windows |
 | Disassembler: auto-guess value type | Guess data type used by instruction | hh-asm | planned | linux+windows |
 | Disassembler: custom override via Lua | Lua can extend disassembler output | hh-lua | planned | linux+windows |
@@ -378,12 +378,12 @@ Total: 712
 | Cheat table framework code template | Generates framework code for tables | app | planned | linux+windows |
 | Lua-registered templates | `registerAutoAssemblerTemplate` adds templates | hh-lua | planned | linux+windows |
 | Custom AA commands from Lua | `registerAutoAssemblerCommand` adds commands | hh-lua | planned | linux+windows |
-| Script editor with syntax highlighting | Editor with highlighting for AA and Lua | app | planned | linux+windows |
-| Script editor: find/replace | Search text in the script | app | planned | linux+windows |
+| Script editor with syntax highlighting | Editor with highlighting for AA and Lua | app | done | linux+windows |
+| Script editor: find/replace | Search text in the script | app | done | linux+windows |
 | Script editor: assign to current cheat table | Saves script into a table entry | app | done | linux+windows |
 | Script editor: execute | Run the script immediately | app | partial | linux+windows |
-| Script editor: undo/redo | Edit history | app | planned | linux+windows |
-| Script editor: auto-complete | Completion for symbols and commands | app | planned | linux+windows |
+| Script editor: undo/redo | Edit history | app | done | linux+windows |
+| Script editor: auto-complete | Completion for symbols and commands | app | done | linux+windows |
 | Script editor: tab/ F9 hotkeys | Shortcuts for running and checking | app | partial | linux+windows |
 | Mono AA commands (`monopipe`, `mono_*`) | Mono-specific script commands | hh-inject | planned | linux+windows |
 | Script disable via checkbox | Toggling the entry runs `[DISABLE]` | hh-asm | done | linux+windows |
@@ -415,22 +415,22 @@ Total: 712
 | Breakpoint: break and trace | Single-steps and logs instructions after a hit | hh-debug | done | linux+windows |
 | Trace: max count | Limits number of traced instructions | hh-debug | done | linux+windows |
 | Trace: step over calls | Do not trace into calls | hh-debug | done | linux+windows |
-| Trace: stop condition | Stop on a given condition | hh-debug | engine only | linux+windows |
+| Trace: stop condition | Stop on a given condition | hh-debug | done | linux+windows |
 | Trace: step over system modules | Skip traces inside system DLLs | hh-debug | planned | windows |
 | Trace window | Tree of traced instructions with registers | app | done | linux+windows |
-| Trace: save/load trace | Persist trace to file | hh-debug | planned | linux+windows |
-| Trace: search | Search in traced instructions | app | planned | linux+windows |
+| Trace: save/load trace | Persist trace to file | hh-debug | done | linux+windows |
+| Trace: search | Search in traced instructions | app | done | linux+windows |
 | Find out what accesses this address | Lists instructions that read/write the address | hh-debug | done | linux+windows |
 | Find out what writes to this address | Lists instructions that write the address | hh-debug | done | linux+windows |
 | Find out what addresses this instruction accesses | Lists addresses touched by an instruction | hh-debug | done | linux+windows |
 | Access/write result window | Shows instruction, count, and register state | app | done | linux+windows |
 | Result window: show register values | Registers at the time of the hit | app | done | linux+windows |
-| Result window: more info | Extended hit details and stack | app | planned | linux+windows |
+| Result window: more info | Extended hit details and stack | app | done | linux+windows |
 | Result window: replace with code that does nothing | NOPs the found instruction | hh-asm | done | linux+windows |
 | Result window: add to code list | Saves instruction in the code list | app | done | linux+windows |
 | Result window: show disassembler | Jump to instruction | app | done | linux+windows |
-| Result window: show structure | Open dissector from register | app | planned | linux+windows |
-| Result window: copy to address list | Adds found addresses to table | app | planned | linux+windows |
+| Result window: show structure | Open dissector from register | app | done | linux+windows |
+| Result window: copy to address list | Adds found addresses to table | app | done | linux+windows |
 | Result window: stop/start | Pause recording | app | partial | linux+windows |
 | Exception handling options | Choose which exceptions break | hh-debug | done | linux+windows |
 | Step into | Execute one instruction | hh-debug | done | linux+windows |
@@ -442,7 +442,7 @@ Total: 712
 | Single-step options (step ignore exceptions) | Handle exceptions while stepping | hh-debug | planned | linux+windows |
 | Change registers | Edit general-purpose registers while stopped | hh-debug | done | linux+windows |
 | Edit flags | Edit EFLAGS bits | hh-debug | done | linux+windows |
-| Edit FPU / XMM registers | Edit floating point and vector registers | hh-debug | engine only | linux+windows |
+| Edit FPU / XMM registers | Edit floating point and vector registers | hh-debug | done | linux+windows |
 | Register view | Registers with change highlights | app | done | linux+windows |
 | Set new instruction pointer | Continue from another address | hh-debug | done | linux+windows |
 | Stack view | Shows stack with symbol annotations | app | done | linux+windows |
@@ -547,8 +547,8 @@ Total: 712
 | Code list: replace with NOPs | Patch and keep original bytes for restore | hh-asm | done | linux+windows |
 | Code list: restore original code | Undo patch | hh-asm | done | linux+windows |
 | Code list: save/load | Persist code list | app | done | linux+windows |
-| Code list: pause the game | Pause target from the advanced window | app | planned | linux+windows |
-| Code list: hotkey to pause | Hotkey to pause/resume | app | planned | linux+windows |
+| Code list: pause the game | Pause target from the advanced window | app | done | linux+windows |
+| Code list: hotkey to pause | Hotkey to pause/resume | app | done | linux+windows |
 | Code list: find out what addresses | Run debug tracing from list entries | hh-debug | planned | linux+windows |
 | Dissect code | Scans modules for calls, jumps, strings | hh-asm | done | linux+windows |
 | Dissect code: referenced strings | Lists strings and who references them | hh-asm | done | linux+windows |
@@ -579,7 +579,7 @@ Total: 712
 |---|---|---|---|---|
 | Speedhack enable | Injects a DLL scaling time functions | hh-inject | partial | linux+windows |
 | Speed multiplier | User sets speed factor (0.1x to many x) | hh-inject | partial | linux+windows |
-| Speedhack presets | Stored speed values with hotkeys | app | planned | linux+windows |
+| Speedhack presets | Stored speed values with hotkeys | app | done | linux+windows |
 | Speedhack hotkeys | Global keys to apply speeds | app | partial | linux+windows |
 | Hooked time APIs: QueryPerformanceCounter | Scales performance counter | hh-inject | planned | windows |
 | Hooked time APIs: GetTickCount/GetTickCount64 | Scales tick counts | hh-inject | planned | windows |
@@ -810,9 +810,9 @@ Total: 712
 | Text to speech | Speaks text from scripts | hh-lua | planned | windows |
 | Memory record hotkeys list | Overview of all assigned hotkeys | app | planned | linux+windows |
 | Save/load window layout | Remember window positions | app | done | linux+windows |
-| Compact mode | Smaller main window | app | planned | linux+windows |
+| Compact mode | Smaller main window | app | done | linux+windows |
 | Hide/show main window hotkey | Toggle visibility | app | planned | linux+windows |
-| Command line arguments | Open table or process from CLI | app | planned | linux+windows |
+| Command line arguments | Open table or process from CLI | app | done | linux+windows |
 | Table file association (.CT) | Opens tables on double-click | app | planned | windows |
 | Installer / portable mode | Distribution formats | app | planned | linux+windows |
 | Update check | Checks for new versions | app | planned | linux+windows |
@@ -820,14 +820,14 @@ Total: 712
 | Unrandomizer | Forces random function results to fixed values | hh-debug | planned | windows |
 | Network table sharing | Open table from URL | app | planned | linux+windows |
 | Process/Window hider | Hide windows of other processes | app | planned | windows |
-| Memory view: auto-assemble window | Open AA editor from menu | app | planned | linux+windows |
-| Pause/resume CE hotkeys | Hotkeys to pause target | app | planned | linux+windows |
-| Calculator / hex converter | Tools to convert numbers | app | planned | linux+windows |
+| Memory view: auto-assemble window | Open AA editor from menu | app | done | linux+windows |
+| Pause/resume CE hotkeys | Hotkeys to pause target | app | done | linux+windows |
+| Calculator / hex converter | Tools to convert numbers | app | done | linux+windows |
 | Help file | In-app documentation | app | planned | linux+windows |
 | About dialog | Version and credits | app | done | linux+windows |
 | Crash handling | Reports exceptions in CE | app | planned | linux+windows |
 | Multiple CE windows (Open another instance) | Run several instances | app | planned | linux+windows |
-| Cheat table open via drag-drop file | Drop table or exe | app | planned | linux+windows |
+| Cheat table open via drag-drop file | Drop table or exe | app | done | linux+windows |
 | DLL injection tool | Inject DLL into process | hh-inject | planned | windows |
 | Shared object injection tool | Inject .so into process | hh-inject | planned | linux |
 | Code execution in target (executeCode) | Runs code via remote thread/ptrace | hh-inject | planned | linux+windows |

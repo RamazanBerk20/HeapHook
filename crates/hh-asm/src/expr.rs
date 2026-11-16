@@ -26,7 +26,15 @@ impl SymbolTable {
     }
 }
 
+/// A host-provided symbol lookup (Cheat Engine's `registerSymbolLookupCallback`), asked after
+/// every built-in lookup failed.
+pub type SymbolLookup = std::sync::Arc<dyn Fn(&str) -> Option<Addr>>;
+
+/// By name, case-insensitive; `$process` is the main module (the first one listed).
 pub(crate) fn find_module<'m>(mods: &'m [Module], name: &str) -> Option<&'m Module> {
+    if name.eq_ignore_ascii_case("$process") {
+        return mods.first();
+    }
     mods.iter().find(|m| m.name.eq_ignore_ascii_case(name))
 }
 
@@ -278,8 +286,18 @@ pub(crate) fn std_lookup(
 
 /// Backs the `resolve_address` IPC command.
 pub fn resolve_address(p: &dyn Process, syms: &SymbolTable, expr: &str) -> Result<Addr> {
+    resolve_address_with(p, syms, expr, &|_| None)
+}
+
+/// [`resolve_address`] that asks `extra` for names nothing else knows.
+pub fn resolve_address_with(
+    p: &dyn Process,
+    syms: &SymbolTable,
+    expr: &str,
+    extra: &dyn Fn(&str) -> Option<Addr>,
+) -> Result<Addr> {
     let mods = p.modules().unwrap_or_default();
-    let lookup = |n: &str| std_lookup(p, syms, &mods, n);
+    let lookup = |n: &str| std_lookup(p, syms, &mods, n).or_else(|| extra(n));
     eval(
         expr,
         &Ctx {

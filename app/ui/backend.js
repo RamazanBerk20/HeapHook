@@ -251,6 +251,39 @@ export const api = {
   structImport: (path) => call('struct_import', { path }),
   /** -> {version, license, remote_ok, platform} */
   appInfo: () => call('app_info', {}),
+
+  // ---------- 1.0: search, memory, process, trust per entry, files ----------
+  /** req: {start, end?, pattern: "48 8B ?? 05", backward?, limit?} -> [addr] (forward: matches at >= start, ascending; backward: below start, descending) */
+  memSearch: (req) => call('mem_search', { req }),
+  /** req: {start, end, text, limit?} -> [{addr, text}] (instructions whose text contains `text`, case-insensitive) */
+  disasmSearch: (req) => call('disasm_search', { req }),
+  /** -> addr of a new block (prot: {r, w, x}) */
+  memAlloc: (size, prot) => call('mem_alloc', { size, prot }),
+  memFree: (addr, size) => call('mem_free', { addr, size }),
+  /** Suspends (true) or resumes the whole process; lua_poll.process.paused follows */
+  processPause: (pause) => call('process_pause', { pause }),
+  /** trace: whatever the UI wants back from traceLoad (JSON) */
+  traceSave: (path, trace) => call('trace_save', { path, trace }),
+  traceLoad: (path) => call('trace_load', { path }),
+  /** Readable listing of the live table */
+  tableExportText: (path) => call('table_export_text', { path }),
+  /** Appends a table file's entries (they arrive untrusted) -> {version, table, trust, untrusted} */
+  tableMerge: (path) => call('table_merge', { path }),
+  /** Inserts entries (new ids) after entry `after` (null: at the end); entries with Lua arrive untrusted -> {version, ids} */
+  tablePaste: (entries, after, base) => call('table_paste', { entries, after, base }),
+  /** Consent for the Lua of these entries (and their children) that arrived from another table */
+  tableTrustEntries: (ids) => call('table_trust_entries', { ids }),
+  /** -> true when the table changed since it was opened or saved */
+  tableDirty: () => call('table_dirty', {}),
+  /** A dropped file's text (browser drop) opened like table_open -> {version, table, trust, untrusted} */
+  tableOpenData: (name, data, force = false) => call('table_open_data', { name, data, force }),
+  /** Reads an Auto Assembler script from a file; its Lua needs consent (aaTrust) before aaExecute runs it */
+  aaLoadFile: (path) => call('aa_load_file', { path }),
+  aaTrust: (script) => call('aa_trust', { script }),
+  /** Command-line arguments, once: {table, pid, attach, launch: {program, args}|null} */
+  appArgs: () => call('app_args', {}),
+  /** Quits (after the unsaved-changes question) */
+  appQuit: () => call('app_quit', {}),
 };
 
 /** Ask for a file path: native dialog in the app, a text prompt in a browser (mock or bridge). */

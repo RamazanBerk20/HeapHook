@@ -8,7 +8,7 @@ use hh_core::{Addr, Error, Module, Process, Region, RegionKind, Result};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
-use crate::path::{Bases, PointerPath, walk};
+use crate::path::{Bases, PointerPath, region_stacks, thread_stacks, walk};
 use crate::{Progress, cancelled};
 
 const MAGIC: &[u8; 8] = b"HHPMAP01";
@@ -36,6 +36,8 @@ struct MapHeader {
     pointer_size: usize,
     regions: Vec<Region>,
     modules: Vec<Module>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    stacks: Vec<(Addr, Addr)>,
 }
 
 /// A snapshot of all pointers of one process.
@@ -45,6 +47,9 @@ pub struct PointerMap {
     /// Readable regions at collection time, sorted by address.
     pub regions: Vec<Region>,
     pub modules: Vec<Module>,
+    /// Thread stack ranges in `THREADSTACK<n>` order (see [`crate::thread_stacks`]); empty
+    /// = the regions tagged as stacks (maps saved before per-thread stacks).
+    pub stacks: Vec<(Addr, Addr)>,
     /// Sorted by (value, addr).
     pub(crate) entries: Vec<Entry>,
     by_addr: OnceLock<Vec<Entry>>,
@@ -125,8 +130,15 @@ fn scan_chunk(
 }
 
 impl PointerMap {
-    /// One pass over the process's readable memory, in parallel.
+    /// One pass over the process's readable memory, in parallel. Thread stacks are the
+    /// regions tagged as stacks; see [`PointerMap::collect_ex`].
     pub fn collect(p: &dyn Process, opts: &CollectOptions, progress: &Progress) -> Result<Self> {
+        Self::collect_ex(p, opts, false, progress)
+    }
+
+    /// [`PointerMap::collect`]; `local`: `p` runs on this machine, so every thread's stack
+    /// is found (`THREADSTACK1`... for the other threads; see [`crate::thread_stacks`]).
+    pub fn collect_ex(p: &dyn Process, opts: &CollectOptions, local: bool, progress: &Progress) -> Result<Self> {
         let ps = p.pointer_size();
         if ps != 4 && ps != 8 {
             return Err(Error::Unsupported("pointer size other than 4 or 8"));
@@ -144,6 +156,7 @@ impl PointerMap {
         regions.sort_by_key(|r| r.start);
         let mut modules = p.modules()?;
         extend_bss(&mut modules, &regions);
+        let stacks = if local { thread_stacks(p, true)? } else { region_stacks(&regions) };
         let valid = ranges(&regions);
         let mut chunks = Vec::new();
         for r in regions.iter().filter(|r| !opts.writable_only || r.prot.w) {
@@ -162,6 +175,7 @@ impl PointerMap {
             chunks
                 .par_iter()
                 .flat_map_iter(|&(s, n)| {
+                    progress.wait_if_paused();
                     if progress.is_cancelled() {
                         return Vec::new();
                     }
@@ -179,13 +193,14 @@ impl PointerMap {
         if progress.is_cancelled() {
             return Err(cancelled());
         }
-        Ok(Self::from_entries(ps, regions, modules, entries))
+        Ok(Self::from_entries(ps, regions, modules, stacks, entries))
     }
 
     fn from_entries(
         pointer_size: usize,
         regions: Vec<Region>,
         modules: Vec<Module>,
+        stacks: Vec<(Addr, Addr)>,
         mut entries: Vec<Entry>,
     ) -> Self {
         entries.par_sort_unstable_by_key(|e| (e.value, e.addr));
@@ -193,9 +208,15 @@ impl PointerMap {
             pointer_size,
             regions,
             modules,
+            stacks,
             entries,
             by_addr: OnceLock::new(),
         }
+    }
+
+    /// Thread stack ranges in `THREADSTACK<n>` order.
+    pub fn stack_ranges(&self) -> Vec<(Addr, Addr)> {
+        if self.stacks.is_empty() { region_stacks(&self.regions) } else { self.stacks.clone() }
     }
 
     /// Number of pointers.
@@ -220,7 +241,7 @@ impl PointerMap {
     }
 
     pub(crate) fn bases(&self) -> Bases {
-        Bases::new(&self.modules, &self.regions)
+        Bases::new(&self.modules, &self.stack_ranges())
     }
 
     /// Where `path` led in this snapshot.
@@ -238,6 +259,7 @@ impl PointerMap {
             pointer_size: self.pointer_size,
             regions: self.regions.clone(),
             modules: self.modules.clone(),
+            stacks: self.stacks.clone(),
         })
         .map_err(|e| Error::Other(e.to_string()))?;
         w.write_all(MAGIC)?;
@@ -277,7 +299,7 @@ impl PointerMap {
         let mut n8 = [0u8; 8];
         r.read_exact(&mut n8)?;
         let count = u64::from_le_bytes(n8);
-        if count.checked_mul(16) != Some(file_len - 20 - hlen) {
+        if count.checked_mul(16) != file_len.checked_sub(20 + hlen) {
             return Err(bad());
         }
         let mut entries = Vec::with_capacity(count as usize);
@@ -297,6 +319,7 @@ impl PointerMap {
             h.pointer_size,
             regions,
             h.modules,
+            h.stacks,
             entries,
         ))
     }

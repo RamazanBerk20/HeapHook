@@ -977,7 +977,7 @@ fn lua_poll_reports_the_process_and_its_exit() {
     let pid = t.child.id();
     app.open_process(pid).unwrap();
     let p = serde_json::to_value(app.lua_poll(0).unwrap()).unwrap();
-    assert_eq!(p["process"], json!({"pid": pid, "name": "hh-target", "is_64bit": true, "alive": true}));
+    assert_eq!(p["process"], json!({"pid": pid, "name": "hh-target", "is_64bit": true, "alive": true, "paused": false}));
     t.send("quit");
     t.child.wait().unwrap();
     wait("exit seen", || (!app.lua_poll(0).unwrap().process.unwrap().alive).then_some(()));
@@ -1671,6 +1671,7 @@ fn remote_session_end_to_end_and_connection_drop() {
     let p = serde_json::to_value(app.lua_poll(0).unwrap()).unwrap();
     assert_eq!((p["process"]["remote"].as_str(), p["process"]["alive"].as_bool()), (Some(addr.as_str()), Some(true)));
 
+    assert!(app.remote_status().unwrap().unwrap().connected, "liveness by ping");
     drop(server);
     let lost = wait("lost connection seen", || app.lua_poll(0).unwrap().process.and_then(|p| p.lost));
     assert!(lost.contains("connection to server lost"), "{lost}");
@@ -1968,6 +1969,83 @@ fn untrusted_table_lua_never_runs_on_any_route() {
     assert_eq!(marks(&marker).lines().count(), before + 1, "the current entry still runs");
     needs_consent(app.table_set_active(&[2], true));
     assert_eq!(marks(&marker).lines().count(), before + 1);
+
+    // Lua that reaches a trusted table from another one asks for itself, on every route:
+    // paste, a put carrying it, undo, the UI's merge, a dropped file, the Auto Assemble window.
+    let mine = dir.path().join("mine.json");
+    let my_script = format!("// mine\n{}", marker_script(&marker));
+    heaphook::table::save(&mine, &Table { entries: vec![Entry { id: 1, description: "mine".into(), script: Some(my_script), ..Entry::default() }], ..Table::default() }).unwrap();
+    app.table_open(mine.to_str().unwrap(), false).unwrap();
+    app.table_trust(true).unwrap();
+    let lines = || marks(&marker).lines().count();
+    let n = lines();
+    let entry_consent = |r: Result<(), String>| {
+        let e = r.expect_err("must be refused");
+        assert!(e.starts_with(heaphook::cheat::NEEDS_ENTRY_CONSENT), "{e}");
+    };
+    // 1. paste (from the untrusted table's file: what the UI's clipboard carries)
+    let pasted = app.table_paste(vec![evil.entries[0].clone()], Some(1), None).unwrap();
+    let pid_ = pasted.ids[0];
+    assert_eq!(app.table_get().unwrap().untrusted, vec![pid_]);
+    entry_consent(app.table_set_active(&[pid_], true));
+    app.lua_exec(&format!("getAddressList().getMemoryRecordByID({pid_}).Active = true")).unwrap();
+    entry_consent(app.hotkey_press(&[17, 113]).map(|_| ()));
+    assert!(!app.global_combos().contains(&vec![17, 113]), "a pasted entry's hotkey is not system-wide before its consent");
+    assert_eq!(lines(), n, "paste\n{}", log_text(&app));
+    // ... while the table's own entry still runs.
+    app.table_set_active(&[1], true).unwrap();
+    app.table_set_active(&[1], false).unwrap();
+    assert_eq!(lines(), n + 2);
+    // 2. a put that brings the same script under a new id, 3. undo bringing a deleted one back
+    let cur = app.table_get().unwrap();
+    let mut tb = cur.table.clone();
+    tb.entries.push(Entry { id: 99, description: "typed?".into(), script: evil.entries[0].script.clone(), ..Entry::default() });
+    app.table_put(tb, cur.version).unwrap();
+    entry_consent(app.table_set_active(&[99], true));
+    let cur = app.table_get().unwrap();
+    let mut tb = cur.table.clone();
+    tb.entries.retain(|e| e.id != pid_);
+    app.table_put(tb, cur.version).unwrap();
+    app.table_history(false).unwrap();
+    entry_consent(app.table_set_active(&[pid_], true));
+    assert_eq!(lines(), n + 2, "put / undo");
+    // 4. the UI's merge: its entries ask; the table script it brings asks for the table
+    let st = app.table_merge(&evil_path).unwrap();
+    assert_eq!(st.trust, heaphook::cheat::Trust::Ask);
+    let merged = st.table.entries.iter().find(|e| e.description == "Infinite HP" && !st.untrusted.is_empty() && st.untrusted.contains(&e.id) && e.id != pid_).map(|e| e.id).unwrap();
+    entry_consent(app.table_set_active(&[merged], true));
+    app.table_set_active(&[1], true).unwrap();
+    app.table_set_active(&[1], false).unwrap();
+    assert_eq!(lines(), n + 4, "merge keeps the own entry running");
+    // 5. a file dropped on the window: opened like any table
+    let st = app.table_open_data("evil.json", &std::fs::read_to_string(&file).unwrap(), false).unwrap();
+    assert_eq!(st.trust, heaphook::cheat::Trust::Ask);
+    needs_consent(app.table_set_active(&[1], true));
+    assert_eq!(lines(), n + 4, "drop");
+    // 6. the Auto Assemble window: a script file asks, a typed one does not
+    let aa = dir.path().join("evil.cea");
+    std::fs::write(&aa, marker_script(&marker)).unwrap();
+    let text = app.aa_load_file(aa.to_str().unwrap()).unwrap();
+    needs_consent(app.aa_execute(&text, true, None));
+    assert_eq!(lines(), n + 4, "aa window");
+    app.aa_trust(&text).unwrap();
+    let st = app.aa_execute(&text, true, None).unwrap();
+    app.aa_execute(&text, false, Some(&st)).unwrap();
+    assert_eq!(lines(), n + 6, "agreed aa script");
+    let typed = format!("// typed here\n{}", marker_script(&marker));
+    let st = app.aa_execute(&typed, true, None).unwrap();
+    app.aa_execute(&typed, false, Some(&st)).unwrap();
+    assert_eq!(lines(), n + 8, "typed aa script");
+    // 7. consent for the entry: it runs, and its hotkey goes system-wide
+    app.table_open(mine.to_str().unwrap(), false).unwrap();
+    app.table_trust(true).unwrap();
+    let pasted = app.table_paste(vec![evil.entries[0].clone()], None, None).unwrap();
+    entry_consent(app.table_set_active(&pasted.ids, true));
+    app.table_trust_entries(&pasted.ids).unwrap();
+    assert!(app.table_get().unwrap().untrusted.is_empty());
+    app.table_set_active(&pasted.ids, true).unwrap();
+    assert_eq!(lines(), n + 9, "agreed entry");
+    assert!(app.global_combos().contains(&vec![17, 113]));
 }
 
 /// Settings "never": nothing of a loaded table's Lua runs, consent cannot be given, and turning
@@ -2003,6 +2081,30 @@ fn never_setting_holds_on_every_route() {
     assert_eq!(app.table_get().unwrap().trust, heaphook::cheat::Trust::Declined);
     assert!(app.global_combos().is_empty());
     assert_eq!(marks(&marker), "");
+
+    // Lua from another table in the user's own table: no consent can be given for it.
+    let st = app.settings_get().unwrap();
+    let app = App::default();
+    app.open_process(t.child.id()).unwrap();
+    app.settings_set(st.clone()).unwrap();
+    let evil = hostile_table(&marker, &t);
+    let pasted = app.table_paste(vec![evil.entries[0].clone()], None, None).unwrap();
+    never(app.table_set_active(&pasted.ids, true));
+    assert!(app.table_trust_entries(&pasted.ids).unwrap_err().contains("never"));
+    let aa = dir.path().join("evil.cea");
+    std::fs::write(&aa, marker_script(&marker)).unwrap();
+    let text = app.aa_load_file(aa.to_str().unwrap()).unwrap();
+    assert!(app.aa_execute(&text, true, None).unwrap_err().contains("never"));
+    assert!(app.aa_trust(&text).unwrap_err().contains("never"));
+    // Agreed first, then "never": the entry's consent is withdrawn too.
+    let mut ask = st.clone();
+    ask.table_script = "ask".into();
+    app.settings_set(ask).unwrap();
+    app.table_trust_entries(&pasted.ids).unwrap();
+    app.settings_set(st).unwrap();
+    never(app.table_set_active(&pasted.ids, true));
+    assert_eq!(app.table_get().unwrap().untrusted, pasted.ids);
+    assert_eq!(marks(&marker), "");
 }
 
 /// Settings "Allow Lua scripts to access files and run programs" off: hh-lua's own `io`/`os`
@@ -2023,4 +2125,138 @@ fn lua_file_and_program_access_can_be_turned_off() {
     }
     assert!(!std::path::Path::new("/tmp/never-written.json").exists());
     assert!(app.ui_image("/usr/share/pixmaps/x.png").unwrap_err().contains("do not allow"));
+}
+
+// ---------------------------------------------------------------- 1.0 additions
+
+/// Memory viewer search, block allocation, pausing the process, trace files, the table as
+/// text and "unsaved changes".
+#[test]
+fn search_alloc_pause_trace_files_and_dirty() {
+    let mut t = Target::spawn();
+    let app = App::default();
+    let pid = t.child.id();
+    app.open_process(pid).unwrap();
+    use heaphook::search::{DisasmSearchReq, SearchReq};
+    let text: String = "HeapHook test string".bytes().map(|b| format!("{b:02x} ")).collect();
+    let str_a = parse_addr(&t.addr("str")).unwrap();
+    let find = |pattern: &str, start: u64, backward: bool| {
+        app.mem_search(&SearchReq { start: hex(start), pattern: pattern.into(), backward, limit: Some(1000), ..SearchReq::default() }).unwrap()
+    };
+    assert!(find(&text, 0, false).contains(&hex(str_a)));
+    assert_eq!(find(&text, str_a, false)[0], hex(str_a), "forward includes the start");
+    assert_eq!(find(&text, str_a + 1, true)[0], hex(str_a), "backward: the nearest below");
+    assert!(!find(&text, str_a, true).contains(&hex(str_a)), "backward excludes the start");
+    assert!(find("48 65 61 70 ?? 6f 6f 6b", 0, false).contains(&hex(str_a)), "wildcards");
+    assert!(app.mem_search(&SearchReq { start: "0".into(), pattern: "?? ??".into(), ..SearchReq::default() }).is_err());
+    // Disassembly search over the target's own module.
+    let m = app.modules().unwrap().into_iter().find(|m| m.name.starts_with("hh-target")).unwrap();
+    let base = parse_addr(&m.base).unwrap();
+    let rets = app.disasm_search(&DisasmSearchReq { start: m.base.clone(), end: hex(base + m.size.min(16 << 20)), text: "RET".into(), limit: Some(5) }).unwrap();
+    assert_eq!(rets.len(), 5);
+    assert!(rets.iter().all(|r| r.text.to_lowercase().contains("ret")));
+    assert!(app.disasm_search(&DisasmSearchReq { start: "0".into(), end: hex(1 << 40), text: "ret".into(), limit: None }).is_err());
+
+    // Allocate, use and free a block.
+    let a = app.mem_alloc(0x1000, hh_core::Prot { r: true, w: true, x: false }).unwrap();
+    app.write_bytes(&a, "deadbeef").unwrap();
+    assert_eq!(app.read_memory(&a, 4).unwrap(), "deadbeef");
+    app.mem_free(&a, 0x1000).unwrap();
+    assert_eq!(app.read_memory(&a, 4).unwrap(), "????????");
+
+    // Pause: every thread stops, the target answers nothing until resumed.
+    let state = || std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap().split(") ").nth(1).unwrap().chars().next().unwrap();
+    app.process_pause(true).unwrap();
+    assert_eq!(state(), 'T');
+    assert!(app.lua_poll(0).unwrap().process.unwrap().paused);
+    t.send("get");
+    assert!(t.lines.recv_timeout(Duration::from_millis(300)).is_err(), "a paused target must not answer");
+    // Values can still be read and written while it is paused.
+    app.write_value(&t.addr("i32"), de(json!("4bytes")), "31337", &Fmt::default(), None).unwrap();
+    app.process_pause(false).unwrap();
+    assert_eq!(serde_json::from_str::<Value>(&t.line()).unwrap()["i32"], 31337);
+    assert!(!app.lua_poll(0).unwrap().process.unwrap().paused);
+    // Closing a paused process lets it run again.
+    app.process_pause(true).unwrap();
+    app.close_process().unwrap();
+    assert_ne!(state(), 'T');
+
+    // Trace files round trip; anything else is refused.
+    let dir = tempfile::tempdir().unwrap();
+    let p = dir.path().join("t.hhtrace");
+    let trace = json!({"version": 1, "addr": "0x1000", "rows": [{"addr": "0x1000", "text": "nop", "context": {"rax": "0x1"}}]});
+    app.trace_save(p.to_str().unwrap(), &trace).unwrap();
+    assert_eq!(app.trace_load(p.to_str().unwrap()).unwrap(), trace);
+    std::fs::write(&p, "{\"rows\": []}").unwrap();
+    assert!(app.trace_load(p.to_str().unwrap()).unwrap_err().contains("not a HeapHook trace"));
+
+    // The table as text, and unsaved changes (activation does not count).
+    app.open_process(pid).unwrap();
+    assert!(!app.table_dirty().unwrap(), "an empty new table has nothing to save");
+    let group = Entry { id: 2, description: "Player".into(), children: vec![i32_entry(1, &t)], ..Entry::default() };
+    put(&app, vec![group]);
+    assert!(app.table_dirty().unwrap());
+    let tp = dir.path().join("t.json");
+    app.table_export(tp.to_str().unwrap()).unwrap();
+    assert!(!app.table_dirty().unwrap());
+    app.table_set_active(&[1], true).unwrap();
+    assert!(!app.table_dirty().unwrap(), "activation is not an unsaved change");
+    let txt = dir.path().join("t.txt");
+    app.table_export_text(txt.to_str().unwrap()).unwrap();
+    let listing = std::fs::read_to_string(&txt).unwrap();
+    assert!(listing.contains("Player\t\tgroup") && listing.contains(&format!("  hp\t{}\t4 bytes\t31337", t.addr("i32"))), "{listing}");
+    app.table_open(tp.to_str().unwrap(), false).unwrap();
+    assert!(!app.table_dirty().unwrap(), "just opened");
+}
+
+/// FPU / XMM registers can be edited; a trace stops where its stop condition holds.
+#[test]
+fn fpu_xmm_registers_and_trace_stop_condition() {
+    let mut t = Target::spawn_exe(exe("hh-debug", "hh-debug-target"));
+    let app = App::default();
+    app.open_process(t.child.id()).unwrap();
+    app.debug_attach().unwrap();
+    let (store, outer) = (t.addr("store"), t.addr("outer"));
+    let broken = |app: &App| wait("a break", || Some(app.debug_status().unwrap()).filter(|s| s.state == "broken"));
+    let id = app.debug_add_breakpoint(&bp(json!({"addr": store}))).unwrap();
+    t.send("store");
+    let tid = broken(&app).tid.unwrap();
+    app.debug_set_register(tid, "xmm3", "00112233445566778899aabbccddeeff").unwrap();
+    app.debug_set_register(tid, "st0", "-2.5").unwrap();
+    app.debug_set_register(tid, "MXCSR", "0x1fa0").unwrap();
+    let c = app.debug_context(tid).unwrap();
+    assert_eq!(c["fpu"]["xmm"][3], "00112233445566778899aabbccddeeff");
+    assert_eq!(c["fpu"]["st"][0]["value"], "-2.5");
+    assert!(app.debug_set_register(tid, "xmm3", "1234").is_err());
+    assert!(app.debug_set_register(tid, "st0", "abc").is_err());
+    assert!(app.debug_set_register(tid, "fcw", "0x10000").is_err());
+    app.debug_remove_breakpoint(id).unwrap();
+    app.debug_continue(false).unwrap();
+    assert!(t.line().starts_with("ok"));
+    // Trace from outer, stopping when it reaches store.
+    let id = app.debug_add_breakpoint(&bp(json!({"addr": outer, "action": "trace", "steps": 50, "stop_when": format!("rip=={store}")}))).unwrap();
+    assert_eq!(app.debug_breakpoints().unwrap()[0].stop_when.as_deref(), Some(format!("rip=={store}").as_str()));
+    t.send("outer");
+    let st = broken(&app);
+    assert_eq!((st.rip.as_deref(), st.reason.as_deref()), (Some(store.as_str()), Some(format!("trace stop, breakpoint {id}").as_str())));
+    assert!(app.debug_add_breakpoint(&bp(json!({"addr": outer, "action": "trace", "stop_when": "rax ==="}))).is_err());
+    app.debug_remove_breakpoint(id).unwrap();
+    app.debug_continue(false).unwrap();
+    assert!(t.line().starts_with("ok"));
+}
+
+/// Form changes coalesce per property; `since` 0 always gets the whole tree.
+#[test]
+fn form_changes_coalesce_and_snapshot() {
+    let app = App::default();
+    app.lua_exec("f = createForm() l = createLabel(f)").unwrap();
+    let first = app.ui_poll(0).unwrap();
+    assert!(first.snapshot.is_some() && first.changes.is_empty());
+    app.lua_exec("for i = 1, 5000 do l.Caption = 'n' .. i end").unwrap();
+    let r = app.ui_poll(first.next).unwrap();
+    assert!(r.snapshot.is_none());
+    let caps: Vec<_> = r.changes.iter().filter(|c| serde_json::to_value(c).unwrap().to_string().contains("Caption")).collect();
+    assert_eq!(caps.len(), 1, "5000 caption updates arrive as one");
+    assert!(serde_json::to_value(caps[0]).unwrap().to_string().contains("n5000"));
+    assert!(app.ui_poll(r.next + 100).unwrap().snapshot.is_some(), "a UI ahead of the backend (restarted) gets the tree");
 }

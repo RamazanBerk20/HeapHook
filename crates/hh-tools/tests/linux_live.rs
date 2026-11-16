@@ -78,6 +78,16 @@ fn live_hh_target() {
     assert!(!d.strings(Some("HeapHook"), 0, 10).is_empty(), "no HeapHook string among {:?}", d.strings(None, 0, 20));
     let main_ref = d.referenced_functions(0, 50).into_iter().find(|f| f.internal).unwrap();
     assert!(d.xref_count(main_ref.addr, main_ref.addr + 1, &[]) >= main_ref.callers as usize);
+    // Save and load the dissection.
+    let dir = tempfile::tempdir().unwrap();
+    let dfile = dir.path().join("target.hhdis");
+    d.save(&dfile, &Progress::new()).unwrap();
+    let back = hh_tools::dissect::Dissection::load(&dfile, &Progress::new()).unwrap();
+    assert_eq!(back, d);
+    assert_eq!(back.summary(), s);
+    // Remote mode: headers from memory only.
+    let hm = hh_tools::headers::summary_with(p, &exe, false).unwrap();
+    assert_eq!((hm.format.as_str(), hm.source.as_str()), ("elf", "memory"));
 
     let h = hh_tools::headers::summary(p, &exe).unwrap();
     assert_eq!((h.format.as_str(), h.source.as_str()), ("elf", "file"));
@@ -109,7 +119,6 @@ fn live_hh_target() {
     // Save the region holding i32, change the value, load the file back.
     let a = t.addr("i32");
     let r = p.regions().unwrap().into_iter().find(|r| r.start <= a && a < r.start + r.size).unwrap();
-    let dir = tempfile::tempdir().unwrap();
     let file = dir.path().join("heap.hhmem");
     let range = hh_tools::memory::Range { start: r.start, size: r.size };
     let saved = hh_tools::memory::save_memory(p, &[range], &file, &Progress::new()).unwrap();
@@ -120,8 +129,15 @@ fn live_hh_target() {
     let mut v = [0u8; 4];
     p.read_exact(a, &mut v).unwrap();
     assert_eq!(i32::from_le_bytes(v), 999);
-    let back = hh_tools::memory::load_memory(p, &file, None).unwrap();
+    // Plan first: the region is mapped and writable, nothing written yet.
+    let plan = hh_tools::memory::plan_load(p, &file, None).unwrap();
+    assert_eq!(plan.bytes, r.size);
+    assert!(plan.blocks.iter().all(|b| b.mapped && b.writable), "{plan:?}");
+    p.read_exact(a, &mut v).unwrap();
+    assert_eq!(i32::from_le_bytes(v), 999);
+    let back = hh_tools::memory::load_memory_approved(p, &file, None, &plan.blocks).unwrap();
     assert!(back.failed.is_empty());
+    assert_eq!(back.bytes, r.size);
     assert_eq!(t.cmd("get")["i32"], 123456);
 
     // Find what points at the chain's first heap object: the static base.

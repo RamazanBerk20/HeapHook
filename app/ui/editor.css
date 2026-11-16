@@ -1,0 +1,67 @@
+/* editor additions. Tokens live in styles.css: --canvas --canvas-2 --surface --text --text-2 --muted --border --hairline --hover, pastel --red/--blue/--green/--yellow with -bg variants, --font-mono, --fs/--fs-sm/--fs-xs, --s1..--s5, --r-sm/--r, --line, --dur. Both themes come from the tokens. */
+
+/* The textarea draws caret and selection only; the mirror behind it draws the text. Both must
+   share font, padding, tab size and line height exactly (editor.js copies them from the textarea). */
+.ed-wrap { position: relative; flex: 1; min-width: 0; overflow: hidden; background: var(--surface); }
+.ed-wrap > textarea.ed-ta {
+  position: absolute; inset: 0; width: 100%; height: 100%; z-index: 1;
+  background: transparent; color: transparent; -webkit-text-fill-color: transparent; caret-color: var(--text);
+  font-variant-ligatures: none; font-kerning: none;
+}
+.ed-wrap > textarea.ed-ta::selection { background: color-mix(in srgb, var(--blue) 26%, transparent); }
+.ed-wrap > textarea.ed-ta::placeholder { -webkit-text-fill-color: var(--muted); color: var(--muted); }
+.ed-hl { position: absolute; inset: 0; overflow: hidden; pointer-events: none; user-select: none; }
+.ed-in { position: absolute; top: 0; left: 0; min-width: 100%; white-space: pre; color: var(--text-2); font-variant-ligatures: none; font-kerning: none; }
+.ed-ln { height: var(--ed-lh, 18px); }
+.ed-ln.ed-err { background: var(--red-bg); }
+/* Room for the textarea's horizontal scrollbar, so the gutter can scroll as far as the text. */
+.ed-host .aa-gutter { padding-bottom: 28px; }
+.ed-gerr { background: var(--red-bg); color: var(--red); border-radius: var(--r-sm); padding: 0 2px; }
+
+/* Colour only for meaning: directives and keywords, literals, registers, comments. */
+.ed-dir, .ed-kw { color: var(--blue); }
+.ed-str, .ed-num { color: var(--green); }
+.ed-reg { color: var(--yellow); }
+.ed-com { color: var(--muted); }
+.ed-mn, .ed-fn { color: var(--text); }
+.ed-lab { color: var(--text); text-decoration: underline; text-decoration-color: var(--border); text-underline-offset: 3px; }
+.ed-match { background: var(--yellow-bg); border-radius: 2px; }
+.ed-cur { background: var(--yellow-bg); border-radius: 2px; outline: 1px solid var(--yellow); }
+/* A hidden or bidi control character: zero width like in the textarea, drawn as a red bar. */
+.ed-hid { display: inline-block; width: 0; height: var(--ed-lh, 18px); vertical-align: top; border-left: 2px solid var(--red); margin-right: -2px; }
+.ed-hidden { position: absolute; right: 18px; bottom: 16px; z-index: 2; padding: 1px 6px; font-size: var(--fs-xs); background: var(--red-bg); color: var(--red); border-radius: var(--r-sm); pointer-events: none; }
+
+/* ---------- find / replace ---------- */
+.ed-find {
+  position: absolute; top: 4px; right: 18px; z-index: 3; width: min(390px, calc(100% - 26px));
+  display: flex; flex-direction: column; gap: 4px; padding: 4px;
+  background: var(--surface); border: var(--line); border-radius: var(--r); box-shadow: var(--shadow-pop);
+}
+.ed-find-row { display: flex; align-items: center; gap: 2px; min-width: 0; }
+.ed-find input.ed-find-in { flex: 1; height: 26px; min-width: 0; }
+.ed-find .btn { height: 26px; flex: none; }
+.ed-find .btn.icon { width: 26px; }
+.ed-find .btn .ic { width: 14px; height: 14px; }
+.ed-case { display: inline-flex; align-items: center; gap: 4px; padding: 0 6px; height: 26px; font: var(--fs-xs) var(--font-mono); color: var(--muted); border-radius: var(--r); cursor: pointer; }
+.ed-case:has(input:checked) { color: var(--text); background: var(--hover); }
+.ed-count { min-width: 64px; padding: 0 4px; text-align: right; font-size: var(--fs-xs); color: var(--muted); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.ed-count.none { color: var(--red); }
+
+/* ---------- completion ---------- */
+.ed-pop {
+  position: absolute; z-index: 4; margin: 0; padding: 2px; list-style: none;
+  min-width: 200px; max-width: min(380px, 90%); max-height: 198px; overflow: auto;
+  background: var(--surface); border: var(--line); border-radius: var(--r); box-shadow: var(--shadow-pop);
+  font: var(--fs-sm)/20px var(--font-mono);
+}
+.ed-pop li { display: flex; justify-content: space-between; gap: 12px; padding: 0 6px; border-radius: var(--r-sm); white-space: nowrap; color: var(--text-2); cursor: default; }
+.ed-pop li[aria-selected="true"] { background: var(--blue-bg); color: var(--text); }
+.ed-pop-w { overflow: hidden; text-overflow: ellipsis; }
+.ed-pop-k { flex: none; color: var(--muted); font: var(--fs-xs)/20px var(--font-ui); }
+
+/* ---------- Auto Assemble window ---------- */
+.ed-aawin-title { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.ed-src { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ed-aawin .dlg-head .btn { flex: none; }
+@media (max-width: 960px) { .ed-find kbd, .ed-aawin .dlg-actions kbd { display: none; } }
+@media (prefers-reduced-motion: reduce) { .ed-pop li, .ed-find .btn { transition: none; } }

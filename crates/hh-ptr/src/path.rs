@@ -34,21 +34,21 @@ pub(crate) struct Bases {
 }
 
 impl Bases {
-    pub fn new(modules: &[Module], regions: &[Region]) -> Self {
+    /// `stacks`: thread stack ranges, `THREADSTACK0` first.
+    pub fn new(modules: &[Module], stacks: &[(Addr, Addr)]) -> Self {
         Bases {
             modules: modules
                 .iter()
                 .map(|m| (m.name.to_ascii_lowercase(), m.base))
                 .collect(),
-            stacks: regions
-                .iter()
-                .filter(|r| is_stack(r))
-                .map(|r| r.start.saturating_add(r.size))
-                .collect(),
+            stacks: stacks.iter().map(|s| s.1).collect(),
         }
     }
     pub fn of_process(p: &dyn Process) -> Result<Self> {
-        Ok(Self::new(&p.modules()?, &p.regions()?))
+        Self::of_process_ex(p, false)
+    }
+    pub fn of_process_ex(p: &dyn Process, local: bool) -> Result<Self> {
+        Ok(Self::new(&p.modules()?, &thread_stacks(p, local)?))
     }
     /// Address a base name stands for; `None` name = absolute (0).
     pub fn addr_of(&self, name: Option<&str>) -> Option<Addr> {
@@ -72,9 +72,56 @@ pub(crate) fn walk(
         .try_fold(base, |a, &o| Some(read(a)?.wrapping_add_signed(o)))
 }
 
+/// Stack ranges of tagged stack regions (`[stack]`), in address order.
+pub(crate) fn region_stacks(regions: &[Region]) -> Vec<(Addr, Addr)> {
+    regions.iter().filter(|r| is_stack(r)).map(|r| (r.start, r.start.saturating_add(r.size))).collect()
+}
+
+/// Thread stack ranges `[start, end)` in `THREADSTACK<n>` order. Without `local` (or off
+/// Linux) these are the regions tagged as stacks (`[stack]`: the main thread's on Linux).
+/// With `local` on Linux — set it only when `p` runs on this machine, since this reads
+/// `/proc/<pid>` — the main thread's stack comes first, then each other thread's (by
+/// thread id): the mapping holding the stack pointer from `/proc/<pid>/task/<tid>/syscall`
+/// (needs ptrace access; threads that are running, not blocked, are skipped). Anything that
+/// cannot be read degrades to the tagged regions.
+pub fn thread_stacks(p: &dyn Process, local: bool) -> Result<Vec<(Addr, Addr)>> {
+    let regions = p.regions()?;
+    #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
+    let mut out = region_stacks(&regions);
+    #[cfg(target_os = "linux")]
+    if local && let Ok(tids) = p.threads() {
+        for tid in tids.into_iter().filter(|&t| t != p.pid()) {
+            let Some(sp) = linux_sp(p.pid(), tid) else { continue };
+            let Some(r) = regions.iter().find(|r| r.start <= sp && sp - r.start < r.size) else { continue };
+            let range = (r.start, r.start.saturating_add(r.size));
+            if r.kind == hh_core::RegionKind::Private && !out.contains(&range) {
+                out.push(range);
+            }
+        }
+    }
+    let _ = local;
+    Ok(out)
+}
+
+/// Stack pointer of a thread blocked in (or just out of) a system call: the second-to-last
+/// field of `/proc/<pid>/task/<tid>/syscall` (`running` while it runs).
+#[cfg(target_os = "linux")]
+fn linux_sp(pid: u32, tid: u32) -> Option<Addr> {
+    let s = std::fs::read_to_string(format!("/proc/{pid}/task/{tid}/syscall")).ok()?;
+    let f: Vec<&str> = s.split_whitespace().collect();
+    let sp = f.len().checked_sub(2).filter(|_| f.len() >= 3).map(|i| f[i])?;
+    u64::from_str_radix(sp.strip_prefix("0x")?, 16).ok().filter(|&v| v != 0)
+}
+
 /// Resolves a path to its current address in a live process.
 pub fn resolve(p: &dyn Process, path: &PointerPath) -> Result<Addr> {
-    let bases = Bases::of_process(p)?;
+    resolve_ex(p, path, false)
+}
+
+/// [`resolve`]; `local`: `p` runs on this machine, so every thread's stack resolves (see
+/// [`thread_stacks`]).
+pub fn resolve_ex(p: &dyn Process, path: &PointerPath, local: bool) -> Result<Addr> {
+    let bases = Bases::of_process_ex(p, local)?;
     let base = bases
         .addr_of(path.module.as_deref())
         .ok_or_else(|| Error::Other(format!("unknown base {:?}", path.module)))?

@@ -8,10 +8,10 @@
 //! other thread is held stopped, except for instructions that may block in the kernel and
 //! after [`LIFT_WAIT`], so nothing runs past a breakpoint unseen.
 use std::cell::Cell;
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::Arc;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, SyncSender, TryRecvError};
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use hh_asm::{FlowKind, MemAccess};
@@ -19,10 +19,18 @@ use hh_core::{Addr, Error, Module, Pid, Process, Prot, Result};
 
 use crate::os::Os;
 use crate::{
-    Action, BpId, BpKind, BpMethod, BpOptions, BreakReason, Breakpoint, BreakpointInfo, Context,
-    Event, HitRecord, Hooks, LIFT_WAIT, Live, MAX_RECORDS, Masked, Predicate, Shared, SignalAction,
-    State, ThreadInfo, Tid,
+    Action, BpExtra, BpId, BpKind, BpMethod, BpOptions, BreakOn, BreakReason, Breakpoint,
+    BreakpointInfo, Context, DataHit, Event, HitRecord, Hooks, LIFT_WAIT, LaunchOptions,
+    LaunchStop, Live, MAX_COVERAGE, MAX_LOG_RATE, MAX_RECORDS, MAX_TRACE_STEPS, Masked, Predicate,
+    Shared, SignalAction, State, StepKind, StepOptions, ThreadInfo, Tid, TraceAccess, TraceStep,
+    Trigger, module_matches,
 };
+
+/// How a session begins.
+pub(crate) enum Start {
+    Attach(Pid),
+    Launch(Box<LaunchOptions>),
+}
 
 const PAGE: u64 = 4096;
 
@@ -71,13 +79,6 @@ pub(crate) enum Mode {
 }
 
 #[derive(Debug)]
-pub(crate) enum StepKind {
-    Into,
-    Over,
-    Out,
-}
-
-#[derive(Debug)]
 enum Stop {
     Trap {
         stepped: bool,
@@ -89,6 +90,40 @@ enum Stop {
         addr: Option<Addr>,
         first_chance: bool,
     },
+    /// A debug event the user wants to break on ([`BreakOn`]).
+    Trigger(Trigger),
+}
+
+/// Code a step or trace runs through at full speed instead of single-stepping.
+#[derive(Clone, Default)]
+struct Fence {
+    skip: Vec<(Addr, Addr)>,
+    stay: Option<(Addr, Addr)>,
+}
+
+impl Fence {
+    fn fenced(&self, a: Addr) -> bool {
+        self.skip.iter().any(|&(s, e)| a >= s && a < e)
+            || self.stay.is_some_and(|(s, e)| a < s || a >= e)
+    }
+}
+
+/// State of a running break-and-trace beyond its [`Goal::Trace`].
+#[derive(Clone, Copy)]
+struct TraceRun {
+    base_sp: u64,
+    deadline: Option<Instant>,
+    until_return: bool,
+    capture: bool,
+    /// The function the trace started in is returning (its `ret` is being stepped).
+    ret_done: bool,
+}
+
+/// "Executed instruction set" recording ([`crate::Debugger::coverage_start`]).
+#[derive(Default)]
+struct Cov {
+    armed: HashSet<Addr>,
+    hit: BTreeSet<Addr>,
 }
 
 #[derive(Default, Clone, Copy, PartialEq, Eq)]
@@ -110,6 +145,8 @@ struct PageHit {
     ip: Addr,
     accesses: Vec<MemAccess>,
     fault: Option<Addr>,
+    /// Value of each access before the instruction ran (`DataHit::old`).
+    before: Vec<Option<u64>>,
 }
 
 #[derive(Default)]
@@ -140,6 +177,9 @@ struct Th {
     was_ret: bool,
     /// Where it last re-ran an instruction that faulted on a page we had just unprotected.
     page_retry: Option<Addr>,
+    /// Code its step / trace runs through at full speed.
+    fence: Option<Fence>,
+    trace: Option<TraceRun>,
 }
 
 impl Th {
@@ -160,13 +200,19 @@ struct Temp {
     tid: Option<Tid>,
     min_sp: u64,
     run_to: bool,
+    /// Qualifying hits left before it acts (run to the N-th hit).
+    count: u64,
 }
 
 struct Bp {
     info: BreakpointInfo,
     hooks: Hooks,
     records: BTreeMap<(Addr, Option<Addr>), HitRecord>,
-    trace: Vec<Context>,
+    trace: Vec<TraceStep>,
+    /// A pending breakpoint the user disabled: not armed when it resolves.
+    parked: bool,
+    /// Hardware data watch: the watched value at the last hit (or when armed).
+    last_val: Option<u64>,
 }
 
 impl Bp {
@@ -204,22 +250,21 @@ fn guard<R>(default: R, f: impl FnOnce() -> R) -> R {
 type Cmd = Box<dyn FnOnce(&mut Engine) + Send>;
 
 pub(crate) fn run(
-    pid: Pid,
-    mem: Arc<Live>,
+    how: Start,
     shared: Arc<Shared>,
     events: Sender<Event>,
     rx: Receiver<Cmd>,
-    ok: SyncSender<Result<()>>,
+    ok: SyncSender<Result<Arc<Live>>>,
 ) {
     ENGINE_THREAD.with(|c| c.set(true));
-    let mut e = match Engine::start(pid, mem, shared, events) {
+    let mut e = match Engine::start(how, shared, events) {
         Ok(e) => e,
         Err(err) => {
             let _ = ok.send(Err(err));
             return;
         }
     };
-    let _ = ok.send(Ok(()));
+    let _ = ok.send(Ok(e.live.clone()));
     if catch_unwind(AssertUnwindSafe(|| e.main_loop(&rx))).is_err() {
         // A bug, not bad input: at least leave the target running without our int3s.
         let _ = catch_unwind(AssertUnwindSafe(|| e.detach()));
@@ -284,6 +329,16 @@ pub(crate) struct Engine {
     started: Instant,
     /// Times the watchdog had to repair a stall (see `watchdog`).
     recoveries: u64,
+    pub(crate) break_on: BreakOn,
+    /// Why the coming break happens, when a debug event asked for it.
+    trigger: Option<Trigger>,
+    /// Breakpoints are ignored until the current step completes.
+    quiet: bool,
+    cov: Option<Cov>,
+    /// A launched process breaks at its entry point.
+    break_entry: bool,
+    /// Tracepoint rate limit: window start, lines sent in it, lines dropped since the last.
+    log_rate: (Instant, u32, u64),
 }
 
 /// Entries kept in the event history.
@@ -296,14 +351,31 @@ const DOG_EVERY: Duration = Duration::from_millis(10);
 const STALL: Duration = Duration::from_millis(250);
 
 impl Engine {
-    fn start(
-        pid: Pid,
-        live: Arc<Live>,
-        shared: Arc<Shared>,
-        events: Sender<Event>,
-    ) -> Result<Engine> {
+    fn start(how: Start, shared: Arc<Shared>, events: Sender<Event>) -> Result<Engine> {
+        let live = |pid: Pid| -> Result<Arc<Live>> {
+            Ok(Arc::new(Live {
+                pid,
+                cur: RwLock::new(hh_core::open(pid)?),
+            }))
+        };
+        let (os, raws, live, launch) = match how {
+            Start::Attach(pid) => {
+                let live = live(pid)?;
+                let (os, raws) = Os::attach(pid, &*live)?;
+                (os, raws, live, None)
+            }
+            Start::Launch(o) => {
+                let mut os = Os::launch(&o)?;
+                match live(os.pid()) {
+                    Ok(l) => (os, Vec::new(), l, Some(o.stop)),
+                    Err(e) => {
+                        os.kill();
+                        return Err(e);
+                    }
+                }
+            }
+        };
         let mem: Arc<dyn Process> = live.clone();
-        let (os, raws) = Os::attach(pid, &*mem)?;
         let view: Arc<dyn Process> = Arc::new(Masked {
             inner: mem.clone(),
             shared: shared.clone(),
@@ -343,12 +415,25 @@ impl Engine {
             history: VecDeque::with_capacity(HISTORY),
             started: Instant::now(),
             recoveries: 0,
+            break_on: BreakOn::default(),
+            trigger: None,
+            quiet: false,
+            cov: None,
+            break_entry: false,
+            log_rate: (Instant::now(), 0, 0),
         };
-        let r = e.init(raws);
-        if r.is_err() {
+        let r = match launch {
+            None => e.init(raws),
+            Some(stop) => e.init_launch(stop),
+        };
+        if let Err(err) = r {
             let _ = e.detach();
+            if launch.is_some() {
+                e.os.kill();
+            }
+            return Err(err);
         }
-        r.map(|_| e)
+        Ok(e)
     }
 
     fn init(&mut self, raws: Vec<(Tid, Raw)>) -> Result<()> {
@@ -358,6 +443,32 @@ impl Engine {
         self.modules = self.mem.modules().unwrap_or_default();
         self.hook_loader();
         self.resume_all()
+    }
+
+    /// A launched process stopped before its first instruction: hook its entry point (the
+    /// loader breakpoint is set up from there), then stop or run as asked.
+    fn init_launch(&mut self, stop: LaunchStop) -> Result<()> {
+        self.modules = self.mem.modules().unwrap_or_default();
+        if let Some(e) = self.os.exec_entry()
+            && self.arm_sw(e).is_ok()
+        {
+            self.entry = Some(e);
+        }
+        let stop = match stop {
+            LaunchStop::Entry if self.entry.is_none() => LaunchStop::FirstInstruction,
+            s => s,
+        };
+        match stop {
+            LaunchStop::FirstInstruction => {
+                self.trigger = Some(Trigger::Start);
+                self.enter_break(self.os.pid(), BreakReason::Pause)
+            }
+            LaunchStop::Entry => {
+                self.break_entry = true;
+                self.resume_all()
+            }
+            LaunchStop::Run => self.resume_all(),
+        }
     }
 
     fn hook_loader(&mut self) {
@@ -553,19 +664,22 @@ impl Engine {
             if defer { " (deferred)" } else { "" }
         ));
         let stop = match raw {
-            Raw::Trap { code, int3 } => self.classify(tid, code, int3)?,
+            Raw::Trap { code, int3 } => Some(self.classify(tid, code, int3)?),
             Raw::Signal {
                 code,
                 addr,
                 first_chance,
-            } => Stop::Signal {
+            } => Some(Stop::Signal {
                 code,
                 addr,
                 first_chance,
-            },
+            }),
             Raw::ThreadCreated(new) => {
                 self.threads.entry(new).or_default();
                 self.emit(Event::ThreadCreated { tid: new });
+                if self.break_on.thread_created {
+                    return self.fire(new, Trigger::ThreadCreated { tid: new }, defer);
+                }
                 return if defer { Ok(()) } else { self.resume_all() };
             }
             Raw::GuestCreated(new) => {
@@ -578,7 +692,9 @@ impl Engine {
                 return if defer { Ok(()) } else { self.resume_all() };
             }
             Raw::ThreadExited => {
-                self.thread_gone(tid, defer);
+                if self.thread_gone(tid, defer) && self.break_on.thread_exited {
+                    return self.fire(tid, Trigger::ThreadExited { tid }, defer);
+                }
                 return if defer { Ok(()) } else { self.resume_all() };
             }
             Raw::ProcessExited { code } => {
@@ -587,19 +703,43 @@ impl Engine {
                 return Ok(());
             }
             Raw::ModuleLoaded(m) => {
-                self.emit(Event::ModuleLoaded(m));
-                return if defer { Ok(()) } else { self.resume_all() };
+                self.emit(Event::ModuleLoaded(m.clone()));
+                self.modules.retain(|o| o.base != m.base);
+                if module_matches(&self.break_on.module_loaded, &m) {
+                    self.trigger.get_or_insert(Trigger::ModuleLoaded(m.clone()));
+                }
+                self.modules.push(m);
+                self.resolve_pending();
+                None
             }
             Raw::ModuleUnloaded(base) => {
                 self.emit(Event::ModuleUnloaded { base });
-                return if defer { Ok(()) } else { self.resume_all() };
+                if let Some(i) = self.modules.iter().position(|m| m.base == base) {
+                    let m = self.modules.remove(i);
+                    self.forget_range(m.base, m.base.saturating_add(m.size.max(1)));
+                    if module_matches(&self.break_on.module_unloaded, &m) {
+                        self.trigger.get_or_insert(Trigger::ModuleUnloaded(m));
+                    }
+                }
+                self.flush_disables()?;
+                None
             }
             Raw::Exec => {
                 let stepping = self.on_exec();
                 if stepping && !defer {
                     return self.enter_break(self.os.pid(), BreakReason::Step);
                 }
-                return if defer { Ok(()) } else { self.resume_all() };
+                None
+            }
+        };
+        let stop = match stop {
+            Some(s) => s,
+            None => {
+                return match self.trigger.take() {
+                    Some(t) => self.fire(tid, t, defer),
+                    None if defer => Ok(()),
+                    None => self.resume_all(),
+                };
             }
         };
         if defer {
@@ -610,7 +750,8 @@ impl Engine {
         }
     }
 
-    fn thread_gone(&mut self, tid: Tid, defer: bool) {
+    /// Forgets an exited task; true when it was one of the user's threads.
+    fn thread_gone(&mut self, tid: Tid, defer: bool) -> bool {
         let th = self.threads.remove(&tid);
         self.deferred.retain(|d| d.0 != tid);
         let (gone, keep) = std::mem::take(&mut self.temps)
@@ -623,7 +764,7 @@ impl Engine {
         if self.exclusive == Some(tid) {
             self.exclusive = None;
         }
-        let Some(th) = th else { return };
+        let Some(th) = th else { return false };
         // It died mid-step: put its lifted breakpoints back.
         if let Some(a) = th.lift_sw {
             let _ = self.unlift_sw(a);
@@ -638,6 +779,7 @@ impl Engine {
         if !th.guest {
             self.emit(Event::ThreadExited { tid });
         }
+        !th.guest
     }
 
     /// Breakpoints a process-wrapper write landed inside of were dropped from the patch
@@ -647,6 +789,9 @@ impl Engine {
         for a in dropped {
             self.sw.remove(&a);
             self.temps.retain(|t| t.addr != a);
+            if let Some(c) = &mut self.cov {
+                c.armed.remove(&a);
+            }
             if self.loader == Some(a) {
                 self.loader = None;
             }
@@ -687,6 +832,10 @@ impl Engine {
         for b in self.bps.values_mut() {
             b.info.enabled = false;
             b.info.slot = None;
+            b.info.resolved = false;
+        }
+        if let Some(c) = &mut self.cov {
+            c.armed.clear();
         }
         // The kernel cleared the debug registers; reset the backend's copy.
         let _ = self.os.set_dr(None, [0; 4], 0);
@@ -811,6 +960,14 @@ impl Engine {
 
     fn handle(&mut self, tid: Tid, stop: Stop) -> Result<()> {
         match stop {
+            Stop::Trigger(t) => {
+                let tid = match self.threads.get(&tid).is_some_and(|t| !t.guest) {
+                    true => tid,
+                    false => self.user_tid()?,
+                };
+                self.trigger = Some(t);
+                self.enter_break(tid, BreakReason::Pause)
+            }
             Stop::Signal {
                 code,
                 addr,
@@ -895,14 +1052,26 @@ impl Engine {
                         continue;
                     }
                     let Some(id) = self.slots[slot] else { continue };
-                    if self
-                        .bps
-                        .get(&id)
-                        .is_some_and(|b| b.info.bp.kind == BpKind::Execute)
-                    {
-                        self.th(tid).at_bp = true;
-                    }
-                    self.hit(id, tid, &ctx, &mut brk, None, None)?;
+                    let Some(b) = self.bps.get(&id) else { continue };
+                    let data = match b.info.bp.kind {
+                        BpKind::Execute => {
+                            self.th(tid).at_bp = true;
+                            None
+                        }
+                        _ => {
+                            let (a, n) = (b.info.bp.address, b.info.bp.size);
+                            let new = self.value_at(a, n as usize);
+                            let b = self.bps.get_mut(&id).expect("checked");
+                            let old = std::mem::replace(&mut b.last_val, new);
+                            Some(DataHit {
+                                address: a,
+                                size: n,
+                                old,
+                                new,
+                            })
+                        }
+                    };
+                    self.hit(id, tid, &ctx, &mut brk, None, None, data)?;
                 }
                 if let Some(a) = sw {
                     self.th(tid).at_bp = true;
@@ -915,18 +1084,30 @@ impl Engine {
                         .map(|b| b.info.id)
                         .collect();
                     for id in ids {
-                        self.hit(id, tid, &ctx, &mut brk, Some(a), None)?;
+                        self.hit(id, tid, &ctx, &mut brk, Some(a), None, None)?;
                     }
                     if let Some(i) = self.temps.iter().position(|t| {
                         t.addr == a && t.tid.is_none_or(|x| x == tid) && ctx.rsp >= t.min_sp
                     }) {
-                        let t = self.temps.remove(i);
-                        self.disarm_sw(t.addr)?;
-                        if t.run_to {
-                            brk.get_or_insert(BreakReason::Step);
+                        if self.temps[i].count > 1 {
+                            self.temps[i].count -= 1;
                         } else {
-                            self.advanced(tid, &ctx, &mut brk)?;
+                            let t = self.temps.remove(i);
+                            self.disarm_sw(t.addr)?;
+                            if t.run_to {
+                                brk.get_or_insert(BreakReason::Step);
+                            } else {
+                                self.advanced(tid, &ctx, &mut brk)?;
+                            }
                         }
+                    }
+                    if let Some(c) = &mut self.cov
+                        && c.armed.remove(&a)
+                    {
+                        if c.hit.len() < MAX_COVERAGE {
+                            c.hit.insert(a);
+                        }
+                        self.disarm_sw(a)?;
                     }
                     if self.loader == Some(a) {
                         self.modules_changed();
@@ -936,10 +1117,16 @@ impl Engine {
                         self.disarm_sw(a)?;
                         self.hook_loader();
                         self.modules_changed();
+                        if std::mem::take(&mut self.break_entry) {
+                            self.trigger.get_or_insert(Trigger::Entry);
+                        }
                     }
                 }
                 if stepped {
                     self.after_step(tid, &ctx, &mut brk)?;
+                }
+                if self.trigger.is_some() {
+                    brk.get_or_insert(BreakReason::Pause);
                 }
                 self.flush_disables()?;
                 match brk {
@@ -954,7 +1141,9 @@ impl Engine {
         self.threads.entry(tid).or_default()
     }
 
-    /// `insn`: the instruction that hit, when known. `accessed`: the address a page watch saw.
+    /// `insn`: the instruction that hit, when known. `accessed`: the address a page watch
+    /// saw. `data`: the value of a data breakpoint around the access.
+    #[allow(clippy::too_many_arguments)]
     fn hit(
         &mut self,
         id: BpId,
@@ -963,15 +1152,40 @@ impl Engine {
         brk: &mut Option<BreakReason>,
         insn: Option<Addr>,
         accessed: Option<Addr>,
+        data: Option<DataHit>,
     ) -> Result<()> {
-        let Some(bp) = self.bps.get_mut(&id) else {
-            return Ok(());
-        };
-        if !bp.info.enabled {
+        if self.quiet {
             return Ok(());
         }
+        let Some(bp) = self.bps.get(&id) else {
+            return Ok(());
+        };
+        if !bp.info.enabled || bp.info.extra.thread.is_some_and(|t| t != tid) {
+            return Ok(());
+        }
+        if let Some(m) = &bp.info.extra.outside_module {
+            let at = match (insn, bp.info.bp.kind) {
+                (Some(a), _) => a,
+                (None, BpKind::Execute) => ctx.rip,
+                // Data traps report the next instruction; the accessing one ends at rip.
+                (None, _) => ctx.rip.saturating_sub(1),
+            };
+            let inside = self
+                .modules
+                .iter()
+                .any(|x| x.name.eq_ignore_ascii_case(m) && at >= x.base && at - x.base < x.size);
+            if inside {
+                return Ok(());
+            }
+        }
+        let bp = self.bps.get_mut(&id).expect("checked");
         if let Some(c) = &bp.hooks.condition
             && !guard(false, || c(ctx))
+        {
+            return Ok(());
+        }
+        if let (Some(c), Some(d)) = (&bp.hooks.value_condition, &data)
+            && !guard(false, || c(ctx, d))
         {
             return Ok(());
         }
@@ -984,9 +1198,24 @@ impl Engine {
         if !acting {
             return Ok(());
         }
+        let log_only = bp.info.extra.log_only;
+        if log_only {
+            let text = match bp.hooks.message.clone() {
+                Some(f) => guard(String::from("(message hook panicked)"), || {
+                    f(ctx, data.as_ref())
+                }),
+                None => format!("bp {id} hit by thread {tid} at {:#x}", ctx.rip),
+            };
+            self.log(id, tid, text);
+        }
+        let Some(bp) = self.bps.get_mut(&id) else {
+            return Ok(());
+        };
         match bp.info.bp.action.clone() {
             Action::Break => {
-                brk.get_or_insert(BreakReason::Breakpoint(id));
+                if !log_only {
+                    brk.get_or_insert(BreakReason::Breakpoint(id));
+                }
             }
             Action::Record => {
                 let address = match &bp.hooks.address_of {
@@ -1035,22 +1264,125 @@ impl Engine {
                 steps,
                 step_over_calls,
             } => {
+                let opts = bp.info.extra.trace.clone();
                 if self.th(tid).goal != Goal::Idle || steps == 0 {
                     return Ok(());
                 }
                 if let Some(bp) = self.bps.get_mut(&id) {
                     bp.trace.clear();
                 }
-                let goal = Goal::Trace {
+                let fence = self.fence(&opts.skip_modules, opts.stay_in);
+                let run = TraceRun {
+                    base_sp: ctx.rsp,
+                    deadline: (opts.max_ms > 0)
+                        .then(|| Instant::now() + Duration::from_millis(opts.max_ms)),
+                    until_return: opts.until_return,
+                    capture: opts.capture_memory,
+                    ret_done: false,
+                };
+                let th = self.th(tid);
+                th.goal = Goal::Trace {
                     bp: id,
                     left: steps,
                     over: step_over_calls,
                 };
-                self.th(tid).goal = goal;
+                th.trace = Some(run);
+                th.fence = fence;
                 self.trace_step(tid, ctx, brk)?;
             }
         }
         Ok(())
+    }
+
+    /// Sends a tracepoint line, at most [`MAX_LOG_RATE`] a second.
+    fn log(&mut self, bp: BpId, tid: Tid, mut text: String) {
+        let (since, sent, dropped) = &mut self.log_rate;
+        if since.elapsed() >= Duration::from_secs(1) {
+            (*since, *sent) = (Instant::now(), 0);
+        }
+        if *sent >= MAX_LOG_RATE {
+            *dropped += 1;
+            return;
+        }
+        *sent += 1;
+        if text.len() > 4096 {
+            let mut n = 4096;
+            while !text.is_char_boundary(n) {
+                n -= 1;
+            }
+            text.truncate(n);
+        }
+        let dropped = std::mem::take(dropped);
+        self.emit(Event::Log {
+            bp,
+            tid,
+            text,
+            dropped,
+        });
+    }
+
+    /// Little-endian value of `n` (1..=8) bytes at `a`.
+    fn value_at(&self, a: Addr, n: usize) -> Option<u64> {
+        let mut b = [0u8; 8];
+        let n = n.clamp(1, 8);
+        self.view.read_exact(a, &mut b[..n]).ok()?;
+        Some(u64::from_le_bytes(b))
+    }
+
+    /// The fence for module patterns / a range, from the current module list.
+    fn fence(&self, modules: &[String], stay: Option<(Addr, Addr)>) -> Option<Fence> {
+        let skip: Vec<(Addr, Addr)> = self
+            .modules
+            .iter()
+            .filter(|m| crate::module_matches(modules, m))
+            .map(|m| (m.base, m.base.saturating_add(m.size)))
+            .collect();
+        (!skip.is_empty() || stay.is_some()).then_some(Fence { skip, stay })
+    }
+
+    /// The thread sits in fenced code: where to run to instead of stepping (the return
+    /// address on top of the stack, when it is plausibly one and not fenced itself).
+    fn fence_return(&self, tid: Tid, ctx: &Context) -> Option<Addr> {
+        let f = self.threads.get(&tid)?.fence.as_ref()?;
+        if !f.fenced(ctx.rip) {
+            return None;
+        }
+        let ret = self.view.read_ptr(ctx.rsp).ok()?;
+        (!f.fenced(ret) && crate::after_call(&*self.view, ret)).then_some(ret)
+    }
+
+    /// The instruction is a call into fenced code.
+    fn fenced_call(&self, tid: Tid, ctx: &Context) -> bool {
+        let Some(f) = self.threads.get(&tid).and_then(|t| t.fence.as_ref()) else {
+            return false;
+        };
+        let regs = crate::registers(ctx);
+        hh_asm::analyze_instruction(&*self.view, ctx.rip, Some(&regs)).is_ok_and(|i| {
+            i.kind == FlowKind::Call && i.target.is_some_and(|t| f.fenced(t))
+        })
+    }
+
+    /// Memory the instruction at `ctx.rip` is about to touch, with its current bytes.
+    fn capture(&self, ctx: &Context) -> Vec<TraceAccess> {
+        let acc = hh_asm::memory_accesses(&*self.view, ctx.rip, &crate::registers(ctx))
+            .unwrap_or_default();
+        acc.into_iter()
+            .take(16)
+            .map(|m| {
+                let mut before = vec![0u8; m.size.min(64)];
+                if self.view.read_exact(m.addr, &mut before).is_err() {
+                    before.clear();
+                }
+                TraceAccess {
+                    addr: m.addr,
+                    size: m.size as u32,
+                    read: m.read,
+                    write: m.write,
+                    before,
+                    after: None,
+                }
+            })
+            .collect()
     }
 
     /// Applies the auto-disables of this event (all threads stopped first: debug registers
@@ -1078,28 +1410,107 @@ impl Engine {
         let Goal::Trace { bp, left, over } = self.th(tid).goal else {
             return Ok(());
         };
-        let Some(b) = self.bps.get_mut(&bp) else {
-            self.th(tid).goal = Goal::Idle;
+        let run = self.th(tid).trace;
+        if !self.bps.contains_key(&bp) {
+            self.end_trace(tid);
             return Ok(());
-        };
-        b.trace.push(ctx.clone());
-        let steps = b.trace.len() as u32;
-        let stop = b.hooks.stop_when.clone();
-        if stop.is_some_and(|f| guard(false, || f(ctx))) {
-            self.th(tid).goal = Goal::Idle;
-            brk.get_or_insert(BreakReason::TraceStop(bp));
-        } else if left <= 1 {
-            self.th(tid).goal = Goal::Idle;
+        }
+        // Fenced code is not traced: run it until it returns, or end the trace when it was
+        // left some other way (e.g. by returning out of `stay_in`).
+        let fenced = self.threads[&tid]
+            .fence
+            .as_ref()
+            .is_some_and(|f| f.fenced(ctx.rip));
+        if fenced && !run.is_some_and(|r| r.ret_done) {
+            // Entered by a call or jump (not by returning out of the traced code).
+            let by_ret = self.bps[&bp]
+                .trace
+                .last()
+                .is_some_and(|s| self.is_ret(s.context.rip));
+            if !by_ret && self.fence_return(tid, ctx).is_some() {
+                return self.issue_step(tid, ctx, over);
+            }
+            self.end_trace(tid);
+            let steps = self.bps[&bp].trace.len() as u32;
             self.emit(Event::TraceDone { bp, steps });
+            return Ok(());
+        }
+        if let Some(c) = &mut self.cov
+            && c.hit.len() < MAX_COVERAGE
+        {
+            c.hit.insert(ctx.rip);
+        }
+        let capture = run.is_some_and(|r| r.capture);
+        let accesses = match capture {
+            true => self.capture(ctx),
+            false => Vec::new(),
+        };
+        // What the previous instruction wrote, now that it ran.
+        let prev: Vec<(usize, Addr, usize)> = self.bps[&bp]
+            .trace
+            .last()
+            .map(|s| {
+                s.accesses
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, a)| a.write)
+                    .map(|(i, a)| (i, a.addr, (a.size as usize).min(64)))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let afters: Vec<(usize, Option<Vec<u8>>)> = prev
+            .into_iter()
+            .map(|(i, a, n)| {
+                let mut b = vec![0u8; n];
+                (i, self.view.read_exact(a, &mut b).ok().map(|_| b))
+            })
+            .collect();
+        let b = self.bps.get_mut(&bp).expect("checked");
+        if let Some(last) = b.trace.last_mut() {
+            for (i, v) in afters {
+                last.accesses[i].after = v;
+            }
+        }
+        b.trace.push(TraceStep {
+            context: ctx.clone(),
+            accesses,
+        });
+        let steps = b.trace.len();
+        let stop = b.hooks.stop_when.clone();
+        let done = left <= 1
+            || steps >= MAX_TRACE_STEPS
+            || run.is_some_and(|r| r.ret_done || r.deadline.is_some_and(|d| Instant::now() >= d));
+        if stop.is_some_and(|f| guard(false, || f(ctx))) {
+            self.end_trace(tid);
+            brk.get_or_insert(BreakReason::TraceStop(bp));
+        } else if done {
+            self.end_trace(tid);
+            self.emit(Event::TraceDone {
+                bp,
+                steps: steps as u32,
+            });
         } else {
-            self.th(tid).goal = Goal::Trace {
+            let returning =
+                run.is_some_and(|r| r.until_return && ctx.rsp >= r.base_sp) && self.is_ret(ctx.rip);
+            let th = self.th(tid);
+            th.goal = Goal::Trace {
                 bp,
                 left: left - 1,
                 over,
             };
-            self.issue_step(tid, ctx.rip, ctx.rsp, over)?;
+            if returning && let Some(r) = &mut th.trace {
+                r.ret_done = true;
+            }
+            self.issue_step(tid, ctx, over)?;
         }
         Ok(())
+    }
+
+    fn end_trace(&mut self, tid: Tid) {
+        let th = self.th(tid);
+        th.goal = Goal::Idle;
+        th.trace = None;
+        th.fence = None;
     }
 
     /// Where a step over `pc` should stop instead of single-stepping: after a call (unless
@@ -1116,15 +1527,26 @@ impl Engine {
     }
 
     /// Advances a goal by one instruction: a single-step, or for a call / rep stepped over,
-    /// a temporary breakpoint after it (this thread, stack back where it was).
-    fn issue_step(&mut self, tid: Tid, pc: Addr, sp: u64, over: bool) -> Result<()> {
-        if over && let Some(next) = self.step_over_target(pc) {
+    /// a temporary breakpoint after it (this thread, stack back where it was). In fenced
+    /// code it runs to the return address instead, and a call into fenced code is stepped
+    /// over.
+    fn issue_step(&mut self, tid: Tid, ctx: &Context, over: bool) -> Result<()> {
+        let (pc, sp) = (ctx.rip, ctx.rsp);
+        let target = match self.fence_return(tid, ctx) {
+            Some(ret) => Some((ret, sp.wrapping_add(self.mem.pointer_size() as u64))),
+            None if over || self.fenced_call(tid, ctx) => {
+                self.step_over_target(pc).map(|next| (next, sp))
+            }
+            None => None,
+        };
+        if let Some((next, min_sp)) = target {
             self.arm_sw(next)?;
             self.temps.push(Temp {
                 addr: next,
                 tid: Some(tid),
-                min_sp: sp,
+                min_sp,
                 run_to: false,
+                count: 1,
             });
             // The other threads run while the call does.
             if self.exclusive == Some(tid) {
@@ -1147,8 +1569,13 @@ impl Engine {
 
     /// The thread completed one (possibly stepped-over) instruction of its goal.
     fn advanced(&mut self, tid: Tid, ctx: &Context, brk: &mut Option<BreakReason>) -> Result<()> {
-        match self.th(tid).goal {
+        let goal = self.th(tid).goal;
+        match goal {
             Goal::Idle => {}
+            // A step into fenced code (a jump through a PLT stub) runs on until it returns.
+            Goal::Step | Goal::Over if self.fence_return(tid, ctx).is_some() => {
+                self.issue_step(tid, ctx, false)?;
+            }
             Goal::Step | Goal::Over => {
                 self.th(tid).goal = Goal::Idle;
                 brk.get_or_insert(BreakReason::Step);
@@ -1162,7 +1589,7 @@ impl Engine {
                     let th = self.th(tid);
                     th.goal = Goal::Out(n + 1);
                     th.was_ret = was_ret;
-                    self.issue_step(tid, ctx.rip, ctx.rsp, true)?;
+                    self.issue_step(tid, ctx, true)?;
                 }
             }
             Goal::Trace { .. } => self.trace_step(tid, ctx, brk)?,
@@ -1180,19 +1607,105 @@ impl Engine {
             .is_ok_and(|i| i.kind == FlowKind::Interrupt)
     }
 
+    /// Reports loaded / unloaded modules, forgets our patches in unloaded ones, arms pending
+    /// breakpoints that resolve now and sets the trigger of a [`BreakOn`] match.
     fn modules_changed(&mut self) {
         let Ok(now) = self.mem.modules() else { return };
         for m in &now {
             if !self.modules.iter().any(|o| o.base == m.base) {
                 self.emit(Event::ModuleLoaded(m.clone()));
+                if module_matches(&self.break_on.module_loaded, m) {
+                    self.trigger.get_or_insert(Trigger::ModuleLoaded(m.clone()));
+                }
             }
         }
-        for o in &self.modules {
-            if !now.iter().any(|m| m.base == o.base) {
-                self.emit(Event::ModuleUnloaded { base: o.base });
+        let gone: Vec<Module> = self
+            .modules
+            .iter()
+            .filter(|o| !now.iter().any(|m| m.base == o.base))
+            .cloned()
+            .collect();
+        for o in gone {
+            self.emit(Event::ModuleUnloaded { base: o.base });
+            self.forget_range(o.base, o.base.saturating_add(o.size.max(1)));
+            if module_matches(&self.break_on.module_unloaded, &o) {
+                self.trigger.get_or_insert(Trigger::ModuleUnloaded(o));
             }
         }
         self.modules = now;
+        self.resolve_pending();
+    }
+
+    /// Memory `[start, end)` is unmapped (a module unloaded): drop our int3s there without
+    /// writing (the bytes are gone, and something else may be mapped there next), forget
+    /// page protections, and disable the breakpoints in it. Pending ones wait for the next
+    /// resolve.
+    fn forget_range(&mut self, start: Addr, end: Addr) {
+        let inside = |a: Addr| a >= start && a < end;
+        let addrs: Vec<Addr> = self.sw.keys().copied().filter(|&a| inside(a)).collect();
+        if !addrs.is_empty() {
+            let mut p = self.shared.lock();
+            for a in &addrs {
+                p.orig.remove(a);
+                p.lifted.remove(a);
+            }
+        }
+        for a in &addrs {
+            self.sw.remove(a);
+        }
+        self.temps.retain(|t| !inside(t.addr));
+        if self.loader.is_some_and(inside) {
+            self.loader = None;
+        }
+        if self.entry.is_some_and(inside) {
+            self.entry = None;
+        }
+        if let Some(c) = &mut self.cov {
+            c.armed.retain(|&a| !inside(a));
+        }
+        for th in self.threads.values_mut() {
+            if th.lift_sw.is_some_and(inside) {
+                th.lift_sw = None;
+            }
+        }
+        let pages: Vec<Addr> = self.pages.range(start & !(PAGE - 1)..end).map(|(&a, _)| a).collect();
+        for p in pages {
+            if p >= start & !(PAGE - 1) && p + PAGE <= end.next_multiple_of(PAGE) {
+                self.pages.remove(&p);
+            }
+        }
+        let hit: Vec<(BpId, BpMethod, bool)> = self
+            .bps
+            .values()
+            .filter(|b| {
+                let (s, e) = match b.info.bp.method {
+                    BpMethod::Page => b.pages(),
+                    _ => (b.info.bp.address, b.info.bp.address.saturating_add(b.info.len.max(1))),
+                };
+                s < end && e > start && (b.info.enabled || b.info.resolved)
+            })
+            .map(|b| (b.info.id, b.info.bp.method, b.info.pending.is_some()))
+            .collect();
+        for (id, method, pending) in hit {
+            let was = self.bps[&id].info.enabled;
+            if let Some(b) = self.bps.get_mut(&id) {
+                b.info.resolved = false;
+            }
+            match method {
+                BpMethod::Software => {
+                    if let Some(b) = self.bps.get_mut(&id) {
+                        b.info.enabled = false;
+                    }
+                    if was && !pending {
+                        self.emit(Event::BreakpointDisabled { bp: id });
+                    }
+                }
+                // Debug registers and the protection of pages outside the range need the
+                // process halted: disabled with this event's other auto-disables.
+                _ if was => self.to_disable.push(id),
+                _ => {}
+            }
+        }
     }
 
     // ---- page watches ---------------------------------------------------------------------
@@ -1239,10 +1752,16 @@ impl Engine {
         if let Some(ctx) = ctx {
             let accesses = hh_asm::memory_accesses(&*self.view, ctx.rip, &crate::registers(&ctx))
                 .unwrap_or_default();
+            // Read through /proc (not the instruction): the page's protection does not matter.
+            let before = accesses
+                .iter()
+                .map(|m| self.value_at(m.addr, m.size))
+                .collect();
             self.th(tid).page_hit = Some(PageHit {
                 ip: ctx.rip,
                 accesses,
                 fault,
+                before,
             });
         }
         self.os.set_pass(tid, false);
@@ -1269,19 +1788,26 @@ impl Engine {
         for (id, s, e, kind) in watches {
             let hit = match ph.accesses.is_empty() {
                 // Could not decode: trust the fault address.
-                true => ph.fault.filter(|&f| f >= s && f < e),
+                true => ph.fault.filter(|&f| f >= s && f < e).map(|f| (f, 1, None)),
                 false => ph
                     .accesses
                     .iter()
-                    .find(|m| {
+                    .zip(&ph.before)
+                    .find(|(m, _)| {
                         m.addr < e
                             && m.addr.saturating_add(m.size.max(1) as u64) > s
                             && (kind != BpKind::Write || m.write)
                     })
-                    .map(|m| m.addr),
+                    .map(|(m, &old)| (m.addr, m.size, old)),
             };
-            if let Some(a) = hit {
-                self.hit(id, tid, ctx, brk, Some(ph.ip), Some(a))?;
+            if let Some((a, size, old)) = hit {
+                let data = DataHit {
+                    address: a,
+                    size: size.clamp(1, 8) as u8,
+                    old,
+                    new: self.value_at(a, size),
+                };
+                self.hit(id, tid, ctx, brk, Some(ph.ip), Some(a), Some(data))?;
             }
         }
         Ok(())
@@ -1318,11 +1844,23 @@ impl Engine {
                         Some(r) => r,
                         None => regions.insert(self.mem.regions()?),
                     };
-                    let r = rs
-                        .iter()
-                        .find(|r| page >= r.start && page - r.start < r.size)
-                        .ok_or(Error::NoAccess { addr: page })?;
-                    (r.prot, r.prot, 0)
+                    match rs.iter().find(|r| page >= r.start && page - r.start < r.size) {
+                        Some(r) => (r.prot, r.prot, 0),
+                        // Unmapped (e.g. its module unloaded): nothing to restore there, but a
+                        // watch cannot be armed on it.
+                        None => {
+                            let all = Prot {
+                                r: true,
+                                w: true,
+                                x: true,
+                            };
+                            if self.page_want(page, all) != all {
+                                return Err(Error::NoAccess { addr: page });
+                            }
+                            page += PAGE;
+                            continue;
+                        }
+                    }
                 }
             };
             let want = self.page_want(page, orig);
@@ -1580,14 +2118,20 @@ impl Engine {
             th.goal = Goal::Idle;
             th.goal_step = false;
             th.want_step = false;
+            th.fence = None;
+            th.trace = None;
         }
+        self.quiet = false;
         for t in std::mem::take(&mut self.temps) {
             self.disarm_sw(t.addr)?;
         }
         self.exclusive = None;
         let signal = matches!(reason, BreakReason::Signal { .. });
         self.broken = Some((tid, signal));
-        let context = Box::new(self.os.context(tid).unwrap_or_default());
+        if let Some(why) = self.trigger.take() {
+            self.emit(Event::Stopped { tid, why });
+        }
+        let context = Box::new(self.os.context_full(tid).unwrap_or_default());
         self.emit(Event::Break {
             tid,
             reason,
@@ -1732,6 +2276,13 @@ impl Engine {
                     let _ = self.os.set_dr(None, addrs, dr7);
                     return Err(e);
                 }
+                let (kind, size) = (self.bps[&id].info.bp.kind, self.bps[&id].info.bp.size);
+                if on && kind != BpKind::Execute {
+                    let v = self.value_at(addr, size as usize);
+                    if let Some(b) = self.bps.get_mut(&id) {
+                        b.last_val = v;
+                    }
+                }
             }
             BpMethod::Page => {
                 let span = self.bps[&id].pages();
@@ -1752,13 +2303,20 @@ impl Engine {
         hooks: Hooks,
         options: BpOptions,
         len: Option<u64>,
+        extra: BpExtra,
+        pending: Option<String>,
     ) -> Result<BpId> {
         self.live()?;
         if bp.kind == BpKind::Execute {
             bp.size = 1;
         }
+        if pending.is_some() {
+            bp.address = 0;
+        }
         let len = len.unwrap_or(bp.size as u64);
-        self.note(format!("cmd add {bp:?} {options:?} len={len}"));
+        self.note(format!(
+            "cmd add {bp:?} {options:?} len={len} {extra:?} pending={pending:?}"
+        ));
         match bp.method {
             BpMethod::Software if bp.kind != BpKind::Execute => {
                 return Err(Error::Unsupported(
@@ -1771,7 +2329,7 @@ impl Engine {
                     bp.size
                 )));
             }
-            BpMethod::Hardware if !bp.address.is_multiple_of(bp.size as u64) => {
+            BpMethod::Hardware if !bp.address.is_multiple_of(bp.size as u64) && pending.is_none() => {
                 return Err(Error::Other(format!(
                     "hardware breakpoint address {:#x} is not aligned to its size {}",
                     bp.address, bp.size
@@ -1804,17 +2362,83 @@ impl Engine {
                     options,
                     len,
                     records_dropped: 0,
+                    extra,
+                    resolved: false,
+                    pending: pending.clone(),
                 },
                 hooks,
                 records: BTreeMap::new(),
                 trace: Vec::new(),
+                parked: false,
+                last_val: None,
             },
         );
-        if let Err(e) = self.with_halted(|e| e.set_enabled_raw(id, true)) {
+        let r = match pending {
+            Some(_) => self.with_halted(|e| {
+                e.resolve_pending();
+                Ok(())
+            }),
+            None => self.with_halted(|e| e.set_enabled_raw(id, true)),
+        };
+        if let Err(e) = r {
             self.bps.remove(&id);
             return Err(e);
         }
         Ok(id)
+    }
+
+    /// Arms the pending breakpoints whose expression resolves now (to mapped memory, and
+    /// executable memory for execute breakpoints). Halts the process for debug registers
+    /// and page watches when it runs; the caller resumes.
+    fn resolve_pending(&mut self) {
+        let ids: Vec<BpId> = self
+            .bps
+            .values()
+            .filter(|b| b.info.pending.is_some() && !b.info.resolved && !b.parked)
+            .map(|b| b.info.id)
+            .collect();
+        if ids.is_empty() || !self.alive {
+            return;
+        }
+        let syms = hh_asm::SymbolTable::default();
+        let regions = self.mem.regions().unwrap_or_default();
+        for id in ids {
+            let b = &self.bps[&id];
+            let (expr, kind, method, size) = (
+                b.info.pending.clone().unwrap_or_default(),
+                b.info.bp.kind,
+                b.info.bp.method,
+                b.info.bp.size,
+            );
+            let Ok(a) = hh_asm::resolve_address(&*self.view, &syms, &expr) else {
+                continue;
+            };
+            let ok = regions.iter().any(|r| {
+                a >= r.start && a - r.start < r.size && (r.prot.x || kind != BpKind::Execute)
+            }) && (method != BpMethod::Hardware || a.is_multiple_of(size as u64));
+            if !ok {
+                continue;
+            }
+            if method != BpMethod::Software && self.running() && self.halt().is_err() {
+                continue;
+            }
+            if let Some(b) = self.bps.get_mut(&id) {
+                b.info.bp.address = a;
+                b.info.resolved = true;
+            }
+            match self.set_enabled_raw(id, true) {
+                Ok(()) => {
+                    self.note(format!("pending {id} ({expr}) armed at {a:#x}"));
+                    self.emit(Event::BreakpointResolved { bp: id, address: a });
+                }
+                Err(e) => {
+                    self.note(format!("pending {id} ({expr}) at {a:#x}: {e}"));
+                    if let Some(b) = self.bps.get_mut(&id) {
+                        b.info.resolved = false;
+                    }
+                }
+            }
+        }
     }
 
     pub(crate) fn remove_bp(&mut self, id: BpId) -> Result<()> {
@@ -1830,8 +2454,25 @@ impl Engine {
 
     pub(crate) fn set_enabled(&mut self, id: BpId, on: bool) -> Result<()> {
         self.note(format!("cmd enable {id} {on}"));
-        self.bp(id)?;
+        let b = self.bp(id)?;
+        if b.info.pending.is_some() {
+            b.parked = !on;
+            if !b.info.resolved {
+                return match on {
+                    true => self.with_halted(|e| {
+                        e.resolve_pending();
+                        Ok(())
+                    }),
+                    false => Ok(()),
+                };
+            }
+        }
         self.with_halted(|e| e.set_enabled_raw(id, on))
+    }
+
+    pub(crate) fn set_extra(&mut self, id: BpId, extra: BpExtra) -> Result<()> {
+        self.bp(id)?.info.extra = extra;
+        Ok(())
     }
 
     pub(crate) fn set_hooks(&mut self, id: BpId, hooks: Hooks) -> Result<()> {
@@ -1869,7 +2510,73 @@ impl Engine {
     }
 
     pub(crate) fn trace_log(&mut self, id: BpId) -> Result<Vec<Context>> {
+        Ok(self.bp(id)?.trace.iter().map(|s| s.context.clone()).collect())
+    }
+
+    pub(crate) fn trace_steps(&mut self, id: BpId) -> Result<Vec<TraceStep>> {
         Ok(self.bp(id)?.trace.clone())
+    }
+
+    // ---- coverage ("executed instruction set") ---------------------------------------------
+
+    pub(crate) fn cov_start(&mut self, entries: Vec<Addr>) -> Result<usize> {
+        self.note(format!("cmd coverage start ({} entries)", entries.len()));
+        self.live()?;
+        if entries.len() > MAX_COVERAGE {
+            return Err(Error::Other(format!(
+                "at most {MAX_COVERAGE} coverage addresses"
+            )));
+        }
+        let regions = self.mem.regions()?;
+        let exec = |a: Addr| {
+            regions
+                .iter()
+                .any(|r| r.prot.x && a >= r.start && a - r.start < r.size)
+        };
+        let mut entries: Vec<Addr> = entries.into_iter().filter(|&a| exec(a)).collect();
+        entries.sort_unstable();
+        entries.dedup();
+        self.with_halted(|e| {
+            if let Some(old) = e.cov.take() {
+                for a in old.armed {
+                    e.disarm_sw(a)?;
+                }
+            }
+            let mut cov = Cov::default();
+            for a in entries {
+                if e.arm_sw(a).is_ok() {
+                    cov.armed.insert(a);
+                }
+            }
+            let n = cov.armed.len();
+            e.cov = Some(cov);
+            Ok(n)
+        })
+    }
+
+    pub(crate) fn cov_hits(&self) -> Vec<Addr> {
+        self.cov
+            .as_ref()
+            .map(|c| c.hit.iter().copied().collect())
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn cov_stop(&mut self) -> Result<Vec<Addr>> {
+        self.note("cmd coverage stop".into());
+        let Some(c) = self.cov.take() else {
+            return Ok(Vec::new());
+        };
+        let hits = c.hit.iter().copied().collect();
+        if self.alive && !c.armed.is_empty() {
+            // Halted, so a hit already queued is classified (and rewound) while still ours.
+            self.with_halted(|e| {
+                for &a in &c.armed {
+                    e.disarm_sw(a)?;
+                }
+                Ok(())
+            })?;
+        }
+        Ok(hits)
     }
 
     // ---- signal policy --------------------------------------------------------------------
@@ -1923,11 +2630,42 @@ impl Engine {
         self.threads
             .iter()
             .filter(|(_, t)| !t.guest)
-            .map(|(&tid, t)| ThreadInfo {
-                tid,
-                suspended: t.suspended,
+            .map(|(&tid, t)| {
+                let (name, state, user_ms, kernel_ms) = self.os.thread_info(tid);
+                ThreadInfo {
+                    tid,
+                    suspended: t.suspended,
+                    name,
+                    state,
+                    user_ms,
+                    kernel_ms,
+                }
             })
             .collect()
+    }
+
+    /// A live user thread to report a break on (the main one if it still runs).
+    fn user_tid(&self) -> Result<Tid> {
+        let pid = self.os.pid();
+        let users: Vec<Tid> = self
+            .threads
+            .iter()
+            .filter(|(_, t)| !t.guest)
+            .map(|(&t, _)| t)
+            .collect();
+        match users.contains(&pid) {
+            true => Ok(pid),
+            false => users.first().copied().ok_or(Error::ProcessGone),
+        }
+    }
+
+    /// Breaks for a debug event now, or queues it behind the stops of a halt in progress.
+    fn fire(&mut self, tid: Tid, t: Trigger, defer: bool) -> Result<()> {
+        if defer {
+            self.deferred.push_back((tid, Stop::Trigger(t)));
+            return Ok(());
+        }
+        self.handle(tid, Stop::Trigger(t))
     }
 
     fn user_thread(&mut self, tid: Tid) -> Result<&mut Th> {
@@ -1950,7 +2688,7 @@ impl Engine {
 
     pub(crate) fn context(&mut self, tid: Tid) -> Result<Context> {
         self.stopped(tid)?;
-        self.os.context(tid)
+        self.os.context_full(tid)
     }
 
     pub(crate) fn set_context(&mut self, tid: Tid, ctx: &Context) -> Result<()> {
@@ -1986,17 +2724,7 @@ impl Engine {
         if self.broken.is_some() {
             return Ok(());
         }
-        let pid = self.os.pid();
-        let users: Vec<Tid> = self
-            .threads
-            .iter()
-            .filter(|(_, t)| !t.guest)
-            .map(|(&t, _)| t)
-            .collect();
-        let tid = match users.contains(&pid) {
-            true => pid,
-            false => *users.first().ok_or(Error::ProcessGone)?,
-        };
+        let tid = self.user_tid()?;
         self.enter_break(tid, BreakReason::Pause)
     }
 
@@ -2023,12 +2751,13 @@ impl Engine {
         self.resume_all()
     }
 
-    pub(crate) fn step(&mut self, tid: Tid, kind: StepKind) -> Result<()> {
-        self.note(format!("cmd step {tid} {kind:?}"));
+    pub(crate) fn step(&mut self, tid: Tid, kind: StepKind, opts: StepOptions) -> Result<()> {
+        self.note(format!("cmd step {tid} {kind:?} {opts:?}"));
         self.broken_tid()?;
         self.stopped(tid)?;
-        let (pc, sp) = self.os.pc_sp(tid)?;
-        let was_ret = self.is_ret(pc);
+        let ctx = self.os.context(tid)?;
+        let was_ret = self.is_ret(ctx.rip);
+        let fence = self.fence(&opts.over_modules, None);
         let th = self.th(tid);
         th.goal = match kind {
             StepKind::Into => Goal::Step,
@@ -2036,21 +2765,28 @@ impl Engine {
             StepKind::Out => Goal::Out(0),
         };
         th.was_ret = was_ret;
+        th.fence = fence;
         self.exclusive = Some(tid);
-        if let Err(e) = self.issue_step(tid, pc, sp, !matches!(kind, StepKind::Into)) {
+        if let Err(e) = self.issue_step(tid, &ctx, kind != StepKind::Into) {
             self.exclusive = None;
-            self.th(tid).goal = Goal::Idle;
+            let th = self.th(tid);
+            th.goal = Goal::Idle;
+            th.fence = None;
             return Err(e);
         }
+        self.quiet = opts.skip_breakpoints;
         self.take_break()?;
         self.resume_all()
     }
 
-    pub(crate) fn run_to(&mut self, addr: Addr, tid: Option<Tid>) -> Result<()> {
-        self.note(format!("cmd run_to {addr:#x} {tid:?}"));
+    pub(crate) fn run_to(&mut self, addr: Addr, tid: Option<Tid>, count: u64) -> Result<()> {
+        self.note(format!("cmd run_to {addr:#x} {tid:?} x{count}"));
         let btid = self.broken_tid()?;
         if let Some(t) = tid {
             self.user_thread(t)?;
+        }
+        if count == 0 {
+            return Err(Error::Other("run to: the hit count must be at least 1".into()));
         }
         self.arm_sw(addr)?;
         self.temps.push(Temp {
@@ -2058,6 +2794,7 @@ impl Engine {
             tid,
             min_sp: 0,
             run_to: true,
+            count,
         });
         // A thread already sitting at `addr` would only hit it again: step it past first.
         for t in [Some(btid), tid].into_iter().flatten() {
@@ -2067,6 +2804,60 @@ impl Engine {
         }
         self.take_break()?;
         self.resume_all()
+    }
+
+    pub(crate) fn run_until_return(&mut self, tid: Tid, frame: usize) -> Result<()> {
+        self.note(format!("cmd run_until_return {tid} frame {frame}"));
+        self.broken_tid()?;
+        self.stopped(tid)?;
+        let ctx = self.os.context(tid)?;
+        let chain = crate::frame_chain(&*self.view, ctx.rbp, frame.saturating_add(1).min(4096));
+        let Some(&(ret, slot)) = chain.get(frame) else {
+            return Err(Error::Other(format!(
+                "frame {frame} is beyond the frame-pointer walk ({} frames)",
+                chain.len() + 1
+            )));
+        };
+        self.arm_sw(ret)?;
+        self.temps.push(Temp {
+            addr: ret,
+            tid: Some(tid),
+            // After the return the slot holding the return address has been popped.
+            min_sp: slot.wrapping_add(self.mem.pointer_size() as u64),
+            run_to: true,
+            count: 1,
+        });
+        if self.os.pc_sp(tid).is_ok_and(|(pc, _)| pc == ret) {
+            self.th(tid).at_bp = true;
+        }
+        self.take_break()?;
+        self.resume_all()
+    }
+
+    pub(crate) fn set_ip(&mut self, tid: Tid, addr: Addr) -> Result<()> {
+        self.note(format!("cmd set_ip {tid} {addr:#x}"));
+        self.stopped(tid)?;
+        let exec = self
+            .mem
+            .regions()?
+            .iter()
+            .any(|r| r.prot.x && addr >= r.start && addr - r.start < r.size);
+        if !exec {
+            return Err(Error::Other(format!(
+                "{addr:#x} is not in executable memory"
+            )));
+        }
+        hh_asm::analyze_instruction(&*self.view, addr, None)
+            .map_err(|e| Error::Other(format!("no instruction at {addr:#x}: {e}")))?;
+        let mut ctx = self.os.context(tid)?;
+        if ctx.rip == addr {
+            return Ok(());
+        }
+        ctx.rip = addr;
+        self.os.set_context(tid, &ctx)?;
+        // Continuing runs the instruction there, breakpoint or not.
+        self.th(tid).at_bp = true;
+        Ok(())
     }
 
     /// Runs `f` (an OS-level operation needing a stopped thread, e.g. a remote syscall)

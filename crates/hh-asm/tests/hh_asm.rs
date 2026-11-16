@@ -9,6 +9,9 @@ struct TestProc {
     mods: Vec<Module>,
     ptr: usize,
     next: Mutex<u64>,
+    pid: u32,
+    /// (prot, near) of every alloc.
+    alloc_log: Mutex<Vec<(Prot, Option<Addr>)>>,
 }
 
 impl TestProc {
@@ -18,6 +21,8 @@ impl TestProc {
             mods: Vec::new(),
             ptr,
             next: Mutex::new(0),
+            pid: 1,
+            alloc_log: Mutex::new(Vec::new()),
         }
     }
     fn map(&self, start: Addr, data: Vec<u8>) {
@@ -69,7 +74,7 @@ impl Memory for TestProc {
 
 impl Process for TestProc {
     fn pid(&self) -> u32 {
-        1
+        self.pid
     }
     fn regions(&self) -> Result<Vec<Region>> {
         Ok(self
@@ -93,7 +98,8 @@ impl Process for TestProc {
     fn modules(&self) -> Result<Vec<Module>> {
         Ok(self.mods.clone())
     }
-    fn alloc(&self, size: u64, _prot: Prot, near: Option<Addr>) -> Result<Addr> {
+    fn alloc(&self, size: u64, prot: Prot, near: Option<Addr>) -> Result<Addr> {
+        self.alloc_log.lock().unwrap().push((prot, near));
         let mut n = self.next.lock().unwrap();
         let base = near.map_or(0x5000_0000, |a| (a & !0xFFFF) + 0x10_0000);
         let a = base + *n;
@@ -1648,8 +1654,9 @@ fn aa_new_errors() {
     let h = &mut AaHooks::default();
     let cases = [
         (
-            "[ENABLE]\nalloc(x,10)\nx:\nfoo:\n  nop\n[DISABLE]\n",
-            4,
+            // CE's default declares `foo:` implicitly; {$strict} makes it an error.
+            "[ENABLE]\n{$strict}\nalloc(x,10)\nx:\nfoo:\n  nop\n[DISABLE]\n",
+            5,
             "not declared",
         ),
         ("[ENABLE]\nkalloc(x,10)\n[DISABLE]\n", 2, "kernel mode"),
@@ -2177,4 +2184,800 @@ fn garbage_scripts_never_panic_or_hang() {
         let _ = aa_check(&p, &syms, &s, &mut AaHooks::default());
     }
     assert!(t.elapsed().as_secs() < 60, "{:?}", t.elapsed());
+}
+
+// ---------------------------------------------------------------- 1.0 feature gaps
+
+type Log = std::sync::Arc<Mutex<Vec<String>>>;
+
+fn logger() -> (Log, Log) {
+    let l = Log::default();
+    (l.clone(), l)
+}
+
+/// A CE-style script using the new directives, enabled then disabled.
+const NEW_DIRECTIVES: &str = r#"
+define(target,game.exe+1005)
+define(tmp,1)
+undefine(tmp)
+define(fill,CC)
+[ENABLE]
+{$ifdef tmp}
+this line is skipped
+{$endif}
+{$ifndef CPU64}
+garbage
+{$else}
+{$ifdef HEAPHOOK}
+alloc(newmem,$1000,target)
+{$else}
+garbage too
+{$endif}
+{$endif}
+assert(target,29 81 ?? 00 00 00)
+aobscanmodule(aobhit,$process,"29 81 E0 ?? 00 00")
+allocnx(data,100)
+fullaccess(game.exe+3000,10,1000)
+label(code,return,flt)
+registersymbol(aobhit,flt,cmdval)
+luacall(print('hi'))
+newmem:
+code:
+  sub [rcx+E0],eax
+  jmp return
+  align 10 fill
+flt:
+  dd (float)1.5
+implicit:
+  db #PATCHME#
+{$ifdef already}
+seenalready:
+  db 77
+registersymbol(seenalready)
+{$endif}
+data:
+  dd 1234
+mycmd(7)
+org data+8
+  dd 5678
+loadbinary(data+10,file.bin)
+target:
+  jmp newmem
+  nop
+return:
+
+[DISABLE]
+target:
+  db 29 81 E0 00 00 00
+unregistersymbol(aobhit,flt,cmdval,seenalready)
+dealloc(newmem)
+dealloc(data)
+"#;
+
+fn new_directive_hooks(log: &Log) -> AaHooks {
+    let (l1, l2, l3, l4, l5) = (log.clone(), log.clone(), log.clone(), log.clone(), log.clone());
+    AaHooks {
+        lua: Some(Box::new(|_| panic!("luacall must use lua_call"))),
+        lua_call: Some(Box::new(move |code| {
+            l1.lock().unwrap().push(format!("luacall {code}"));
+            Ok(())
+        })),
+        read_file: Some(Box::new(move |f| {
+            l2.lock().unwrap().push(format!("read {f}"));
+            Ok(vec![1, 2, 3, 4])
+        })),
+        command: Some(Box::new(move |(name, args, check)| {
+            l3.lock().unwrap().push(format!("cmd {name}({args}) {check}"));
+            Ok((name == "mycmd").then(|| format!("cmdval:\n  dd {args}\n")))
+        })),
+        prologue: Some(Box::new(move |(s, check)| {
+            l4.lock().unwrap().push(format!("prologue {check}"));
+            Ok(s.replace("#PATCHME#", "90"))
+        })),
+        epilogue: Some(Box::new(move |(enable, check)| {
+            l5.lock().unwrap().push(format!("epilogue {enable} {check}"));
+            Ok(())
+        })),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn aa_new_directives_enable_disable_restores_memory() {
+    let p = game64();
+    let before = p.snapshot();
+    let mut syms = SymbolTable::default();
+    syms.register("already", 1);
+    let (log, l) = logger();
+    let mut hooks = new_directive_hooks(&l);
+    assert_eq!(aa_check(&p, &syms, NEW_DIRECTIVES, &mut hooks), None);
+    assert_eq!(p.snapshot(), before, "check must not write");
+    {
+        let got = log.lock().unwrap();
+        assert!(got.iter().all(|x| !x.starts_with("luacall") && !x.starts_with("read")), "{got:?}");
+        assert!(got.contains(&"cmd mycmd(7) true".to_string()), "{got:?}");
+        assert!(got.contains(&"epilogue false true".to_string()), "{got:?}");
+    }
+    log.lock().unwrap().clear();
+
+    let st = aa_execute(&p, &mut syms, NEW_DIRECTIVES, true, None, &mut hooks).unwrap();
+    assert_eq!(
+        *log.lock().unwrap(),
+        [
+            "prologue false",
+            "luacall print('hi')",
+            "cmd mycmd(7) false",
+            "read file.bin",
+            "epilogue true false"
+        ]
+    );
+    let hook = GAME64 + 0x1005;
+    assert_eq!(syms.get("aobhit"), Some(hook));
+    assert_eq!(
+        st.scans,
+        vec![AaScan {
+            name: "aobhit".into(),
+            addr: hook,
+            matches: None
+        }]
+    );
+    let newmem = st.allocs.iter().find(|a| a.name == "newmem").unwrap().addr;
+    let data = st.allocs.iter().find(|a| a.name == "data").unwrap().addr;
+    // sub (6) + jmp rel32 (5), padded with CC up to 16.
+    let mut b = [0u8; 16];
+    p.read(newmem, &mut b).unwrap();
+    assert_eq!(&b[11..], &[0xCC; 5]);
+    let flt = syms.get("flt").unwrap();
+    assert_eq!(flt, newmem + 0x10);
+    let mut f = [0u8; 4];
+    p.read(flt, &mut f).unwrap();
+    assert_eq!(f32::from_le_bytes(f), 1.5);
+    p.read(flt + 4, &mut f[..1]).unwrap();
+    assert_eq!(f[0], 0x90, "prologue patched the script, implicit label placed");
+    assert!(syms.get("seenalready").is_some(), "{{$ifdef}} saw the registered symbol");
+    let mut d = [0u8; 20];
+    p.read(data, &mut d).unwrap();
+    assert_eq!(&d[..4], &0x1234u32.to_le_bytes(), "numbers are hex");
+    assert_eq!(&d[4..8], &7u32.to_le_bytes(), "custom command output");
+    assert_eq!(&d[8..12], &0x5678u32.to_le_bytes(), "org");
+    assert_eq!(&d[16..20], &[1, 2, 3, 4], "loadbinary");
+    let l = disassemble(&p, &syms, hook, 1).unwrap();
+    assert_eq!(l[0].text, format!("jmp {newmem:X}"));
+    let log2 = p.alloc_log.lock().unwrap().clone();
+    assert!(log2.iter().any(|(pr, _)| !pr.x && pr.w), "allocnx is not executable: {log2:?}");
+
+    aa_execute(&p, &mut syms, NEW_DIRECTIVES, false, Some(&st), &mut hooks).unwrap();
+    assert_eq!(p.snapshot(), before, "memory restored byte for byte");
+    for n in ["aobhit", "flt", "cmdval", "seenalready"] {
+        assert_eq!(syms.get(n), None, "{n}");
+    }
+}
+
+#[test]
+fn aa_conditionals() {
+    let p = game64();
+    let syms = SymbolTable::default();
+    let h = &mut AaHooks {
+        lua: Some(Box::new(|_| panic!("{{$lua}} in a skipped branch must not run"))),
+        ..Default::default()
+    };
+    let ok = "[ENABLE]\n{$ifdef nothing}\n{$lua}\nreturn ''\n{$asm}\n{$ifdef x}\ngarbage\n{$else}\nmore garbage\n{$endif}\n{$endif}\n[DISABLE]\n";
+    assert_eq!(check_msg(&p, ok, h), "");
+    // A define's name is tested before replacement; redefinition replaces.
+    let s = "define(A,B)\ndefine(A,C)\n[ENABLE]\n{$ifdef A}\nalloc(C,10)\nC:\n  nop\n{$endif}\n[DISABLE]\n";
+    let mut syms2 = SymbolTable::default();
+    let st = aa_execute(&p, &mut syms2, s, true, None, &mut AaHooks::default()).unwrap();
+    assert_eq!(st.allocs[0].name, "C");
+    // 32-bit targets see CPU32, not CPU64.
+    let p32 = TestProc::new(4).module("game.exe", 0x40_0000, vec![0; 0x100]);
+    let s = "[ENABLE]\n{$ifdef CPU64}\ngarbage\n{$endif}\n{$ifndef CPU32}\ngarbage\n{$endif}\n[DISABLE]\n";
+    assert_eq!(check_msg(&p32, s, &mut AaHooks::default()), "");
+    let cases = [
+        ("[ENABLE]\n{$ifdef a}\n[DISABLE]\n", 2, "without {$endif}"),
+        ("[ENABLE]\n{$endif}\n[DISABLE]\n", 2, "without {$ifdef}"),
+        ("[ENABLE]\n{$else}\n[DISABLE]\n", 2, "without {$ifdef}"),
+        ("[ENABLE]\n{$ifdef a}\n{$else}\n{$else}\n{$endif}\n[DISABLE]\n", 4, "without"),
+        ("[ENABLE]\n{$ifdef}\n[DISABLE]\n", 2, "unsupported directive"),
+    ];
+    for (s, line, msg) in cases {
+        let e = aa_check(&p, &syms, s, &mut AaHooks::default()).unwrap();
+        assert_eq!(e.line, line, "{s:?}: {}", e.message);
+        assert!(e.message.contains(msg), "{s:?}: {}", e.message);
+    }
+    let deep = format!(
+        "[ENABLE]\n{}{}[DISABLE]\n",
+        "{$ifdef x}\n".repeat(65),
+        "{$endif}\n".repeat(65)
+    );
+    assert!(check_msg(&p, &deep, &mut AaHooks::default()).contains("nested deeper"));
+}
+
+#[test]
+fn aa_strict_and_implicit_labels() {
+    let p = game64();
+    let h = &mut AaHooks::default();
+    // Default: `exit:` declares itself; `1000:` stays an address.
+    let s = "[ENABLE]\nalloc(m,100)\nm:\n  jmp exit\n  nop\nexit:\n  ret\n[DISABLE]\n";
+    assert_eq!(check_msg(&p, s, h), "");
+    let strict = s.replace("[ENABLE]\n", "[ENABLE]\n{$strict}\n");
+    assert!(check_msg(&p, &strict, h).contains("not declared"));
+    let back = s.replace("[ENABLE]\n", "[ENABLE]\n{$strict}\n{$nostrict}\n");
+    assert_eq!(check_msg(&p, &back, h), "");
+    // A typo in a use is still an error.
+    let typo = s.replace("jmp exit", "jmp exti");
+    assert!(check_msg(&p, &typo, h).contains("exti"), "{}", check_msg(&p, &typo, h));
+    let mut syms = SymbolTable::default();
+    let st = aa_execute(
+        &p,
+        &mut syms,
+        "[ENABLE]\n20000010:\n  db 11\n[DISABLE]\n",
+        true,
+        None,
+        h,
+    )
+    .unwrap();
+    assert_eq!(st.originals[0].0, 0x2000_0010, "hex address, not a label");
+}
+
+#[test]
+fn aa_align_and_org_forms() {
+    let p = game64();
+    let mut syms = SymbolTable::default();
+    let s = "[ENABLE]\nalloc(m,100)\nlabel(a,b,c)\nregistersymbol(a,b,c)\nm:\n  db 1\n  align 4\na:\n  db 2\n  align(8,0)\nb:\n  db 3\n  align 4,EE\nc:\norg m+40\n  db 55\n[DISABLE]\n";
+    let st = aa_execute(&p, &mut syms, s, true, None, &mut AaHooks::default()).unwrap();
+    let m = st.allocs[0].addr;
+    assert_eq!(
+        (syms.get("a"), syms.get("b"), syms.get("c")),
+        (Some(m + 4), Some(m + 8), Some(m + 0xC))
+    );
+    let mut b = [0u8; 13];
+    p.read(m, &mut b).unwrap();
+    assert_eq!(b, [1, 0x90, 0x90, 0x90, 2, 0, 0, 0, 3, 0xEE, 0xEE, 0xEE, 0]);
+    let mut x = [0u8];
+    p.read(m + 0x40, &mut x).unwrap();
+    assert_eq!(x[0], 0x55);
+    for bad in ["align 0", "align 10001", "align 4,100", "align x", "align 4 1 2"] {
+        let s = format!("[ENABLE]\nalloc(m,10)\nm:\n{bad}\n[DISABLE]\n");
+        assert!(check_msg(&p, &s, &mut AaHooks::default()).contains("align"), "{bad}");
+    }
+    let s = "[ENABLE]\n  align 4\n[DISABLE]\n";
+    assert!(check_msg(&p, s, &mut AaHooks::default()).contains("align"));
+}
+
+#[test]
+fn aa_alloc_protection_and_near_hint() {
+    let p = game64();
+    let mut syms = SymbolTable::default();
+    let s = "[ENABLE]\nalloc(a,10)\nallocnx(b,10)\nallocxo(c,10)\nalloc(d,10,,r)\nalloc(e,10,PAGE_EXECUTE_READ)\ngame.exe+1005:\n  jmp a\n  nop\na:\n  jmp game.exe+100B\n[DISABLE]\n";
+    let st = aa_execute(&p, &mut syms, s, true, None, &mut AaHooks::default()).unwrap();
+    let log = p.alloc_log.lock().unwrap().clone();
+    let prot = |r, w, x| Prot { r, w, x };
+    assert_eq!(
+        log.iter().map(|l| l.0).collect::<Vec<_>>(),
+        [
+            prot(true, true, true),
+            prot(true, true, false),
+            prot(true, false, true),
+            prot(true, false, false),
+            prot(true, false, true)
+        ]
+    );
+    // No address given on 64-bit: allocated near the patched address, so the hook is 5 bytes.
+    assert!(log.iter().all(|l| l.1 == Some(GAME64 + 0x1005)), "{log:?}");
+    assert_eq!(
+        disassemble(&p, &syms, GAME64 + 0x1005, 1).unwrap()[0].bytes.len(),
+        5
+    );
+    aa_execute(&p, &mut syms, s, false, Some(&st), &mut AaHooks::default()).unwrap();
+    let bad = "[ENABLE]\nalloc(a,10,,rwq)\n[DISABLE]\n";
+    assert!(check_msg(&p, bad, &mut AaHooks::default()).contains("protection"));
+}
+
+#[test]
+fn aa_aob_uniqueness() {
+    let p = game64();
+    let mut syms = SymbolTable::default();
+    // CC filler occurs thousands of times; 29 81 once.
+    let s = "[ENABLE]\naobscanmodule(many,game.exe,CC CC CC CC)\naobscan(one,29 81 E0 00)\n[DISABLE]\n";
+    let run = |u: AobUnique, syms: &mut SymbolTable| {
+        aa_execute(
+            &p,
+            syms,
+            s,
+            true,
+            None,
+            &mut AaHooks {
+                aob_unique: u,
+                ..Default::default()
+            },
+        )
+    };
+    let st = run(AobUnique::Off, &mut syms).unwrap();
+    assert_eq!(st.scans.iter().map(|x| x.matches).collect::<Vec<_>>(), [None, None]);
+    let st = run(AobUnique::Warn, &mut syms).unwrap();
+    assert_eq!(st.scans[0].matches, Some(MAX_AOB_COUNT));
+    assert_eq!(st.scans[1].matches, Some(1));
+    assert_eq!(st.scans[1].addr, GAME64 + 0x1005);
+    let e = run(AobUnique::Fail, &mut syms).unwrap_err().to_string();
+    assert!(e.contains("not unique") && e.contains("line 2"), "{e}");
+    let e = aa_check(
+        &p,
+        &syms,
+        s,
+        &mut AaHooks {
+            aob_unique: AobUnique::Fail,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert!(e.message.contains("1000 or more matches"), "{}", e.message);
+    // State without `scans` (saved by an older version) still loads.
+    let old: AaState =
+        serde_json::from_str(r#"{"allocs":[],"registered":[],"originals":[]}"#).unwrap();
+    assert!(old.scans.is_empty());
+}
+
+#[test]
+fn aa_assert_wildcards_lists_and_globalalloc() {
+    let p = game64();
+    let mut syms = SymbolTable::default();
+    let h = &mut AaHooks::default();
+    assert_eq!(
+        check_msg(&p, "[ENABLE]\nassert(game.exe+1005,29 ?? E? 00 * 00)\n[DISABLE]\n", h),
+        ""
+    );
+    assert!(
+        check_msg(&p, "[ENABLE]\nassert(game.exe+1005,29 ?? E? 01)\n[DISABLE]\n", h)
+            .contains("assert failed")
+    );
+    let s = "[ENABLE]\nglobalalloc(g,100,game.exe)\nalloc(m,10)\nlabel(x,y)\nregistersymbol(x,y,m)\nm:\nx:\n  db 1\ny:\n  db 2\n[DISABLE]\nunregistersymbol(x,y,m)\ndealloc(m)\n";
+    let st = aa_execute(&p, &mut syms, s, true, None, h).unwrap();
+    let m = st.allocs[0].addr;
+    assert_eq!((syms.get("x"), syms.get("y"), syms.get("m")), (Some(m), Some(m + 1), Some(m)));
+    let g = syms.get("g").unwrap();
+    aa_execute(&p, &mut syms, s, false, Some(&st), h).unwrap();
+    assert_eq!((syms.get("x"), syms.get("y")), (None, None));
+    // globalalloc survives disable and is reused by the next enable.
+    assert_eq!(syms.get("g"), Some(g));
+    let st = aa_execute(&p, &mut syms, s, true, None, h).unwrap();
+    assert_eq!(syms.get("g"), Some(g));
+    assert!(st.allocs.iter().all(|a| a.name != "g"));
+}
+
+#[test]
+fn aa_lua_sections_and_nesting() {
+    let p = game64();
+    let mut syms = SymbolTable::default();
+    let (log, l) = logger();
+    let mut hooks = AaHooks {
+        lua: Some(Box::new(move |src: String| {
+            l.lock().unwrap().push(src.trim().to_string());
+            // Lua may emit another {$lua} block.
+            Ok(if src.contains("outer") {
+                "{$lua}\nreturn 'inner'\n{$asm}\n".into()
+            } else {
+                String::new()
+            })
+        })),
+        ..Default::default()
+    };
+    let s = "{$lua}\nif syntaxcheck then return end\n[ENABLE]\nprint('on') -- outer\n[DISABLE]\nprint('off')\n{$asm}\n";
+    let st = aa_execute(&p, &mut syms, s, true, None, &mut hooks).unwrap();
+    assert_eq!(
+        *log.lock().unwrap(),
+        [
+            "if syntaxcheck then return end",
+            "print('on') -- outer",
+            "return 'inner'"
+        ]
+    );
+    log.lock().unwrap().clear();
+    aa_execute(&p, &mut syms, s, false, Some(&st), &mut hooks).unwrap();
+    assert_eq!(
+        *log.lock().unwrap(),
+        ["if syntaxcheck then return end", "print('off')"]
+    );
+    // Header directly before {$asm}: an empty part, not run.
+    log.lock().unwrap().clear();
+    let s = "[ENABLE]\n{$lua}\nprint(1)\n[DISABLE]\n{$asm}\n";
+    aa_execute(&p, &mut syms, s, false, None, &mut hooks).unwrap();
+    assert!(log.lock().unwrap().is_empty());
+    // Lines stay right after a split block.
+    let s = "{$lua}\n[ENABLE]\nx = 1\n{$asm}\n  bogus\n[DISABLE]\n";
+    let e = aa_check(&p, &syms, s, &mut hooks).unwrap();
+    assert_eq!(e.line, 5, "{}", e.message);
+}
+
+#[test]
+fn aa_custom_commands_symbol_lookup_and_luacall() {
+    let p = game64();
+    let mut syms = SymbolTable::default();
+    // A command expanding to itself is capped.
+    let mut hooks = AaHooks {
+        command: Some(Box::new(|(n, _, _)| Ok((n == "loop").then(|| "loop()\n".to_string())))),
+        ..Default::default()
+    };
+    assert!(check_msg(&p, "[ENABLE]\nloop()\n[DISABLE]\n", &mut hooks).contains("custom command"));
+    // Errors from a command carry the line; `None` falls through to the assembler.
+    let mut hooks = AaHooks {
+        command: Some(Box::new(|(n, _, _)| match n.as_str() {
+            "boom" => Err(Error::Other("no".into())),
+            _ => Ok(None),
+        })),
+        ..Default::default()
+    };
+    let e = aa_check(&p, &syms, "[ENABLE]\n\nboom(1)\n[DISABLE]\n", &mut hooks).unwrap();
+    assert_eq!((e.line, e.message.as_str()), (3, "no"));
+    let e = aa_check(&p, &syms, "[ENABLE]\nother(1)\n[DISABLE]\n", &mut hooks).unwrap();
+    assert_eq!(e.line, 2);
+    // The host's symbol lookup is asked last.
+    let lookup: SymbolLookup = std::sync::Arc::new(|n: &str| (n == "magic").then_some(0x2000_0020));
+    let mut hooks = AaHooks {
+        symbol_lookup: Some(lookup.clone()),
+        ..Default::default()
+    };
+    let st = aa_execute(&p, &mut syms, "[ENABLE]\nmagic:\n  dd magic\n[DISABLE]\n", true, None, &mut hooks)
+        .unwrap();
+    let mut b = [0u8; 4];
+    p.read(0x2000_0020, &mut b).unwrap();
+    assert_eq!(u32::from_le_bytes(b), 0x2000_0020);
+    aa_execute(&p, &mut syms, "[ENABLE]\nmagic:\n  dd magic\n[DISABLE]\n", false, Some(&st), &mut hooks)
+        .unwrap();
+    assert_eq!(resolve_address_with(&p, &syms, "magic+4", &*lookup).unwrap(), 0x2000_0024);
+    assert!(resolve_address(&p, &syms, "magic").is_err());
+    // luacall without any Lua is an error when running, nothing when checking.
+    let s = "[ENABLE]\nluacall(x())\n[DISABLE]\n";
+    assert_eq!(check_msg(&p, s, &mut AaHooks::default()), "");
+    let e = aa_execute(&p, &mut syms, s, true, None, &mut AaHooks::default()).unwrap_err();
+    assert!(e.to_string().contains("luacall"), "{e}");
+    // ... and falls back to the {$lua} hook, its output ignored.
+    let (log, l) = logger();
+    let mut hooks = AaHooks {
+        lua: Some(Box::new(move |s| {
+            l.lock().unwrap().push(s);
+            Ok("garbage that is not assembled".into())
+        })),
+        ..Default::default()
+    };
+    aa_execute(&p, &mut syms, s, true, None, &mut hooks).unwrap();
+    assert_eq!(*log.lock().unwrap(), ["x()"]);
+}
+
+#[test]
+fn aa_loadbinary_and_fullaccess_errors() {
+    let p = game64();
+    let h = &mut AaHooks::default();
+    let s = "[ENABLE]\nalloc(m,10)\nloadbinary(m,x.bin)\n[DISABLE]\n";
+    assert!(check_msg(&p, s, h).contains("file access is not enabled"));
+    let mut syms = SymbolTable::default();
+    let mut hooks = AaHooks {
+        read_file: Some(Box::new(|_| Err(Error::Other("denied by consent".into())))),
+        ..Default::default()
+    };
+    assert_eq!(check_msg(&p, s, &mut hooks), "", "checking never reads the file");
+    let e = aa_execute(&p, &mut syms, s, true, None, &mut hooks).unwrap_err();
+    assert!(e.to_string().contains("denied by consent"), "{e}");
+    let mut hooks = AaHooks {
+        read_file: Some(Box::new(|_| Ok(vec![0; MAX_ASSEMBLED_BYTES + 1]))),
+        ..Default::default()
+    };
+    let e = aa_execute(&p, &mut syms, s, true, None, &mut hooks).unwrap_err();
+    assert!(e.to_string().contains("larger than"), "{e}");
+    let s = "[ENABLE]\nfullaccess(game.exe,zz)\n[DISABLE]\n";
+    assert!(check_msg(&p, s, h).contains("bad size"));
+}
+
+#[test]
+fn aa_api_hook_template() {
+    let p = game64();
+    let before = p.snapshot();
+    let mut syms = SymbolTable::default();
+    let script = injection_template(&p, GAME64 + 0x1000, Template::ApiHook).unwrap();
+    assert_eq!(aa_check(&p, &syms, &script, &mut AaHooks::default()), None, "{script}");
+    let st = aa_execute(&p, &mut syms, &script, true, None, &mut AaHooks::default())
+        .unwrap_or_else(|e| panic!("{e}\n{script}"));
+    let newfunction = st.allocs[0].addr;
+    let orig = syms.get("originalcall").expect("originalcall registered");
+    let l = disassemble(&p, &syms, GAME64 + 0x1000, 1).unwrap();
+    assert_eq!(l[0].text, format!("jmp {newfunction:X}"));
+    assert_eq!(
+        disassemble(&p, &syms, newfunction, 1).unwrap()[0].text,
+        format!("jmp {orig:X}")
+    );
+    // The trampoline runs the moved entry and continues after it.
+    let t = disassemble(&p, &syms, orig, 2).unwrap();
+    assert_eq!(t[0].text, "mov [rsp+8],rbx");
+    assert_eq!(t[1].text, format!("jmp {:X}", GAME64 + 0x1005));
+    aa_execute(&p, &mut syms, &script, false, Some(&st), &mut AaHooks::default()).unwrap();
+    assert_eq!(p.snapshot(), before);
+    assert_eq!(syms.get("originalcall"), None);
+}
+
+/// Code that reads a pointer, a float and a string through absolute addresses.
+fn typed_code() -> (TestProc, Addr) {
+    let p = game64();
+    p.write(GAME64 + 0x3030, &1.5f32.to_le_bytes()).unwrap();
+    let syms = SymbolTable::default();
+    let at = GAME64 + 0x2000;
+    let code = assemble(
+        &p,
+        &syms,
+        at,
+        "mov rax,[140003000]\nmovss xmm0,[140003030]\nmov eax,[140003010]\nmov eax,[rcx+E0]",
+    )
+    .unwrap();
+    p.write(at, &code).unwrap();
+    (p, at)
+}
+
+#[test]
+fn disassemble_with_options() {
+    let (p, at) = typed_code();
+    let syms = SymbolTable::default();
+    let plain = disassemble(&p, &syms, at, 4).unwrap();
+    assert_eq!(disassemble_with(&p, &syms, at, 4, &DisasmOptions::default()).unwrap(), plain);
+    let opts = DisasmOptions {
+        guess_types: true,
+        ..Default::default()
+    };
+    let l = disassemble_with(&p, &syms, at, 3, &opts).unwrap();
+    let c: Vec<&str> = l.iter().map(|x| x.comment.as_str()).collect();
+    assert_eq!(
+        c,
+        [
+            "[game.exe+3000]->20000000",
+            "[game.exe+3030]=(float)1.5",
+            "[game.exe+3010]='Hello'"
+        ]
+    );
+    // The host's names come first.
+    let opts = DisasmOptions {
+        address_name: Some(std::sync::Arc::new(|a| {
+            (a == GAME64 + 0x3000).then(|| "player".to_string())
+        })),
+        ..Default::default()
+    };
+    assert_eq!(
+        disassemble_with(&p, &syms, at, 1, &opts).unwrap()[0].comment,
+        "[player]=0000000020000000"
+    );
+    let att = DisasmOptions {
+        syntax: Syntax::Att,
+        ..Default::default()
+    };
+    let l = disassemble_with(&p, &syms, GAME64 + 0x1000, 2, &att).unwrap();
+    assert_eq!(l[0].text, "mov %rbx,8(%rsp)");
+    assert_eq!(l[1].text, "sub %eax,0xe0(%rcx)");
+    for arch in [Arch::Arm, Arch::Arm64] {
+        let e = disassemble_with(
+            &p,
+            &syms,
+            at,
+            1,
+            &DisasmOptions {
+                arch,
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(e, Error::Unsupported(_)), "{e}");
+    }
+    // 32-bit decoding of 64-bit code on request.
+    let x86 = DisasmOptions {
+        arch: Arch::X86,
+        ..Default::default()
+    };
+    assert_eq!(
+        disassemble_with(&p, &syms, GAME64 + 0x1000, 1, &x86).unwrap()[0].text,
+        "dec eax"
+    );
+}
+
+#[test]
+fn guess_types_of_operands() {
+    let (p, at) = typed_code();
+    let g = |a: Addr, r: Option<&Registers>| guess_operand_type(&p, a, r).unwrap();
+    assert_eq!(g(at, None), Some((GAME64 + 0x3000, ValueType::Pointer)));
+    assert_eq!(g(at + 8, None), Some((GAME64 + 0x3030, ValueType::Float)));
+    let third = disassemble(&p, &SymbolTable::default(), at, 3).unwrap()[2].addr;
+    assert_eq!(g(third, None), Some((GAME64 + 0x3010, ValueType::String)));
+    let fourth = disassemble(&p, &SymbolTable::default(), at, 4).unwrap()[3].addr;
+    assert_eq!(g(fourth, None), None, "needs rcx");
+    let r = regs(&[("rcx", GAME64 + 0x3020 - 0xE0)]);
+    assert_eq!(g(fourth, Some(&r)), Some((GAME64 + 0x3020, ValueType::Dword)));
+    // Plain values.
+    p.write(0x2000_0010, &1.0f32.to_le_bytes()).unwrap();
+    assert_eq!(guess_value_type(&p, 0x2000_0010, 4, false), Some(ValueType::Float));
+    p.write(0x2000_0010, &2.5f64.to_le_bytes()).unwrap();
+    assert_eq!(guess_value_type(&p, 0x2000_0010, 8, false), Some(ValueType::Double));
+    p.write(0x2000_0010, &[b'h', 0, b'e', 0, b'l', 0, b'l', 0]).unwrap();
+    assert_eq!(guess_value_type(&p, 0x2000_0010, 4, false), Some(ValueType::UnicodeString));
+    p.write(0x2000_0010, &7u64.to_le_bytes()).unwrap();
+    assert_eq!(guess_value_type(&p, 0x2000_0010, 8, false), Some(ValueType::Qword));
+    assert_eq!(guess_value_type(&p, 0x2000_0010, 1, false), Some(ValueType::Byte));
+    assert_eq!(guess_value_type(&p, 0x10, 4, false), None);
+}
+
+#[test]
+fn assembly_scan_and_references() {
+    let p = game64();
+    let none = std::sync::atomic::AtomicBool::new(false);
+    let scan = |pat: &str, max: usize| asm_scan(&p, 0, u64::MAX, pat, max, &none).unwrap();
+    let addrs = |pg: &AsmScanPage| pg.hits.iter().map(|h| h.addr).collect::<Vec<_>>();
+    assert_eq!(addrs(&scan("sub [r?x+*],e?x", 10)), [GAME64 + 0x1005]);
+    assert_eq!(addrs(&scan("MOV  EAX , [RCX+E0]", 10)), [GAME64 + 0x100B]);
+    let seq = scan("mov eax,[*]; ret", 10);
+    assert_eq!(addrs(&seq), [GAME64 + 0x1011]);
+    assert_eq!(seq.hits[0].text, "mov eax,[140003020]; ret");
+    assert_eq!(seq.next, None);
+    // Paging.
+    let pg = scan("int3", 3);
+    assert_eq!(addrs(&pg), [GAME64, GAME64 + 1, GAME64 + 2]);
+    assert_eq!(pg.next, Some(GAME64 + 3));
+    let pg2 = asm_scan(&p, pg.next.unwrap(), u64::MAX, "int3", 2, &none).unwrap();
+    assert_eq!(addrs(&pg2), [GAME64 + 3, GAME64 + 4]);
+    let stop = std::sync::atomic::AtomicBool::new(true);
+    assert!(asm_scan(&p, 0, u64::MAX, "nop", 1, &stop).is_err());
+    assert!(asm_scan(&p, 0, u64::MAX, " ; ", 1, &none).is_err());
+    assert!(asm_scan(&p, 0, u64::MAX, &"nop;".repeat(17), 1, &none).is_err());
+    assert!(asm_scan(&p, 0, u64::MAX, &"?".repeat(MAX_ASM_PATTERN + 1), 1, &none).is_err());
+    // AOB scans page the same way: continue after the last hit.
+    let a = aob_scan(&p, 0, u64::MAX, "CC CC", 2).unwrap();
+    let b = aob_scan(&p, a[1] + 1, u64::MAX, "CC CC", 1).unwrap();
+    assert_eq!(b, [a[1] + 1]);
+
+    // References.
+    let syms = SymbolTable::default();
+    let jmp = assemble(&p, &syms, GAME64 + 0x2000, "jmp 140001000").unwrap();
+    p.write(GAME64 + 0x2000, &jmp).unwrap();
+    let r = |from, target, fwd| find_reference(&p, from, target, fwd, 1 << 20, &none).unwrap();
+    assert_eq!(r(GAME64, GAME64 + 0x3020, true), Some(GAME64 + 0x1011));
+    assert_eq!(r(GAME64 + 0x3000, GAME64 + 0x3020, false), Some(GAME64 + 0x1011));
+    assert_eq!(r(GAME64 + 0x1011, GAME64 + 0x3020, true), None, "strictly after");
+    assert_eq!(r(GAME64 + 0x3FFF, GAME64 + 0x1000, false), Some(GAME64 + 0x2000));
+    assert_eq!(r(GAME64, GAME64 + 0x1000, true), Some(GAME64 + 0x2000));
+    assert_eq!(r(GAME64, 0xDEAD_BEEF, true), None);
+    assert!(find_reference(&p, GAME64, 1, true, 100, &stop).is_err());
+}
+
+#[test]
+fn garbage_asm_patterns_never_panic() {
+    let p = TestProc::new(8);
+    let mut seed = 5u64;
+    let mut next = || {
+        seed = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        (seed >> 33) as usize
+    };
+    let bytes: Vec<u8> = (0..0x4000).map(|_| next() as u8).collect();
+    p.map(0x1000_0000, bytes);
+    let chars: Vec<char> = "*?;[]+-, \nmovjeaxr0123456789".chars().collect();
+    let none = std::sync::atomic::AtomicBool::new(false);
+    let t = std::time::Instant::now();
+    for _ in 0..300 {
+        let len = next() % 40;
+        let s: String = (0..len).map(|_| chars[next() % chars.len()]).collect();
+        let _ = asm_scan(&p, 0, u64::MAX, &s, 5, &none);
+    }
+    assert!(t.elapsed().as_secs() < 60, "{:?}", t.elapsed());
+}
+
+#[test]
+fn garbage_directives_never_panic_or_hang() {
+    let p = game64();
+    let mut syms = SymbolTable::default();
+    syms.register("reg", 0x2000_0000);
+    let frags = [
+        "{$ifdef a}",
+        "{$ifndef cpu64}",
+        "{$ifdef reg}",
+        "{$else}",
+        "{$endif}",
+        "{$strict}",
+        "{$nostrict}",
+        "{$lua}",
+        "{$asm}",
+        "[ENABLE]",
+        "[DISABLE]",
+        "define(a,b)",
+        "undefine(a)",
+        "undefine()",
+        "align 10",
+        "align(FFFFFFFF,FF)",
+        "align 4 CC",
+        "org m+10",
+        "org",
+        "allocnx(n,10)",
+        "allocxo(n,10,PAGE_bogus)",
+        "alloc(q,10,,rwx)",
+        "loadbinary(m,f)",
+        "luacall(x)",
+        "luacall(",
+        "custom(1,2)",
+        "aobscanmodule(z,$process,\"CC CC\")",
+        "assert(m,?? ** *)",
+        "fullaccess(m,10,20)",
+        "alloc(m,100)",
+        "m:",
+        "imp:",
+        "jmp imp",
+        "db 1",
+        "label(a,b,c)",
+        "registersymbol(a,b,c)",
+    ];
+    let mut seed = 13u64;
+    let mut next = || {
+        seed = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        (seed >> 33) as usize
+    };
+    let t = std::time::Instant::now();
+    for _ in 0..2_000 {
+        let n = 1 + next() % 14;
+        let body: Vec<&str> = (0..n).map(|_| frags[next() % frags.len()]).collect();
+        let s = format!("[ENABLE]\n{}\n[DISABLE]\n", body.join("\n"));
+        let mut hooks = AaHooks {
+            lua: Some(Box::new(|_| Ok("{$ifdef a}\nalign 4\n".into()))),
+            command: Some(Box::new(|(n, a, _)| Ok((n == "custom").then(|| format!("db {a}\ncustom({a})\n"))))),
+            read_file: Some(Box::new(|_| Ok(vec![1; 16]))),
+            aob_unique: AobUnique::Warn,
+            ..Default::default()
+        };
+        let _ = aa_check(&p, &syms, &s, &mut hooks);
+    }
+    assert!(t.elapsed().as_secs() < 120, "{:?}", t.elapsed());
+}
+
+#[test]
+fn symbol_list_filters_and_pages() {
+    let base = 0x6200_0000_0000;
+    let mut p = TestProc::new(8).module("libsym.so", base, build_elf(true, false, false));
+    p.pid = 4242;
+    let mut syms = SymbolTable::default();
+    syms.register("zz_user", 0x10);
+    syms.register("mall_user", 0x20);
+    let all = symbol_list(&p, &syms, None, "", 0, 100);
+    assert_eq!(all.total, 4);
+    assert_eq!(
+        all.rows.iter().map(|r| (r.name.as_str(), r.user)).collect::<Vec<_>>(),
+        [("mall_user", true), ("zz_user", true), ("malloc", false), ("free", false)]
+    );
+    assert_eq!(all.rows[2].module, "libsym.so");
+    let f = symbol_list(&p, &syms, None, "MALL", 0, 100);
+    assert_eq!(f.total, 2);
+    let page = symbol_list(&p, &syms, None, "", 1, 2);
+    assert_eq!((page.total, page.rows.len()), (4, 2));
+    assert_eq!(page.rows[0].name, "zz_user");
+    let m = symbol_list(&p, &syms, Some("$process"), "", 0, 100);
+    assert_eq!(m.total, 2);
+    assert!(symbol_list(&p, &syms, Some("nope"), "", 0, 100).rows.is_empty());
+}
+
+#[test]
+fn remote_targets_read_symbols_from_memory() {
+    // The path names a real local ELF with `malloc`; the target's memory holds a PE with
+    // `Sleep`. A remote target's paths are not local files.
+    let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"));
+    let path = dir.join("hh_asm_remote_decoy.so");
+    std::fs::write(&path, build_elf(true, false, true)).unwrap();
+    let base = 0x6300_0000_0000;
+    let img = build_pe(true, false);
+    let mut p = TestProc::new(8);
+    p.pid = 31337;
+    p.mods.push(Module {
+        name: "lib.so".into(),
+        path: path.to_string_lossy().into(),
+        base,
+        size: img.len() as u64,
+    });
+    p.map(base, img);
+    let syms = SymbolTable::default();
+    assert_eq!(resolve_address(&p, &syms, "malloc").unwrap(), base + 0x1100);
+    set_module_files_local(31337, false);
+    assert_eq!(resolve_address(&p, &syms, "Sleep").unwrap(), base + 0x2100);
+    assert!(resolve_address(&p, &syms, "malloc").is_err());
+    set_module_files_local(31337, true);
+    assert_eq!(resolve_address(&p, &syms, "malloc").unwrap(), base + 0x1100);
 }

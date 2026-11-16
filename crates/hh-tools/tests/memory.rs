@@ -216,3 +216,198 @@ fn elf_headers_never_open_a_fifo() {
     let r = rx.recv_timeout(std::time::Duration::from_secs(10)).expect("headers view hung on a FIFO");
     assert!(r.is_err() || r.unwrap() == "memory");
 }
+
+// ---------------------------------------------------------------- 1.0: load plan, search, stats
+
+#[test]
+fn load_plan_then_approved_blocks_only() {
+    let mut p = proc_();
+    p.add(0x20000, vec![0x22; 0x1000], R, RegionKind::Private, None);
+    let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let f = dir.path().join("plan.hhmem");
+    let snap = Snapshot {
+        blocks: vec![
+            Block { addr: 0x13000, data: vec![0xAA; 0x10] },
+            Block { addr: 0x10000, data: vec![0xBB; 0x20] },
+            Block { addr: 0x20000, data: vec![0xCC; 0x10] },
+            Block { addr: 0x30000, data: vec![0xDD; 0x10] },
+            Block { addr: 0x10FF0, data: vec![0xEE; 0x20] },
+        ],
+    };
+    save_snapshot(&snap, &f).unwrap();
+    let before = bytes(&p, 0x10000, 0x20);
+    let plan = plan_load(&p, &f, None).unwrap();
+    // Sorted by address; nothing written yet.
+    let got: Vec<_> = plan.blocks.iter().map(|b| (b.index, b.addr, b.len, b.mapped, b.writable)).collect();
+    assert_eq!(
+        got,
+        [
+            (0, 0x10000, 0x20, true, true),
+            (1, 0x10FF0, 0x20, true, true),
+            (2, 0x13000, 0x10, true, true),
+            (3, 0x20000, 0x10, true, false),
+            (4, 0x30000, 0x10, false, false),
+        ]
+    );
+    assert_eq!((plan.bytes, plan.unmapped, plan.read_only), (0x70, 1, 1));
+    assert_eq!(bytes(&p, 0x10000, 0x20), before);
+    assert_eq!(serde_json::to_value(plan.blocks[0]).unwrap()["addr"], "0x10000");
+
+    // Only block 2 approved.
+    let r = load_memory_approved(&p, &f, None, &plan.blocks[2..3]).unwrap();
+    assert_eq!((r.blocks, r.bytes, r.failed.len()), (1, 0x10, 0));
+    assert_eq!(bytes(&p, 0x13000, 0x10), [0xAA; 0x10]);
+    assert_eq!(bytes(&p, 0x10000, 0x20), before);
+    // An unmapped block fails, reported like load_memory does.
+    let r = load_memory_approved(&p, &f, None, &plan.blocks[4..]).unwrap();
+    assert_eq!(r.failed, [0x30000]);
+    // Relocated plans move every block by the same distance.
+    let moved = plan_load(&p, &f, Some(0x10100)).unwrap();
+    assert_eq!(moved.blocks[2].addr, 0x13100);
+    // A plan for another file (or a changed file) is refused without writing anything.
+    let mut stale = plan.blocks[0];
+    stale.len = 0x21;
+    assert!(load_memory_approved(&p, &f, None, &[plan.blocks[1], stale]).is_err());
+    assert_eq!(bytes(&p, 0x10FF0, 0x10), bytes(&proc_(), 0x10FF0, 0x10));
+    let mut out_of_range = plan.blocks[0];
+    out_of_range.index = 99;
+    assert!(load_memory_approved(&p, &f, None, &[out_of_range]).is_err());
+    // load_memory still writes everything.
+    let r = load_memory(&p, &f, None).unwrap();
+    assert_eq!(r.failed, [0x30000]);
+}
+
+#[test]
+fn hostile_memory_files_fail_cleanly() {
+    let p = proc_();
+    let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let f = dir.path().join("bad.hhmem");
+    let head = |count: u32| {
+        let mut v = b"HHMEM\x01\0\0".to_vec();
+        v.extend_from_slice(&count.to_le_bytes());
+        v.extend_from_slice(&0u32.to_le_bytes());
+        v
+    };
+    // Billions of declared blocks in a tiny file: refused before allocating an index.
+    std::fs::write(&f, head(u32::MAX)).unwrap();
+    assert!(plan_load(&p, &f, None).is_err());
+    assert!(search_file(&f, &[Some(1)], 10, &Progress::new()).is_err());
+    // A block longer than the file.
+    let mut v = head(1);
+    v.extend_from_slice(&0x10000u64.to_le_bytes());
+    v.extend_from_slice(&(1u64 << 40).to_le_bytes());
+    std::fs::write(&f, &v).unwrap();
+    assert!(plan_load(&p, &f, None).is_err());
+    assert!(load_memory_approved(&p, &f, None, &[]).is_err());
+    // Wrapping block.
+    let mut v = head(1);
+    v.extend_from_slice(&(u64::MAX - 1).to_le_bytes());
+    v.extend_from_slice(&4u64.to_le_bytes());
+    v.extend_from_slice(&[0; 4]);
+    std::fs::write(&f, &v).unwrap();
+    assert!(plan_load(&p, &f, None).is_err());
+    std::fs::write(&f, b"HHMEM").unwrap();
+    assert!(plan_load(&p, &f, None).is_err());
+    std::fs::write(&f, b"").unwrap();
+    assert!(search_file(&f, &[Some(1)], 10, &Progress::new()).is_err());
+}
+
+#[test]
+fn search_saved_snapshot_files() {
+    let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let f = dir.path().join("s.hhmem");
+    // The second block is larger than one read piece (16 MiB) with a hit across the border.
+    let mut big = vec![0u8; (16 << 20) + 64];
+    let border = (16 << 20) - 2;
+    big[border..border + 4].copy_from_slice(&1234i32.to_le_bytes());
+    let mut small = vec![0u8; 64];
+    small[8..12].copy_from_slice(&1234i32.to_le_bytes());
+    small[60..64].copy_from_slice(&1234i32.to_le_bytes());
+    let snap = Snapshot { blocks: vec![Block { addr: 0x1000, data: small }, Block { addr: 0x4000_0000, data: big }] };
+    save_snapshot(&snap, &f).unwrap();
+    drop(snap);
+    let prog = Progress::new();
+    let fmt = hh_scan::Fmt::default();
+    let hits = search_file_value(&f, hh_scan::VType::Bytes4, "1234", &fmt, 100, &prog).unwrap();
+    assert_eq!(hits, [0x1008, 0x103C, 0x4000_0000 + border as u64]);
+    assert_eq!(prog.snapshot().done, 64 + (16 << 20) + 64);
+    assert_eq!(search_file_value(&f, hh_scan::VType::Bytes4, "1234", &fmt, 2, &Progress::new()).unwrap(), [0x1008, 0x103C]);
+    // Wildcards: D2 ?? 00 00.
+    let hits = search_file(&f, &[Some(0xD2), None, Some(0), Some(0)], 100, &Progress::new()).unwrap();
+    assert_eq!(hits.len(), 3);
+    assert!(search_file(&f, &[], 1, &Progress::new()).is_err());
+    assert!(search_file(&f, &vec![None; MAX_PATTERN + 1], 1, &Progress::new()).is_err());
+    let c = Progress::new();
+    c.cancel();
+    assert!(search_file(&f, &[Some(1)], 1, &c).is_err());
+}
+
+#[test]
+fn region_statistics() {
+    let mut p = proc_();
+    p.add(0x400000, vec![0; 0x2000], RX, RegionKind::Image, Some("/x/a.so"));
+    p.add(0x7ff000, vec![0; 0x1000], RW, RegionKind::Private, Some("[stack]"));
+    p.module("a.so", 0x400000, 0x2000);
+    let s = region_stats(&regions(&p).unwrap());
+    assert_eq!((s.regions, s.bytes), (4, 0x6000));
+    let rows = |v: &[StatRow]| v.iter().map(|r| (r.key.clone(), r.regions, r.bytes)).collect::<Vec<_>>();
+    assert_eq!(rows(&s.by_prot), [("rw-p".into(), 3, 0x4000), ("r-xp".into(), 1, 0x2000)]);
+    assert_eq!(rows(&s.by_tag), [("heap".into(), 1, 0x2000), ("image".into(), 1, 0x2000), ("private".into(), 1, 0x1000), ("stack".into(), 1, 0x1000)]);
+    assert_eq!(rows(&s.by_kind)[0], ("Private".into(), 3, 0x4000));
+    assert_eq!(rows(&s.by_module), [("a.so".into(), 1, 0x2000)]);
+}
+
+#[test]
+fn page_change_map() {
+    let p = proc_();
+    let ranges = readable_ranges(&p, false).unwrap();
+    let a = snapshot(&p, &ranges, &Progress::new()).unwrap();
+    p.put(0x10010, &[0xF0]);
+    p.put(0x10FFF, &[0xF0, 0xF1]); // straddles two pages
+    p.put(0x13100, &[0x99]);
+    let b = snapshot(&p, &ranges, &Progress::new()).unwrap();
+    // One page per cell.
+    let m = change_map(&a, &b, 0x10000, 0x14000, 4).unwrap();
+    assert_eq!(m.cell_size, 0x1000);
+    assert_eq!(m.compared, [1, 1, 0, 1]);
+    assert_eq!(m.changed, [1, 1, 0, 1]);
+    // Two cells: pages are summed per cell.
+    let m = change_map(&a, &b, 0x10000, 0x14000, 2).unwrap();
+    assert_eq!((m.cell_size, m.compared.clone(), m.changed.clone()), (0x2000, vec![2, 1], vec![2, 1]));
+    // The resolution is capped.
+    let m = change_map(&a, &b, 0, u64::MAX, usize::MAX).unwrap();
+    assert_eq!(m.changed.len(), MAX_MAP_CELLS);
+    assert_eq!(m.changed.iter().sum::<u32>(), 3);
+    assert!(change_map(&a, &b, 5, 5, 4).is_err());
+}
+
+/// A module whose memory holds a minimal ELF but whose path names a different local file
+/// (as with a remote target): local mode parses the local file, remote mode only memory.
+#[cfg(unix)]
+#[test]
+fn remote_targets_never_read_local_module_files() {
+    let mut elf = vec![0u8; 0x1000];
+    elf[..4].copy_from_slice(b"\x7fELF");
+    elf[4] = 2;
+    elf[5] = 1;
+    elf[16] = 3; // ET_DYN
+    elf[18] = 62;
+    elf[32..40].copy_from_slice(&64u64.to_le_bytes()); // phoff
+    elf[54..56].copy_from_slice(&56u16.to_le_bytes());
+    elf[56..58].copy_from_slice(&1u16.to_le_bytes());
+    let ph = 64;
+    elf[ph..ph + 4].copy_from_slice(&1u32.to_le_bytes()); // PT_LOAD
+    elf[ph + 4..ph + 8].copy_from_slice(&5u32.to_le_bytes());
+    elf[ph + 40..ph + 48].copy_from_slice(&0x1000u64.to_le_bytes());
+    let mut p = FakeProc::new();
+    p.add(0x500000, elf, RX, RegionKind::Image, None);
+    let local = std::env::current_exe().unwrap();
+    p.modules.push(hh_core::Module { name: "m".into(), path: local.to_str().unwrap().into(), base: 0x500000, size: 0x1000 });
+    let m = &p.modules[0];
+    assert_eq!(hh_tools::headers::summary(&p, m).unwrap().source, "file");
+    let h = hh_tools::headers::summary_with(&p, m, false).unwrap();
+    assert_eq!((h.source.as_str(), h.sections.len()), ("memory", 1));
+    let opts = hh_tools::dissect::DissectOptions { local_files: false, ..Default::default() };
+    let d = hh_tools::dissect::dissect(&p, &p.modules, &opts, &Progress::new()).unwrap();
+    assert!(d.functions(0, 100).iter().all(|f| f.name.is_none()));
+}

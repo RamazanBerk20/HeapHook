@@ -48,6 +48,8 @@ struct AppBp {
     script: bool,
     /// Why the engine disabled it (exec, one-shot, max hits, overwritten).
     note: Option<String>,
+    /// Trace: break at the first traced step where this holds.
+    stop: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -87,6 +89,8 @@ pub struct BpReq {
     pub one_shot: bool,
     /// Disable once the hit count reaches this (recorders: stop recording after N hits).
     pub max_hits: Option<u64>,
+    /// Trace only: break at the first traced instruction where this holds (condition syntax).
+    pub stop_when: String,
 }
 
 /// `debug_watch_range`: a page-protection watch of any length.
@@ -127,6 +131,9 @@ pub struct BpOut {
     pub hits: u64,
     pub slot: Option<u8>,
     pub condition: Option<String>,
+    /// Trace stop condition.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stop_when: Option<String>,
     pub options: BpOptions,
     /// Hits not recorded because the record list is full.
     pub records_dropped: u64,
@@ -201,6 +208,69 @@ fn reg_mut<'a>(c: &'a mut Context, name: &str) -> Option<&'a mut u64> {
         "gs_base" => &mut c.gs_base,
         _ => return None,
     })
+}
+
+type RegSet = Box<dyn FnOnce(&mut Context) -> R<()>>;
+
+/// Parses `value` for register `name` (see `debug_set_register`) into a setter.
+fn set_reg(name: &str, value: &str) -> R<RegSet> {
+    let idx = |p: &str, n: usize| name.strip_prefix(p).and_then(|i| i.parse::<usize>().ok()).filter(|&i| i < n);
+    if let Some(i) = idx("st", 8) {
+        let v: f64 = value.trim().parse().map_err(|_| format!("{name}: {value:?} is not a number"))?;
+        return Ok(Box::new(move |c| {
+            c.fpu.st[i] = to_f80(v);
+            Ok(())
+        }));
+    }
+    if let Some(i) = idx("xmm", 16) {
+        let h: String = value.chars().filter(|c| !c.is_whitespace()).collect();
+        let h = h.trim_start_matches("0x");
+        if h.len() != 32 || !h.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(format!("{name}: give 32 hex digits"));
+        }
+        let mut b = [0u8; 16];
+        for (k, x) in b.iter_mut().enumerate() {
+            *x = u8::from_str_radix(&h[2 * k..2 * k + 2], 16).unwrap_or(0);
+        }
+        return Ok(Box::new(move |c| {
+            c.fpu.xmm[i] = b;
+            Ok(())
+        }));
+    }
+    let v = parse_addr(value)?;
+    let name = name.to_string();
+    Ok(Box::new(move |c| {
+        let small = |max: u64| u32::try_from(v).ok().filter(|&x| x as u64 <= max).ok_or_else(|| format!("{name}: {v:#x} is too large"));
+        match name.as_str() {
+            "mxcsr" => c.fpu.mxcsr = small(u32::MAX as u64)?,
+            "fcw" => c.fpu.fcw = small(0xffff)? as u16,
+            "fsw" => c.fpu.fsw = small(0xffff)? as u16,
+            n => *reg_mut(c, n).ok_or_else(|| format!("unknown register {n:?}"))? = v,
+        }
+        Ok(())
+    }))
+}
+
+/// f64 -> x87 80-bit extended (exact: every f64 fits).
+fn to_f80(v: f64) -> [u8; 10] {
+    let bits = v.to_bits();
+    let sign = ((bits >> 63) as u16) << 15;
+    let exp = ((bits >> 52) & 0x7ff) as i32;
+    let frac = bits & ((1 << 52) - 1);
+    let (e, m): (u16, u64) = match exp {
+        0 if frac == 0 => (0, 0),
+        0 => {
+            // Subnormal double: normalize the fraction.
+            let shift = frac.leading_zeros() - 11;
+            (((1 - 1023 + 16383) - shift as i32) as u16, (frac << shift) << 11)
+        }
+        0x7ff => (0x7fff, (1 << 63) | (frac << 11)),
+        _ => ((exp - 1023 + 16383) as u16, (1 << 63) | (frac << 11)),
+    };
+    let mut out = [0u8; 10];
+    out[..8].copy_from_slice(&m.to_le_bytes());
+    out[8..].copy_from_slice(&(sign | e).to_le_bytes());
+    out
 }
 
 /// x87 80-bit extended -> f64 (approximate, for display).
@@ -357,7 +427,7 @@ impl Dbg {
     }
 
     fn hooks(&self, b: &AppBp, proc: &dyn Process) -> R<Hooks> {
-        Ok(Hooks { address_of: if b.ea { Some(ea_hook(proc, b.addr)?) } else { None }, condition: condition_hook(&b.cond)?, ..Hooks::default() })
+        Ok(Hooks { address_of: if b.ea { Some(ea_hook(proc, b.addr)?) } else { None }, condition: condition_hook(&b.cond)?, stop_when: condition_hook(&b.stop)?, ..Hooks::default() })
     }
 
     /// Drains debugger events into the session state and the log. `lua_onbp`: the script
@@ -456,6 +526,10 @@ impl App {
     pub fn debug_attach(&self) -> R<DebugStatus> {
         let sess = self.session()?;
         self.local_only("The debugger")?;
+        // A process paused from the UI runs again: the debugger stops it its own way.
+        if sess.paused.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            sess.raw.resume().map_err(s)?;
+        }
         {
             let mut g = lock(&sess.dbg);
             if g.is_none() {
@@ -564,8 +638,9 @@ impl App {
             size /= 2;
         }
         let cond = Some(req.condition.trim().to_string()).filter(|c| !c.is_empty());
+        let stop = Some(req.stop_when.trim().to_string()).filter(|c| !c.is_empty() && matches!(action, Action::Trace { .. }));
         self.with_dbg(|d, sess| {
-            let mut b = AppBp { id: 0, addr: address, ea: req.ea, cond, script, note: None };
+            let mut b = AppBp { id: 0, addr: address, ea: req.ea, cond, script, note: None, stop };
             let hooks = d.hooks(&b, &*sess.proc)?;
             b.id = d.d.add_breakpoint_with(Breakpoint { address, kind, size, method, action }, hooks, opts_of(req)).map_err(s)?;
             let id = b.id;
@@ -591,7 +666,7 @@ impl App {
         self.with_dbg(|d, _| {
             let opts = BpOptions { max_hits: req.max_hits.filter(|&m| m > 0), ..BpOptions::default() };
             let id = d.d.add_watch_range(start, req.len, kind, Action::Record, Hooks::default(), opts).map_err(s)?;
-            d.bps.push(AppBp { id, addr: start, ea: false, cond: None, script: false, note: None });
+            d.bps.push(AppBp { id, addr: start, ea: false, cond: None, script: false, note: None, stop: None });
             Ok(id)
         })
     }
@@ -702,6 +777,7 @@ impl App {
                         hits: i.hits,
                         slot: i.slot,
                         condition: b.cond.clone(),
+                        stop_when: b.stop.clone(),
                         options: i.options.clone(),
                         records_dropped: i.records_dropped,
                         owner: if b.script { "script" } else { "user" },
@@ -773,11 +849,14 @@ impl App {
     }
 
     /// Sets one register of `REGS` (hex value) of a stopped thread.
+    /// Also `st0`..`st7` (a decimal number), `xmm0`..`xmm15` (32 hex digits, the byte order
+    /// `debug_context` shows) and `mxcsr`, `fcw`, `fsw` (hex).
     pub fn debug_set_register(&self, tid: Tid, name: &str, value: &str) -> R<()> {
-        let v = parse_addr(value)?;
+        let name = name.trim().to_ascii_lowercase();
+        let set = set_reg(&name, value)?;
         self.with_dbg(|d, _| {
             let mut c = d.d.context(tid).map_err(s)?;
-            *reg_mut(&mut c, name).ok_or_else(|| format!("unknown register {name:?}"))? = v;
+            set(&mut c)?;
             d.d.set_context(tid, c).map_err(s)
         })
     }
@@ -879,7 +958,7 @@ impl App {
             return self.with_dbg(|d, _| {
                 let k = if kind == "write" { BpKind::Write } else { BpKind::Access };
                 let id = d.d.add_watch_range(start, spec.size.max(1) as u64, k, Action::Break, Hooks::default(), BpOptions::default()).map_err(s)?;
-                d.bps.push(AppBp { id, addr: start, ea: false, cond: None, script: true, note: None });
+                d.bps.push(AppBp { id, addr: start, ea: false, cond: None, script: true, note: None, stop: None });
                 Ok(id)
             });
         }
@@ -1147,6 +1226,20 @@ impl Cond {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn f80_round_trip() {
+        // Subnormal doubles become normal extended numbers (f80, a display helper, rounds them to 0).
+        assert_eq!(to_f80(5e-324), [0, 0, 0, 0, 0, 0, 0, 0x80, 0xcd, 0x3b]);
+        for v in [0.0, -0.0, 1.0, -1.5, 3.25e10, 1e-300, 2.2250738585072014e-308, f64::MAX, f64::INFINITY, -f64::INFINITY] {
+            assert_eq!(f80(&to_f80(v)).to_bits(), v.to_bits(), "{v}");
+        }
+        assert!(f80(&to_f80(f64::NAN)).is_nan());
+        // 1.0 is the textbook encoding: exponent 0x3fff, explicit integer bit.
+        assert_eq!(to_f80(1.0), [0, 0, 0, 0, 0, 0, 0, 0x80, 0xff, 0x3f]);
+        assert!(set_reg("xmm0", "12").is_err());
+        assert!(set_reg("st0", "x").is_err());
+    }
 
     #[test]
     fn conditions() {

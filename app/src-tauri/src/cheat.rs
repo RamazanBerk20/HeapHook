@@ -43,6 +43,34 @@ struct Inner {
     /// allowed before the table changed hands (entries carried over by a forced open, the
     /// current entries when a script merges a file in).
     vetted: HashMap<i64, String>,
+    /// Entries whose `{$lua}` arrived from another table (paste, merge, a script's
+    /// `loadTable(f, true)`, a put carrying a script from an untrusted source): id -> the
+    /// user agreed to it. Their Lua runs on their own consent, whatever `trust` says.
+    foreign: HashMap<i64, bool>,
+    /// Hashes of Lua-running scripts that came from an untrusted source this session (an
+    /// opened, merged or pasted table, an Auto Assembler file). An entry that gets one by
+    /// any route (put, paste, undo) is foreign until agreed; `aa_execute` asks for it too.
+    tainted: HashSet<u64>,
+    /// Hashes of the scripts the table file itself brought: under the table's own consent
+    /// (an undo or an edit restoring one is not "from elsewhere").
+    own: HashSet<u64>,
+    /// Content hash of the table when it was last opened or saved (`dirty`).
+    saved: u64,
+}
+
+/// Hash of a script's text (session-local; never stored).
+pub(crate) fn script_hash(s: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    s.hash(&mut h);
+    h.finish()
+}
+
+/// The table without runtime state, hashed: what "unsaved changes" compares.
+fn content_hash(t: &Table) -> u64 {
+    let mut t = t.clone();
+    for_each_mut(&mut t.entries, &mut |e| e.frozen = false);
+    script_hash(&serde_json::to_string(&t).unwrap_or_default())
 }
 
 /// Table versions kept for undo.
@@ -61,6 +89,7 @@ impl Inner {
         let ids: HashSet<i64> = all(&t.entries).into_iter().map(|(e, _)| e.id).collect();
         self.rt.retain(|id, _| ids.contains(id));
         let old = std::mem::replace(&mut self.table, t);
+        self.mark_foreign(&old);
         if history && old != self.table {
             self.undo.push(old);
             if self.undo.len() > MAX_UNDO {
@@ -75,7 +104,46 @@ impl Inner {
     /// execute reads the record through `TableHost::get` (the engine runs what it gets) or
     /// asks this first (the app's own pre-checks, for a clear error).
     fn lua_ok(&self, e: &Entry) -> bool {
-        self.trust.allows() || !runs_lua(e) || self.vetted.get(&e.id) == e.script.as_ref()
+        if !runs_lua(e) || self.vetted.get(&e.id) == e.script.as_ref() {
+            return true;
+        }
+        match self.foreign.get(&e.id) {
+            Some(&agreed) => agreed,
+            None => self.trust.allows(),
+        }
+    }
+
+    /// After `old` was replaced: an entry that is new or got another script, and whose script
+    /// came from an untrusted source, is foreign (asks before its Lua runs). Foreign entries
+    /// stay so through edits; ids gone or without Lua are forgotten.
+    fn mark_foreign(&mut self, old: &Table) {
+        let before: HashMap<i64, Option<&String>> = all(&old.entries).into_iter().map(|(e, _)| (e.id, e.script.as_ref())).collect();
+        let mut now = HashMap::new();
+        for (e, _) in all(&self.table.entries).into_iter().filter(|(e, _)| runs_lua(e)) {
+            let script = e.script.as_deref().unwrap_or_default();
+            let h = script_hash(script);
+            let elsewhere = before.get(&e.id) != Some(&e.script.as_ref()) && self.tainted.contains(&h) && !self.own.contains(&h);
+            let agreed = match self.foreign.get(&e.id) {
+                Some(&a) if !elsewhere => Some(a),
+                _ if elsewhere && self.vetted.get(&e.id) != e.script.as_ref() => Some(false),
+                _ => None,
+            };
+            if let Some(a) = agreed {
+                now.insert(e.id, a);
+            }
+        }
+        self.foreign = now;
+    }
+
+    fn st(&self) -> TableState {
+        let mut untrusted: Vec<i64> = self.foreign.iter().filter(|(_, a)| !**a).map(|(id, _)| *id).collect();
+        untrusted.sort_unstable();
+        TableState { version: self.version, table: self.table.clone(), trust: self.trust, untrusted }
+    }
+
+    fn taint(&mut self, entries: &[Entry]) {
+        let h: Vec<u64> = all(entries).into_iter().filter(|(e, _)| runs_lua(e)).filter_map(|(e, _)| e.script.as_deref().map(script_hash)).collect();
+        self.tainted.extend(h);
     }
 }
 
@@ -146,6 +214,9 @@ impl Trust {
 
 /// Error prefix the UI answers with a question and `table_trust`.
 pub const NEEDS_CONSENT: &str = "needs consent:";
+/// Error prefix for an entry that came from another table: the UI asks about the entries and
+/// answers with `table_trust_entries` (it also starts with [`NEEDS_CONSENT`]).
+pub const NEEDS_ENTRY_CONSENT: &str = "needs consent: entries:";
 
 /// A script with a `{$lua}` block (hh-asm matches the directive case-insensitively).
 pub(crate) fn script_runs_lua(s: &str) -> bool {
@@ -162,6 +233,8 @@ pub struct TableState {
     pub table: Table,
     /// Consent for the table's Lua (`own`, `agreed`, `ask`, `declined`).
     pub trust: Trust,
+    /// Entries whose Lua came from another table and still needs the user's consent.
+    pub untrusted: Vec<i64>,
 }
 
 pub fn is_group(e: &Entry) -> bool {
@@ -294,8 +367,7 @@ fn record(e: &Entry, parent: Option<i64>, rt: Option<&Rt>, blocked: bool) -> Rec
 
 impl Live {
     pub fn state(&self) -> TableState {
-        let g = lock(&self.0);
-        TableState { version: g.version, table: g.table.clone(), trust: g.trust }
+        lock(&self.0).st()
     }
 
     pub fn trust(&self) -> Trust {
@@ -304,6 +376,12 @@ impl Live {
 
     pub(crate) fn set_trust(&self, t: Trust) {
         let mut g = lock(&self.0);
+        if t == Trust::Agreed {
+            let own: Vec<u64> = all(&g.table.entries).into_iter().filter(|(e, _)| runs_lua(e) && !g.foreign.contains_key(&e.id)).filter_map(|(e, _)| e.script.as_deref().map(script_hash)).collect();
+            for h in own {
+                g.tainted.remove(&h);
+            }
+        }
         if g.trust != t {
             g.trust = t;
             g.bump();
@@ -313,11 +391,12 @@ impl Live {
     /// Settings turned to "never": a loaded table's Lua stops running (the user's own stays).
     pub(crate) fn revoke_agreed(&self) {
         let mut g = lock(&self.0);
-        if g.trust == Trust::Agreed || !g.vetted.is_empty() {
+        if g.trust == Trust::Agreed || !g.vetted.is_empty() || g.foreign.values().any(|a| *a) {
             if g.trust == Trust::Agreed {
                 g.trust = Trust::Declined;
             }
             g.vetted.clear();
+            g.foreign.values_mut().for_each(|a| *a = false);
             g.bump();
         }
     }
@@ -327,7 +406,8 @@ impl Live {
     pub(crate) fn distrust_keeping_current(&self) {
         let mut g = lock(&self.0);
         if g.trust.allows() {
-            let v: Vec<(i64, String)> = all(&g.table.entries).into_iter().filter(|(e, _)| runs_lua(e)).filter_map(|(e, _)| Some((e.id, e.script.clone()?))).collect();
+            // Only what may run now (an entry still waiting for its own consent stays waiting).
+            let v: Vec<(i64, String)> = all(&g.table.entries).into_iter().filter(|(e, _)| runs_lua(e) && g.lua_ok(e)).filter_map(|(e, _)| Some((e.id, e.script.clone()?))).collect();
             g.vetted.extend(v);
             g.trust = Trust::Ask;
             g.bump();
@@ -336,10 +416,11 @@ impl Live {
 
     /// Description of the first entry in the subtree of `id` whose script runs Lua it may
     /// not run now (see `Inner::lua_ok`).
-    pub(crate) fn blocked(&self, id: i64) -> Option<String> {
+    /// `true` with it when that entry came from another table (its own consent).
+    pub(crate) fn blocked(&self, id: i64) -> Option<(String, bool)> {
         let g = lock(&self.0);
         let (e, _) = all(&g.table.entries).into_iter().find(|(e, _)| e.id == id)?;
-        all(std::slice::from_ref(e)).into_iter().find(|(c, _)| !g.lua_ok(c)).map(|(c, _)| c.description.clone())
+        all(std::slice::from_ref(e)).into_iter().find(|(c, _)| !g.lua_ok(c)).map(|(c, _)| (c.description.clone(), g.foreign.contains_key(&c.id)))
     }
 
     pub fn version(&self) -> u64 {
@@ -406,7 +487,7 @@ impl Live {
         let cur = g.table.clone();
         g.install(t, false);
         if redo { g.undo.push(cur) } else { g.redo.push(cur) }
-        Ok(TableState { version: g.version, table: g.table.clone(), trust: g.trust })
+        Ok(g.st())
     }
 
     /// (undo steps, redo steps) available.
@@ -445,8 +526,119 @@ impl Live {
         g.redo.clear();
         g.trust = Trust::Ask;
         g.vetted = vetted;
+        g.foreign.clear();
+        let entries = g.table.entries.clone();
+        g.taint(&entries);
+        g.own = all(&entries).into_iter().filter(|(e, _)| runs_lua(e)).filter_map(|(e, _)| e.script.as_deref().map(script_hash)).collect();
+        g.saved = content_hash(&g.table);
         g.bump();
-        TableState { version: g.version, table: g.table.clone(), trust: g.trust }
+        g.st()
+    }
+
+    /// Inserts `entries` (new ids, inactive) after entry `after` (in its list) or at the end.
+    /// Whatever runs Lua among them is foreign: a paste, a merge or a drop from another
+    /// table never carries consent along. Returns the new version and the new top-level ids.
+    pub(crate) fn insert_foreign(&self, mut entries: Vec<Entry>, after: Option<i64>, base: Option<u64>) -> R<(u64, Vec<i64>)> {
+        let mut g = lock(&self.0);
+        if let Some(b) = base.filter(|b| *b != g.version) {
+            return Err(format!("stale table version {b} (current {})", g.version));
+        }
+        let mut next = all(&g.table.entries).iter().map(|(e, _)| e.id).max().unwrap_or(0);
+        for_each_mut(&mut entries, &mut |e| {
+            next += 1;
+            e.id = next;
+            e.frozen = false;
+            e.ct_extra.clear();
+            table::clean_entry(e);
+        });
+        let mut t = g.table.clone();
+        let ids: Vec<i64> = entries.iter().map(|e| e.id).collect();
+        let mut place = Some(entries);
+        if let Some(a) = after {
+            fn put_after(list: &mut Vec<Entry>, a: i64, place: &mut Option<Vec<Entry>>) {
+                if let Some(i) = list.iter().position(|e| e.id == a) {
+                    let items = place.take().unwrap_or_default();
+                    list.splice(i + 1..i + 1, items);
+                    return;
+                }
+                for e in list.iter_mut() {
+                    if place.is_none() {
+                        return;
+                    }
+                    put_after(&mut e.children, a, place);
+                }
+            }
+            put_after(&mut t.entries, a, &mut place);
+        }
+        if let Some(rest) = place {
+            t.entries.extend(rest);
+        }
+        table::check_limits(&t.entries)?;
+        let added: Vec<Entry> = ids.iter().filter_map(|id| all(&t.entries).into_iter().find(|(e, _)| e.id == *id).map(|(e, _)| e.clone())).collect();
+        g.taint(&added);
+        g.install(t, true);
+        // Whatever runs Lua among them is foreign, even when the same text is this table's own.
+        for (e, _) in all(&added).into_iter().filter(|(e, _)| runs_lua(e)) {
+            g.foreign.insert(e.id, false);
+        }
+        g.bump();
+        Ok((g.version, ids))
+    }
+
+    /// The user's yes for the foreign entries in the subtrees of `ids`; their scripts count as
+    /// agreed content from now on (a copy of them elsewhere does not ask again).
+    pub(crate) fn agree_entries(&self, ids: &[i64]) -> usize {
+        let mut g = lock(&self.0);
+        let mut n = 0;
+        let mut hashes = Vec::new();
+        for (e, _) in all(&g.table.entries).into_iter().filter(|(e, _)| ids.contains(&e.id)) {
+            for (c, _) in all(std::slice::from_ref(e)) {
+                if g.foreign.get(&c.id) == Some(&false) {
+                    hashes.push((c.id, c.script.as_deref().map(script_hash)));
+                }
+            }
+        }
+        for (id, h) in hashes {
+            g.foreign.insert(id, true);
+            if let Some(h) = h {
+                g.tainted.remove(&h);
+            }
+            n += 1;
+        }
+        if n > 0 {
+            g.bump();
+        }
+        n
+    }
+
+    /// Scripts from an untrusted source (an Auto Assembler file): `aa_execute` asks first.
+    pub(crate) fn taint_script(&self, s: &str) {
+        lock(&self.0).tainted.insert(script_hash(s));
+    }
+
+    pub(crate) fn untaint_script(&self, s: &str) {
+        lock(&self.0).tainted.remove(&script_hash(s));
+    }
+
+    pub(crate) fn is_tainted(&self, s: &str) -> bool {
+        lock(&self.0).tainted.contains(&script_hash(s))
+    }
+
+    /// Whether the table changed since it was opened or saved (activation does not count).
+    pub fn dirty(&self) -> bool {
+        let g = lock(&self.0);
+        let h = content_hash(&g.table);
+        h != g.saved && !(g.saved == 0 && g.table == Table::default())
+    }
+
+    pub(crate) fn mark_saved(&self) {
+        let mut g = lock(&self.0);
+        g.saved = content_hash(&g.table);
+    }
+
+    /// Whether entry `id`'s Lua waits for its own consent (it came from another table).
+    pub(crate) fn is_foreign_ask(&self, id: i64) -> bool {
+        lock(&self.0).foreign.get(&id) == Some(&false)
     }
 
     /// Process changed: scripts patched the old process, so they are off; value entries stay
@@ -743,23 +935,22 @@ the table was not opened: these active scripts could not be disabled (open anywa
     /// Lua `loadTable(file, true)`: appends the file's entries (new ids, inactive) and keeps
     /// the current table, its scripts and their Lua state. The file is as untrusted as any
     /// other: the table needs consent again for its new Lua (the current entries keep running).
-    pub(crate) fn table_merge(&self, path: &str) -> R<()> {
+    /// Also the UI's "Merge table": the entries arrive foreign (their Lua asks first); the
+    /// table only needs consent again when the merge brings it a table script.
+    pub fn table_merge(&self, path: &str) -> R<TableState> {
         let add = table::load(Path::new(path))?;
-        self.x.live.distrust_keeping_current();
-        let cur = self.x.live.state();
-        let mut next = all(&cur.table.entries).iter().map(|(e, _)| e.id).max().unwrap_or(0);
-        let mut entries = add.entries;
-        for_each_mut(&mut entries, &mut |e| {
-            next += 1;
-            e.id = next;
-            e.frozen = false;
-        });
-        let mut t = cur.table;
-        t.entries.extend(entries);
-        if t.lua_script.trim().is_empty() {
-            t.lua_script = add.lua_script;
+        let script = self.x.live.state().table.lua_script.trim().is_empty() && !add.lua_script.trim().is_empty();
+        if script {
+            self.x.live.distrust_keeping_current();
         }
-        self.x.live.put(t, cur.version).map(|_| ())
+        self.x.live.insert_foreign(add.entries, None, None)?;
+        if script {
+            let cur = self.x.live.state();
+            let mut t = cur.table;
+            t.lua_script = add.lua_script;
+            self.x.live.put(t, cur.version)?;
+        }
+        Ok(self.x.live.state())
     }
 
     /// Runs `[DISABLE]` of every active script while the process lives; (id, error) of
@@ -774,7 +965,54 @@ the table was not opened: these active scripts could not be disabled (open anywa
 
     /// Writes the live table; JSON or `.CT` by extension.
     pub fn table_export(&self, path: &str) -> R<()> {
-        table::save(Path::new(path), &self.x.live.state().table)
+        table::save(Path::new(path), &self.x.live.state().table)?;
+        self.x.live.mark_saved();
+        Ok(())
+    }
+
+    /// A readable listing of the table (description, address, type, value; groups indented).
+    pub fn table_export_text(&self, path: &str) -> R<()> {
+        let t = self.x.live.state().table;
+        let vals = self.session().ok();
+        let mut out = String::new();
+        fn go(app: &App, list: &[Entry], depth: usize, live: bool, out: &mut String) {
+            for e in list {
+                let pad = "  ".repeat(depth);
+                let kind = if e.script.is_some() { "script".to_string() } else if is_group(e) { "group".to_string() } else { table::type_name(e) };
+                let addr = if e.script.is_some() || is_group(e) { String::new() } else { expr_of(e) };
+                let value = if live && e.script.is_none() && !is_group(e) { app.entry_value(e).unwrap_or_else(|| "??".into()) } else { String::new() };
+                let line = [format!("{pad}{}", e.description), addr, kind, value].join("\t");
+                out.push_str(line.trim_end());
+                out.push('\n');
+                go(app, &e.children, depth + 1, live, out);
+            }
+        }
+        out.push_str("Description\tAddress\tType\tValue\n");
+        go(self, &t.entries, 0, vals.is_some(), &mut out);
+        std::fs::write(path, out).map_err(|e| format!("{path}: {e}"))
+    }
+
+    /// The live value of a value entry, formatted like the table shows it.
+    fn entry_value(&self, e: &Entry) -> Option<String> {
+        let addr = self.entry_addr(e).ok()?;
+        let p = self.session().ok()?.proc.clone();
+        let r = hh_scan::ValueRefEx { r: hh_scan::ValueRef { addr, vtype: e.vtype, fmt: fmt_of(e) }, custom: e.custom };
+        hh_scan::read_values_ex(&*p, &[r]).pop().flatten()
+    }
+
+    /// A table file the user dropped on the window in a browser (the dev bridge): its text,
+    /// opened like `table_open` (same consent; nothing runs).
+    pub fn table_open_data(&self, name: &str, data: &str, force: bool) -> R<TableState> {
+        if data.len() as u64 > table::MAX_FILE {
+            return Err(format!("{name}: larger than {} MiB", table::MAX_FILE >> 20));
+        }
+        let dir = tempfile_dir()?;
+        let ext = if name.to_ascii_lowercase().ends_with(".ct") { "CT" } else { "json" };
+        let p = dir.join(format!("dropped.{ext}"));
+        std::fs::write(&p, data).map_err(|e| format!("{}: {e}", p.display()))?;
+        let r = self.table_open(&p.to_string_lossy(), force);
+        let _ = std::fs::remove_dir_all(&dir);
+        r
     }
 
     /// Resolved address of a value entry.
@@ -805,7 +1043,8 @@ the table was not opened: these active scripts could not be disabled (open anywa
     /// the gate itself is `Inner::lua_ok`, which the engine cannot get around.
     fn check_trust(&self, ids: &[i64]) -> R<()> {
         match ids.iter().find_map(|&id| self.x.live.blocked(id)) {
-            Some(e) => Err(self.consent_error(&e)),
+            Some((e, true)) => Err(self.entry_consent_error(&e)),
+            Some((e, false)) => Err(self.consent_error(&e)),
             None => Ok(()),
         }
     }
@@ -820,6 +1059,36 @@ the table was not opened: these active scripts could not be disabled (open anywa
             Trust::Declined => format!("{what}: not run: you chose not to run this table's Lua (open the table again to be asked again)"),
             _ => format!("{NEEDS_CONSENT} {what}: this table runs Lua code, which can use your files and the process"),
         }
+    }
+
+    /// Why an entry pasted or merged from another table does not run its Lua yet.
+    pub(crate) fn entry_consent_error(&self, what: &str) -> String {
+        if lock(&self.x.settings).table_script == "never" {
+            return format!("{what}: not run: it runs Lua from another table and Settings say never to run a table's Lua");
+        }
+        format!("{NEEDS_ENTRY_CONSENT} {what}: this entry came from another table (pasted, merged or dropped in) and runs Lua code, which can use your files and the process")
+    }
+
+    /// The user's yes for the Lua of entries that came from another table (the subtrees of
+    /// `ids`); refused while Settings say never.
+    pub fn table_trust_entries(&self, ids: &[i64]) -> R<()> {
+        if lock(&self.x.settings).table_script == "never" {
+            return Err("Settings say never to run a table's Lua: change \"Lua script in a loaded table\" first".into());
+        }
+        self.x.live.agree_entries(ids);
+        Ok(())
+    }
+
+    /// Pastes (or drops) entries after entry `after`: new ids, inactive, and the ones that run
+    /// Lua wait for their own consent. `base`: the table version the UI saw.
+    pub fn table_paste(&self, entries: Vec<Entry>, after: Option<i64>, base: Option<u64>) -> R<PasteOut> {
+        let (version, ids) = self.x.live.insert_foreign(entries, after, base)?;
+        Ok(PasteOut { version, ids })
+    }
+
+    /// Whether the table has changes not yet saved (or not from the opened file).
+    pub fn table_dirty(&self) -> R<bool> {
+        Ok(self.x.live.dirty())
     }
 
     /// The user's answer to [`NEEDS_CONSENT`] (or to the question when the table was opened).
@@ -948,6 +1217,23 @@ the table was not opened: these active scripts could not be disabled (open anywa
             self.x.lua.console.push("err", &format!("freeze: {e}"));
         }
     }
+}
+
+/// `table_paste` answer.
+#[derive(Debug, Clone, Serialize)]
+pub struct PasteOut {
+    pub version: u64,
+    pub ids: Vec<i64>,
+}
+
+/// A private temporary directory (mode 0700 on Unix).
+fn tempfile_dir() -> R<std::path::PathBuf> {
+    let d = std::env::temp_dir().join(format!("heaphook-{}-{}", std::process::id(), script_hash(&format!("{:?}", std::time::Instant::now()))));
+    let mut b = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    std::os::unix::fs::DirBuilderExt::mode(&mut b, 0o700);
+    b.create(&d).map_err(|e| format!("{}: {e}", d.display()))?;
+    Ok(d)
 }
 
 #[cfg(test)]

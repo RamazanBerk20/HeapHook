@@ -15,24 +15,28 @@ use std::mem::zeroed;
 use hh_core::{Addr, Error, Module, Pid, Process, Prot, Result};
 use windows_sys::Win32::Foundation::{
     CloseHandle, DBG_CONTINUE, DBG_EXCEPTION_NOT_HANDLED, EXCEPTION_ACCESS_VIOLATION,
-    EXCEPTION_BREAKPOINT, EXCEPTION_SINGLE_STEP, HANDLE, NTSTATUS, STATUS_WX86_BREAKPOINT,
-    STATUS_WX86_SINGLE_STEP,
+    EXCEPTION_BREAKPOINT, EXCEPTION_SINGLE_STEP, FILETIME, HANDLE, LocalFree, NTSTATUS,
+    STATUS_WX86_BREAKPOINT, STATUS_WX86_SINGLE_STEP,
 };
 use windows_sys::Win32::Storage::FileSystem::GetFinalPathNameByHandleW;
 use windows_sys::Win32::System::Diagnostics::Debug::{
     CONTEXT, CONTEXT_ALL_AMD64, CONTEXT_CONTROL_AMD64, CONTEXT_DEBUG_REGISTERS_AMD64,
     CONTEXT_FLOATING_POINT_AMD64, CONTEXT_INTEGER_AMD64, CONTEXT_SEGMENTS_AMD64,
-    CREATE_PROCESS_DEBUG_EVENT, CREATE_THREAD_DEBUG_EVENT, ContinueDebugEvent, DEBUG_EVENT,
-    DebugActiveProcess, DebugActiveProcessStop, DebugBreakProcess, DebugSetProcessKillOnExit,
-    EXCEPTION_DEBUG_EVENT, EXIT_PROCESS_DEBUG_EVENT, EXIT_THREAD_DEBUG_EVENT, GetThreadContext,
-    LOAD_DLL_DEBUG_EVENT, M128A, ReadProcessMemory, SetThreadContext, UNLOAD_DLL_DEBUG_EVENT,
+    CONTEXT_XSTATE_AMD64, CREATE_PROCESS_DEBUG_EVENT, CREATE_THREAD_DEBUG_EVENT,
+    ContinueDebugEvent, DEBUG_EVENT, DebugActiveProcess, DebugActiveProcessStop,
+    DebugBreakProcess, DebugSetProcessKillOnExit, EXCEPTION_DEBUG_EVENT,
+    EXIT_PROCESS_DEBUG_EVENT, EXIT_THREAD_DEBUG_EVENT, GetThreadContext, InitializeContext,
+    LOAD_DLL_DEBUG_EVENT, LocateXStateFeature, M128A, ReadProcessMemory, SetThreadContext,
+    SetXStateFeaturesMask, UNLOAD_DLL_DEBUG_EVENT,
     WOW64_CONTEXT, WOW64_CONTEXT_CONTROL, WOW64_CONTEXT_DEBUG_REGISTERS,
     WOW64_CONTEXT_EXTENDED_REGISTERS, WOW64_CONTEXT_INTEGER, WOW64_CONTEXT_SEGMENTS,
     WaitForDebugEvent, Wow64GetThreadContext, Wow64SetThreadContext,
 };
 use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};
 use windows_sys::Win32::System::Threading::{
-    IsWow64Process, OpenThread, ResumeThread, SuspendThread, THREAD_QUERY_LIMITED_INFORMATION,
+    CREATE_UNICODE_ENVIRONMENT, CreateProcessW, DEBUG_ONLY_THIS_PROCESS, GetThreadDescription,
+    GetThreadTimes, IsWow64Process, OpenThread, PROCESS_INFORMATION, ResumeThread, STARTUPINFOW,
+    SuspendThread, THREAD_QUERY_LIMITED_INFORMATION, TerminateProcess,
 };
 
 use crate::engine::{Mode, Raw};
@@ -239,6 +243,10 @@ pub(crate) struct Os {
     wow64: bool,
     /// Notifications a failed `halt_all` collected (already continued), for `poll`.
     backlog: Vec<(Tid, Raw)>,
+    /// Launched by us: the image entry point (until the engine took it).
+    entry: Option<Addr>,
+    /// A launched WOW64 process still has its 32-bit loader breakpoint to come.
+    wow_initial: bool,
 }
 
 impl Os {
@@ -277,6 +285,8 @@ impl Os {
             pending_breaks: 1,
             wow64: false,
             backlog: Vec::new(),
+            entry: None,
+            wow_initial: false,
         };
         // The system reports the existing process, threads and DLLs, then the break-in.
         loop {
@@ -297,6 +307,154 @@ impl Os {
             }
         }
         Ok((os, Vec::new()))
+    }
+
+    /// Creates the process with DEBUG_ONLY_THIS_PROCESS and returns frozen at the loader
+    /// breakpoint (before the executable's code runs).
+    pub fn launch(o: &crate::LaunchOptions) -> Result<Os> {
+        if o.stdin.is_some() || o.stdout.is_some() || o.stderr.is_some() {
+            return Err(Error::Unsupported(
+                "stdio file descriptors when launching on Windows",
+            ));
+        }
+        let mut cmd = command_line(&o.program, &o.args);
+        let env: Option<Vec<u16>> = o.env.as_ref().map(|v| {
+            let mut b: Vec<u16> = Vec::new();
+            for (k, val) in v {
+                b.extend(format!("{k}={val}").encode_utf16());
+                b.push(0);
+            }
+            if v.is_empty() {
+                b.push(0);
+            }
+            b.push(0);
+            b
+        });
+        let cwd: Option<Vec<u16>> = o
+            .cwd
+            .as_ref()
+            .map(|c| c.encode_utf16().chain([0]).collect());
+        let mut si: STARTUPINFOW = unsafe { zeroed() };
+        si.cb = std::mem::size_of::<STARTUPINFOW>() as u32;
+        let mut pi: PROCESS_INFORMATION = unsafe { zeroed() };
+        let ok = unsafe {
+            CreateProcessW(
+                std::ptr::null(),
+                cmd.as_mut_ptr(),
+                std::ptr::null(),
+                std::ptr::null(),
+                0,
+                DEBUG_ONLY_THIS_PROCESS | CREATE_UNICODE_ENVIRONMENT,
+                env.as_ref().map_or(std::ptr::null(), |e| e.as_ptr().cast()),
+                cwd.as_ref().map_or(std::ptr::null(), |c| c.as_ptr()),
+                &si,
+                &mut pi,
+            )
+        };
+        if ok == 0 {
+            return Err(last_err());
+        }
+        close(pi.hThread);
+        // Our exit must not kill it; drop / detach release it.
+        unsafe { DebugSetProcessKillOnExit(0) };
+        let brk = unsafe {
+            let ntdll = GetModuleHandleA(c"ntdll.dll".as_ptr().cast());
+            GetProcAddress(ntdll, c"DbgBreakPoint".as_ptr().cast())
+        }
+        .map_or(0, |f| f as usize as u64);
+        let mut os = Os {
+            pid: pi.dwProcessId,
+            hproc: std::ptr::null_mut(),
+            th: BTreeMap::new(),
+            ev: None,
+            dr: ([0; 4], 0),
+            brk,
+            pending_breaks: 0,
+            wow64: false,
+            backlog: Vec::new(),
+            entry: None,
+            wow_initial: false,
+        };
+        let fail = |os: &mut Os, e: Error| {
+            unsafe { TerminateProcess(pi.hProcess, 1) };
+            os.continue_ev();
+            unsafe { DebugActiveProcessStop(os.pid) };
+            close(pi.hProcess);
+            Err(e)
+        };
+        // Process creation, ntdll, then the loader breakpoint.
+        loop {
+            let Some(de) = os.wait(10_000) else {
+                return fail(
+                    &mut os,
+                    Error::Other("the launched program did not start".into()),
+                );
+            };
+            let code = de.dwDebugEventCode;
+            if code == EXCEPTION_DEBUG_EVENT
+                && unsafe { de.u.Exception.ExceptionRecord.ExceptionCode } == EXCEPTION_BREAKPOINT
+            {
+                break; // frozen here; continued with DBG_CONTINUE
+            }
+            if code == CREATE_PROCESS_DEBUG_EVENT {
+                os.entry = unsafe { de.u.CreateProcessInfo.lpStartAddress }
+                    .map(|f| f as usize as u64);
+            }
+            if let Ev::Raw(Raw::ProcessExited { .. }) = os.translate(&de) {
+                return fail(&mut os, Error::ProcessGone);
+            }
+            os.continue_ev();
+        }
+        close(pi.hProcess);
+        os.wow_initial = os.wow64;
+        Ok(os)
+    }
+
+    /// Terminates the (launched) process and stops debugging it.
+    pub fn kill(&mut self) {
+        if !self.hproc.is_null() {
+            unsafe { TerminateProcess(self.hproc, 1) };
+        }
+        for _ in 0..100 {
+            self.continue_ev();
+            let Some(de) = self.wait(100) else { break };
+            if de.dwDebugEventCode == EXIT_PROCESS_DEBUG_EVENT {
+                self.continue_ev();
+                break;
+            }
+        }
+        unsafe { DebugActiveProcessStop(self.pid) };
+        self.th.clear();
+    }
+
+    /// Name (thread description), state and user / kernel CPU milliseconds of a thread.
+    pub fn thread_info(&self, tid: Tid) -> (String, String, u64, u64) {
+        let Some(t) = self.th.get(&tid) else {
+            return Default::default();
+        };
+        let ms = |f: &FILETIME| ((f.dwHighDateTime as u64) << 32 | f.dwLowDateTime as u64) / 10_000;
+        let mut ft: [FILETIME; 4] = unsafe { zeroed() };
+        let [c, e, k, u] = &mut ft;
+        let (user, kernel) = match unsafe { GetThreadTimes(t.h, c, e, k, u) } {
+            0 => (0, 0),
+            _ => (ms(u), ms(k)),
+        };
+        let mut name = String::new();
+        let mut p: windows_sys::core::PWSTR = std::ptr::null_mut();
+        if unsafe { GetThreadDescription(t.h, &mut p) } >= 0 && !p.is_null() {
+            let mut n = 0;
+            while n < 1024 && unsafe { *p.add(n) } != 0 {
+                n += 1;
+            }
+            name = String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(p, n) });
+            unsafe { LocalFree(p.cast()) };
+        }
+        let state = match (t.suspended, self.ev.is_some()) {
+            (true, _) => "suspended",
+            (_, true) => "stopped",
+            _ => "running",
+        };
+        (name, state.into(), user, kernel)
     }
 
     pub fn loader_hook(&self, _mem: &dyn Process) -> Option<Addr> {
@@ -416,6 +574,11 @@ impl Os {
                     let rec = x.ExceptionRecord;
                     let code = rec.ExceptionCode;
                     let at = rec.ExceptionAddress as Addr;
+                    if code == STATUS_WX86_BREAKPOINT && self.wow_initial {
+                        // The 32-bit loader breakpoint of a launched WOW64 process.
+                        self.wow_initial = false;
+                        return Ev::Skip;
+                    }
                     if code == EXCEPTION_BREAKPOINT
                         && self.pending_breaks > 0
                         && self.brk != 0
@@ -465,8 +628,9 @@ impl Os {
         self.th.contains_key(&tid) && !self.is_stopped(tid)
     }
 
+    /// Entry point of a launched process.
     pub fn exec_entry(&self) -> Option<Addr> {
-        None
+        self.entry
     }
 
     /// Protection change for page watches (hh-core's VirtualProtectEx works while attached).
@@ -754,8 +918,23 @@ impl Os {
         })
     }
 
+    /// `context` plus the YMM upper halves (CONTEXT_XSTATE) where the CPU and OS have AVX.
+    pub fn context_full(&self, tid: Tid) -> Result<Context> {
+        let mut c = self.context(tid)?;
+        if !self.wow64
+            && let Some(y) = with_xstate(self.h(tid)?, |_| None)
+        {
+            c.fpu.ymm_hi = y;
+            c.fpu.has_ymm = true;
+        }
+        Ok(c)
+    }
+
     pub fn set_context(&mut self, tid: Tid, c: &Context) -> Result<()> {
         if self.wow64 {
+            if c.fpu.has_ymm {
+                return Err(Error::Unsupported("YMM registers of 32-bit processes"));
+            }
             return self.set_context32(tid, c);
         }
         let h = self.h(tid)?;
@@ -793,7 +972,12 @@ impl Os {
                 | CONTEXT_INTEGER_AMD64
                 | CONTEXT_SEGMENTS_AMD64
                 | CONTEXT_FLOATING_POINT_AMD64,
-        )
+        )?;
+        if c.fpu.has_ymm {
+            with_xstate(h, |_| Some(c.fpu.ymm_hi))
+                .ok_or(Error::Unsupported("YMM registers (no AVX state)"))?;
+        }
+        Ok(())
     }
 
     pub fn take_dr6(&mut self, tid: Tid) -> Result<u64> {
@@ -906,6 +1090,85 @@ impl Os {
         self.th.clear();
         Ok(())
     }
+}
+
+/// Reads the thread's YMM upper halves (CONTEXT_XSTATE, feature 2 = AVX); when `write`
+/// gives new ones, writes them back. `None` without AVX state or on failure.
+fn with_xstate(
+    h: HANDLE,
+    write: impl FnOnce(&[[u8; 16]; 16]) -> Option<[[u8; 16]; 16]>,
+) -> Option<[[u8; 16]; 16]> {
+    const AVX: u32 = 2;
+    let flags = CONTEXT_ALL_AMD64 | CONTEXT_XSTATE_AMD64;
+    let mut len = 0u32;
+    unsafe { InitializeContext(std::ptr::null_mut(), flags, std::ptr::null_mut(), &mut len) };
+    if len == 0 {
+        return None;
+    }
+    let mut buf = vec![0u8; len as usize];
+    let mut ctx: *mut CONTEXT = std::ptr::null_mut();
+    unsafe {
+        if InitializeContext(buf.as_mut_ptr().cast(), flags, &mut ctx, &mut len) == 0
+            || SetXStateFeaturesMask(ctx, 1 << AVX) == 0
+            || GetThreadContext(h, ctx) == 0
+        {
+            return None;
+        }
+        let mut n = 0u32;
+        let p = LocateXStateFeature(ctx, AVX, &mut n) as *mut u8;
+        if p.is_null() || n < 256 {
+            return None;
+        }
+        let mut cur = [[0u8; 16]; 16];
+        for (i, y) in cur.iter_mut().enumerate() {
+            std::ptr::copy_nonoverlapping(p.add(16 * i), y.as_mut_ptr(), 16);
+        }
+        let Some(new) = write(&cur) else {
+            return Some(cur);
+        };
+        for (i, y) in new.iter().enumerate() {
+            std::ptr::copy_nonoverlapping(y.as_ptr(), p.add(16 * i), 16);
+        }
+        if SetXStateFeaturesMask(ctx, 1 << AVX) == 0 || SetThreadContext(h, ctx) == 0 {
+            return None;
+        }
+        drop(buf);
+        Some(new)
+    }
+}
+
+/// A Windows command line (CommandLineToArgvW quoting rules).
+fn command_line(program: &str, args: &[String]) -> Vec<u16> {
+    let mut out = String::new();
+    for (i, a) in std::iter::once(program).chain(args.iter().map(|s| s.as_str())).enumerate() {
+        if i > 0 {
+            out.push(' ');
+        }
+        if !a.is_empty() && !a.contains([' ', '\t', '"']) {
+            out.push_str(a);
+            continue;
+        }
+        out.push('"');
+        let mut slashes = 0;
+        for ch in a.chars() {
+            match ch {
+                '\\' => slashes += 1,
+                '"' => {
+                    out.extend(std::iter::repeat_n('\\', slashes * 2 + 1));
+                    out.push('"');
+                    slashes = 0;
+                }
+                c => {
+                    out.extend(std::iter::repeat_n('\\', slashes));
+                    out.push(c);
+                    slashes = 0;
+                }
+            }
+        }
+        out.extend(std::iter::repeat_n('\\', slashes * 2));
+        out.push('"');
+    }
+    out.encode_utf16().chain([0]).collect()
 }
 
 fn write_dr(h: HANDLE, wow64: bool, addrs: [u64; 4], dr7: u64) -> Result<()> {

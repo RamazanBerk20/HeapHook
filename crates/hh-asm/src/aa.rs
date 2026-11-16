@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::asm::{assemble_line, bitness, split_top};
 use crate::disasm::{decode_at, formatter};
-use crate::expr::{Ctx, SymbolTable, eval, find_module, module_offset, parse_num};
+use crate::expr::{Ctx, SymbolLookup, SymbolTable, eval, find_module, module_offset, parse_num};
 use iced_x86::Formatter;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -26,7 +26,42 @@ pub struct AaState {
     pub registered: Vec<(String, Addr)>,
     /// Bytes overwritten by the script, in write order.
     pub originals: Vec<(Addr, Vec<u8>)>,
+    /// Every `aobscan*` the section ran, in script order.
+    #[serde(default)]
+    pub scans: Vec<AaScan>,
 }
+
+/// One `aobscan` / `aobscanmodule` / `aobscanregion` result.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AaScan {
+    pub name: String,
+    /// First match (the address the name gets).
+    pub addr: Addr,
+    /// Matches in the scanned range, counted up to [`MAX_AOB_COUNT`]; `None` when not
+    /// counted ([`AobUnique::Off`] stops at the first match, like Cheat Engine).
+    pub matches: Option<usize>,
+}
+
+/// What `aobscan*` does when its pattern matches more than once.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AobUnique {
+    /// Take the first match, do not count (Cheat Engine's behaviour).
+    #[default]
+    Off,
+    /// Count the matches into [`AaState::scans`], take the first.
+    Warn,
+    /// Count, and fail the script when a pattern matches more than once.
+    Fail,
+}
+
+/// Most matches an `aobscan` counts when uniqueness is checked.
+pub const MAX_AOB_COUNT: usize = 1000;
+/// Deepest `{$ifdef}` nesting.
+pub const MAX_IF_DEPTH: usize = 64;
+/// Most custom (`registerAutoAssemblerCommand`) command expansions per script.
+pub const MAX_CUSTOM_COMMANDS: usize = 1024;
+/// Largest `align` boundary.
+pub const MAX_ALIGN: u64 = 0x10000;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AaError {
@@ -48,10 +83,32 @@ type Hook<A, O> = Option<Box<dyn FnMut(A) -> Result<O>>>;
 /// | `createthread(addr)` | `create_thread` | after all writes succeeded; an error rolls the enable back |
 /// | `{$try}` ... `{$except}` | `try_except` | after all writes; gets (start of guarded code, handler address) and must install a handler in the target that resumes at the handler on an exception |
 /// | `sharedallocate(name,size)` | `shared_alloc` | in script order; returns the address of named memory shared between processes; registered like `globalalloc` |
+/// | `luacall(code)` | `lua_call`, else `lua` (output ignored) | while preprocessing, in script order; never while checking |
+/// | `loadbinary(addr,file)` | `read_file` | while assembling; returns the file's bytes (the host applies its consent / file-access rules); not called while checking, but required |
+/// | `name(args)` not built in | `command` | while preprocessing (also while checking, with `true`); `Some(text)` replaces the line, `None` = not a custom command |
+/// | whole script | `prologue` | first, on every section run; returns the script to use |
+/// | after a section | `epilogue` | after all writes succeeded; an error rolls the section back |
+/// | unknown symbol | `symbol_lookup` | after every built-in lookup failed |
 ///
 /// Not supported at all: `kalloc` (kernel mode), `aobscanex`.
 #[derive(Default)]
 pub struct AaHooks {
+    /// `luacall(code)`; without it the `lua` hook runs the code and its output is ignored.
+    pub lua_call: Hook<String, ()>,
+    /// `loadbinary(address, file)`: file name -> contents (at most [`MAX_ASSEMBLED_BYTES`]).
+    pub read_file: Hook<String, Vec<u8>>,
+    /// Custom commands (Cheat Engine's `registerAutoAssemblerCommand`): (lowercase name,
+    /// argument text, syntax check only) -> replacement script text, or `None` if `name` is
+    /// not one.
+    pub command: Hook<(String, String, bool), Option<String>>,
+    /// `registerAutoAssemblerPrologue`: (script, syntax check only) -> script.
+    pub prologue: Hook<(String, bool), String>,
+    /// Runs after a section succeeded: (enable, syntax check only).
+    pub epilogue: Hook<(bool, bool), ()>,
+    /// `registerSymbolLookupCallback` (failure stage): name -> address.
+    pub symbol_lookup: Option<SymbolLookup>,
+    /// What `aobscan*` does with a pattern that matches more than once.
+    pub aob_unique: AobUnique,
     /// `{$lua}` block source -> Auto Assembler text to insert in its place.
     pub lua: Hook<String, String>,
     /// `include(file)` -> script text.
@@ -194,6 +251,10 @@ fn directive(line: &str) -> Option<(String, Vec<String>)> {
 
 const DIRECTIVES: &[&str] = &[
     "alloc",
+    "allocnx",
+    "allocxo",
+    "align",
+    "loadbinary",
     "globalalloc",
     "dealloc",
     "label",
@@ -210,36 +271,66 @@ const DIRECTIVES: &[&str] = &[
     "sharedallocate",
     "include",
     "define",
+    "undefine",
+    "luacall",
     "readmem",
     "reassemble",
 ];
 
+/// Text between the outer parentheses of `name(...)`.
+fn raw_args(line: &str) -> &str {
+    let t = line.trim_end();
+    line.find('(')
+        .and_then(|o| t.get(o + 1..t.len().saturating_sub(1)))
+        .unwrap_or("")
+}
+
+fn is_section(t: &str) -> bool {
+    t.eq_ignore_ascii_case("[enable]") || t.eq_ignore_ascii_case("[disable]")
+}
+
 /// Pulls `{$lua}` ... `{$asm}` blocks out verbatim, before comment stripping could mangle Lua
 /// (`{1, 2}`, `7 // 2`, `/* */`). Each block leaves a `{$lua:N}` marker (N indexes `blocks`)
-/// and blank lines, so line numbers stay right.
+/// and blank lines, so line numbers stay right. `[ENABLE]` / `[DISABLE]` inside a block split
+/// it (Cheat Engine splits sections before running Lua), the marker of the part after the
+/// header going on that part's first line.
 fn extract_lua(text: &str, blocks: &mut Vec<String>) -> String {
     let mut out = String::with_capacity(text.len());
-    let mut cur: Option<String> = None;
+    // (source, marker already written)
+    let mut cur: Option<(String, bool)> = None;
+    let finish = |cur: &mut Option<(String, bool)>, blocks: &mut Vec<String>| {
+        if let Some((src, true)) = cur.take() {
+            blocks.push(src);
+        }
+    };
     for l in text.lines() {
         let t = l.trim();
-        if let Some(src) = cur.as_mut() {
-            if t.eq_ignore_ascii_case("{$asm}") {
-                blocks.extend(cur.take());
-                out.push_str("{$asm}\n");
-            } else {
-                src.push_str(l);
-                src.push('\n');
+        if cur.is_some() && t.eq_ignore_ascii_case("{$asm}") {
+            finish(&mut cur, blocks);
+            out.push_str("{$asm}\n");
+        } else if cur.is_some() && is_section(t) {
+            finish(&mut cur, blocks);
+            out.push_str(t);
+            out.push('\n');
+            cur = Some((String::new(), false));
+        } else if let Some((src, marked)) = cur.as_mut() {
+            src.push_str(l);
+            src.push('\n');
+            if *marked {
                 out.push('\n');
+            } else {
+                out.push_str(&format!("{{$lua:{}}}\n", blocks.len()));
+                *marked = true;
             }
         } else if t.eq_ignore_ascii_case("{$lua}") {
             out.push_str(&format!("{{$lua:{}}}\n", blocks.len()));
-            cur = Some(String::new());
+            cur = Some((String::new(), true));
         } else {
             out.push_str(l);
             out.push('\n');
         }
     }
-    blocks.extend(cur);
+    finish(&mut cur, blocks);
     out
 }
 
@@ -272,67 +363,147 @@ fn section_lines(
 }
 
 /// Shared by every nesting level of one script's preprocessing.
-#[derive(Default)]
-struct Budget {
+struct Pre<'a> {
+    hooks: &'a mut AaHooks,
+    lua_blocks: Vec<String>,
+    syms: &'a SymbolTable,
+    bits: u32,
+    dry: bool,
     bytes: usize,
     lua_runs: usize,
     includes: usize,
+    commands: usize,
 }
 
-/// Expands `{$lua}` blocks, `include`, and `define` into plain lines.
+impl Pre<'_> {
+    /// Hook output -> lines at `ln`, counted against the script size.
+    fn lines_of(&mut self, text: &str, ln: usize) -> R<Vec<(usize, String)>> {
+        self.bytes = self.bytes.saturating_add(text.len());
+        if self.bytes > MAX_SCRIPT_BYTES {
+            return err(
+                ln,
+                format!("script expands to more than {MAX_SCRIPT_BYTES} bytes"),
+            );
+        }
+        Ok(strip_comments(&extract_lua(text, &mut self.lua_blocks))
+            .lines()
+            .map(|l| (ln, l.trim().to_string()))
+            .filter(|(_, l)| !l.is_empty())
+            .collect())
+    }
+    /// `{$ifdef name}`: a define, a registered symbol, or a predefined name.
+    fn defined(&self, name: &str, defines: &[(String, String)]) -> bool {
+        let n = name.to_ascii_lowercase();
+        let predefined: &[&str] = if self.bits == 64 {
+            &["heaphook", "cpu64", "x64", "x86_64", "amd64"]
+        } else {
+            &["heaphook", "cpu32", "x86", "i386"]
+        };
+        predefined.contains(&n.as_str())
+            || defines.iter().any(|(d, _)| d.eq_ignore_ascii_case(name))
+            || self.syms.get(name).is_some()
+    }
+}
+
+/// Expands `{$lua}` blocks, `include`, `define`, `{$ifdef}` and custom commands into plain
+/// lines.
 fn preprocess(
     mut lines: Vec<(usize, String)>,
-    hooks: &mut AaHooks,
-    lua_blocks: &mut Vec<String>,
+    cx: &mut Pre,
     depth: usize,
-    budget: &mut Budget,
 ) -> R<Vec<(usize, String)>> {
     let mut out: Vec<(usize, String)> = Vec::new();
     let mut defines: Vec<(String, String)> = Vec::new();
+    // Open `{$ifdef}`s: (line, this branch is taken, an enclosing one is skipped, seen else).
+    let mut conds: Vec<(usize, bool, bool, bool)> = Vec::new();
     let mut i = 0;
     while i < lines.len() {
         let ln = lines[i].0;
         let mut line = std::mem::take(&mut lines[i].1);
+        i += 1;
+        let lower = line.to_ascii_lowercase();
+        // Conditionals first: their names must not go through define replacement.
+        let cond = |kw: &str| {
+            lower
+                .strip_prefix(kw)
+                .and_then(|r| r.strip_suffix('}'))
+                .filter(|r| r.starts_with(char::is_whitespace))
+                .map(|r| line[kw.len()..kw.len() + r.len()].trim().to_string())
+        };
+        let skipping = conds.last().is_some_and(|c| !c.1 || c.2);
+        if let Some((name, neg)) = cond("{$ifdef").map(|n| (n, false)).or_else(|| cond("{$ifndef").map(|n| (n, true))) {
+            if name.is_empty() {
+                return err(ln, "{$ifdef} needs a name");
+            }
+            if conds.len() >= MAX_IF_DEPTH {
+                return err(ln, format!("{{$ifdef}} nested deeper than {MAX_IF_DEPTH}"));
+            }
+            let taken = cx.defined(&name, &defines) != neg;
+            conds.push((ln, taken, skipping, false));
+            continue;
+        }
+        match lower.as_str() {
+            "{$else}" => {
+                let Some(c) = conds.last_mut().filter(|c| !c.3) else {
+                    return err(ln, "{$else} without {$ifdef}");
+                };
+                c.1 = !c.1;
+                c.3 = true;
+                continue;
+            }
+            "{$endif}" => {
+                if conds.pop().is_none() {
+                    return err(ln, "{$endif} without {$ifdef}");
+                }
+                continue;
+            }
+            _ if skipping => continue,
+            _ => {}
+        }
         let too_big = || AaError {
             line: ln,
             message: format!("script expands to more than {MAX_SCRIPT_BYTES} bytes"),
         };
+        // `define(name,...)` / `undefine(name)` keep their name: redefining works.
+        let keep = match lower.trim_start() {
+            l if l.starts_with("undefine(") => line.len(),
+            l if l.starts_with("define(") => line.find(',').unwrap_or(line.len()),
+            _ => 0,
+        };
+        let (head, mut rest) = (line[..keep].to_string(), line[keep..].to_string());
         for (n, v) in &defines {
-            line = replace_word(&line, n, v, MAX_SCRIPT_BYTES).ok_or_else(too_big)?;
+            rest = replace_word(&rest, n, v, MAX_SCRIPT_BYTES).ok_or_else(too_big)?;
         }
-        budget.bytes = budget.bytes.saturating_add(line.len());
-        if budget.bytes > MAX_SCRIPT_BYTES {
+        line = head + &rest;
+        cx.bytes = cx.bytes.saturating_add(line.len());
+        if cx.bytes > MAX_SCRIPT_BYTES {
             return Err(too_big());
         }
         let lower = line.to_ascii_lowercase();
-        i += 1;
         if lower.starts_with("{$") {
             match lower.as_str() {
                 _ if lower.starts_with("{$lua:") => {
-                    budget.lua_runs += 1;
-                    if budget.lua_runs > MAX_LUA_BLOCKS {
+                    cx.lua_runs += 1;
+                    if cx.lua_runs > MAX_LUA_BLOCKS {
                         return err(ln, format!("more than {MAX_LUA_BLOCKS} {{$lua}} blocks"));
                     }
                     let src = lower
                         .get(6..lower.len().saturating_sub(1))
                         .and_then(|n| n.parse::<usize>().ok())
-                        .and_then(|i| lua_blocks.get(i))
+                        .and_then(|i| cx.lua_blocks.get(i))
                         .cloned()
                         .unwrap_or_default();
-                    let Some(lua) = hooks.lua.as_mut() else {
+                    let Some(lua) = cx.hooks.lua.as_mut() else {
                         return err(ln, "{$lua} blocks need a Lua engine");
                     };
                     let text = lua(src).map_err(at(ln))?;
-                    let new: Vec<(usize, String)> = strip_comments(&text)
-                        .lines()
-                        .map(|l| (ln, l.trim().to_string()))
-                        .filter(|(_, l)| !l.is_empty())
-                        .collect();
+                    let new = cx.lines_of(&text, ln)?;
                     lines.splice(i..i, new);
                 }
-                "{$asm}" | "{$strict}" => {}
+                "{$asm}" => {}
+                "{$strict}" | "{$nostrict}" => out.push((ln, lower)),
                 "{$try}" | "{$except}" => {
-                    if hooks.try_except.is_none() {
+                    if cx.hooks.try_except.is_none() {
                         return err(
                             ln,
                             "{$try}/{$except} is unsupported without an exception-handler hook",
@@ -350,38 +521,83 @@ fn preprocess(
                     return err(ln, "define(name,value) expected");
                 }
                 // Value may itself contain commas.
-                let open = line.find('(').unwrap_or(0);
-                let comma = line[open..]
-                    .find(',')
-                    .map(|c| open + c + 1)
-                    .unwrap_or(line.len());
-                let value = line[comma..line.trim_end().len() - 1].trim().to_string();
-                if defines.len() >= MAX_DEFINES {
+                let value = raw_args(&line)
+                    .split_once(',')
+                    .map_or("", |(_, v)| v)
+                    .trim()
+                    .to_string();
+                if let Some(d) = defines.iter_mut().find(|d| d.0.eq_ignore_ascii_case(&args[0])) {
+                    d.1 = value;
+                } else if defines.len() >= MAX_DEFINES {
                     return err(ln, format!("more than {MAX_DEFINES} defines"));
+                } else {
+                    defines.push((args[0].clone(), value));
                 }
-                defines.push((args[0].clone(), value));
+            }
+            Some((name, args)) if name == "undefine" => {
+                if args.iter().all(|a| a.is_empty()) {
+                    return err(ln, "undefine(name) expected");
+                }
+                defines.retain(|(d, _)| !args.iter().any(|a| a.eq_ignore_ascii_case(d)));
+            }
+            Some((name, _)) if name == "luacall" => {
+                let code = raw_args(&line).to_string();
+                if cx.dry {
+                    continue;
+                }
+                let h = &mut cx.hooks;
+                match (h.lua_call.as_mut(), h.lua.as_mut()) {
+                    (Some(f), _) => f(code).map_err(at(ln))?,
+                    (None, Some(f)) => {
+                        f(code).map_err(at(ln))?;
+                    }
+                    (None, None) => return err(ln, "luacall needs a Lua engine"),
+                }
             }
             Some((name, args)) if name == "include" => {
                 if depth > 8 {
                     return err(ln, "include nesting too deep");
                 }
-                budget.includes += 1;
-                if budget.includes > MAX_INCLUDES {
+                cx.includes += 1;
+                if cx.includes > MAX_INCLUDES {
                     return err(ln, format!("more than {MAX_INCLUDES} includes"));
                 }
-                let Some(inc) = hooks.include.as_mut() else {
+                let Some(inc) = cx.hooks.include.as_mut() else {
                     return err(ln, "include needs a file loader");
                 };
                 let text = inc(args.join(",")).map_err(at(ln))?;
-                let new = strip_comments(&extract_lua(&text, lua_blocks))
-                    .lines()
-                    .map(|l| (ln, l.trim().to_string()))
-                    .filter(|(_, l)| !l.is_empty())
-                    .collect();
-                out.extend(preprocess(new, hooks, lua_blocks, depth + 1, budget)?);
+                let new = cx.lines_of(&text, ln)?;
+                out.extend(preprocess(new, cx, depth + 1)?);
+            }
+            Some((name, _))
+                if !DIRECTIVES.contains(&name.as_str()) && cx.hooks.command.is_some() =>
+            {
+                let args = raw_args(&line).to_string();
+                let dry = cx.dry;
+                let f = cx.hooks.command.as_mut().ok_or_else(|| AaError {
+                    line: ln,
+                    message: "internal: command hook".into(),
+                })?;
+                match f((name, args, dry)).map_err(at(ln))? {
+                    Some(text) => {
+                        cx.commands += 1;
+                        if cx.commands > MAX_CUSTOM_COMMANDS {
+                            return err(
+                                ln,
+                                format!("more than {MAX_CUSTOM_COMMANDS} custom command runs"),
+                            );
+                        }
+                        let new = cx.lines_of(&text, ln)?;
+                        lines.splice(i..i, new);
+                    }
+                    None => out.push((ln, line)),
+                }
             }
             _ => out.push((ln, line)),
         }
+    }
+    if let Some((ln, ..)) = conds.first() {
+        return err(*ln, "{$ifdef} without {$endif}");
     }
     Ok(out)
 }
@@ -389,15 +605,27 @@ fn preprocess(
 #[derive(Debug)]
 enum Item {
     Origin(String),
+    /// `org address`: like `address:`, never an implicit label.
+    Org(String),
     Label(String),
     Asm(String),
     Bytes(Vec<u8>),
     Reassemble(String),
+    /// `align n,fill`.
+    Align(u64, u8),
+    /// `loadbinary(address,file)`: bytes written at an address, not at the current one.
+    Load(String, Vec<u8>),
 }
 
 /// Parses `11 22 ?? 3? *` (spaces optional, `*`/`?` alone = any byte) into (byte, mask).
 fn parse_pattern(s: &str) -> Result<Vec<(u8, u8)>> {
     let bad = || Error::Parse(format!("bad pattern '{s}'"));
+    // A quoted pattern: "11 22 ?? 33".
+    let s = s.trim();
+    let s = ['"', '\'']
+        .iter()
+        .find_map(|q| s.strip_prefix(*q).and_then(|x| x.strip_suffix(*q)))
+        .unwrap_or(s);
     let nib = |c: char| match c {
         '?' | '*' | 'x' | 'X' => Some((0, 0)),
         _ => c.to_digit(16).map(|d| (d as u8, 0xF)),
@@ -537,6 +765,8 @@ struct Run<'a> {
     locals: HashMap<String, Addr>,
     fake_next: Addr,
     new_allocs: Vec<AaAlloc>,
+    /// The host's symbol lookup, asked last.
+    extra: Option<SymbolLookup>,
 }
 
 impl Run<'_> {
@@ -546,6 +776,7 @@ impl Run<'_> {
             .get(&l)
             .copied()
             .or_else(|| crate::expr::std_lookup(self.p, &self.syms, &self.mods, name))
+            .or_else(|| self.extra.as_ref().and_then(|f| f(name)))
     }
     fn eval(&self, expr: &str, line: usize) -> R<Addr> {
         let f = |n: &str| self.lookup(n);
@@ -558,7 +789,7 @@ impl Run<'_> {
         )
         .map_err(at(line))
     }
-    fn alloc(&mut self, size: u64, near: Option<Addr>) -> Result<Addr> {
+    fn alloc(&mut self, size: u64, near: Option<Addr>, prot: Prot) -> Result<Addr> {
         if self.dry {
             let a = near.unwrap_or(0x1000_0000).wrapping_add(self.fake_next);
             self.fake_next = self
@@ -566,15 +797,7 @@ impl Run<'_> {
                 .saturating_add(size.saturating_add(0x1FFF) & !0xFFF);
             return Ok(a);
         }
-        self.p.alloc(
-            size,
-            Prot {
-                r: true,
-                w: true,
-                x: true,
-            },
-            near,
-        )
+        self.p.alloc(size, prot, near)
     }
     fn free_new(&self) {
         if !self.dry {
@@ -598,6 +821,51 @@ fn is_ident(s: &str) -> bool {
     !s.is_empty() && s.chars().all(|c| c.is_alphanumeric() || "_@.".contains(c))
 }
 
+/// `label:` / `address:`, optionally followed by an instruction: (head, tail).
+fn origin_of(line: &str) -> Option<(&str, &str)> {
+    let c = line.find(':')?;
+    let (head, tail) = (line[..c].trim(), line[c + 1..].trim());
+    let seg = crate::asm::parse_reg(head).is_some_and(|r| r.is_segment_register());
+    (!seg && !head.contains('[') && !head.contains(' ') && !tail.starts_with('['))
+        .then_some((head, tail))
+}
+
+/// The first `address:` of the section that already resolves to something the script did not
+/// allocate (a module address, an `aobscan` result): where the code will be patched.
+fn patch_site(r: &Run, lines: &[(usize, String)]) -> Option<Addr> {
+    lines.iter().find_map(|(_, l)| {
+        let (head, _) = origin_of(l)?;
+        if r.new_allocs.iter().any(|a| a.name.eq_ignore_ascii_case(head)) {
+            return None;
+        }
+        r.eval(head, 0).ok().filter(|a| *a != 0)
+    })
+}
+
+/// `rwx` letters or a Windows `PAGE_*` name.
+fn parse_prot(s: &str) -> Option<Prot> {
+    let s = s.trim().to_ascii_lowercase();
+    let (r, w, x) = match s.strip_prefix("page_") {
+        Some("noaccess") => (false, false, false),
+        Some("readonly") => (true, false, false),
+        Some("readwrite") | Some("writecopy") => (true, true, false),
+        Some("execute") | Some("execute_read") => (true, false, true),
+        Some("execute_readwrite") | Some("execute_writecopy") => (true, true, true),
+        Some(_) => return None,
+        None if !s.is_empty() && s.chars().all(|c| "rwx-".contains(c)) => {
+            (s.contains('r'), s.contains('w'), s.contains('x'))
+        }
+        None => return None,
+    };
+    Some(Prot { r, w, x })
+}
+
+const RWX: Prot = Prot {
+    r: true,
+    w: true,
+    x: true,
+};
+
 /// Runs one section. `prev` is the enable state when disabling.
 fn run(
     p: &dyn Process,
@@ -608,6 +876,17 @@ fn run(
     hooks: &mut AaHooks,
     dry: bool,
 ) -> R<AaState> {
+    let prologued;
+    let script = match hooks.prologue.as_mut() {
+        Some(f) => {
+            prologued = f((script.to_string(), dry)).map_err(at(0))?;
+            if prologued.len() > MAX_SCRIPT_BYTES {
+                return err(0, format!("prologue: script longer than {MAX_SCRIPT_BYTES} bytes"));
+            }
+            prologued.as_str()
+        }
+        None => script,
+    };
     let mut lua_blocks = Vec::new();
     let (lines, has_disable) = section_lines(script, enable, &mut lua_blocks);
     if !enable && !has_disable {
@@ -625,8 +904,19 @@ fn run(
         }
         return Ok(AaState::default());
     }
-    let lines = preprocess(lines, hooks, &mut lua_blocks, 0, &mut Budget::default())?;
     let bits = bitness(p);
+    let mut pre = Pre {
+        hooks: &mut *hooks,
+        lua_blocks,
+        syms,
+        bits,
+        dry,
+        bytes: 0,
+        lua_runs: 0,
+        includes: 0,
+        commands: 0,
+    };
+    let lines = preprocess(lines, &mut pre, 0)?;
     let mut r = Run {
         p,
         syms: syms.clone(),
@@ -635,6 +925,7 @@ fn run(
         locals: HashMap::new(),
         fake_next: 0x10000,
         new_allocs: Vec::new(),
+        extra: hooks.symbol_lookup.clone(),
     };
     if let Some(st) = prev {
         for a in &st.allocs {
@@ -654,6 +945,10 @@ fn run(
     // {$try} label stack and finished (line, try label, except label) pairs.
     let mut try_open: Vec<(usize, String)> = Vec::new();
     let mut tries: Vec<(usize, String, String)> = Vec::new();
+    let mut scans: Vec<AaScan> = Vec::new();
+    // Cheat Engine's default: an undeclared `name:` is a label; `{$strict}` makes it an error.
+    let mut strict = false;
+    let mut site: Option<Option<Addr>> = None;
 
     let result = (|| -> R<()> {
         let mut in_struct: Option<(usize, String, u64)> = None;
@@ -706,22 +1001,40 @@ fn run(
                 tries.push((ln, t, e));
                 continue;
             }
+            if lower == "{$strict}" || lower == "{$nostrict}" {
+                strict = lower == "{$strict}";
+                continue;
+            }
+            if let Some(a) = lower.strip_prefix("org ") {
+                items.push((ln, Item::Org(line[line.len() - a.len()..].trim().to_string())));
+                continue;
+            }
+            // `align n[,fill]`, `align n fill` or `align(n[,fill])`.
+            if let Some(a) = lower.strip_prefix("align").filter(|a| a.starts_with([' ', '('])) {
+                let a = a.trim().trim_start_matches('(').trim_end_matches(')');
+                let mut it = a.split([',', ' ']).filter(|s| !s.is_empty());
+                let (n, fill) = (it.next().and_then(parse_num), it.next().map(parse_num));
+                let n = n.filter(|n| (1..=MAX_ALIGN).contains(n));
+                let fill = match fill {
+                    None => Some(0x90),
+                    Some(f) => f.filter(|f| *f <= 0xFF).map(|f| f as u8),
+                };
+                let (Some(n), Some(fill), None) = (n, fill, it.next()) else {
+                    return err(ln, format!("align n[,fill byte] expected (n at most {MAX_ALIGN:X})"));
+                };
+                items.push((ln, Item::Align(n, fill)));
+                continue;
+            }
             let Some((name, args)) =
                 directive(line).filter(|(n, _)| DIRECTIVES.contains(&n.as_str()))
             else {
                 // `label:` / `address:` optionally followed by an instruction on the same line.
-                if let Some(c) = line.find(':') {
-                    let head = line[..c].trim();
-                    let tail = line[c + 1..].trim();
-                    let seg = crate::asm::parse_reg(head).is_some_and(|r| r.is_segment_register());
-                    if !seg && !head.contains('[') && !head.contains(' ') && !tail.starts_with('[')
-                    {
-                        items.push((ln, Item::Origin(head.to_string())));
-                        if !tail.is_empty() {
-                            items.push((ln, Item::Asm(tail.to_string())));
-                        }
-                        continue;
+                if let Some((head, tail)) = origin_of(line) {
+                    items.push((ln, Item::Origin(head.to_string())));
+                    if !tail.is_empty() {
+                        items.push((ln, Item::Asm(tail.to_string())));
                     }
+                    continue;
                 }
                 items.push((ln, Item::Asm(line.clone())));
                 continue;
@@ -734,7 +1047,7 @@ fn run(
                 }
             };
             match name.as_str() {
-                "alloc" | "globalalloc" => {
+                "alloc" | "allocnx" | "allocxo" | "globalalloc" => {
                     need(2)?;
                     let key = args[0].to_ascii_lowercase();
                     if name == "globalalloc"
@@ -747,11 +1060,44 @@ fn run(
                         line: ln,
                         message: format!("bad size '{}'", args[1]),
                     })?;
-                    let near = match args.get(2) {
-                        Some(n) if !n.is_empty() => Some(r.eval(n, ln)?),
-                        _ => None,
+                    let mut prot = match name.as_str() {
+                        "allocnx" => parse_prot("rw"),
+                        // Execute-only is not portable: read + execute.
+                        "allocxo" => parse_prot("rx"),
+                        _ => Some(RWX),
                     };
-                    let a = r.alloc(size.max(1), near).map_err(at(ln))?;
+                    if let Some(s) = args.get(3).filter(|s| !s.is_empty()) {
+                        prot = parse_prot(s);
+                    }
+                    let mut near_arg = args.get(2).filter(|n| !n.is_empty());
+                    // `alloc(x,size,PAGE_READWRITE)`: a protection in the address slot.
+                    if let Some(pr) = near_arg.filter(|n| n.to_ascii_lowercase().starts_with("page_")) {
+                        prot = parse_prot(pr);
+                        near_arg = None;
+                    }
+                    let prot = prot.ok_or_else(|| AaError {
+                        line: ln,
+                        message: format!("{name}: bad protection (rwx letters or PAGE_*)"),
+                    })?;
+                    let near = match near_arg {
+                        Some(n) => Some(r.eval(n, ln)?),
+                        None => None,
+                    };
+                    // 64-bit without an address: near the first patched address, so `jmp`
+                    // between the hook and the allocation stays 5 bytes.
+                    // Looked up once per section: rescanning per alloc would be quadratic.
+                    let hint = if near.is_none() && bits == 64 {
+                        *site.get_or_insert_with(|| patch_site(&r, &lines))
+                    } else {
+                        None
+                    };
+                    let a = match hint {
+                        Some(h) => r
+                            .alloc(size.max(1), Some(h), prot)
+                            .or_else(|_| r.alloc(size.max(1), None, prot)),
+                        None => r.alloc(size.max(1), near, prot),
+                    }
+                    .map_err(at(ln))?;
                     r.locals.insert(key, a);
                     if name == "globalalloc" {
                         global.push((args[0].clone(), a));
@@ -802,7 +1148,7 @@ fn run(
                                 return err(ln, "sharedallocate is unsupported without a hook");
                             };
                             if dry {
-                                r.alloc(size.max(1), None).map_err(at(ln))?
+                                r.alloc(size.max(1), None, RWX).map_err(at(ln))?
                             } else {
                                 h((args[0].clone(), size)).map_err(at(ln))?
                             }
@@ -838,7 +1184,9 @@ fn run(
                             (lo, hi, args[3..].join(" "), format!("{lo:X}-{hi:X}"))
                         }
                     };
-                    let hits = aob_scan(p, lo, hi, &pat, 1).map_err(at(ln))?;
+                    let unique = hooks.aob_unique;
+                    let max = if unique == AobUnique::Off { 1 } else { MAX_AOB_COUNT };
+                    let hits = aob_scan(p, lo, hi, &pat, max).map_err(at(ln))?;
                     let a = *hits.first().ok_or_else(|| AaError {
                         line: ln,
                         message: format!(
@@ -846,7 +1194,38 @@ fn run(
                             args[0]
                         ),
                     })?;
+                    if unique == AobUnique::Fail && hits.len() > 1 {
+                        let more = if hits.len() >= MAX_AOB_COUNT { "or more " } else { "" };
+                        return err(
+                            ln,
+                            format!(
+                                "{name}({}): pattern '{pat}' is not unique: {} {more}matches in {place}",
+                                args[0],
+                                hits.len()
+                            ),
+                        );
+                    }
+                    scans.push(AaScan {
+                        name: args[0].clone(),
+                        addr: a,
+                        matches: (unique != AobUnique::Off).then_some(hits.len()),
+                    });
                     r.locals.insert(args[0].to_ascii_lowercase(), a);
+                }
+                "loadbinary" => {
+                    need(2)?;
+                    let file = args[1..].join(",").trim().trim_matches('"').to_string();
+                    let Some(h) = hooks.read_file.as_mut() else {
+                        return err(ln, "loadbinary: file access is not enabled");
+                    };
+                    let data = if dry { Vec::new() } else { h(file).map_err(at(ln))? };
+                    if data.len() > MAX_ASSEMBLED_BYTES {
+                        return err(
+                            ln,
+                            format!("loadbinary: file larger than {MAX_ASSEMBLED_BYTES} bytes"),
+                        );
+                    }
+                    items.push((ln, Item::Load(args[0].clone(), data)));
                 }
                 "assert" => {
                     need(2)?;
@@ -860,17 +1239,14 @@ fn run(
                 "fullaccess" => {
                     need(2)?;
                     let a = r.eval(&args[0], ln)?;
-                    let n = parse_size(&args[1]).unwrap_or(1);
+                    let n = parse_size(&args[1]).ok_or_else(|| AaError {
+                        line: ln,
+                        message: format!("fullaccess: bad size '{}'", args[1]),
+                    })?;
+                    // shortcut: a third "preferred size" argument is accepted and ignored;
+                    // the whole pages holding the range are changed anyway.
                     if !dry {
-                        match p.protect(
-                            a,
-                            n,
-                            Prot {
-                                r: true,
-                                w: true,
-                                x: true,
-                            },
-                        ) {
+                        match p.protect(a, n.max(1), RWX) {
                             Ok(_) | Err(Error::Unsupported(_)) => {}
                             Err(e) => return Err(at(ln)(e)),
                         }
@@ -952,12 +1328,21 @@ fn run(
         }
     }
     for (_, it) in &items {
-        if let Item::Label(l) = it {
-            labels.insert(l.clone());
+        match it {
+            Item::Label(l) => {
+                labels.insert(l.clone());
+            }
+            // Implicit label: a bare name that is nothing else (not a number, not a symbol).
+            Item::Origin(s)
+                if !strict && is_ident(s) && parse_num(s).is_none() && r.lookup(s).is_none() =>
+            {
+                labels.insert(s.to_ascii_lowercase());
+            }
+            _ => {}
         }
     }
-    // `x:` is a declared label, else an address expression (which may use labels, as in
-    // `exit+2:`). An undeclared bare name is an error, as in Cheat Engine.
+    // `x:` is a label, else an address expression (which may use labels, as in `exit+2:`).
+    // Under `{$strict}` an undeclared bare name is an error.
     for (ln, it) in items.iter_mut() {
         let Item::Origin(s) = it else { continue };
         let l = s.to_ascii_lowercase();
@@ -1006,7 +1391,7 @@ fn run(
     // Write everything, rolling back on failure.
     let mut originals: Vec<(Addr, Vec<u8>)> = Vec::new();
     if !dry {
-        for (ln, a, bytes) in &writes {
+        for (ln, a, bytes) in writes.iter().filter(|w| !w.2.is_empty()) {
             let mut old = vec![0u8; bytes.len()];
             let res = p
                 .read_exact(*a, &mut old)
@@ -1051,6 +1436,9 @@ fn run(
             thread_addrs.push((*ln, a));
         }
         if dry {
+            if let Some(f) = hooks.epilogue.as_mut() {
+                f((enable, true)).map_err(at(0))?;
+            }
             return Ok(registered);
         }
         if let Some((ln, _)) = thread_addrs.first()
@@ -1072,6 +1460,9 @@ fn run(
             if let Some(h) = hooks.create_thread.as_mut() {
                 h(a).map_err(at(ln))?;
             }
+        }
+        if let Some(f) = hooks.epilogue.as_mut() {
+            f((enable, false)).map_err(at(0))?;
         }
         Ok(registered)
     };
@@ -1101,6 +1492,7 @@ fn run(
         allocs,
         registered,
         originals,
+        scans,
     })
 }
 
@@ -1136,14 +1528,38 @@ fn place(r: &Run, items: &[(usize, Item)], labels: &HashSet<String>, bits: u32) 
         let mut changed = false;
         let mut unresolved: Option<(usize, String)> = None;
         let mut out = Vec::new();
+        // (index in `out`, item) of raw data, copied once after placement converged.
+        let mut raw: Vec<(usize, usize)> = Vec::new();
         let mut total = 0usize;
         for (i, (ln, it)) in items.iter().enumerate() {
+            let too_big = |total: usize| {
+                if total > MAX_ASSEMBLED_BYTES {
+                    err(
+                        *ln,
+                        format!("script assembles to more than {MAX_ASSEMBLED_BYTES} bytes"),
+                    )
+                } else {
+                    Ok(())
+                }
+            };
             if let Item::Bytes(b) = it {
-                // Copied once, after placement converged.
                 let c = cur.unwrap_or(0);
                 cur = Some(c.wrapping_add(b.len() as u64));
                 total = total.saturating_add(b.len());
+                too_big(total)?;
+                raw.push((out.len(), i));
                 out.push((*ln, c, Vec::new()));
+                continue;
+            }
+            if let Item::Align(n, fill) = it {
+                let Some(c) = cur else {
+                    return err(*ln, "align without an address");
+                };
+                let pad = ((n - c % n) % n) as usize;
+                cur = Some(c.wrapping_add(pad as u64));
+                total = total.saturating_add(pad);
+                too_big(total)?;
+                out.push((*ln, c, vec![*fill; pad]));
                 continue;
             }
             let ln = *ln;
@@ -1166,21 +1582,30 @@ fn place(r: &Run, items: &[(usize, Item)], labels: &HashSet<String>, bits: u32) 
                 }
                 r.lookup(n)
             };
+            let ev = |e: &str| {
+                eval(
+                    e,
+                    &Ctx {
+                        lookup: &lookup,
+                        mem: Some(r.p),
+                    },
+                )
+                .map_err(at(ln))
+            };
             let bytes = match it {
-                Item::Origin(e) => {
-                    cur = Some(
-                        eval(
-                            e,
-                            &Ctx {
-                                lookup: &lookup,
-                                mem: Some(r.p),
-                            },
-                        )
-                        .map_err(at(ln))?,
-                    );
+                Item::Origin(e) | Item::Org(e) => {
+                    cur = Some(ev(e)?);
                     None
                 }
-                Item::Label(_) => None,
+                Item::Load(e, b) => {
+                    let a = ev(e)?;
+                    total = total.saturating_add(b.len());
+                    too_big(total)?;
+                    raw.push((out.len(), i));
+                    out.push((ln, a, Vec::new()));
+                    None
+                }
+                Item::Label(_) | Item::Align(..) => None,
                 Item::Asm(t) => {
                     let Some(c) = cur else {
                         return err(ln, "code without an address (missing 'name:' line)");
@@ -1193,14 +1618,7 @@ fn place(r: &Run, items: &[(usize, Item)], labels: &HashSet<String>, bits: u32) 
                         return err(ln, "code without an address");
                     };
                     if let std::collections::hash_map::Entry::Vacant(v) = reasm.entry(i) {
-                        let a = eval(
-                            e,
-                            &Ctx {
-                                lookup: &lookup,
-                                mem: Some(r.p),
-                            },
-                        )
-                        .map_err(at(ln))?;
+                        let a = ev(e)?;
                         let (ins, _) = decode_at(r.p, a).map_err(at(ln))?;
                         let mut text = String::new();
                         formatter().format(&ins, &mut text);
@@ -1219,12 +1637,7 @@ fn place(r: &Run, items: &[(usize, Item)], labels: &HashSet<String>, bits: u32) 
                 }
                 b.resize(sizes[i], 0x90);
                 total = total.saturating_add(b.len());
-                if total > MAX_ASSEMBLED_BYTES {
-                    return err(
-                        ln,
-                        format!("script assembles to more than {MAX_ASSEMBLED_BYTES} bytes"),
-                    );
-                }
+                too_big(total)?;
                 let c = cur.unwrap_or(0);
                 cur = Some(c.wrapping_add(b.len() as u64));
                 out.push((ln, c, b));
@@ -1234,14 +1647,11 @@ fn place(r: &Run, items: &[(usize, Item)], labels: &HashSet<String>, bits: u32) 
             if let Some((ln, n)) = unresolved {
                 return err(ln, format!("label '{n}' is used but never defined"));
             }
-            let raw = items.iter().filter_map(|(_, it)| match it {
-                Item::Bytes(b) => Some(Some(b)),
-                Item::Asm(_) | Item::Reassemble(_) => Some(None),
-                _ => None,
-            });
-            for (o, b) in out.iter_mut().zip(raw) {
-                if let Some(b) = b {
-                    o.2 = b.clone();
+            for (o, i) in raw {
+                if let (Some(slot), Some((_, Item::Bytes(b) | Item::Load(_, b)))) =
+                    (out.get_mut(o), items.get(i))
+                {
+                    slot.2 = b.clone();
                 }
             }
             return Ok((out, now));
@@ -1286,6 +1696,9 @@ pub enum Template {
     CodeInjection,
     AobInjection,
     FullInjection,
+    /// Hooks a function entry: the entry jumps to `newfunction`; `originalcall` (registered)
+    /// runs the moved entry bytes and continues in the original function.
+    ApiHook,
 }
 
 /// Produces a script that hooks the instruction(s) at `addr` (at least 5 bytes are moved).
@@ -1351,6 +1764,9 @@ pub fn injection_template(p: &dyn Process, addr: Addr, kind: Template) -> Result
         }
         Template::FullInjection => format!(
             "define(address,{name})\ndefine(bytes,{origb})\n\n[ENABLE]\nassert(address,bytes)\nalloc(newmem,$1000,address)\nlabel(code)\nlabel(return)\n\nnewmem:\n\ncode:\n{code}  jmp return\n\naddress:\n  jmp newmem\n{nops}return:\n\n[DISABLE]\naddress:\n  db bytes\n\ndealloc(newmem)\n"
+        ),
+        Template::ApiHook => format!(
+            "define(address,{name})\ndefine(bytes,{origb})\n\n[ENABLE]\nassert(address,bytes)\nalloc(newfunction,$1000,address)\nlabel(originalcall)\nlabel(returnhere)\nregistersymbol(originalcall)\n\nnewfunction:\n  // Replacement for the function. Call or jump to originalcall to run the original.\n  jmp originalcall\n\noriginalcall:\n{code}  jmp returnhere\n\naddress:\n  jmp newfunction\n{nops}returnhere:\n\n[DISABLE]\naddress:\n  db bytes\n\nunregistersymbol(originalcall)\ndealloc(newfunction)\n"
         ),
     })
 }

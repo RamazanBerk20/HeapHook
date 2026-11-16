@@ -8,6 +8,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::{hexaddr, hexbytes};
 
+/// Most entries and most bytes per entry a `<CheatCodes>` import accepts (an instruction is
+/// at most 15 bytes; the slack covers hand-made multi-instruction entries).
+pub const MAX_CODE_ENTRIES: usize = 100_000;
+pub const MAX_CODE_BYTES: usize = 4096;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CodeEntry {
     pub description: String,
@@ -118,7 +123,7 @@ impl CodeList {
 
     /// Cheat Engine `<CheatCodes>` section (`Before` / `After` context is left empty).
     pub fn to_ct_xml(&self) -> String {
-        let esc = |s: &str| s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;");
+        let esc = crate::xml_escape;
         let mut x = String::from("<CheatCodes>\n");
         for e in &self.entries {
             x += "  <CodeEntry>\n";
@@ -142,9 +147,14 @@ impl CodeList {
         };
         let mut entries = Vec::new();
         for e in doc.descendants().filter(|n| n.has_tag_name("CodeEntry")) {
-            let original = e
-                .children()
-                .find(|c| c.has_tag_name("Actual"))
+            if entries.len() >= MAX_CODE_ENTRIES {
+                return Err(Error::Parse(format!("more than {MAX_CODE_ENTRIES} <CodeEntry> elements")));
+            }
+            let actual = e.children().find(|c| c.has_tag_name("Actual"));
+            if actual.is_some_and(|a| a.children().filter(|b| b.has_tag_name("Byte")).count() > MAX_CODE_BYTES) {
+                return Err(Error::Parse(format!("<CodeEntry> with more than {MAX_CODE_BYTES} bytes")));
+            }
+            let original = actual
                 .map(|a| {
                     a.children()
                         .filter(|b| b.has_tag_name("Byte"))

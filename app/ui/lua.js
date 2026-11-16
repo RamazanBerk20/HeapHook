@@ -1,6 +1,7 @@
 // Lua console view, the dialogs scripts open (showMessage / messageDialog / inputQuery), the
 // backend poller (console log, table version, bound hotkeys, beeps) and in-app hotkeys.
 import { api } from './backend.js';
+import { attachEditor } from './editor.js';
 import { $, h, store, toast, modal, splitter } from './util.js';
 import { state, emit } from './core.js';
 import { comboOf, vkOf } from './keys.js';
@@ -29,12 +30,8 @@ export function initLua({ openTableScript }) {
   }
 
   // ---------- editor ----------
-  const lines = () => {
-    gut.textContent = Array.from({ length: ta.value.split('\n').length }, (_, i) => i + 1).join('\n');
-    gut.scrollTop = ta.scrollTop;
-  };
-  ta.addEventListener('input', lines);
-  ta.addEventListener('scroll', () => { gut.scrollTop = ta.scrollTop; });
+  const ed = attachEditor(ta, { lang: 'lua', gutter: gut });
+  const lines = () => ed.refresh();
   async function run() {
     const code = ta.value;
     if (!code.trim() || running) return;
@@ -61,7 +58,6 @@ export function initLua({ openTableScript }) {
     else if (ctrl && e.key === 'ArrowUp') recall(-1);
     else if (ctrl && e.key === 'ArrowDown') recall(1);
     else if (e.key === 'Escape' && busy) api.luaInterrupt();
-    else if (e.key === 'Tab' && !e.shiftKey && !ctrl) ta.setRangeText('  ', ta.selectionStart, ta.selectionEnd, 'end');
     else return;
     e.preventDefault(); e.stopPropagation();
   });
@@ -140,6 +136,7 @@ export function initLua({ openTableScript }) {
       emit('backend:process', p.process);
       emit('table:selection', p.selection);
       emit('ui:seq', p.ui_seq);
+      if (p.window) emit('backend:window', p.window);
       bound = new Set(p.hotkeys.map((k) => k.join(',')));
       if (busy !== p.busy) { busy = p.busy; sync(); }
       if (sound != null && p.sound > sound) beep();
@@ -182,7 +179,12 @@ export function initLua({ openTableScript }) {
     const typing = e.target.matches?.('input, textarea, select, [contenteditable]');
     if (typing && !e.ctrlKey && !e.altKey && !e.metaKey && c.every((k) => k === 16 || PRINTABLE(k))) return;
     e.preventDefault(); e.stopPropagation();
-    api.hotkeyPress(c).catch((err) => (String(err?.message || err).includes('needs consent:') ? emit('table:consent') : toast(err)));
+    api.hotkeyPress(c).catch((err) => {
+      const m = String(err?.message || err);
+      if (m.includes('needs consent: entries:')) toast('This hotkey\'s entry came from another table: activate it once in the cheat table to answer whether its Lua may run', 'info');
+      else if (m.includes('needs consent:')) emit('table:consent');
+      else toast(err);
+    });
   }, true);
 
   return {

@@ -840,6 +840,78 @@ textarea.lf-memo { padding: 4px 6px; resize: none; line-height: 17px; font-famil
 /* the hex toolbar gained two selects: drop key hints first when narrow */
 @media (max-width: 1180px) { #hex-pane .panel-head .toolbar kbd, #hex-pane .panel-head .hints { display: none; } }
 /* A remote target's badge needs room: the view tabs keep their names, their key hints go to the tooltips (and F1). */
-@media (max-width: 2200px) {
-  .topbar:has(#remote-badge:not([hidden])) .tabs kbd { display: none; }
+@media (max-width: 2600px) {
+  .topbar:has(#remote-badge:not([hidden]), #lua-stop-top:not([hidden]), #lf-close-all:not([hidden]), #paused-badge:not([hidden])) :is(.tabs, #tbl-open, #tbl-save, .lua-top) kbd { display: none; }
 }
+
+/* ---------- 1.0: top bar that fits every width from 900 px ----------
+   Order of giving up room: key hints, labels of inactive views, Open/Save labels, the brand,
+   About (in the Tools menu and F1), then every view label and the debugger chip's words. The
+   process chip shrinks last and never below 120 px; Stop script / Close scripts stay. */
+.topbar > * { flex: none; }
+.topbar > .grow { flex: 1 1 0; min-width: 0; }
+.topbar .proc-btn { flex: 0 1 auto; min-width: 120px; }
+.topbar .busy { flex: 0 1 auto; min-width: 0; overflow: hidden; }
+#busy-text { min-width: 0; overflow: hidden; text-overflow: ellipsis; max-width: 220px; }
+.recent-btn { width: 22px; min-width: 22px; padding: 0; margin-left: -6px; }
+.recent-btn .ic { width: 12px; height: 12px; }
+.paused-badge { border: 0; cursor: pointer; flex: none; }
+.paused-badge:hover { box-shadow: inset 0 0 0 1px var(--yellow); }
+.vh { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+@media (max-width: 2000px) {
+  .tabs kbd, #tbl-open kbd, #tbl-save kbd, .lua-top kbd { display: none; }
+}
+/* With the remote badge or a running script's controls there is less room: labels go earlier. */
+@media (max-width: 1720px) {
+  .topbar:has(#remote-badge:not([hidden]), #lua-stop-top:not([hidden])) .tabs [role=tab]:not([aria-selected=true]) .bl { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+}
+@media (max-width: 1500px) {
+  .tabs [role=tab]:not([aria-selected=true]) .bl, #tbl-open .bl, #tbl-save .bl, .lua-top .bl { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+  .remote-badge .ra { display: none; }
+}
+@media (max-width: 1440px) { .brand { display: none; } }
+@media (max-width: 1280px) { #about-btn { display: none; } .topbar .proc-btn { max-width: 280px; } }
+@media (max-width: 1100px) {
+  .tabs [role=tab] .bl, .dbg-btn .dbg-state, #busy-text { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+  .tabs [role=tab] { padding: 0 8px; }
+  .dbg-btn { padding: 0 8px; }
+  .topbar .proc-btn { max-width: 220px; }
+  /* In the Tools menu (Alt T) and on F1. */
+  #tbl-recent, #help-btn { display: none; }
+}
+
+/* ---------- 1.0: cheat table filter, sort, columns, foreign entries, compact mode ---------- */
+.tbl-search { flex: 0 1 220px; min-width: 120px; margin-left: var(--s2); }
+.tbl-search input { height: 26px; width: 100%; padding-left: 28px; font-size: var(--fs-sm); }
+.tbl-search > .ic { top: 6px; left: 8px; width: 14px; height: 14px; }
+.tbl .cols-tbl, .tbl .trow { grid-template-columns: var(--tbl-cols, 58px minmax(140px, 2fr) minmax(130px, 1.4fr) minmax(90px, 0.8fr) minmax(100px, 1.2fr)); }
+.tbl.hide-addr [data-col=addr], .tbl.hide-vtype [data-col=vtype], .tbl.hide-value [data-col=value] { display: none; }
+.th-sort { all: unset; cursor: pointer; display: inline-flex; align-items: center; gap: 4px; border-radius: var(--r-sm); }
+.th-sort:hover { color: var(--text); }
+.th-sort:focus-visible { box-shadow: var(--focus); }
+[aria-sort=ascending] > .th-sort::after { content: '\2191'; color: var(--text); }
+[aria-sort=descending] > .th-sort::after { content: '\2193'; color: var(--text); }
+.mark.untrusted { color: var(--yellow); }
+.mark.untrusted .ic { width: 12px; height: 12px; }
+body.compact #scan-top, body.compact #div-table { display: none; }
+body.compact #table { flex: 1; }
+body.drop-file::after {
+  content: 'Drop a cheat table to open it'; position: fixed; inset: 8px; display: grid; place-items: center; pointer-events: none;
+  border: 2px dashed var(--blue); border-radius: var(--r-lg); background: var(--backdrop); color: var(--text); font-weight: 600; z-index: 50;
+}
+
+/* ---------- 1.0: speed presets, HeapHook hotkeys, calculator ---------- */
+.speed-presets { display: flex; gap: 4px; flex-wrap: wrap; margin: var(--s2) 0; }
+.speed-presets .btn { gap: 6px; }
+.inline-link { height: auto; padding: 0 2px; text-decoration: underline; }
+.ahk-rows { display: flex; flex-direction: column; gap: 4px; margin: 4px 0 var(--s2); }
+.ahk-row { display: grid; grid-template-columns: minmax(160px, 1fr) 72px minmax(120px, 1fr) minmax(0, 1.2fr) 28px; gap: var(--s2); align-items: center; }
+.ahk-row input[hidden] { display: block !important; visibility: hidden; }
+.ahk-note { margin: 0; font-size: var(--fs-xs); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.calc-out { display: grid; grid-template-columns: auto 1fr; gap: 2px var(--s3); margin: var(--s2) 0 0; font-size: var(--fs-sm); }
+.calc-out dt { color: var(--muted); align-self: center; }
+.calc-out dd { margin: 0; display: flex; align-items: center; gap: var(--s2); color: var(--text); word-break: break-all; }
+.calc-out dd span { flex: 1; }
+.calc-copy { height: 20px; padding: 0 6px; font-size: var(--fs-xs); }
+@media (max-width: 1300px) { #table .toolbar kbd { display: none; } #table .toolbar .btn:not(.icon) { padding: 0 8px; } }
+@media (max-width: 1000px) { .tbl-search { flex-basis: 150px; } }

@@ -27,6 +27,8 @@ const FREEZE_RESYNC: Duration = Duration::from_secs(1);
 const HOTKEY_DEDUPE: Duration = Duration::from_millis(150);
 /// Form changes kept for `ui_poll`; a UI further behind gets a snapshot instead.
 const UI_CAP: usize = 20_000;
+/// Bytes of queued form changes kept for `ui_poll` before the UI must take a snapshot.
+const UI_BYTES: usize = 8 << 20;
 /// Largest image file a form may show (`Picture.loadFromFile`).
 const MAX_IMAGE: u64 = 8 << 20;
 
@@ -80,10 +82,14 @@ pub struct Console {
     ui: Mutex<UiLog>,
 }
 
-#[derive(Default)]
-struct UiLog {
-    changes: VecDeque<(u64, UiChange)>,
-    seq: u64,
+/// Form changes for `ui_poll`: hh-lua's bounded log (updates coalesce per property; capped by
+/// count and bytes; a UI that fell behind takes a snapshot).
+struct UiLog(hh_lua::ChangeLog);
+
+impl Default for UiLog {
+    fn default() -> Self {
+        UiLog(hh_lua::ChangeLog::new(UI_CAP, UI_BYTES))
+    }
 }
 
 /// `ui_poll` answer: the changes after `since`, or the whole tree when the UI is too far
@@ -235,7 +241,7 @@ impl Host for Console {
     }
     fn load_table(&self, path: &str, merge: bool) -> HResult<()> {
         let app = self.app_os("loadTable")?;
-        if merge { app.table_merge(path) } else { app.table_open(path, false).map(|_| ()) }.map_err(HError::Other)
+        if merge { app.table_merge(path).map(|_| ()) } else { app.table_open(path, false).map(|_| ()) }.map_err(HError::Other)
     }
     fn save_table(&self, path: &str, _protect: bool) -> HResult<()> {
         self.app_os("saveTable")?.table_export(path).map_err(HError::Other)
@@ -296,13 +302,7 @@ impl DebugHost for Console {
 /// into the engine.
 impl UiHost for Console {
     fn changed(&self, change: &UiChange) {
-        let mut g = lock(&self.ui);
-        g.seq += 1;
-        let seq = g.seq;
-        g.changes.push_back((seq, change.clone()));
-        while g.changes.len() > UI_CAP {
-            g.changes.pop_front();
-        }
+        lock(&self.ui).0.push(change);
     }
 }
 
@@ -451,6 +451,8 @@ pub struct LuaPoll {
     pub selection: crate::cheat::Selection,
     /// Sequence number of the last form change (call `ui_poll` when it moves).
     pub ui_seq: u64,
+    /// Close requests and dropped files of the window.
+    pub window: crate::commands::WinEvents,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -461,6 +463,8 @@ pub struct ProcessState {
     /// Remote target whose connection dropped: why.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lost: Option<String>,
+    /// Suspended with `process_pause`.
+    pub paused: bool,
 }
 
 /// Who a hotkey belongs to.
@@ -469,6 +473,8 @@ pub enum Target {
     /// Entry id and index into its `hotkeys`.
     Entry(i64, usize),
     Lua(u32),
+    /// Index into the settings' `app_hotkeys`.
+    App(usize),
 }
 
 /// Registers the given combos with the OS; returns which succeeded. Set by `main.rs`.
@@ -567,10 +573,11 @@ impl App {
                     let r = lock(&self.x.remote_alive);
                     if r.sess == session_key(&s) { (r.alive, r.lost.clone()) } else { (true, None) }
                 };
-                ProcessState { info: s.info.clone(), alive, lost }
+                ProcessState { info: s.info.clone(), alive, lost, paused: s.paused.load(SeqCst) }
             }),
             selection: self.x.live.selection(),
-            ui_seq: lock(&c.ui).seq,
+            ui_seq: lock(&c.ui).0.seq(),
+            window: lock(&self.x.win).clone(),
         })
     }
 
@@ -579,16 +586,16 @@ impl App {
     /// Form changes after `since` (`since` 0, or too far behind: the whole tree instead).
     pub fn ui_poll(&self, since: u64) -> R<UiPoll> {
         let g = lock(&self.x.lua.console.ui);
-        let next = g.seq;
-        let behind = g.changes.front().is_some_and(|f| f.0 > since + 1);
-        if since == 0 || behind || since > next {
-            drop(g);
-            // Changes made while the snapshot is taken are in it and also replayed: the UI
-            // applies them idempotently.
-            return Ok(UiPoll { next, changes: Vec::new(), snapshot: Some(self.x.lua.engine.ui_snapshot()) });
+        let next = g.0.seq();
+        let changes = if since > next { None } else { g.0.since(since) };
+        drop(g);
+        match changes {
+            Some(c) => Ok(UiPoll { next, changes: c.into_iter().map(|(seq, change)| UiSeqChange { seq, change }).collect(), snapshot: None }),
+            // `since` 0, too far behind (changes were dropped for room) or from an older
+            // engine: the whole tree. Changes made while it is taken are in it and also
+            // replayed; the UI applies them idempotently.
+            None => Ok(UiPoll { next, changes: Vec::new(), snapshot: Some(self.x.lua.engine.ui_snapshot()) }),
         }
-        let changes = g.changes.iter().filter(|c| c.0 > since).map(|(seq, c)| UiSeqChange { seq: *seq, change: c.clone() }).collect();
-        Ok(UiPoll { next, changes, snapshot: None })
     }
 
     /// A user event on a form control (`OnClick`, `OnClose`, ...); returns the handler's results.
@@ -650,6 +657,7 @@ impl App {
     pub(crate) fn bindings(&self) -> Vec<(Vec<u32>, Target)> {
         let mut out: Vec<(Vec<u32>, Target)> = self.x.live.hotkeys().into_iter().map(|(k, id, i)| (k, Target::Entry(id, i))).collect();
         out.extend(lock(&self.x.lua.console.hotkeys).0.iter().map(|(&id, k)| (k.clone(), Target::Lua(id))));
+        out.extend(lock(&self.x.settings).app_hotkeys.iter().enumerate().map(|(i, h)| (h.keys.clone(), Target::App(i))));
         for b in &mut out {
             b.0.sort_unstable();
             b.0.dedup();
@@ -686,6 +694,7 @@ impl App {
                     let _g = self.x.lua.enter();
                     self.x.lua.engine.fire_hotkey(*id).map_err(|e| e.to_string())
                 }
+                Target::App(i) => self.app_hotkey(*i),
             };
             if let Err(e) = r {
                 self.x.lua.console.push("err", &format!("hotkey: {e}"));
@@ -698,13 +707,30 @@ impl App {
         if errs.is_empty() { Ok(hits.len()) } else { Err(errs.join("\n")) }
     }
 
+    /// Runs HeapHook's own hotkey `i` (Settings): a speedhack preset or pause / resume.
+    fn app_hotkey(&self, i: usize) -> R<()> {
+        let h = lock(&self.x.settings).app_hotkeys.get(i).cloned().ok_or("no such hotkey")?;
+        match h.action.as_str() {
+            "speed" => self.speed_set(h.value).map(|_| ()),
+            "pause" => {
+                let paused = self.session()?.paused.load(SeqCst);
+                self.process_pause(!paused)
+            }
+            a => Err(format!("unknown hotkey action {a:?}")),
+        }
+    }
+
     /// The combos registered with the OS (system-wide): only with a modifier key (a plain key
     /// would be taken from every other program), and a table's entry hotkeys only once the
     /// table is trusted. The rest work while HeapHook has focus.
     pub fn global_combos(&self) -> Vec<Vec<u32>> {
         let trusted = self.x.live.trust().allows();
-        let mut combos: Vec<Vec<u32>> =
-            self.bindings().into_iter().filter(|(k, t)| has_modifier(k) && (trusted || matches!(t, Target::Lua(_)))).map(|b| b.0).collect();
+        // An entry pasted or merged from another table: not system-wide before its consent either.
+        let ok = |t: &Target| match t {
+            Target::Lua(_) | Target::App(_) => true,
+            Target::Entry(id, _) => trusted && !self.x.live.is_foreign_ask(*id),
+        };
+        let mut combos: Vec<Vec<u32>> = self.bindings().into_iter().filter(|(k, t)| has_modifier(k) && ok(t)).map(|b| b.0).collect();
         combos.sort();
         combos.dedup();
         combos

@@ -41,6 +41,16 @@ Run from a checkout:
 
     cargo run -p heaphook
 
+Command-line arguments (all optional):
+
+    heaphook [TABLE] [--pid PID | --attach NAME] [--launch PROGRAM [ARGS...]]
+
+- `TABLE`: a cheat table to open (`.CT` or HeapHook `.json`). Opening it asks the same question as File > Open before any of its Lua can run.
+- `--pid PID`: open that process. `--attach NAME`: open the first running process with that name (exact match first, then ignoring case).
+- `--launch PROGRAM ARGS...`: start the program (everything after it are its arguments; an argument may not contain `"`) and open it, like Create process.
+- `-h`, `--help`: the usage text. With `cargo run`, put the arguments after `--`: `cargo run -p heaphook -- game.CT --attach game`.
+- `HEAPHOOK_HOTKEY_LOG=1` prints, on stderr, whether each system-wide hotkey was registered and when one fires (for diagnosing a desktop).
+
 Build the speedhack library (Linux), needed for launching with speedhack:
 
     cargo build --release --manifest-path crates/hh-inject/payload/Cargo.toml

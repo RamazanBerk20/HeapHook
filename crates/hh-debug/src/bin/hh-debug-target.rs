@@ -35,6 +35,12 @@
 //! `bgtrip` (`ok`): a background thread calls trip() and hot(&counter) until `bgstop`.
 //! `vforkbg <ms>` (`ok`): a new thread does clone(CLONE_VFORK) without CLONE_VM; the child
 //! sleeps `ms` and exits, the thread waits for it. `vforks` answers `vforks <done>`.
+//! `dlopen <path>` keeps the handle; `dlclose` closes the last one (`ok`); `libcall <n>`
+//! calls `hh_lib_add(n)` of the last library (`lib <result>`).
+//! `named <name>` (`ok`): a thread with that name waits until `bgstop`.
+//! `deep` (value += 1 via `f1 -> f2 -> f3`, all with frame pointers; `f1` calls at +4 and
+//! `f2` at +4, both return to +9; `f3` stores at +4).
+//! `ymm` answers `ymm <ymm0 as 32 hex bytes> <mxcsr hex>` (needs AVX).
 use std::io::{BufRead, Write};
 
 #[cfg(target_arch = "x86_64")]
@@ -81,6 +87,33 @@ std::arch::global_asm!(
     "hh_trip:",
     "movabs rax, 0x0b0f0b0f00000000",
     "ret",
+    ".globl hh_f1",
+    "hh_f1:",
+    "push rbp",
+    "mov rbp, rsp",
+    "call hh_f2",
+    "pop rbp",
+    "ret",
+    ".globl hh_f2",
+    "hh_f2:",
+    "push rbp",
+    "mov rbp, rsp",
+    "call hh_f3",
+    "pop rbp",
+    "ret",
+    ".globl hh_f3",
+    "hh_f3:",
+    "push rbp",
+    "mov rbp, rsp",
+    "mov qword ptr [rdi], rsi",
+    "pop rbp",
+    "ret",
+    ".globl hh_getfp",
+    "hh_getfp:",
+    "vmovdqu ymmword ptr [rdi], ymm0",
+    "stmxcsr dword ptr [rdi + 32]",
+    "vzeroupper",
+    "ret",
 );
 
 #[cfg(target_arch = "x86_64")]
@@ -93,6 +126,9 @@ unsafe extern "C" {
     fn hh_rep(dst: *mut u8, n: u64);
     fn hh_call(f: extern "C" fn());
     fn hh_trip();
+    fn hh_f1(p: *mut u64, v: u64);
+    fn hh_f3(p: *mut u64, v: u64);
+    fn hh_getfp(out: *mut u8);
 }
 
 #[cfg(target_os = "linux")]
@@ -107,6 +143,7 @@ mod lx {
     pub static BG_STOP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     pub static BG: std::sync::Mutex<Vec<std::thread::JoinHandle<()>>> =
         std::sync::Mutex::new(Vec::new());
+    pub static LIB: std::sync::Mutex<usize> = std::sync::Mutex::new(0);
 
     pub fn nap(us: u64) {
         if us > 0 {
@@ -180,7 +217,7 @@ fn main() {
     let mut out = std::io::stdout().lock();
     writeln!(
         out,
-        r#"{{"pid":{},"store":"{:#x}","load":"{:#x}","outer":"{:#x}","hot":"{:#x}","rec":"{:#x}","rep":"{:#x}","call":"{:#x}","trip":"{:#x}","value":"{:#x}","value2":"{:#x}","buf":"{:#x}","counter":"{:#x}","execve":"{execve:#x}"}}"#,
+        r#"{{"pid":{},"store":"{:#x}","load":"{:#x}","outer":"{:#x}","hot":"{:#x}","rec":"{:#x}","rep":"{:#x}","call":"{:#x}","trip":"{:#x}","value":"{:#x}","value2":"{:#x}","buf":"{:#x}","counter":"{:#x}","execve":"{execve:#x}","f1":"{:#x}","f3":"{:#x}","getfp":"{:#x}"}}"#,
         std::process::id(),
         hh_store as *const () as usize,
         hh_load as *const () as usize,
@@ -194,6 +231,9 @@ fn main() {
         st.v2,
         st.buf,
         st.counter,
+        hh_f1 as *const () as usize,
+        hh_f3 as *const () as usize,
+        hh_getfp as *const () as usize,
     )
     .unwrap();
     out.flush().unwrap();
@@ -248,10 +288,14 @@ fn command(st: &State, line: &str) -> Option<String> {
             #[cfg(target_os = "linux")]
             "dlopen" => {
                 let name = std::ffi::CString::new(line[7..].trim()).unwrap();
-                libc::dlopen(name.as_ptr(), libc::RTLD_NOW);
+                let h = libc::dlopen(name.as_ptr(), libc::RTLD_NOW);
+                if !h.is_null() {
+                    *lx::LIB.lock().unwrap() = h as usize;
+                }
             }
+            "deep" => hh_f1(p, hh_load(p) + 1),
             #[cfg(target_os = "linux")]
-            _ => return Some(linux_command(st, cmd, &mut num)),
+            _ => return Some(linux_command(st, cmd, line, &mut num)),
             #[cfg(not(target_os = "linux"))]
             _ => return Some("error".into()),
         }
@@ -260,7 +304,7 @@ fn command(st: &State, line: &str) -> Option<String> {
 }
 
 #[cfg(target_os = "linux")]
-fn linux_command(st: &State, cmd: &str, num: &mut dyn FnMut() -> u64) -> String {
+fn linux_command(st: &State, cmd: &str, line: &str, num: &mut dyn FnMut() -> u64) -> String {
     use std::sync::atomic::Ordering;
     let p = st.v as *mut u64;
     unsafe {
@@ -468,6 +512,47 @@ fn linux_command(st: &State, cmd: &str, num: &mut dyn FnMut() -> u64) -> String 
                 "ok".into()
             }
             "vforks" => format!("vforks {}", lx::VFORKS.load(Ordering::SeqCst)),
+            "dlclose" => {
+                let h = std::mem::take(&mut *lx::LIB.lock().unwrap());
+                if h != 0 {
+                    libc::dlclose(h as *mut libc::c_void);
+                }
+                "ok".into()
+            }
+            "libcall" => {
+                let h = *lx::LIB.lock().unwrap();
+                let f = libc::dlsym(h as *mut libc::c_void, c"hh_lib_add".as_ptr());
+                if h == 0 || f.is_null() {
+                    return "nolib".into();
+                }
+                let f: extern "C" fn(u64) -> u64 = std::mem::transmute(f);
+                format!("lib {}", f(num()))
+            }
+            "named" => {
+                let name = line.split_whitespace().nth(1).unwrap_or("named").to_string();
+                let started = std::sync::Arc::new(std::sync::Barrier::new(2));
+                let s2 = started.clone();
+                lx::BG_STOP.store(false, Ordering::SeqCst);
+                let h = std::thread::Builder::new()
+                    .name(name)
+                    .spawn(move || {
+                        s2.wait();
+                        while !lx::BG_STOP.load(Ordering::SeqCst) {
+                            lx::nap(2000);
+                        }
+                    })
+                    .unwrap();
+                started.wait();
+                lx::BG.lock().unwrap().push(h);
+                "ok".into()
+            }
+            "ymm" => {
+                let mut out = [0u8; 36];
+                hh_getfp(out.as_mut_ptr());
+                let hex: String = out[..32].iter().map(|b| format!("{b:02x}")).collect();
+                let mx = u32::from_le_bytes(out[32..36].try_into().unwrap());
+                format!("ymm {hex} {mx:x}")
+            }
             "prog" => format!(
                 "prog {} {} {}",
                 hh_load(st.counter as *const u64),

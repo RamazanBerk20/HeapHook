@@ -9,10 +9,33 @@
 //! - code caves (runs of 00 / CC / 90 in executable memory).
 //!
 //! References are stored column-wise sorted by target (17 bytes each) and queried in pages.
-use std::collections::HashMap;
+//! A dissection can grow by modules ([`Dissection::add_modules`]), filter functions by
+//! executed-instruction sets the caller recorded ([`Dissection::code_filter`]), and be saved
+//! and loaded.
+//!
+//! # `.hhdis` file format (version 1)
+//! All integers little-endian:
+//! ```text
+//! magic     8 bytes  "HHDISS\0\0"
+//! version   u32      1
+//! flags     u32      0 (reserved)
+//! meta_len  u64      length of the JSON that follows (at most MAX_META_BYTES)
+//! meta      JSON     {modules, code_bytes, instructions, functions, strings, caves,
+//!                    code}: the shapes the query methods return; `code` lists the
+//!                    disassembled executable ranges as [start, end) number pairs
+//! ref_count u64      at most MAX_SAVED_REFS
+//! ref_count times:   to u64, from u64, kind u8 (0 call, 1 jump, 2 cond_jump, 3 data),
+//!                    sorted by (to, from, kind)
+//! ```
+//! Loading checks every count against the file size and the caps, every kind byte, the
+//! reference order and that functions, strings and caves are sorted, so a hostile file fails
+//! with an error instead of allocating or producing an inconsistent index.
+use std::collections::{BTreeSet, HashMap};
+use std::io::{BufReader, BufWriter, Read, Write};
+use std::path::Path;
 
 use hh_core::{Addr, Error, Module, Process, Result};
-use iced_x86::{Decoder, DecoderOptions, FlowControl, Instruction, OpKind, Register};
+use iced_x86::{Decoder, DecoderOptions, FlowControl, Instruction, Mnemonic, OpKind, Register};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
@@ -49,6 +72,10 @@ pub struct DissectOptions {
     pub max_string: usize,
     /// Minimum code cave length in bytes.
     pub min_cave: usize,
+    /// Module files may be read from the local disk (symbols, ELF headers). Set false for a
+    /// remote target, whose module paths name files on another machine: then only target
+    /// memory is read and functions get no symbol names.
+    pub local_files: bool,
 }
 
 impl Default for DissectOptions {
@@ -58,6 +85,7 @@ impl Default for DissectOptions {
             min_string: 4,
             max_string: 256,
             min_cave: 32,
+            local_files: true,
         }
     }
 }
@@ -105,7 +133,7 @@ pub struct DissectSummary {
 }
 
 /// Results of [`dissect`]; query in pages.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone, PartialEq)]
 pub struct Dissection {
     modules: Vec<String>,
     code_bytes: u64,
@@ -118,6 +146,8 @@ pub struct Dissection {
     by_callers: Vec<u32>,
     strings: Vec<StringRef>,
     caves: Vec<Cave>,
+    /// Executable ranges disassembled, `[start, end)`, sorted.
+    code: Vec<(Addr, Addr)>,
 }
 
 fn page<T: Clone>(v: &[T], offset: usize, limit: usize) -> Vec<T> {
@@ -198,13 +228,242 @@ impl Dissection {
     pub fn caves(&self, offset: usize, limit: usize) -> Vec<Cave> {
         page(&self.caves, offset, limit)
     }
+
+    /// Incremental "add module": dissects the modules not dissected yet and merges them in.
+    /// Strings in already-dissected modules referenced only from the new code are not added.
+    pub fn add_modules(
+        &mut self,
+        p: &dyn Process,
+        modules: &[Module],
+        opts: &DissectOptions,
+        progress: &Progress,
+    ) -> Result<DissectSummary> {
+        let new: Vec<Module> = modules.iter().filter(|m| !self.modules.contains(&m.name)).cloned().collect();
+        if !new.is_empty() {
+            let other = dissect(p, &new, opts, progress)?;
+            self.merge(other);
+        }
+        Ok(self.summary())
+    }
+
+    /// Merges a dissection of other modules into this one.
+    pub fn merge(&mut self, o: Dissection) {
+        self.modules.extend(o.modules);
+        self.code_bytes += o.code_bytes;
+        self.instructions += o.instructions;
+        let mut refs: Vec<Ref> = (0..self.to.len()).map(|i| (self.to[i], self.from[i], self.kind[i])).collect();
+        refs.extend((0..o.to.len()).map(|i| (o.to[i], o.from[i], o.kind[i])));
+        refs.par_sort_unstable();
+        refs.dedup();
+        (self.to, self.from, self.kind) = (Vec::with_capacity(refs.len()), Vec::with_capacity(refs.len()), Vec::with_capacity(refs.len()));
+        for (t, f, k) in refs {
+            self.to.push(t);
+            self.from.push(f);
+            self.kind.push(k);
+        }
+        self.functions.extend(o.functions);
+        self.functions.sort_by_key(|f| f.addr);
+        self.functions.dedup_by(|x, keep| {
+            x.addr == keep.addr && {
+                keep.callers = keep.callers.saturating_add(x.callers);
+                keep.internal |= x.internal;
+                if keep.name.is_none() {
+                    keep.name = x.name.take();
+                }
+                true
+            }
+        });
+        self.by_callers = rank(&self.functions);
+        self.strings.extend(o.strings);
+        self.strings.sort_by_key(|s| s.addr);
+        self.strings.dedup_by(|x, keep| x.addr == keep.addr && {
+            keep.refs = keep.refs.saturating_add(x.refs);
+            true
+        });
+        self.caves.extend(o.caves);
+        self.caves.sort_by_key(|c| c.addr);
+        self.code.extend(o.code);
+        self.code.sort_unstable();
+    }
+
+    /// Code filter without tracing: the internal functions that contain an instruction of
+    /// every `ran` set and of no `not_ran` set. Each set holds executed-instruction addresses
+    /// (from breakpoints or a tracer, recorded by the caller during one action). Sorted by
+    /// address; empty when `ran` is empty.
+    pub fn code_filter(&self, ran: &[Vec<Addr>], not_ran: &[Vec<Addr>]) -> Vec<Function> {
+        let in_code = |a: Addr| {
+            let i = self.code.partition_point(|r| r.0 <= a);
+            i > 0 && a < self.code[i - 1].1
+        };
+        let funcs = |set: &Vec<Addr>| -> BTreeSet<Addr> {
+            set.iter().filter(|&&a| in_code(a)).filter_map(|&a| self.function_at(a)).map(|f| f.addr).collect()
+        };
+        let Some((first, rest)) = ran.split_first() else { return Vec::new() };
+        let mut keep = funcs(first);
+        for s in rest {
+            let f = funcs(s);
+            keep.retain(|a| f.contains(a));
+        }
+        for s in not_ran {
+            for a in funcs(s) {
+                keep.remove(&a);
+            }
+        }
+        keep.into_iter()
+            .filter_map(|a| self.functions.binary_search_by_key(&a, |f| f.addr).ok().map(|i| self.functions[i].clone()))
+            .collect()
+    }
+
+    /// Writes the dissection as an `.hhdis` file (format in the module docs).
+    pub fn save(&self, path: &Path, progress: &Progress) -> Result<()> {
+        #[derive(Serialize)]
+        struct MetaRef<'a> {
+            modules: &'a [String],
+            code_bytes: u64,
+            instructions: u64,
+            functions: &'a [Function],
+            strings: &'a [StringRef],
+            caves: &'a [Cave],
+            code: &'a [(Addr, Addr)],
+        }
+        let meta = serde_json::to_vec(&MetaRef {
+            modules: &self.modules,
+            code_bytes: self.code_bytes,
+            instructions: self.instructions,
+            functions: &self.functions,
+            strings: &self.strings,
+            caves: &self.caves,
+            code: &self.code,
+        })
+        .map_err(|e| Error::Other(format!("dissection JSON: {e}")))?;
+        progress.start(self.to.len() as u64);
+        let mut w = BufWriter::new(std::fs::File::create(path)?);
+        w.write_all(DMAGIC)?;
+        w.write_all(&DVERSION.to_le_bytes())?;
+        w.write_all(&0u32.to_le_bytes())?;
+        w.write_all(&(meta.len() as u64).to_le_bytes())?;
+        w.write_all(&meta)?;
+        w.write_all(&(self.to.len() as u64).to_le_bytes())?;
+        for i in 0..self.to.len() {
+            if i % (1 << 16) == 0 {
+                progress.check()?;
+                progress.add(i.min(1 << 16) as u64);
+            }
+            w.write_all(&self.to[i].to_le_bytes())?;
+            w.write_all(&self.from[i].to_le_bytes())?;
+            w.write_all(&[self.kind[i] as u8])?;
+        }
+        w.flush()?;
+        progress.start(self.to.len() as u64);
+        progress.add(self.to.len() as u64);
+        Ok(())
+    }
+
+    /// Reads an `.hhdis` file written by [`Dissection::save`], validating it.
+    pub fn load(path: &Path, progress: &Progress) -> Result<Dissection> {
+        let bad = |m: &str| Error::Parse(format!("dissection file: {m}"));
+        let f = std::fs::File::open(path)?;
+        let size = f.metadata()?.len();
+        let mut r = BufReader::new(f);
+        let mut head = [0u8; 24];
+        r.read_exact(&mut head).map_err(|_| bad("too short"))?;
+        if &head[..8] != DMAGIC {
+            return Err(bad("not a HeapHook dissection"));
+        }
+        let u32_at = |o: usize| u32::from_le_bytes([head[o], head[o + 1], head[o + 2], head[o + 3]]);
+        if u32_at(8) != DVERSION {
+            return Err(bad(&format!("unsupported version {}", u32_at(8))));
+        }
+        let meta_len = u64::from_le_bytes(head[16..24].try_into().unwrap_or_default());
+        if meta_len > MAX_META_BYTES || meta_len > size.saturating_sub(24) {
+            return Err(bad("metadata length out of range"));
+        }
+        let mut meta = vec![0u8; meta_len as usize];
+        r.read_exact(&mut meta).map_err(|_| bad("truncated"))?;
+        #[derive(Deserialize)]
+        struct Meta {
+            modules: Vec<String>,
+            code_bytes: u64,
+            instructions: u64,
+            functions: Vec<Function>,
+            strings: Vec<StringRef>,
+            caves: Vec<Cave>,
+            #[serde(default)]
+            code: Vec<(Addr, Addr)>,
+        }
+        let mut m: Meta = serde_json::from_slice(&meta).map_err(|e| bad(&format!("metadata: {e}")))?;
+        drop(meta);
+        let sorted = |v: Vec<Addr>| v.windows(2).all(|w| w[0] < w[1]);
+        if !sorted(m.functions.iter().map(|f| f.addr).collect())
+            || !sorted(m.strings.iter().map(|s| s.addr).collect())
+            || !sorted(m.caves.iter().map(|c| c.addr).collect())
+        {
+            return Err(bad("functions, strings and caves must be sorted by address"));
+        }
+        let mut n = [0u8; 8];
+        r.read_exact(&mut n).map_err(|_| bad("truncated"))?;
+        let count = u64::from_le_bytes(n);
+        let left = size.saturating_sub(24 + meta_len + 8);
+        if count > MAX_SAVED_REFS || count.saturating_mul(17) != left {
+            return Err(bad("reference count does not match the file"));
+        }
+        progress.start(count);
+        let count = count as usize;
+        let (mut to, mut from, mut kind) = (Vec::with_capacity(count), Vec::with_capacity(count), Vec::with_capacity(count));
+        let mut rec = [0u8; 17];
+        let mut prev: Option<Ref> = None;
+        for i in 0..count {
+            if i % (1 << 16) == 0 {
+                progress.check()?;
+            }
+            r.read_exact(&mut rec).map_err(|_| bad("truncated"))?;
+            let k = match rec[16] {
+                0 => RefKind::Call,
+                1 => RefKind::Jump,
+                2 => RefKind::CondJump,
+                3 => RefKind::Data,
+                b => return Err(bad(&format!("reference kind {b}"))),
+            };
+            let x: Ref = (u64::from_le_bytes(rec[..8].try_into().unwrap_or_default()), u64::from_le_bytes(rec[8..16].try_into().unwrap_or_default()), k);
+            if prev.is_some_and(|p| p >= x) {
+                return Err(bad("references not sorted"));
+            }
+            prev = Some(x);
+            to.push(x.0);
+            from.push(x.1);
+            kind.push(x.2);
+        }
+        progress.add(count as u64);
+        let by_callers = rank(&m.functions);
+        m.code.sort_unstable();
+        Ok(Dissection {
+            modules: m.modules,
+            code_bytes: m.code_bytes,
+            instructions: m.instructions,
+            to,
+            from,
+            kind,
+            functions: m.functions,
+            by_callers,
+            strings: m.strings,
+            caves: m.caves,
+            code: m.code,
+        })
+    }
 }
+
+const DMAGIC: &[u8; 8] = b"HHDISS\0\0";
+const DVERSION: u32 = 1;
+/// Most references and most metadata bytes a dissection file may hold.
+pub const MAX_SAVED_REFS: u64 = 1 << 27;
+pub const MAX_META_BYTES: u64 = 256 << 20;
 
 /// Readable images of the dissected modules, sorted by start.
 struct Img {
     start: Addr,
     data: Vec<u8>,
     exec: bool,
+    writable: bool,
 }
 
 struct Images {
@@ -236,6 +495,92 @@ impl Images {
     }
     fn is_code(&self, a: Addr) -> bool {
         self.get(a).is_some_and(|(m, _)| m.exec)
+    }
+    /// Pointer stored in a slot that cannot change: a read-only image part (import address
+    /// table, GOT after RELRO).
+    fn const_ptr(&self, a: Addr) -> Option<Addr> {
+        let (m, _) = self.get(a)?;
+        (!m.writable).then(|| self.ptr(a)).flatten().filter(|&v| v != 0)
+    }
+}
+
+/// Address of a memory operand that does not depend on registers.
+fn abs_mem(ins: &Instruction) -> Option<Addr> {
+    if ins.is_ip_rel_memory_operand() {
+        Some(ins.ip_rel_memory_address())
+    } else if ins.memory_base() == Register::None
+        && ins.memory_index() == Register::None
+        && !matches!(ins.memory_segment(), Register::FS | Register::GS)
+    {
+        Some(ins.memory_displacement64())
+    } else {
+        None
+    }
+}
+
+/// `mov reg, [slot]`: (full register, slot address).
+fn slot_load(ins: &Instruction) -> Option<(Register, Addr)> {
+    if ins.mnemonic() != Mnemonic::Mov || ins.op_count() != 2 || ins.op0_kind() != OpKind::Register || ins.op1_kind() != OpKind::Memory {
+        return None;
+    }
+    Some((ins.op0_register().full_register(), abs_mem(ins)?))
+}
+
+/// Final target of a `jmp [slot]` thunk (PLT entry, import stub) at `a` whose slot is constant.
+fn thunk_target(imgs: &Images, a: Addr) -> Option<Addr> {
+    if !imgs.is_code(a) {
+        return None;
+    }
+    let b = imgs.bytes(a)?;
+    let mut d = Decoder::with_ip(imgs.bits, &b[..b.len().min(15)], a, DecoderOptions::NONE);
+    let ins = d.decode();
+    if ins.flow_control() != FlowControl::IndirectBranch || ins.op0_kind() != OpKind::Memory {
+        return None;
+    }
+    imgs.const_ptr(abs_mem(&ins)?).filter(|&t| t != a)
+}
+
+/// Calls into a thunk also count as calls to the function the thunk jumps to. `refs` is
+/// sorted and stays sorted.
+fn resolve_thunks(imgs: &Images, refs: &mut Vec<Ref>) {
+    let mut add = Vec::new();
+    let mut cur: Option<(Addr, Option<Addr>)> = None;
+    for r in refs.iter().filter(|r| r.2 == RefKind::Call) {
+        let t = match cur {
+            Some((a, t)) if a == r.0 => t,
+            _ => {
+                let t = thunk_target(imgs, r.0);
+                cur = Some((r.0, t));
+                t
+            }
+        };
+        if let Some(t) = t {
+            add.push((t, r.1, RefKind::Call));
+        }
+    }
+    if !add.is_empty() {
+        refs.extend(add);
+        refs.par_sort_unstable();
+        refs.dedup();
+    }
+}
+
+/// Indexes of called functions, most callers first.
+fn rank(functions: &[Function]) -> Vec<u32> {
+    let mut v: Vec<u32> = (0..functions.len() as u32).filter(|&i| functions[i as usize].callers > 0).collect();
+    v.sort_by_key(|&i| std::cmp::Reverse(functions[i as usize].callers));
+    v
+}
+
+/// `call reg` right after `mov reg, [slot]` with a constant slot: a call to the slot's value.
+fn reg_call(ins: &Instruction, prev: Option<(Register, Addr)>, imgs: &Images, out: &mut Vec<Ref>) {
+    if ins.flow_control() == FlowControl::IndirectCall
+        && ins.op0_kind() == OpKind::Register
+        && let Some((r, slot)) = prev
+        && ins.op0_register().full_register() == r
+        && let Some(t) = imgs.const_ptr(slot)
+    {
+        out.push((t, ins.ip(), RefKind::Call));
     }
 }
 
@@ -317,6 +662,7 @@ pub fn dissect(
                     start: lo,
                     data,
                     exec: r.prot.x,
+                    writable: r.prot.w,
                 });
             }
         }
@@ -331,6 +677,7 @@ pub fn dissect(
             .collect(),
     };
     let code_bytes: u64 = imgs.list.iter().filter(|m| m.exec).map(|m| m.data.len() as u64).sum();
+    let code: Vec<(Addr, Addr)> = imgs.list.iter().filter(|m| m.exec).map(|m| (m.start, m.start + m.data.len() as u64)).collect();
     progress.start(code_bytes);
 
     // Linear sweep, chunk-parallel. A chunk starts decoding at its first byte; the sweep
@@ -354,6 +701,7 @@ pub fn dissect(
             let mut d = Decoder::with_ip(bits, slice, m.start + o as u64, DecoderOptions::NONE);
             let mut ins = Instruction::default();
             let mut sw = Swept { starts: vec![0; (end - o).div_ceil(64)], ..Default::default() };
+            let mut prev = None;
             while d.can_decode() && d.position() < end - o {
                 let pos = d.position();
                 d.decode_out(&mut ins);
@@ -361,7 +709,9 @@ pub fn dissect(
                     sw.n += 1;
                     sw.starts[pos / 64] |= 1 << (pos % 64);
                     refs_of(&ins, &imgs, &mut sw.refs);
+                    reg_call(&ins, prev, &imgs, &mut sw.refs);
                 }
+                prev = slot_load(&ins);
             }
             scan_caves(&m.data[o..end], m.start + o as u64, opts.min_cave, true, &mut sw.caves);
             progress.add((end - o) as u64);
@@ -383,12 +733,15 @@ pub fn dissect(
     let mut names: HashMap<Addr, String> = HashMap::new();
     let mut seeds: Vec<Addr> = Vec::new();
     for m in modules {
-        if let Ok(h) = crate::headers::summary(p, m)
+        if let Ok(h) = crate::headers::summary_with(p, m, opts.local_files)
             && h.entry != 0
         {
             seeds.push(h.entry);
         }
-        for s in hh_asm::module_symbols(p, m) {
+        // shortcut: hh-asm (at this crate's start commit) has no memory-only symbol loader, so
+        // a remote dissection has no names; switch to it once hh-asm has one.
+        let syms = if opts.local_files { hh_asm::module_symbols(p, m) } else { Vec::new() };
+        for s in syms {
             if imgs.is_code(s.addr) {
                 seeds.push(s.addr);
                 names.entry(s.addr).or_insert(s.name);
@@ -404,6 +757,7 @@ pub fn dissect(
     progress.check()?;
     refs.par_sort_unstable();
     refs.dedup();
+    resolve_thunks(&imgs, &mut refs);
 
     // Functions: call targets (refs are sorted by target) plus seeds.
     let mut calls: Vec<(Addr, u32)> = Vec::new();
@@ -423,8 +777,7 @@ pub fn dissect(
         .into_iter()
         .map(|(addr, callers)| Function { addr, callers, internal: imgs.is_code(addr), name: names.get(&addr).cloned() })
         .collect();
-    let mut by_callers: Vec<u32> = (0..functions.len() as u32).filter(|&i| functions[i as usize].callers > 0).collect();
-    by_callers.sort_by_key(|&i| std::cmp::Reverse(functions[i as usize].callers));
+    let by_callers = rank(&functions);
 
     // Strings at data targets.
     let mut strings = Vec::new();
@@ -463,6 +816,7 @@ pub fn dissect(
         by_callers,
         strings,
         caves,
+        code,
     })
 }
 
@@ -495,6 +849,7 @@ fn recursive(imgs: &Images, mut seen: Vec<Vec<u64>>, seeds: &[Addr], out: &mut V
         let Some((i, o)) = idx(a) else { continue };
         let m = &imgs.list[i];
         let mut d = Decoder::with_ip(imgs.bits, &m.data[o..], a, DecoderOptions::NONE);
+        let mut prev = None;
         while d.can_decode() {
             let o = o + d.position();
             if is_seen(&seen, (i, o)) {
@@ -507,6 +862,8 @@ fn recursive(imgs: &Images, mut seen: Vec<Vec<u64>>, seeds: &[Addr], out: &mut V
             }
             local.clear();
             refs_of(&ins, imgs, &mut local);
+            reg_call(&ins, prev, imgs, &mut local);
+            prev = slot_load(&ins);
             for r in &local {
                 if r.2 != RefKind::Data && idx(r.0).is_some_and(|x| !is_seen(&seen, x)) {
                     work.push(r.0);

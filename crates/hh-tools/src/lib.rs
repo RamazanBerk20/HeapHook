@@ -2,19 +2,26 @@
 //! library calls with serde-serializable inputs and outputs (addresses travel as `"0x..."`
 //! strings, see [`hexaddr`]).
 //!
-//! - [`structure`]: structure dissector (definitions, auto-guess, multi-address compare,
-//!   structure spider, `.CT` `<Structures>` import/export, cheat-table entries).
+//! - [`structure`]: structure dissector (definitions with bit fields and arrays, auto-guess
+//!   with RTTI / symbol naming and an override hook, multi-address compare, lock and
+//!   changed-field highlighting, structure spider, `.CT` `<Structures>` import/export, C / C#
+//!   definitions, cheat-table entries with pointer paths).
 //! - [`dissect`]: "Dissect code" (functions, cross references, referenced strings and
-//!   functions, code caves) over whole modules, parallel, with paged queries.
-//! - [`memory`]: region view, save/load memory to a file, fill, copy, snapshots and diffs,
-//!   "find what points to X".
+//!   functions, code caves) over whole modules, parallel, with paged queries; incremental
+//!   modules, a code filter over caller-recorded execution sets, `.hhdis` save/load.
+//! - [`memory`]: region view and statistics, save/load memory to a file (with a load plan to
+//!   confirm first), search in saved files, fill, copy, snapshots, diffs and a page change
+//!   map, "find what points to X".
 //! - [`signature`]: unique AOB signatures with wildcarded relocatable operands.
 //! - [`headers`]: PE / ELF header summaries.
 //! - [`codelist`]: Cheat Engine's code list ("advanced options"): NOP / restore with
 //!   original-byte verification.
 //!
 //! Long operations take a [`Progress`] that another thread can poll or cancel.
-//! Skipped (need kernel support or a tracer): Ultimap 1/2, Intel PT, code filter via tracing.
+//! Files, cheat tables and target memory are untrusted: every format has caps and is
+//! validated on load. Remote targets pass `local_files = false` where module files would be
+//! read (headers, dissection, structure guessing) so a same-named local file is never parsed.
+//! Skipped (need kernel support or a tracer): Ultimap 1/2, Intel PT, recording executed code.
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
 
 use hh_core::{Addr, Error, Process, Region};
@@ -160,6 +167,29 @@ pub(crate) fn read_some(p: &dyn hh_core::Memory, addr: Addr, len: usize) -> Vec<
     let n = p.read(addr, &mut b).unwrap_or(0);
     b.truncate(n);
     b
+}
+
+/// Text for an XML attribute value or element body. Markup characters and the whitespace an
+/// attribute would normalise away become references; characters XML 1.0 cannot carry at all
+/// (C0 controls other than tab / LF / CR, U+FFFE, U+FFFF) become U+FFFD, so the output always
+/// parses back.
+pub(crate) fn xml_escape(s: &str) -> String {
+    let mut o = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => o.push_str("&amp;"),
+            '<' => o.push_str("&lt;"),
+            '>' => o.push_str("&gt;"),
+            '"' => o.push_str("&quot;"),
+            '\'' => o.push_str("&apos;"),
+            '\t' => o.push_str("&#9;"),
+            '\n' => o.push_str("&#10;"),
+            '\r' => o.push_str("&#13;"),
+            '\u{0}'..='\u{1f}' | '\u{fffe}' | '\u{ffff}' => o.push('\u{fffd}'),
+            c => o.push(c),
+        }
+    }
+    o
 }
 
 /// Largest single buffer a request may ask for (bad input fails instead of allocating).

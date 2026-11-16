@@ -81,6 +81,9 @@ const P = {
   struct: '<rect x="3" y="4" width="7" height="5" rx="1"/><rect x="14" y="15" width="7" height="5" rx="1"/><path d="M6.5 9v8.5H14M6.5 13H14"/>',
   clock: '<circle cx="12" cy="12" r="8"/><path d="M12 8v4l3 2"/>',
   info: '<circle cx="12" cy="12" r="9"/><path d="M12 11v6M12 7.5h.01"/>',
+  more: '<circle cx="5" cy="12" r="1.2"/><circle cx="12" cy="12" r="1.2"/><circle cx="19" cy="12" r="1.2"/>',
+  calc: '<rect x="5" y="3" width="14" height="18" rx="2"/><path d="M8 7h8M8.5 12h.01M12 12h.01M15.5 12h.01M8.5 16h.01M12 16h.01M15.5 16h.01"/>',
+  shield: '<path d="M12 3 5 6v5c0 4.5 3 8 7 10 4-2 7-5.5 7-10V6z"/><path d="M12 8v5M12 16h.01"/>',
   server: '<rect x="3" y="4" width="18" height="7" rx="1.5"/><rect x="3" y="13" width="18" height="7" rx="1.5"/><path d="M7 7.5h.01M7 16.5h.01"/>',
 };
 export const icon = (name, cls = '') =>
@@ -185,6 +188,7 @@ export function contextMenu(x, y, items, returnFocus) {
   closeMenu();
   const el = h('div.menu', { role: 'menu' });
   for (const it of items) {
+    if (!it) continue;
     if (it === '-') { el.append(h('div.menu-sep', { role: 'separator' })); continue; }
     const b = h('button.menu-item', {
       role: it.checked == null ? 'menuitem' : 'menuitemradio', 'aria-checked': it.checked == null ? null : String(!!it.checked),
@@ -234,6 +238,24 @@ export function prompt(title, value = '', { label = title, hint = '', mono = tru
 }
 
 export const kbdHint = (s) => h('kbd', null, s);
+
+/**
+ * Adds lines to the F1 shortcut list: `section` is a <dt> title (created in the second column
+ * when missing); each item is `[keys, text]`, keys like "Ctrl F" or "Ctrl F / F3" (split on " / ").
+ */
+export function helpAdd(section, items) {
+  const cols = $$('#dlg-help dl');
+  let dt = $$('#dlg-help dt').find((d) => d.textContent === section);
+  if (!dt) { dt = h('dt', null, section); cols.at(-1).append(dt); }
+  let at = dt;
+  while (at.nextElementSibling?.tagName === 'DD') at = at.nextElementSibling;
+  for (const [keys, text] of items) {
+    const parts = keys.split(' / ').flatMap((k, i) => (i ? [' / ', h('kbd', null, k)] : [h('kbd', null, k)]));
+    const dd = h('dd', null, ...parts, ' ' + text);
+    at.after(dd);
+    at = dd;
+  }
+}
 
 /** Characters that hide or reorder text (controls, zero-width, bidi overrides): never shown raw from untrusted text. */
 const HIDDEN = /[\u0000-\u0008\u000b-\u001f\u007f-\u009f​-‏‪-‮⁠-⁩﻿]/g;

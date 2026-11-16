@@ -6,6 +6,7 @@ use std::process::{Child, ChildStdin, Command, Stdio};
 
 use hh_ptr::{
     CollectOptions, PointerMap, PointerPath, Progress, RescanOptions, ScanOptions, Source,
+    thread_stacks,
 };
 use serde_json::Value;
 
@@ -148,4 +149,40 @@ fn rediscovers_hh_target_chain() {
     }
     std::fs::remove_file(tmp("scan")).ok();
     std::fs::remove_file(tmp("rescan")).ok();
+}
+
+#[test]
+fn paused_and_resumed_scan_of_hh_target() {
+    let t = Target::spawn();
+    let p = hh_core::open(t.child.id()).unwrap();
+    let (chain, value) = (t.addr("chain"), t.addr("chain_value"));
+
+    // hh-target has an idle second thread, parked in a futex wait: its stack is found
+    // from /proc/<pid>/task/<tid>/syscall (we are its parent, so ptrace access is allowed).
+    let stacks = thread_stacks(&*p, true).unwrap();
+    assert_eq!(thread_stacks(&*p, false).unwrap().len(), 1, "only [stack] is tagged");
+    assert!(stacks.len() >= 2, "{stacks:x?}");
+    let map = PointerMap::collect_ex(&*p, &CollectOptions::default(), true, &Progress::new()).unwrap();
+    assert_eq!(map.stack_ranges(), stacks);
+
+    let o = ScanOptions { max_level: 4, max_offset: 0x100, stack_max: 0x10000, ..Default::default() };
+    let out = std::env::temp_dir().join(format!("hh-ptr-live-{}-paused", std::process::id()));
+    let prog = Progress::new();
+    prog.pause();
+    let r = std::thread::scope(|s| {
+        let h = s.spawn(|| map.scan(value, &o, &[], &out, &prog));
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert!(!h.is_finished() && prog.snapshot().paused && prog.snapshot().found == 0);
+        prog.resume();
+        h.join().unwrap().unwrap()
+    });
+    assert!(r.is_compact() && !r.is_empty());
+    let rows = r.results_ex(0, 1000, Some(&*p), true).unwrap();
+    assert!(rows.iter().all(|row| row.address == Some(value)), "every path resolves");
+    let exe = map.modules.iter().find(|m| m.name == "hh-target").unwrap();
+    if (exe.base..exe.base + exe.size).contains(&chain) {
+        let paths = r.read(0, r.len() as usize).unwrap();
+        assert!(paths.iter().any(|p| p.module.as_deref() == Some("hh-target") && p.base_offset == (chain - exe.base) as i64));
+    }
+    std::fs::remove_file(out).ok();
 }

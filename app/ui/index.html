@@ -5,6 +5,9 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>HeapHook</title>
 <link rel="stylesheet" href="styles.css">
+<link rel="stylesheet" href="editor.css">
+<link rel="stylesheet" href="mem.css">
+<link rel="stylesheet" href="dbg.css">
 <script type="module" src="app.js"></script>
 </head>
 <body>
@@ -15,6 +18,7 @@
     <kbd>Ctrl P</kbd>
   </button>
   <button id="remote-badge" class="badge blue remote-badge" type="button" hidden aria-haspopup="menu" title="The target is on a remote server. Click to disconnect."></button>
+  <button id="paused-badge" class="badge yellow paused-badge" type="button" hidden title="The process is paused. Click to resume it (Ctrl Alt P)">paused</button>
   <button id="lua-stop-top" class="btn ghost lua-top" type="button" hidden title="Stop the running Lua script (Esc)" aria-label="Stop the running Lua script" data-icon="stop"><span class="bl">Stop script</span> <kbd>Esc</kbd></button>
   <button id="lf-close-all" class="btn ghost lua-top" type="button" hidden title="Close every window a Lua script opened" aria-label="Close every window a Lua script opened" data-icon="x"><span class="bl">Close scripts</span></button>
   <nav class="tabs" role="tablist" aria-label="Views">
@@ -33,7 +37,9 @@
   </button>
  <button id="speed-btn" class="dbg-btn speed-btn" type="button" hidden title="Speedhack (Ctrl Shift Up / Down / Backspace)" data-icon="clock"><span id="speed-text" class="mono">1×</span></button>
   <span id="mock-badge" class="badge yellow" hidden title="No Tauri runtime: using the built-in mock backend">mock backend</span>
+  <button id="tools-btn" class="btn ghost icon" type="button" aria-haspopup="menu" aria-label="Tools and more" title="Tools: calculator, Auto Assemble, compact mode, table files (Alt T)" data-icon="more"></button>
   <button title="Open (Ctrl O)" id="tbl-open" class="btn ghost" type="button" data-icon="folder"><span class="bl">Open</span> <kbd>Ctrl O</kbd></button>
+  <button id="tbl-recent" class="btn ghost icon recent-btn" type="button" aria-haspopup="menu" aria-label="Recent tables" title="Recent tables" data-icon="chevD"></button>
   <button title="Save (Ctrl S)" id="tbl-save" class="btn ghost" type="button" data-icon="save"><span class="bl">Save</span> <kbd>Ctrl S</kbd></button>
   <button id="settings-btn" class="btn ghost icon" type="button" aria-label="Settings (Ctrl ,)" title="Settings (Ctrl ,)" data-icon="gear"></button>
   <button id="help-btn" class="btn ghost icon" type="button" aria-label="Keyboard shortcuts (F1)" title="Keyboard shortcuts (F1)" data-icon="keyboard"></button>
@@ -180,6 +186,7 @@
     <section id="table" class="panel table" aria-labelledby="tbl-title">
       <div class="panel-head">
         <h2 id="tbl-title">Cheat table <span id="tbl-count" class="count mono"></span></h2>
+        <div class="tbl-search search" data-icon="search"><input id="tbl-filter" type="search" placeholder="Filter (Ctrl F)" aria-label="Filter the cheat table by description or address" spellcheck="false" autocomplete="off"></div>
         <div class="toolbar">
           <button id="tb-add" class="btn ghost" type="button" data-icon="plus">Address <kbd>Ctrl Shift A</kbd></button>
           <button id="tb-script" class="btn ghost" type="button" data-icon="code">Script</button>
@@ -192,7 +199,7 @@
       </div>
       <div class="tbl" role="treegrid" aria-label="Cheat table" aria-multiselectable="true" tabindex="0">
         <div class="tbl-head cols-tbl" role="row">
-          <span role="columnheader">Active</span><span role="columnheader">Description</span><span role="columnheader">Address</span><span role="columnheader">Type</span><span role="columnheader">Value</span>
+          <span role="columnheader">Active</span><span role="columnheader" data-col="description" aria-sort="none"><button type="button" class="th-sort" data-sort="description" title="Sort by description">Description</button></span><span role="columnheader" data-col="addr" aria-sort="none"><button type="button" class="th-sort" data-sort="addr" title="Sort by address">Address</button></span><span role="columnheader" data-col="vtype" aria-sort="none"><button type="button" class="th-sort" data-sort="vtype" title="Sort by type">Type</button></span><span role="columnheader" data-col="value" aria-sort="none"><button type="button" class="th-sort" data-sort="value" title="Sort by value">Value</button></span>
         </div>
         <div class="tbl-body" role="rowgroup"></div>
         <p id="tbl-empty" class="empty">No entries. Select scan results and press <kbd>Enter</kbd>, or add one with <kbd>Ctrl Shift A</kbd>.</p>
@@ -304,6 +311,7 @@
         <div class="panel-head">
           <h2 id="cl-title">Code list <span id="cl-count" class="count mono"></span></h2>
           <span class="hints"><kbd>Space</kbd> NOP / restore · <kbd>Del</kbd> remove</span>
+          <span class="toolbar"><button id="cl-pause" class="btn ghost" type="button" data-icon="pause" title="Pause / resume the whole process (Ctrl Alt P)" aria-pressed="false"><span class="bl">Pause process</span></button></span>
         </div>
         <div id="cl-list" class="list" role="listbox" aria-label="Code list" tabindex="0"></div>
       </section>
@@ -674,6 +682,8 @@
     <p id="tr-at" class="hint mono"></p>
     <div class="field"><label for="tr-steps">Instructions to trace</label><input id="tr-steps" name="steps" class="mono" type="number" min="1" max="100000" value="1000"></div>
     <label class="check"><input name="step_over_calls" type="checkbox"> Step over calls</label>
+    <div class="field"><label for="tr-stop">Stop when (optional)</label><input id="tr-stop" name="stop_when" class="mono" spellcheck="false" autocomplete="off" placeholder="e.g. rax==0 || rip==0x401000"></div>
+    <p class="hint">Checked at every traced instruction; when it holds, the trace stops and the process breaks there.</p>
     <div class="dlg-actions">
       <button class="btn primary" value="ok">Trace <kbd>Enter</kbd></button>
       <button class="btn" value="cancel" formnovalidate>Cancel <kbd>Esc</kbd></button>
@@ -684,7 +694,7 @@
 <dialog id="dlg-hotkeys" class="dlg dlg-wide" aria-labelledby="hk-title">
   <form method="dialog">
     <h2 id="hk-title">Hotkeys</h2>
-    <p class="hint">Click a key field and press the combination. Global when the system allows it, otherwise while HeapHook has focus.</p>
+    <p class="hint">Click a key field and press the combination. Each row says where it works: system-wide needs Ctrl, Shift, Alt or Win and a trusted table, and under Wayland is only sure while HeapHook has focus.</p>
     <div class="hk-head" aria-hidden="true"><span>Action</span><span>Keys</span><span>Value</span><span>Description</span><span></span></div>
     <div id="hk-rows" class="hk-rows"></div>
     <button id="hk-add" class="btn ghost" type="button" data-icon="plus">Hotkey</button>

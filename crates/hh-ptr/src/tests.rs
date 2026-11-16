@@ -820,3 +820,224 @@ fn bench_1gib() {
     }
     std::fs::remove_file(tmp("bench")).unwrap();
 }
+
+// ---------------------------------------------------------------- 1.0 feature gaps
+
+#[test]
+fn old_format_files_still_load() {
+    // Written by the fixed-size (v1) code before the compact format existed.
+    let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/v1-results.ptr");
+    let f = ResultFile::open(&fixture).unwrap();
+    assert!(!f.is_compact());
+    assert_eq!(f.len(), 10);
+    let all: BTreeSet<_> = f.read(0, usize::MAX).unwrap().into_iter().collect();
+    assert_eq!(all, expected());
+    assert_eq!(f.read(9, 5).unwrap().len(), 1);
+    // Rescans and sorts of an old file write the new format.
+    let img = image();
+    let map = collect(&img.fake, &CollectOptions::default());
+    let r = f.rescan(Source::Map(&map), &RescanOptions { target: Some(img.target), ..Default::default() }, &tmp("v1-rescan"), &Progress::new()).unwrap();
+    assert!(r.is_compact() && r.len() == 10);
+    let s = f.sorted(&tmp("v1-sorted")).unwrap();
+    assert!(s.is_compact());
+    assert_eq!(s.read(0, usize::MAX).unwrap().into_iter().collect::<BTreeSet<_>>(), expected());
+    for n in ["v1-rescan", "v1-sorted"] {
+        std::fs::remove_file(tmp(n)).unwrap();
+    }
+}
+
+fn header(bases: &[&str], max_level: usize) -> ResultHeader {
+    ResultHeader { pointer_size: 8, max_level, target: 0x1234, bases: bases.iter().map(|s| s.to_string()).collect() }
+}
+
+/// Writes `paths` (base index or `ABS`, base offset, offsets) as a v2 file.
+fn write_v2(path: &std::path::Path, h: &ResultHeader, paths: &[(u32, i64, Vec<i64>)]) -> ResultFile {
+    let mut w = results::Writer::create(path, h).unwrap();
+    let mut buf = Vec::new();
+    for (b, o, offs) in paths {
+        results::encode(&mut buf, *b, *o, offs.iter().copied());
+    }
+    w.write_encoded(&buf).unwrap();
+    w.finish().unwrap();
+    ResultFile::open(path).unwrap()
+}
+
+#[test]
+fn compact_format_pages_and_rejects_corruption() {
+    let h = header(&["a.exe", "b.dll"], 4);
+    let paths: Vec<(u32, i64, Vec<i64>)> = (0..10_000i64)
+        .map(|i| (if i % 3 == 0 { results::ABS } else { (i % 2) as u32 }, i * 8 - 4000, (0..(i % 4 + 1)).map(|k| k * 0x10 - (i % 5)).collect()))
+        .collect();
+    let out = tmp("v2-paging");
+    let f = write_v2(&out, &h, &paths);
+    assert!(f.is_compact() && f.len() == 10_000);
+    let want = |i: usize| {
+        let (b, o, offs) = &paths[i];
+        PointerPath { module: (*b != results::ABS).then(|| h.bases[*b as usize].clone()), base_offset: *o, offsets: offs.clone() }
+    };
+    for (off, n) in [(0, 3), (4095, 3), (4096, 1), (8190, 5), (9998, 10)] {
+        let got = f.read(off, n).unwrap();
+        let exp: Vec<_> = (off as usize..(off as usize + n).min(10_000)).map(want).collect();
+        assert_eq!(got, exp, "page at {off}");
+    }
+    assert!(f.read(10_000, 5).unwrap().is_empty() && f.read(u64::MAX, 5).unwrap().is_empty());
+    // Much smaller than fixed-size records: 12 + header + 10000 * (13 + 4 * 4) for v1.
+    let size = std::fs::metadata(&out).unwrap().len();
+    assert!(size < 10_000 * 29 / 3, "{size} bytes");
+
+    // Hostile files are errors, never panics or huge allocations.
+    let good = std::fs::read(&out).unwrap();
+    let try_bytes = |b: &[u8]| {
+        std::fs::write(&out, b).unwrap();
+        ResultFile::open(&out).and_then(|f| f.read(0, usize::MAX))
+    };
+    assert!(try_bytes(&good[..good.len() - 1]).is_err());
+    let mut b = good.clone();
+    let n = b.len();
+    b[n - 16..n - 8].copy_from_slice(&u64::MAX.to_le_bytes()); // absurd count
+    assert!(try_bytes(&b).is_err());
+    let mut b = good.clone();
+    b[n - 8..].copy_from_slice(&3u64.to_le_bytes()); // index offset inside the records
+    assert!(try_bytes(&b).is_err());
+    let mut b = good.clone();
+    let hlen = u32::from_le_bytes(b[8..12].try_into().unwrap()) as usize;
+    b[12 + hlen..12 + hlen + 40].fill(0xff); // unterminated varints
+    assert!(try_bytes(&b).is_err());
+    let mut b = good.clone();
+    b[12 + hlen] = 9; // base index out of range
+    assert!(try_bytes(&b).is_err());
+    std::fs::remove_file(out).unwrap();
+}
+
+#[test]
+fn external_merge_sort_matches_in_memory_sort() {
+    // Two inputs with different base name lists, duplicates within and across files.
+    let a: Vec<(u32, i64, Vec<i64>)> = (0..300i64).map(|i| ((i % 2) as u32, (i * 7919) % 101, vec![i % 3, -(i % 7)])).collect();
+    let b: Vec<(u32, i64, Vec<i64>)> = (0..200i64).map(|i| (if i % 4 == 0 { results::ABS } else { 0 }, (i * 31) % 50, vec![i % 3])).collect();
+    let fa = write_v2(&tmp("merge-a"), &header(&["z.so", "a.exe"], 2), &a);
+    let fb = write_v2(&tmp("merge-b"), &header(&["m.dll"], 3), &b);
+    let paths = |f: &ResultFile| f.read(0, usize::MAX).unwrap();
+    let mut want: Vec<PointerPath> = paths(&fa).into_iter().chain(paths(&fb)).collect();
+    let key = |p: &PointerPath| {
+        let names = ["a.exe", "m.dll", "z.so"];
+        let base = p.module.as_deref().map_or(u32::MAX, |m| names.iter().position(|n| *n == m).unwrap() as u32);
+        let mut offs = [0i64; MAX_LEVEL];
+        offs[..p.offsets.len()].copy_from_slice(&p.offsets);
+        (p.offsets.len(), base, p.base_offset, offs)
+    };
+    want.sort_by_key(key);
+    want.dedup();
+    let in_memory = results::merge_runs(&[&fa, &fb], &tmp("merge-mem"), usize::MAX).unwrap();
+    assert_eq!(paths(&in_memory), want);
+    // Runs of 1 record: 500 run files, merged 64 at a time.
+    for run in [1, 3, 64] {
+        let ext = results::merge_runs(&[&fa, &fb], &tmp("merge-ext"), run).unwrap();
+        assert_eq!(paths(&ext), want, "run {run}");
+        assert_eq!(ext.header.bases, ["a.exe", "m.dll", "z.so"]);
+        assert_eq!(ext.header.max_level, 3);
+    }
+    let left = std::fs::read_dir(std::env::temp_dir()).unwrap().flatten().filter(|e| e.file_name().to_string_lossy().contains("merge-ext.run")).count();
+    assert_eq!(left, 0, "run files left behind");
+    // Sorting a file onto itself works: inputs are read before the output is written.
+    let fa2 = fa.sorted(fa.path()).unwrap();
+    assert_eq!(fa2.len(), paths(&fa2).len() as u64);
+    for n in ["merge-a", "merge-b", "merge-mem", "merge-ext"] {
+        std::fs::remove_file(tmp(n)).unwrap();
+    }
+}
+
+#[test]
+fn scan_offset_filters() {
+    let img = image();
+    let map = collect(&img.fake, &CollectOptions::default());
+    let all = expected();
+    let filtered = |keep: &dyn Fn(&PointerPath) -> bool| all.iter().filter(|p| keep(p)).cloned().collect::<BTreeSet<_>>();
+    let o = |f: &dyn Fn(&mut ScanOptions)| {
+        let mut o = ScanOptions::default();
+        f(&mut o);
+        o
+    };
+    let sw = o(&|o| o.starts_with = vec![0x10]);
+    assert_eq!(scan_set(&map, img.target, &sw, "starts"), filtered(&|p| p.offsets.starts_with(&[0x10])));
+    let sw2 = o(&|o| o.starts_with = vec![0x10, 0x10, 0x10]);
+    assert_eq!(scan_set(&map, img.target, &sw2, "starts3"), filtered(&|p| p.offsets.starts_with(&[0x10, 0x10, 0x10])));
+    let allowed = [0x10, 0x40, 0x28, 0x24];
+    let ao = o(&|o| o.allowed_offsets = allowed.to_vec());
+    assert_eq!(scan_set(&map, img.target, &ao, "allowed"), filtered(&|p| p.offsets.iter().all(|x| allowed.contains(x))));
+    // game+0xA08 is a static node: nothing is searched behind it.
+    let st = o(&|o| o.stop_at_static = true);
+    assert_eq!(scan_set(&map, img.target, &st, "static"), filtered(&|p| *p != g(0x900, &[8, 0x2C])));
+    let bad = o(&|o| o.starts_with = vec![1 << 40]);
+    assert!(map.scan(img.target, &bad, &[], &tmp("bad"), &Progress::new()).is_err());
+}
+
+#[test]
+fn pause_resume_and_time_limit() {
+    let img = image();
+    let map = collect(&img.fake, &CollectOptions::default());
+    let prog = Progress::new();
+    prog.pause();
+    let o = ScanOptions { time_limit_secs: 1, ..ScanOptions::default() };
+    std::thread::scope(|s| {
+        let h = s.spawn(|| map.scan(img.target, &o, &[], &tmp("paused"), &prog));
+        std::thread::sleep(std::time::Duration::from_millis(1300));
+        assert!(!h.is_finished() && prog.snapshot().paused);
+        assert_eq!(prog.snapshot().found, 0);
+        prog.resume();
+        // Paused time does not count against the 1 s limit: everything is found.
+        let r = h.join().unwrap().unwrap();
+        assert_eq!(r.read(0, usize::MAX).unwrap().into_iter().collect::<BTreeSet<_>>(), expected());
+    });
+    assert!(!prog.snapshot().paused && prog.paused_for() >= std::time::Duration::from_millis(1300));
+    // Cancel ends a paused collect too.
+    let p2 = Progress::new();
+    p2.pause();
+    p2.cancel();
+    assert!(PointerMap::collect(&img.fake, &CollectOptions::default(), &p2).is_err());
+    std::fs::remove_file(tmp("paused")).unwrap();
+}
+
+#[test]
+fn per_thread_stacks_in_maps() {
+    let mut img = image();
+    // A second thread's stack: an untagged private mapping the caller identified.
+    let stack1: Addr = 0x7fa0_0000;
+    img.fake.region(stack1, 0x10000, true, RegionKind::Private, None);
+    img.chain(stack1 + 0x10000 - 0x80, &[0x30]);
+    // Remote / unknown processes degrade to the tagged stack regions.
+    assert_eq!(thread_stacks(&img.fake, true).unwrap(), [(0x7ff0_0000, 0x7ff1_0000)]);
+    let mut map = PointerMap::collect_ex(&img.fake, &CollectOptions::default(), true, &Progress::new()).unwrap();
+    assert_eq!(map.stack_ranges(), [(0x7ff0_0000, 0x7ff1_0000)]);
+    map.stacks = vec![(0x7ff0_0000, 0x7ff1_0000), (stack1, stack1 + 0x10000)];
+    let o = ScanOptions { stack_max: 0x100, ..ScanOptions::default() };
+    let found = scan_set(&map, img.target, &o, "stacks");
+    let want = p(Some("THREADSTACK1"), -0x80, &[0x30]);
+    assert!(found.contains(&want), "{found:?}");
+    assert_eq!(map.resolve(&want), Some(img.target));
+    // Saved maps keep the stacks.
+    let f = tmp("stacks.pmap");
+    map.save(&f).unwrap();
+    let loaded = PointerMap::load(&f).unwrap();
+    assert_eq!(loaded.stacks, map.stacks);
+    assert_eq!(loaded.resolve(&want), Some(img.target));
+    std::fs::remove_file(f).unwrap();
+}
+
+#[test]
+fn script_job_runs_in_the_background() {
+    let img = image();
+    let target = img.target;
+    let p: std::sync::Arc<dyn Process> = std::sync::Arc::new(img.fake);
+    let job = PointerScanJob::start(p.clone(), target, ScanOptions::default(), CollectOptions::default(), false, tmp("job")).unwrap();
+    let f = job.wait().unwrap();
+    assert!(job.is_done() && job.progress().found == 10);
+    assert_eq!(f.read(0, usize::MAX).unwrap().into_iter().collect::<BTreeSet<_>>(), expected());
+    assert_eq!(job.wait().unwrap().len(), 10, "wait again gives the same file");
+    let rows = f.results(0, 3, Some(&*p)).unwrap();
+    assert!(rows.iter().all(|r| r.address == Some(target)));
+    let f2 = scan_process(&*p, target, &ScanOptions::default(), &CollectOptions::default(), false, &tmp("job2"), &Progress::new()).unwrap();
+    assert_eq!(f2.len(), 10);
+    for n in ["job", "job2"] {
+        std::fs::remove_file(tmp(n)).unwrap();
+    }
+}

@@ -41,6 +41,19 @@ pub struct Settings {
     pub scan_spill_dir: String,
     /// A hotkey cannot fire again sooner than this (ms).
     pub hotkey_delay_ms: u64,
+    /// HeapHook's own hotkeys: speedhack presets and pausing the process.
+    pub app_hotkeys: Vec<AppHotkey>,
+}
+
+/// One of HeapHook's own hotkeys (not a table's).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AppHotkey {
+    /// CE virtual-key codes.
+    pub keys: Vec<u32>,
+    /// `speed` (set the speedhack to `value`) or `pause` (pause / resume the process).
+    pub action: String,
+    pub value: f64,
 }
 
 impl Default for Settings {
@@ -65,6 +78,7 @@ impl Default for Settings {
             scan_priority: "normal".into(),
             scan_spill_dir: String::new(),
             hotkey_delay_ms: 150,
+            app_hotkeys: Vec::new(),
         }
     }
 }
@@ -94,6 +108,12 @@ impl Settings {
         pick(&mut self.scan_priority, &["normal", "low", "idle"], &d.scan_priority);
         self.scan_spill_dir = self.scan_spill_dir.trim().to_string();
         self.hotkey_delay_ms = self.hotkey_delay_ms.min(10_000);
+        self.app_hotkeys.retain(|h| !h.keys.is_empty() && h.keys.len() <= 6 && match h.action.as_str() {
+            "speed" => h.value > 0.0 && h.value <= 1000.0,
+            "pause" => true,
+            _ => false,
+        });
+        self.app_hotkeys.truncate(64);
         self.signals.retain(|k, v| k.parse::<u32>().is_ok() && ["pass", "ignore", "break"].contains(&v.as_str()));
         self
     }

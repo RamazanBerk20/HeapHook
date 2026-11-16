@@ -2,12 +2,14 @@
 //! (`cheat`) and its files (`table`), the Lua engine (`lua`) and settings (`settings`).
 //! The Tauri wiring lives in `main.rs`.
 pub mod cheat;
+pub mod cli;
 pub mod commands;
 pub mod debug;
 pub mod inject;
 pub mod lua;
 pub mod ptr;
 pub mod remote;
+pub mod search;
 pub mod settings;
 pub mod table;
 pub mod tools;

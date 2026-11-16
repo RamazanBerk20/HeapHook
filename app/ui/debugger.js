@@ -1,8 +1,8 @@
 // Debugger: attach state (top bar), watches ("find out what writes / accesses", "what addresses
 // this instruction accesses", break-and-trace), breakpoints, code list, and the break state
 // (registers, stack, threads) in the memory view's side panel.
-import { api } from './backend.js';
-import { $, $$, h, fmtAddr, isHexAddr, attempt, toast, nf, splitter, modal } from './util.js';
+import { api, askPath } from './backend.js';
+import { $, $$, h, fmtAddr, isHexAddr, attempt, toast, nf, splitter, modal, contextMenu, helpAdd, icon, excerpt } from './util.js';
 import { vlist } from './vlist.js';
 import { state, emit, on, addTicker } from './core.js';
 
@@ -25,6 +25,63 @@ function xmmText(hex) {
   const dw = [3, 2, 1, 0].map((i) => dv.getUint32(i * 4, true).toString(16).toUpperCase().padStart(8, '0')).join(' ');
   const fl = [3, 2, 1, 0].map((i) => +dv.getFloat32(i * 4, true).toPrecision(6)).join(' · ');
   return [dw, fl];
+}
+
+const TRACE_FILTERS = [['HeapHook trace', ['hhtrace']], ['JSON', ['json']]];
+const HEXV = /^(0x)?[0-9a-f]{1,16}$/i;
+const w0x = (s) => '0x' + String(s).replace(/^0x/i, '');
+/** Register name (rax, eax, r8d, al ...) -> [64-bit name, bits] or null. */
+function reg64(n) {
+  let m;
+  if (/^r(ax|bx|cx|dx|si|di|bp|sp)$/.test(n) || n === 'rip') return [n, 64];
+  if ((m = /^e(ax|bx|cx|dx|si|di|bp|sp)$/.exec(n))) return ['r' + m[1], 32];
+  if ((m = /^(ax|bx|cx|dx|si|di|bp|sp)$/.exec(n))) return ['r' + m[1], 16];
+  if ((m = /^([abcd])[lh]$/.exec(n))) return ['r' + m[1] + 'x', 8];
+  if ((m = /^(si|di|bp|sp)l$/.exec(n))) return ['r' + m[1], 8];
+  if ((m = /^(r(?:8|9|1[0-5]))([dwb]?)$/.exec(n))) return [m[1], { '': 64, d: 32, w: 16, b: 8 }[m[2]]];
+  return null;
+}
+/** Access size of an instruction text as a cheat-table type. */
+function vtypeOf(text) {
+  const t = text.toLowerCase(), k = /\b(qword|dword|word|byte)\b/.exec(t);
+  if (k) return { qword: '8bytes', dword: '4bytes', word: '2bytes', byte: 'byte' }[k[1]];
+  const bits = (t.replace(/\[[^\]]*\]/g, ' ').split(/[\s,]+/).slice(1).map(reg64).find(Boolean) || [])[1];
+  return { 8: 'byte', 16: '2bytes', 32: '4bytes', 64: '8bytes' }[bits] || '4bytes';
+}
+/** Memory operand [base+index*s+disp] of a record: {reg, base, off} or {why}. Displacements are hex, as the disassembler prints them. */
+function baseOf(r) {
+  const m = /\[([^\]]+)\]/.exec(r.text);
+  if (!m) return { why: 'no memory operand' };
+  let base = null, off = 0n;
+  for (const t of m[1].replace(/\s+/g, '').toLowerCase().match(/[+-]?[^+-]+/g) || []) {
+    const neg = t[0] === '-', v = t.replace(/^[+-]/, '');
+    if (reg64(v.split('*')[0])) { if (!v.includes('*') && !base && !neg) base = v; }
+    else if (/^(0x)?[0-9a-f]+$/i.test(v)) off += (neg ? -1n : 1n) * BigInt(/^0x/i.test(v) ? v : '0x' + v);
+  }
+  if (!base) return { why: 'no base register' };
+  const [reg, bits] = reg64(base);
+  if (reg === 'rip') return { why: 'RIP-relative operand' };
+  const val = r.context?.[reg];
+  if (typeof val !== 'string' || !HEXV.test(val)) return { why: 'no register snapshot' };
+  return { reg, off, base: '0x' + (bits === 32 ? BigInt(val) & 0xffffffffn : bits === 64 ? BigInt(val) : BigInt(val) & ((1n << BigInt(bits)) - 1n)).toString(16) };
+}
+const hexN = (n) => (t) => { const x = t.replace(/^0x/i, ''); return new RegExp(`^[0-9a-f]{1,${n}}$`, 'i').test(x) ? '0x' + x : null; };
+const REGK = {
+  gpr: { what: 'hex', parse: hexN(16) }, m16: { what: 'hex, up to 4 digits', parse: hexN(4) }, m32: { what: 'hex, up to 8 digits', parse: hexN(8) },
+  st: { what: 'a decimal number, e.g. 1.5 or -2e10', parse: (t) => (/^[+-]?(\d+\.?\d*|\.\d+)(e[+-]?\d+)?$/i.test(t) ? t : null) },
+};
+const regKind = (n) => (/^st\d$/.test(n) ? 'st' : n === 'mxcsr' ? 'm32' : n === 'fcw' || n === 'fsw' ? 'm16' : 'gpr');
+/** Validated trace file (it is untrusted input): plain strings only. */
+function cleanTrace(t) {
+  if (!t || typeof t !== 'object' || t.version !== 1 || !Array.isArray(t.rows)) throw 'Not a HeapHook trace file (version 1 expected)';
+  if (t.rows.length > 1e6) throw 'The trace file has too many records';
+  const rows = t.rows.map((r) => {
+    if (!r || typeof r.addr !== 'string' || !HEXV.test(r.addr) || typeof r.text !== 'string') throw 'The trace file has a malformed record';
+    const c = r.context && typeof r.context === 'object' ? r.context : {}, ctx = {};
+    for (const n of [...GPR, 'rflags']) if (typeof c[n] === 'string' && HEXV.test(c[n])) ctx[n] = w0x(c[n]);
+    return { addr: w0x(r.addr), text: excerpt(r.text, 200), context: GPR.every((n) => n in ctx) && 'rflags' in ctx ? ctx : null };
+  });
+  return { addr: rows.length && !(typeof t.addr === 'string' && HEXV.test(t.addr)) ? rows[0].addr : w0x(t.addr || '0'), steps: Number.isFinite(t.steps) ? t.steps : rows.length, rows };
 }
 
 export function initDebugger({ showView, mem }) {
@@ -161,10 +218,11 @@ export function initDebugger({ showView, mem }) {
     if (o.one_shot) parts.push('one-shot');
     if (o.max_hits) parts.push(`stop at ${nf.format(o.max_hits)}`);
     if (b.condition) parts.push('if ' + b.condition);
+    if (b.stop_when) parts.push('stop when ' + b.stop_when);
     const t = !b.enabled && b.note ? 'off: ' + b.note : parts.join(' · ');
     return h('span.bp-info', { title: [t, b.owner === 'script' ? 'Set by a Lua script (debug_setBreakpoint)' : null].filter(Boolean).join('\n') },
       b.owner === 'script' ? h('span.badge.blue', null, 'Lua') : null,
-      h('span.muted' + (b.condition ? '.mono' : '') + (!b.enabled && b.note ? '.note' : ''), null, t));
+      h('span.muted' + (b.condition || b.stop_when ? '.mono' : '') + (!b.enabled && b.note ? '.note' : ''), null, t));
   }
   bpList.title = 'Insert: add · E or F2: condition and hit options · H: software / hardware · Space: enable · Del: remove';
   /** Add dialog (no `bp`) or the editor of an existing one (`bp`: condition and hit options change in place). */
@@ -295,21 +353,28 @@ export function initDebugger({ showView, mem }) {
   list.removeAttribute('tabindex'); list.removeAttribute('role'); list.removeAttribute('aria-label');
   const wl = vlist(list, {
     cols: WL_COLS, label: 'Watch records', row: 22,
-    empty: () => (!active ? '' : active.stopped ? 'Stopped before any hit.' : active.kind === 'trace' ? 'Waiting for the instruction to execute…' : 'Waiting for the first hit…'),
-    count: () => active?.rows.length ?? 0,
-    item: (i) => active?.rows[i] ?? null,
+    empty: () => (!active ? '' : active.rows.length && q() ? 'No record matches the filter.' : active.loaded ? 'The trace file has no records.' : active.stopped ? 'Stopped before any hit.' : active.kind === 'trace' ? 'Waiting for the instruction to execute…' : 'Waiting for the first hit…'),
+    count: () => shown().length,
+    item: (i) => shown()[i] ?? null,
     cells(r, i) {
       const trace = active.kind === 'trace', ea = active.kind === 'ea' || active.kind === 'range', [m, ...rest] = r.text.split(' ');
-      return [trace ? String(i + 1) : nf.format(r.count), fmtAddr(ea ? r.address : r.addr),
+      return [trace ? String(r.n ?? i + 1) : nf.format(r.count), fmtAddr(ea ? r.address : r.addr),
         h('span.c-text', { role: 'gridcell' }, h('b', null, m), rest.length ? ' ' + rest.join(' ') : ''), h('span.muted', null, ea ? fmtAddr(r.addr) : '')];
     },
-    rowClass: () => 'wl-row',
+    rowClass: (r) => 'wl-row' + (q() && !hideOthers && matcher()(r) ? ' wl-hit' : ''),
     onSelect: (i, r) => { if (active) active.sel = i; renderSnap(r?.context); syncTools(); },
     onActivate: (i, r) => r && emit('mem:goto', { addr: r.addr, pane: 'da' }),
+    onMenu: (x, y, i, r) => wlMenu(x, y, r),
     onKey(e, i, r) {
-      if (e.ctrlKey || e.metaKey || e.altKey) return false;
       const k = e.key.toLowerCase();
-      if (k === 'n' && r) addToCode(r, true);
+      if (e.ctrlKey || e.metaKey) { if (k === 'f' && !e.altKey && !e.shiftKey) { fIn.focus(); fIn.select(); return true; } return false; }
+      if (e.altKey) return false;
+      if (e.key === 'F3') jump(e.shiftKey ? -1 : 1);
+      else if (e.key === 'Escape' && q()) setFilter('');
+      else if (k === 'i' && r) moreInfo(r);
+      else if (k === 'a' && r) copyAddrs(e.shiftKey ? shown() : [r]);
+      else if (k === 'd' && r) openStruct(r);
+      else if (k === 'n' && r && !active.loaded) addToCode(r, true);
       else if (k === 'l' && r) addToCode(r, false);
       else if (k === 's') stopWatch();
       else if (k === 'r') rangeDialog();
@@ -318,22 +383,73 @@ export function initDebugger({ showView, mem }) {
       return true;
     },
   });
+  // ---------- filter / find ----------
+  let hideOthers = true, vc = null;
+  const q = () => (active?.q || '').trim().toLowerCase().replace(/^0x/, '');
+  const matcher = () => { const t = q(); return (r) => `${fmtAddr(r.addr)} ${r.address != null ? fmtAddr(r.address) : ''} ${r.text}`.toLowerCase().includes(t); };
+  /** Matching rows of the active watch (null without a filter), cached per rows array and text. */
+  function matches() {
+    if (!q()) return null;
+    if (!vc || vc.rows !== active.rows || vc.q !== q()) {
+      const m = matcher(), idx = [];
+      active.rows.forEach((r, i) => m(r) && idx.push(i));
+      vc = { rows: active.rows, q: q(), idx, list: idx.map((i) => active.rows[i]) };
+    }
+    return vc;
+  }
+  const shown = () => (active ? (hideOthers && matches()?.list) || active.rows : []);
+  const fIn = h('input#wl-q.mono', { type: 'text', spellcheck: 'false', autocomplete: 'off', placeholder: 'Filter by address or instruction', 'aria-label': 'Filter records by address or instruction' });
+  const fCount = h('span.wl-fcount.mono.muted', { role: 'status', 'aria-live': 'polite' });
+  const fHide = h('button.btn.ghost.wl-fhide', { type: 'button', 'aria-pressed': 'true', title: 'On: list only the matches. Off: list everything and mark the matches (F3 jumps between them).' }, 'Only matches');
+  const fBar = h('div.wl-filter', { role: 'search' }, fIn, fCount, fHide,
+    h('span.wl-fkeys.muted', null, h('kbd', null, 'F3'), ' next · ', h('kbd', null, 'Esc'), ' clear'));
+  $('#wl-head').before(fBar);
+  function syncFilter() {
+    fIn.value = active?.q || '';
+    fHide.setAttribute('aria-pressed', String(hideOthers));
+    const m = matches();
+    fCount.textContent = m ? `${nf.format(m.idx.length)} of ${nf.format(active.rows.length)}` : '';
+  }
+  function setFilter(t) {
+    if (!active) return;
+    active.q = t; active.sel = 0;
+    wl.refresh({ reset: true, force: true });
+    if (shown().length) wl.select(0, { quiet: true });
+    renderSnap(selRow()?.context); syncTools(); syncFilter();
+  }
+  fIn.addEventListener('input', () => setFilter(fIn.value));
+  fIn.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); if (fIn.value) setFilter(''); else wl.focus(); }
+    else if (e.key === 'F3' || e.key === 'Enter') { e.preventDefault(); e.stopPropagation(); jump(e.shiftKey ? -1 : 1); }
+    else if (e.key === 'ArrowDown') { e.preventDefault(); e.stopPropagation(); wl.focus(); }
+  });
+  fHide.addEventListener('click', () => { hideOthers = !hideOthers; setFilter(active?.q || ''); });
+  /** Next / previous match after the selected record, wrapping; the list keeps all rows when "Only matches" is off. */
+  function jump(dir) {
+    const m = matches();
+    if (!m) { toast('Type in the filter first (Ctrl F)', 'info'); return; }
+    if (!m.idx.length) { toast('No match', 'info'); return; }
+    const cur = hideOthers ? m.idx[wl.sel] ?? -1 : wl.sel;
+    const next = dir > 0 ? m.idx.find((i) => i > cur) ?? m.idx[0] : m.idx.findLast((i) => i < cur) ?? m.idx.at(-1);
+    wl.select(hideOthers ? m.idx.indexOf(next) : next);
+  }
+
   /** Makes `w` the shown watch, with its own selection. */
   function showWatch(w) {
     active = w;
-    wl.refresh({ reset: true });
-    if (w?.rows.length) wl.select(w.sel, { quiet: true });
+    wl.refresh({ reset: true, force: true });
+    if (shown().length) wl.select(w.sel, { quiet: true });
     renderTabs(); renderWatch(); attempt(loadWatch);
   }
   async function addWatch(kind, d) {
     if (!(await attach())) return;
     const req = kind === 'ea' ? { addr: d.addr, kind: 'execute', method: state.settings.bp_method, action: 'record', ea: true }
-      : kind === 'trace' ? { addr: d.addr, kind: 'execute', method: state.settings.bp_method, action: 'trace', steps: d.steps, step_over_calls: d.step_over_calls }
+      : kind === 'trace' ? { addr: d.addr, kind: 'execute', method: state.settings.bp_method, action: 'trace', steps: d.steps, step_over_calls: d.step_over_calls, ...(d.stop_when ? { stop_when: d.stop_when } : {}) }
         : { addr: d.addr, kind, size: VSIZE[d.vtype] ?? 4, method: 'hardware', action: 'record' };
     const id = await attempt(() => (kind === 'range' ? api.debugWatchRange(d.req) : api.debugAddBreakpoint(req)));
     if (id == null) return;
     const label = kind === 'range' ? `${d.req.kind === 'access' ? 'Accesses' : 'Writes'} · ${fmtAddr(d.addr)} +${nf.format(d.req.len)}` : `${KIND[kind]} · ${fmtAddr(d.addr)}`;
-    const w = { id, kind, addr: d.addr, label, rows: [], sel: 0, stopped: false, key: '' };
+    const w = { id, kind, addr: d.addr, steps: d.steps, label, rows: [], sel: 0, stopped: false, key: '' };
     watches.push(w);
     active = w;
     showWatch(w);
@@ -387,7 +503,7 @@ export function initDebugger({ showView, mem }) {
     const dlg = $('#dlg-trace'), f = dlg.querySelector('form');
     $('#tr-at').textContent = `${fmtAddr(d.addr)}  ${d.text || ''}`;
     dlg.onclose = () => {
-      if (dlg.returnValue === 'ok') addWatch('trace', { addr: d.addr, steps: Math.max(1, +f.elements.steps.value || 1000), step_over_calls: f.elements.step_over_calls.checked });
+      if (dlg.returnValue === 'ok') addWatch('trace', { addr: d.addr, steps: Math.max(1, +f.elements.steps.value || 1000), step_over_calls: f.elements.step_over_calls.checked, stop_when: f.elements.stop_when?.value.trim() || '' });
     };
     dlg.returnValue = '';
     dlg.showModal();
@@ -399,6 +515,7 @@ export function initDebugger({ showView, mem }) {
     if (!w || w.stopped || !dbg.attached) return;
     const rows = w.kind === 'trace' ? await api.debugTrace(w.id) : await api.debugRecords(w.id);
     if (w !== active || w.stopped) return;
+    if (w.kind === 'trace') rows.forEach((r, i) => { r.n = i + 1; });
     w.rows = rows;
     renderWatch();
     renderTabs();
@@ -407,8 +524,8 @@ export function initDebugger({ showView, mem }) {
     tabs.replaceChildren(...watches.map((w) => {
       const b = dbg.bps.find((x) => x.id === w.id), off = !w.stopped && b && !b.enabled;
       return h('button', {
-        role: 'tab', type: 'button', 'aria-selected': String(w === active), tabindex: w === active ? '0' : '-1', 'data-id': w.id, class: w.stopped ? 'stopped' : off ? 'paused' : null,
-        title: w.stopped ? 'Stopped' : off ? 'Switched off' + (b.note ? ': ' + b.note : '') : 'Live',
+        role: 'tab', type: 'button', 'aria-selected': String(w === active), tabindex: w === active ? '0' : '-1', 'data-id': w.id, class: w.loaded ? 'loaded' : w.stopped ? 'stopped' : off ? 'paused' : null,
+        title: w.loaded ? `Loaded from ${w.file} (read only)` : w.stopped ? 'Stopped' : off ? 'Switched off' + (b.note ? ': ' + b.note : '') : 'Live',
       }, w.label, h('span.count.mono', null, w.kind === 'trace' ? (w.rows.length ? nf.format(w.rows.length) : '') : nf.format(w.rows.reduce((s, r) => s + r.count, 0))));
     }));
     const ab = active && !active.stopped && dbg.bps.find((x) => x.id === active.id);
@@ -421,6 +538,7 @@ export function initDebugger({ showView, mem }) {
     list.hidden = none;
     $('#wl-head').hidden = none;
     $('#wl-regs').hidden = none;
+    fBar.hidden = none;
     syncTools();
   }
   tabs.addEventListener('click', (e) => {
@@ -435,11 +553,13 @@ export function initDebugger({ showView, mem }) {
     showWatch(n);
     tabs.querySelector('[aria-selected=true]')?.focus();
   });
-  const selRow = () => active?.rows[active.sel];
+  const selRow = () => shown()[active?.sel];
   function syncTools() {
     const r = selRow(), live = active && !active.stopped;
     $('#wl-show').disabled = !r;
-    $('#wl-nop').disabled = !r;
+    $('#wl-nop').disabled = !r || active.loaded;
+    $('#wl-info').disabled = !r;
+    $('#wl-save').disabled = active?.kind !== 'trace' || !active.rows.length;
     $('#wl-code').disabled = !r;
     $('#wl-clear').disabled = !live || active.kind === 'trace';
     $('#wl-stop').disabled = !live;
@@ -454,19 +574,21 @@ export function initDebugger({ showView, mem }) {
     head[1].textContent = w.kind === 'ea' || w.kind === 'range' ? 'Accessed address' : 'Address';
     head[2].textContent = 'Instruction';
     head[3].textContent = w.kind === 'ea' || w.kind === 'range' ? 'Instruction address' : '';
-    w.sel = Math.max(0, Math.min(w.sel, w.rows.length - 1));
+    w.sel = Math.max(0, Math.min(w.sel, shown().length - 1));
     wl.refresh({ force: true });
-    if (w.rows.length && wl.sel !== w.sel) wl.select(w.sel, { quiet: true });
+    if (shown().length && wl.sel !== w.sel) wl.select(w.sel, { quiet: true });
     renderSnap(selRow()?.context);
-    syncTools();
+    syncTools(); syncFilter();
   }
   function renderSnap(c) {
     const box = $('#wl-regs');
     if (!c) { box.replaceChildren(h('p.empty', null, 'Select a record to see the registers at its last hit.')); return; }
+    box.replaceChildren(...snapNodes(c));
+  }
+  function snapNodes(c) {
     const flags = BigInt(c.rflags);
-    box.replaceChildren(
-      ...GPR.map((n) => h('span.rg', null, h('span.rn', null, n.toUpperCase()), h('span.rv', null, r64(c[n])))),
-      h('span.rg.flags', null, h('span.rn', null, 'FLAGS'), h('span.rv', null, FLAGS.map(([f, b]) => ((flags >> BigInt(b)) & 1n ? f : f.toLowerCase())).join(' '))));
+    return [...GPR.map((n) => h('span.rg', null, h('span.rn', null, n.toUpperCase()), h('span.rv', null, r64(c[n])))),
+      h('span.rg.flags', null, h('span.rn', null, 'FLAGS'), h('span.rv', null, FLAGS.map(([f, b]) => ((flags >> BigInt(b)) & 1n ? f : f.toLowerCase())).join(' ')))];
   }
   const showRow = () => { const r = selRow(); if (r) emit('mem:goto', { addr: r.addr, pane: 'da' }); };
   async function stopWatch(w = active) {
@@ -490,6 +612,123 @@ export function initDebugger({ showView, mem }) {
   $('#wl-stop').addEventListener('click', () => stopWatch());
   $('#wl-close').addEventListener('click', closeWatch);
   $('#wl-range').addEventListener('click', () => rangeDialog());
+
+  // ---------- record actions: menu, more information, address list, dissector, trace files ----------
+  const tb = $('#wl-clear').parentElement;
+  const tbtn = (id, ic, label, f) => { const b = h('button.btn.ghost.icon', { id, type: 'button', 'aria-label': label, title: label, html: icon(ic) }); b.addEventListener('click', f); return b; };
+  tb.insertBefore(tbtn('wl-info', 'info', 'More information on the record (I)', () => moreInfo(selRow())), $('#wl-clear'));
+  tb.insertBefore(tbtn('wl-save', 'save', 'Save this trace to a file', () => saveTrace()), $('#wl-clear'));
+  tb.insertBefore(tbtn('wl-load', 'folder', 'Open a saved trace', () => loadTrace()), $('#wl-clear'));
+  function wlMenu(x, y, r) {
+    if (!r) return;
+    const why = (t, w) => (w ? `${t} (${w})` : t), noAddr = r.address == null ? 'no accessed address' : '', sd = baseOf(r).why;
+    contextMenu(x, y, [
+      { label: 'Disassemble', kbd: 'Enter', run: showRow },
+      { label: 'More information…', kbd: 'I', run: () => moreInfo(r) },
+      { label: why('Copy to address list', noAddr), kbd: 'A', disabled: !!noAddr, run: () => copyAddrs([r]) },
+      { label: 'Copy all listed addresses to address list', kbd: 'Shift A', disabled: !shown().some((x) => x.address != null), run: () => copyAddrs(shown()) },
+      { label: why('Open in structure dissector', sd), kbd: 'D', disabled: !!sd, run: () => openStruct(r) },
+      '-',
+      { label: 'Replace with NOPs', kbd: 'N', disabled: !!active.loaded, run: () => addToCode(r, true) },
+      { label: 'Add to code list', kbd: 'L', run: () => addToCode(r, false) },
+      '-',
+      { label: 'Filter…', kbd: 'Ctrl F', run: () => { fIn.focus(); fIn.select(); } },
+      { label: 'Save this trace…', disabled: active.kind !== 'trace', run: saveTrace },
+      { label: 'Open a saved trace…', run: loadTrace },
+    ], wl.el);
+  }
+  /** Accessed addresses of `rs` (ea / range records) added to the cheat table. */
+  function copyAddrs(rs) {
+    const seen = new Set(), items = [];
+    for (const r of rs) {
+      if (r.address == null) continue;
+      const a = BigInt(r.address).toString(16);
+      if (!seen.has(a)) { seen.add(a); items.push({ description: `Accessed by ${fmtAddr(r.addr)}`, addr: a, vtype: vtypeOf(r.text) }); }
+    }
+    if (!items.length) { toast('No accessed address: only "what addresses this instruction accesses" and range watches record one', 'info'); return; }
+    emit('table:add', items);
+    toast(`Added ${nf.format(items.length)} address${items.length > 1 ? 'es' : ''} to the address list`, 'info');
+  }
+  function openStruct(r) {
+    const b = baseOf(r);
+    if (b.why) { toast(`Cannot open the dissector: ${b.why}`, 'info'); return; }
+    emit('struct:open', { addr: b.base });
+    toast(`Structure at ${b.reg.toUpperCase()}; the instruction reaches ${b.off < 0n ? '-' : '+'}0x${(b.off < 0n ? -b.off : b.off).toString(16)} into it`, 'info');
+  }
+  async function saveTrace() {
+    const w = active;
+    if (w?.kind !== 'trace' || !w.rows.length) { toast('Select a trace with records first', 'info'); return; }
+    const path = await askPath({ save: true, title: 'Save trace', filters: TRACE_FILTERS, dflt: `trace-${fmtAddr(w.addr)}.hhtrace` });
+    if (!path) return;
+    const rows = w.rows.map(({ addr, text, context }) => ({ addr, text, context }));
+    if (await attempt(async () => { await api.traceSave(path, { version: 1, addr: w.addr, steps: w.steps ?? rows.length, rows }); return true; })) toast(`Saved ${nf.format(rows.length)} records`, 'info');
+  }
+  async function loadTrace() {
+    const path = await askPath({ save: false, title: 'Open trace', filters: TRACE_FILTERS });
+    if (!path) return;
+    const t = await attempt(async () => cleanTrace(await api.traceLoad(path)));
+    if (!t) return;
+    const file = excerpt(String(path).split(/[\\/]/).pop(), 40);
+    t.rows.forEach((r, i) => { r.n = i + 1; });
+    const w = { id: -(++fileSeq), kind: 'trace', addr: t.addr, steps: t.steps, label: `File · ${file}`, file, rows: t.rows, sel: 0, stopped: true, loaded: true, key: '' };
+    watches.push(w);
+    showWatch(w);
+    showView('dbg');
+    wl.focus();
+  }
+  let fileSeq = 0;
+  /** Dialog: instructions around the record, its register snapshot and the stack at its RSP. */
+  async function moreInfo(r) {
+    if (!r) return;
+    const loaded = !!active?.loaded, a = BigInt(r.addr), body = h('div.mi-body', null, h('p.hint', null, 'Loading…'));
+    const d = h('dialog.dlg.dlg-wide.mi-dlg', { 'aria-label': `Record at ${fmtAddr(r.addr)}` }, h('form', { method: 'dialog' },
+      h('h2', null, `Record at ${fmtAddr(r.addr)}`), body,
+      h('div.dlg-actions', null, h('button.btn.primary', { value: 'ok', type: 'submit' }, 'Close ', h('kbd', null, 'Esc')))));
+    d.addEventListener('close', () => { d.remove(); wl.focus(); });
+    document.body.append(d);
+    d.showModal();
+    const sec = (title, note, ...kids) => h('section.mi-sec', null, h('h3', null, title), note ? h('p.hint', null, note) : null, ...kids);
+    const [code, stack] = await Promise.all([miCode(r, a), miStack(r)]);
+    body.replaceChildren(
+      sec('Instructions', code.note + (loaded ? ' Read from the open process, which may differ from the traced one.' : ''), h('div.mi-list.mono', { role: 'list' }, ...code.rows)),
+      sec('Registers', r.context ? 'At the hit of this record.' : '', r.context ? h('div.regs-snap.mi-regs.mono', null, ...snapNodes(r.context)) : h('p.empty', null, 'No register snapshot for this record.')),
+      sec('Stack', stack.note, h('div.mi-list.mono', { role: 'list' }, ...stack.rows)));
+  }
+  async function miCode(r, a) {
+    const starts = [], fn = await api.codeFunction(r.addr).catch(() => null);
+    if (fn?.start) starts.push([BigInt(fn.start), 'the start of its function']);
+    for (const x of active?.rows || []) { const b = BigInt(x.addr); if (b < a) starts.push([b, 'an earlier record']); }
+    const near = starts.filter(([b]) => a - b <= 64n).sort((x, y) => (x[0] > y[0] ? -1 : 1)).slice(0, 3);
+    for (const [b, why] of [...near, [a, null]]) {
+      const ins = await api.disassemble('0x' + b.toString(16), 48).catch(() => null);
+      const at = ins?.findIndex((x) => BigInt(x.addr) === a) ?? -1;
+      if (at < 0) continue;
+      const from = Math.max(0, at - 12);
+      return {
+        note: why ? `Shown from ${fmtAddr(b)}, ${why}, ${a - b} byte(s) before the record (there is no backward disassembly).` : 'Shown from the instruction itself: no known instruction start within 64 bytes before it.',
+        rows: ins.slice(from, at + 9).map((x, i) => h('div.mi-ins', { role: 'listitem', class: from + i === at ? 'mi-ins cur' : 'mi-ins', ...(from + i === at ? { 'aria-current': 'true' } : {}) },
+          h('span.muted', null, fmtAddr(x.addr)), h('span.muted', null, x.bytes), h('span', null, x.text))),
+      };
+    }
+    return { note: 'The memory at this address cannot be disassembled.', rows: [] };
+  }
+  async function miStack(r) {
+    const rsp = r.context?.rsp;
+    if (!rsp) return { note: 'No RSP in the snapshot.', rows: [] };
+    const hex = await api.readMemory(rsp, 128).catch(() => null);
+    if (typeof hex !== 'string') return { note: 'The stack cannot be read.', rows: [] };
+    const bytes = hex.replace(/\s+/g, '').match(/../g) || [], base = BigInt(rsp);
+    return {
+      note: `16 qwords at RSP ${fmtAddr(rsp)}; memory as it is now, not as it was at the hit.`,
+      rows: Array.from({ length: 16 }, (_, i) => {
+        const q = bytes.slice(i * 8, i * 8 + 8);
+        return h('div.mi-stk', { role: 'listitem' }, h('span.muted', null, fmtAddr(base + BigInt(i * 8))), h('span', null, q.length < 8 || q.includes('??') ? '?'.repeat(16) : q.reverse().join('').toUpperCase()));
+      }),
+    };
+  }
+  helpAdd('Debugger', [['Ctrl F', 'Filter the watch list (while it has focus)'], ['F3 / Shift F3', 'Next / previous filter match'], ['Esc', 'Clear the filter'],
+    ['I', 'More information on a watch record'], ['A / Shift A', 'Copy the accessed address (all listed) to the address list'], ['D', 'Open a record\'s base register in the structure dissector'],
+    ['F2', 'Edit the selected register, also ST, XMM, MXCSR, FCW, FSW']]);
 
   // ---------- code list ----------
   // The backend owns it (it is saved with the cheat table); this only shows and drives it.
@@ -579,6 +818,8 @@ export function initDebugger({ showView, mem }) {
     lastCtx = ctx;
     renderBreak(ctx, stack, threads, frames);
   }
+  const regRow = (n, label, text, changed = false, tip = '', cls = '') => h('button.reg' + (cls ? '.' + cls : ''), {
+    type: 'button', 'data-reg': n, class: `reg ${cls} ${changed ? 'chg' : ''}`, title: (tip ? tip + '. ' : '') + 'Enter, F2 or double-click to edit' }, h('span.rn', null, label), h('span.rv.mono', null, text));
   function renderBreak(ctx = null, stack = [], threads = [], frames = []) {
     const msg = dbg.attached ? 'The process is running. Registers and stack are shown while it is stopped at a break (Shift F9).' : 'Debugger not attached.';
     if (!broken() || !ctx) {
@@ -592,18 +833,18 @@ export function initDebugger({ showView, mem }) {
     const fpu = ctx.fpu;
     cpu.replaceChildren(
       h('div.cpu-sec', null, `Thread ${tid()}`, dbg.reason && tid() === dbg.tid ?h('span.muted', null, ' · ' + dbg.reason) : null),
-      ...GPR.map((n) => h('button.reg', { type: 'button', 'data-reg': n, class: chg(n) ? 'reg chg' : 'reg', title: 'Enter or double-click to edit' },
-        h('span.rn', null, n.toUpperCase()), h('span.rv.mono', null, r64(ctx[n])))),
+      ...GPR.map((n) => regRow(n, n.toUpperCase(), r64(ctx[n]), chg(n))),
       h('div.flags', { role: 'group', 'aria-label': 'Flags' }, ...FLAGS.map(([f, b]) => {
         const on_ = !!((flags >> BigInt(b)) & 1n);
         return h('button.flag', { type: 'button', 'data-bit': b, 'aria-pressed': String(on_), title: `Toggle ${f}` }, f, h('span.mono', null, on_ ? '1' : '0'));
       })),
       h('div.cpu-sec', null, 'Segments'),
       h('div.segs.mono', null, ...SEGS.map((n) => h('span', null, h('span.rn', null, n.toUpperCase() + ' '), ctx[n]))),
-      h('div.cpu-sec', null, 'FPU', h('span.muted.mono', null, ` FCW ${fpu.fcw} · FSW ${fpu.fsw} · MXCSR ${fpu.mxcsr}`)),
-      ...fpu.st.map((s, i) => h('div.reg.ro', { title: s.hex }, h('span.rn', null, 'ST' + i), h('span.rv.mono', null, s.value))),
+      h('div.cpu-sec', null, 'FPU'),
+      regRow('fcw', 'FCW', fpu.fcw), regRow('fsw', 'FSW', fpu.fsw), regRow('mxcsr', 'MXCSR', fpu.mxcsr),
+      ...fpu.st.map((s, i) => regRow('st' + i, 'ST' + i, s.value, false, s.hex)),
       h('div.cpu-sec', null, 'SSE'),
-      ...fpu.xmm.map((x, i) => { const [dw, fl] = xmmText(x); return h('div.reg.ro.xmm', { title: fl }, h('span.rn', null, 'XMM' + i), h('span.rv.mono', null, dw)); }));
+      ...fpu.xmm.map((x, i) => { const [dw, fl] = xmmText(x); return regRow('xmm' + i, 'XMM' + i, dw, false, fl, 'xmm'); }));
     stk.replaceChildren(...stack.map((s) => h('button.li.stk-row', { type: 'button', title: 'Show in the hex view', onclick: () => emit('mem:goto', { addr: s.value, pane: 'hex' }) },
       h('span.mono.muted', null, fmtAddr(s.addr)), h('span.mono', null, r64(s.value)), h('span.path', null, s.comment))));
     bt.replaceChildren(h('div.cpu-sec', null, `Thread ${tid()} · call chain`),
@@ -628,20 +869,59 @@ export function initDebugger({ showView, mem }) {
   }
   function editReg(btn) {
     const n = btn.dataset.reg, v = btn.querySelector('.rv');
-    const input = h('input.cell-input.mono', { value: v.textContent, spellcheck: 'false', 'aria-label': `New value of ${n.toUpperCase()} (hex)` });
+    if (n.startsWith('xmm')) { xmmDialog(+n.slice(3)); return; }
+    const k = REGK[regKind(n)];
+    const input = h('input.cell-input.mono', { value: v.textContent, spellcheck: 'false', 'aria-label': `New value of ${n.toUpperCase()} (${k.what})` });
     v.replaceWith(input);
     input.focus(); input.select();
     let done = false;
     const finish = (ok) => {
       if (done) return;
       done = true;
-      const t = input.value.trim().replace(/^0x/i, '');
-      const back = () => cpu.querySelector(`[data-reg="${n}"]`)?.focus();
-      if (ok && /^[0-9a-f]{1,16}$/i.test(t)) setReg(n, '0x' + t).then(back);
-      else { if (ok) toast('Enter a hex value'); loadBreak().then(back); }
+      const val = k.parse(input.value.trim()), back = () => cpu.querySelector(`[data-reg="${n}"]`)?.focus();
+      if (ok && val) setReg(n, val).then(back);
+      else { if (ok) toast(`Enter ${k.what}`); loadBreak().then(back); }
     };
     input.addEventListener('keydown', (e) => { e.stopPropagation(); if (e.key === 'Enter') { e.preventDefault(); finish(true); } else if (e.key === 'Escape') { e.preventDefault(); finish(false); } });
     input.addEventListener('blur', () => finish(false));
+  }
+  /** XMM edit: 32 hex digits (bytes in memory order, as the context reports them) or four floats, kept in step. */
+  function xmmDialog(i) {
+    const cur = lastCtx?.fpu?.xmm?.[i];
+    if (!cur) return;
+    const hexI = h('input.mono', { type: 'text', value: cur, spellcheck: 'false', autocomplete: 'off', 'aria-label': `XMM${i} as 32 hex digits` });
+    const flI = h('input.mono', { type: 'text', spellcheck: 'false', autocomplete: 'off', 'aria-label': `XMM${i} as 4 floats, lowest first` });
+    const err = h('p.hint.mono', { role: 'alert' });
+    const hexOf = () => { const t = hexI.value.replace(/\s+/g, ''); return /^[0-9a-f]{32}$/i.test(t) ? t.toLowerCase() : null; };
+    const floatsOf = () => {
+      const t = flI.value.trim().split(/[\s,]+/);
+      return t.length === 4 && t.every((x) => x !== '' && (!isNaN(Number(x)) || /^[+-]?nan$/i.test(x))) ? t.map((x) => (/nan/i.test(x) ? NaN : Number(x))) : null;
+    };
+    const toFloats = (hx) => { const dv = new DataView(Uint8Array.from(hx.match(/../g), (x) => parseInt(x, 16)).buffer); return [0, 1, 2, 3].map((k) => +dv.getFloat32(k * 4, true).toPrecision(9)).join(' '); };
+    const toHex = (f) => { const dv = new DataView(new ArrayBuffer(16)); f.forEach((x, k) => dv.setFloat32(k * 4, x, true)); return [...new Uint8Array(dv.buffer)].map((b) => b.toString(16).padStart(2, '0')).join(''); };
+    flI.value = toFloats(cur);
+    hexI.addEventListener('input', () => { const x = hexOf(); if (x) flI.value = toFloats(x); });
+    flI.addEventListener('input', () => { const f = floatsOf(); if (f) hexI.value = toHex(f); });
+    const form = h('form', { method: 'dialog' }, h('h2', null, `Edit XMM${i}`),
+      h('label.field', null, h('span', null, '32 hex digits (byte 0 first)'), hexI),
+      h('label.field', null, h('span', null, '4 floats (lowest first, single precision)'), flI), err,
+      h('div.dlg-actions', null,
+        h('button.btn.primary', { value: 'ok', type: 'submit' }, 'Set ', h('kbd', null, 'Enter')),
+        h('button.btn', { value: 'cancel', type: 'submit', formnovalidate: true }, 'Cancel ', h('kbd', null, 'Esc'))));
+    const d = h('dialog.dlg.dlg-sm', { 'aria-label': `Edit XMM${i}` }, form);
+    form.addEventListener('submit', async (e) => {
+      if (e.submitter?.value === 'cancel') return;
+      e.preventDefault();
+      const f = floatsOf(), x = hexOf() || (f && toHex(f));
+      if (!x) { err.textContent = 'Enter 32 hex digits or four numbers'; return; }
+      d.close('ok');
+      await setReg('xmm' + i, x);
+      cpu.querySelector(`[data-reg="xmm${i}"]`)?.focus();
+    });
+    d.addEventListener('close', () => d.remove());
+    document.body.append(d);
+    d.showModal();
+    hexI.select();
   }
   cpu.addEventListener('click', (e) => {
     const f = e.target.closest('.flag');

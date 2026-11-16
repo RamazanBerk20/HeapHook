@@ -15,6 +15,9 @@ import { initDissect } from './dissect.js';
 import { initForms } from './forms.js';
 import { jobs } from './memtools.js';
 import { askPath } from './backend.js';
+import { openCalculator } from './calc.js';
+import { openAaWindow } from './editor.js';
+import { helpAdd } from './util.js';
 
 // static icons
 for (const el of $$('[data-icon]')) el.insertAdjacentHTML('afterbegin', icon(el.dataset.icon));
@@ -344,13 +347,129 @@ $('#about-btn').addEventListener('click', about);
 $('#help-about').addEventListener('click', about);
 $('#settings-btn').addEventListener('click', () => settings.open());
 
+// ---------- pause / resume the whole process ----------
+let paused = false;
+function showPaused(p) {
+  paused = !!p;
+  $('#paused-badge').hidden = !paused;
+  const b = $('#cl-pause');
+  b.setAttribute('aria-pressed', String(paused));
+  b.innerHTML = icon(paused ? 'play' : 'pause') + `<span class="bl">${paused ? 'Resume process' : 'Pause process'}</span>`;
+}
+async function togglePause() {
+  if (!state.proc) { toast('Open a process first'); return; }
+  if (await attempt(async () => { await api.processPause(!paused); return true; })) {
+    showPaused(!paused);
+    toast(paused ? 'Paused the process: every thread is stopped (Ctrl Alt P resumes)' : 'Resumed the process', 'info');
+  }
+}
+on('backend:process', (p) => showPaused(p?.alive && p.paused));
+on('process:closed', () => showPaused(false));
+$('#paused-badge').addEventListener('click', togglePause);
+$('#cl-pause').addEventListener('click', togglePause);
+
+// ---------- compact mode: only the cheat table ----------
+function setCompact(c) {
+  document.body.classList.toggle('compact', c);
+  store.set('compact', c);
+  if (c) showView('scan');
+}
+setCompact(store.get('compact', false));
+
+// ---------- tools menu (top bar) ----------
+function toolsMenu() {
+  const b = $('#tools-btn'), r = b.getBoundingClientRect();
+  contextMenu(r.left, r.bottom + 4, [
+    { label: 'Calculator…', kbd: 'Ctrl Alt K', run: openCalculator },
+    { label: 'Auto Assemble…', kbd: 'Ctrl Alt A', run: openAaWindow },
+    { label: paused ? 'Resume the process' : 'Pause the process', kbd: 'Ctrl Alt P', disabled: !state.proc || !!state.proc.remote, run: togglePause },
+    { label: 'Compact mode: only the cheat table', kbd: 'Ctrl Alt M', checked: document.body.classList.contains('compact'), run: () => setCompact(!document.body.classList.contains('compact')) },
+    '-',
+    { label: 'Open table…', kbd: 'Ctrl O', run: table.load },
+    { label: 'Recent tables…', run: () => table.recentMenu($('#tbl-recent')) },
+    { label: 'Merge a table into this one…', run: table.merge },
+    { label: 'Save table…', kbd: 'Ctrl S', run: table.save },
+    { label: 'Save the table as text…', run: table.saveText },
+    '-',
+    { label: 'Settings…', kbd: 'Ctrl ,', run: () => settings.open() },
+    { label: 'Keyboard shortcuts', kbd: 'F1', run: () => $('#dlg-help').showModal() },
+    { label: 'About HeapHook', run: about },
+  ], b);
+}
+$('#tools-btn').addEventListener('click', toolsMenu);
+
+// ---------- speedhack presets ----------
+{
+  const row = h('div.speed-presets', { role: 'group', 'aria-label': 'Speed presets' },
+    [0.25, 0.5, 1, 2, 5].map((v, i) => h('button.btn', { type: 'button', title: `Speed ${v}× (${i + 1})`, onclick: () => setSpeed(v) }, `${v}×`, h('kbd', null, String(i + 1)))));
+  $('#sp-status').before(row);
+  $('#sp-status').after(h('p.hint', null, 'Presets are keys 1–5 here. To set a speed from anywhere, give it a hotkey in ', h('button.btn.ghost.inline-link', { type: 'button', onclick: () => { $('#dlg-speed').close(); settings.open(); } }, 'Settings › HeapHook hotkeys'), '.'));
+  $('#dlg-speed').addEventListener('keydown', (e) => {
+    const n = '12345'.indexOf(e.key);
+    if (n >= 0 && e.target.id !== 'sp-value') { e.preventDefault(); setSpeed([0.25, 0.5, 1, 2, 5][n]); }
+  });
+}
+
+// ---------- unsaved changes, dropped files, command line ----------
+const TABLE_FILE = /\.(ct|json)$/i;
+let closeSeq = 0, dropSeq = 0, winSeen = false;
+on('backend:window', async (w) => {
+  // The first poll only learns where the counters are (a reload must not replay old events).
+  if (!winSeen) { winSeen = true; closeSeq = w.close_seq; dropSeq = w.drop_seq; return; }
+  if (w.drop_seq !== dropSeq) {
+    dropSeq = w.drop_seq;
+    const p = w.drops.find((x) => TABLE_FILE.test(x));
+    if (p) table.openPath(p); else if (w.drops.length) toast('Drop a cheat table (.CT or .json) to open it', 'info');
+  }
+  if (w.close_seq !== closeSeq) {
+    closeSeq = w.close_seq;
+    api.appQuit(await table.confirmDiscard('Quitting')).catch(toast);
+  }
+});
+// In a browser (dev bridge, mock) a dropped file arrives as data, not as a path.
+document.addEventListener('dragover', (e) => { if ([...(e.dataTransfer?.types || [])].includes('Files')) { e.preventDefault(); document.body.classList.add('drop-file'); } });
+document.addEventListener('dragleave', (e) => { if (!e.relatedTarget) document.body.classList.remove('drop-file'); });
+document.addEventListener('drop', async (e) => {
+  const f = [...(e.dataTransfer?.files || [])][0];
+  document.body.classList.remove('drop-file');
+  if (!f) return;
+  e.preventDefault();
+  if (!TABLE_FILE.test(f.name)) { toast('Drop a cheat table (.CT or .json) to open it', 'info'); return; }
+  if (f.size > 64 << 20) { toast(`${f.name} is larger than 64 MiB`); return; }
+  table.openPath(f.name, { data: await f.text() });
+});
+if (!window.__TAURI__) window.addEventListener('beforeunload', (e) => { if (table.isDirty()) e.preventDefault(); });
+/** heaphook [TABLE] [--pid N | --attach NAME | --launch PROGRAM ARGS...] */
+async function startArgs() {
+  const a = await api.appArgs().catch(() => null);
+  if (!a) return;
+  if (a.pid != null) await attempt(async () => opened(await busy(`Opening process ${a.pid}`, api.openProcess(a.pid))));
+  else if (a.attach) {
+    const list = (await attempt(() => api.listProcesses())) || [];
+    const p = list.find((x) => x.name === a.attach) || list.find((x) => x.name.toLowerCase() === a.attach.toLowerCase());
+    if (p) await attach(p); else toast(`No process named ${a.attach} is running`);
+  } else if (a.launch) {
+    const info = await attempt(() => busy('Starting the program', api.processCreate({ program: a.launch.program, args: a.launch.args, cwd: '', speedhack: false })));
+    if (info) opened(info);
+  }
+  if (a.table) await table.openPath(a.table, { asked: true });
+}
+
+helpAdd('Global', [['Alt T', 'Tools menu'], ['Ctrl Alt K', 'Calculator'], ['Ctrl Alt A', 'Auto Assemble window'], ['Ctrl Alt P', 'Pause / resume the process'], ['Ctrl Alt M', 'Compact mode (only the cheat table)']]);
+helpAdd('Cheat table', [['Ctrl F', 'Filter'], ['Ctrl → / Ctrl ←', 'Expand / collapse all'], ['Ctrl O / Ctrl S', 'Open / save (drop a .CT or .json on the window to open it)']]);
+
 // ---------- global shortcuts ----------
 document.addEventListener('keydown', (e) => {
   if (document.querySelector('dialog[open]')) return;
   if (e.key === 'Escape' && busyCancel()) { e.preventDefault(); return; } // the top bar's busy operation first
   const k = e.key.toLowerCase(), ctrl = e.ctrlKey || e.metaKey;
   const inField = !!e.target.matches?.('input, select, textarea');
-  if (ctrl && k === 'p') openPicker();
+  if (ctrl && e.altKey && k === 'k') openCalculator();
+  else if (ctrl && e.altKey && k === 'a') openAaWindow();
+  else if (ctrl && e.altKey && k === 'p') togglePause();
+  else if (ctrl && e.altKey && k === 'm') setCompact(!document.body.classList.contains('compact'));
+  else if (e.altKey && !ctrl && k === 't') toolsMenu();
+  else if (ctrl && k === 'p') openPicker();
   else if (ctrl && e.shiftKey && k === 'd' && state.proc?.remote) toast(DBG_REMOTE);
   else if (ctrl && k === '1') showView('scan');
   else if (ctrl && k === '2') showView('mem');
@@ -396,3 +515,4 @@ splitter($('#div-mem'), $('#disasm-pane'), { axis: 'y', key: 'split.disasm', min
 splitter($('#div-side'), $('#mem-side'), { axis: 'x', key: 'split.side', min: 220, max: () => innerWidth * 0.45, sign: -1, initial: 340 });
 
 showView(store.get('view', 'scan'));
+startArgs();

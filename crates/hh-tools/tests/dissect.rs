@@ -190,3 +190,138 @@ fn bench_dissect() {
         s.functions
     );
 }
+
+// ---------------------------------------------------------------- 1.0: save/load, merge, filter
+
+#[test]
+fn constant_slots_resolve_indirect_calls() {
+    let (mut p, _, _) = module();
+    // A writable data page inside the module: its slots are not constant.
+    p.add(0x403000, vec![0; 0x1000], RW, RegionKind::Image, Some("/x/test.dll"));
+    p.modules[0].size = 0x4000;
+    asm_seq(&p, 0x401500, &["jmp qword ptr [402108]"]);
+    p.put_u64(0x402108, 0x401600);
+    p.put_u64(0x402110, 0x401650);
+    p.put_u64(0x403000, 0x401680);
+    let site = asm_seq(&p, 0x401700, &["call 401500", "mov rax,qword ptr [402110]", "call rax", "mov rbx,qword ptr [403000]", "call rbx", "ret"]);
+    let d = dissect(&p, &p.modules.clone(), &DissectOptions::default(), &Progress::new()).unwrap();
+    let callers = |a: u64| d.xrefs_to(a, a + 1, &[RefKind::Call], 0, 10).iter().map(|x| x.from).collect::<Vec<_>>();
+    // Through the thunk: the caller of the thunk also calls its target.
+    assert_eq!(callers(0x401500), [site[0]]);
+    assert_eq!(callers(0x401600), [site[0]]);
+    // mov reg,[constant slot]; call reg.
+    assert_eq!(callers(0x401650), [site[2]]);
+    // A writable slot may change: not resolved.
+    assert!(callers(0x401680).is_empty());
+}
+
+fn second_module(p: &mut FakeProc) -> Vec<u64> {
+    p.add(0x700000, vec![0xC3; 0x1000], RX, RegionKind::Image, Some("/x/two.dll"));
+    p.module("two.dll", 0x700000, 0x1000);
+    let a = asm_seq(p, 0x700000, &["call 401300", "call 700100", "ret"]);
+    asm_seq(p, 0x700100, &["ret"]);
+    a
+}
+
+#[test]
+fn add_module_matches_dissecting_both() {
+    let (mut p, _, _) = module();
+    second_module(&mut p);
+    let opts = DissectOptions::default();
+    let mut d = dissect(&p, &p.modules[..1], &opts, &Progress::new()).unwrap();
+    let s = d.add_modules(&p, &p.modules.clone(), &opts, &Progress::new()).unwrap();
+    assert_eq!(s.modules, ["test.dll", "two.dll"]);
+    let both = dissect(&p, &p.modules.clone(), &opts, &Progress::new()).unwrap();
+    assert_eq!(s, both.summary());
+    assert_eq!(d.functions(0, 100), both.functions(0, 100));
+    assert_eq!(d.referenced_functions(0, 100), both.referenced_functions(0, 100));
+    assert_eq!(d.xrefs_to(0, u64::MAX, &[], 0, 1000), both.xrefs_to(0, u64::MAX, &[], 0, 1000));
+    assert_eq!(d.function_at(0x401300).unwrap().callers, 2);
+    // Adding known modules again changes nothing.
+    let again = d.add_modules(&p, &p.modules.clone(), &opts, &Progress::new()).unwrap();
+    assert_eq!(again, s);
+}
+
+#[test]
+fn code_filter_from_recorded_sets() {
+    let (p, main, f1) = module();
+    let d = dissect(&p, &p.modules.clone(), &DissectOptions::default(), &Progress::new()).unwrap();
+    let ran = [vec![main[1], f1[1] + 1], vec![f1[0], 0x401201]];
+    let addrs = |v: Vec<Function>| v.iter().map(|f| f.addr).collect::<Vec<_>>();
+    assert_eq!(addrs(d.code_filter(&ran, &[])), [0x401100]);
+    assert_eq!(addrs(d.code_filter(&ran[..1], &[])), [0x401000, 0x401100]);
+    assert_eq!(addrs(d.code_filter(&ran[..1], &[vec![main[0]]])), [0x401100]);
+    assert!(d.code_filter(&ran, &[vec![f1[0]]]).is_empty());
+    assert!(d.code_filter(&[], &[]).is_empty());
+    // Addresses outside every function are ignored.
+    assert!(d.code_filter(&[vec![0x900000]], &[]).is_empty());
+}
+
+#[test]
+fn dissection_file_round_trip() {
+    let (p, _, _) = module();
+    let d = dissect(&p, &p.modules.clone(), &DissectOptions::default(), &Progress::new()).unwrap();
+    let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let f = dir.path().join("d.hhdis");
+    d.save(&f, &Progress::new()).unwrap();
+    let back = Dissection::load(&f, &Progress::new()).unwrap();
+    assert_eq!(back, d);
+    assert_eq!(back.strings(None, 0, 10), d.strings(None, 0, 10));
+    let c = Progress::new();
+    c.cancel();
+    assert!(Dissection::load(&f, &c).is_err());
+}
+
+/// An `.hhdis` file from parts.
+fn craft(version: u32, meta: &str, count: Option<u64>, refs: &[(u64, u64, u8)]) -> Vec<u8> {
+    let mut v = b"HHDISS\0\0".to_vec();
+    v.extend_from_slice(&version.to_le_bytes());
+    v.extend_from_slice(&0u32.to_le_bytes());
+    v.extend_from_slice(&(meta.len() as u64).to_le_bytes());
+    v.extend_from_slice(meta.as_bytes());
+    v.extend_from_slice(&count.unwrap_or(refs.len() as u64).to_le_bytes());
+    for (t, f, k) in refs {
+        v.extend_from_slice(&t.to_le_bytes());
+        v.extend_from_slice(&f.to_le_bytes());
+        v.push(*k);
+    }
+    v
+}
+
+#[test]
+fn hostile_dissection_files_fail_cleanly() {
+    let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let f = dir.path().join("bad.hhdis");
+    let meta = r#"{"modules":["m"],"code_bytes":1,"instructions":1,"functions":[{"addr":"0x10","callers":1,"internal":true,"name":null}],"strings":[],"caves":[]}"#;
+    let load = |bytes: &[u8]| {
+        std::fs::write(&f, bytes).unwrap();
+        Dissection::load(&f, &Progress::new())
+    };
+    let ok = load(&craft(1, meta, None, &[(0x10, 0x20, 0)])).unwrap();
+    assert_eq!(ok.functions(0, 10)[0].addr, 0x10);
+    assert_eq!(ok.referenced_functions(0, 10).len(), 1);
+    let cases: Vec<(&str, Vec<u8>)> = vec![
+        ("empty", Vec::new()),
+        ("magic", b"HHMEM\x01\0\0garbage garbage garbage".to_vec()),
+        ("version", craft(2, meta, None, &[])),
+        ("meta json", craft(1, "{", None, &[])),
+        ("meta shape", craft(1, r#"{"modules":1}"#, None, &[])),
+        ("count over file", craft(1, meta, Some(u64::MAX / 17), &[])),
+        ("count over cap", craft(1, meta, Some(1 << 40), &[])),
+        ("count short", craft(1, meta, Some(2), &[(1, 2, 0)])),
+        ("kind", craft(1, meta, None, &[(1, 2, 9)])),
+        ("order", craft(1, meta, None, &[(5, 2, 0), (1, 2, 0)])),
+        ("duplicate", craft(1, meta, None, &[(5, 2, 0), (5, 2, 0)])),
+        (
+            "functions order",
+            craft(1, &meta.replace(r#"[{"addr":"0x10""#, r#"[{"addr":"0x20","callers":0,"internal":true,"name":null},{"addr":"0x10""#), None, &[]),
+        ),
+    ];
+    for (what, bytes) in cases {
+        assert!(load(&bytes).is_err(), "{what} was accepted");
+    }
+    // A meta length beyond the file is refused before allocating it.
+    let mut v = craft(1, meta, None, &[]);
+    v[16..24].copy_from_slice(&(1u64 << 40).to_le_bytes());
+    assert!(load(&v).is_err());
+}

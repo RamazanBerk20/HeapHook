@@ -30,6 +30,36 @@ pub struct Table {
     /// `<CheatTable>` children HeapHook does not understand, as raw XML, re-emitted on export.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub ct_extra: Vec<String>,
+    /// Memory viewer bookmarks (HeapHook JSON only; a `.CT` export leaves them out).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub bookmarks: Vec<Bookmark>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Bookmark {
+    /// Address expression.
+    pub address: String,
+    pub name: String,
+}
+
+/// The type column of a value entry, as the table shows it.
+pub fn type_name(e: &Entry) -> String {
+    if let Some(n) = &e.custom_name {
+        return format!("custom: {n}");
+    }
+    match e.vtype {
+        VType::Binary => "binary".into(),
+        VType::Byte => "byte".into(),
+        VType::Bytes2 => "2 bytes".into(),
+        VType::Bytes4 => "4 bytes".into(),
+        VType::Bytes8 => "8 bytes".into(),
+        VType::Float => "float".into(),
+        VType::Double => "double".into(),
+        VType::String => format!("string[{}]{}", if e.len > 0 { e.len } else { 16 }, if e.utf16 { " UTF-16" } else { "" }),
+        VType::Aob => format!("array of byte[{}]", if e.len > 0 { e.len } else { 8 }),
+        v => format!("{v:?}").to_lowercase(),
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -71,14 +101,14 @@ pub struct CodeEntry {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(untagged)]
 pub enum TableIn {
-    Table(Table),
+    Table(Box<Table>),
     Entries(Vec<Entry>),
 }
 
 impl From<TableIn> for Table {
     fn from(t: TableIn) -> Table {
         match t {
-            TableIn::Table(t) => t,
+            TableIn::Table(t) => *t,
             TableIn::Entries(entries) => Table { entries, ..Table::default() },
         }
     }
@@ -99,6 +129,9 @@ pub struct Entry {
     pub utf16: bool,
     pub signed: bool,
     pub hex: bool,
+    /// Display the value in binary (integers; HeapHook only, `.CT` `<HeapHookShowAsBinary>`).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub show_binary: bool,
     pub frozen: bool,
     pub freeze_mode: FreezeMode,
     /// `#RRGGBB` or null.
@@ -135,6 +168,7 @@ impl Default for Entry {
             utf16: false,
             signed: false,
             hex: false,
+            show_binary: false,
             frozen: false,
             freeze_mode: FreezeMode::Exact,
             color: None,
@@ -335,6 +369,7 @@ pub fn from_ct(xml: &str) -> Result<Table, String> {
         None => Vec::new(),
     };
     let mut t = Table {
+        bookmarks: Vec::new(),
         structures,
         entries: child(root, "CheatEntries").map(|l| entries(l, &mut budget)).unwrap_or_default(),
         lua_script: text(root, "LuaScript").unwrap_or_default(),
@@ -406,7 +441,7 @@ fn codes(list: Node) -> Vec<CodeEntry> {
 const ENTRY_TAGS: &[&str] = &[
     "ID", "Description", "Options", "Color", "VariableType", "AssemblerScript", "GroupHeader", "ShowAsHex",
     "ShowAsSigned", "Length", "Unicode", "CodePage", "ZeroTerminate", "ByteLength", "AllowIncrease",
-    "AllowDecrease", "Address", "Offsets", "DropDownList", "Hotkeys", "CheatEntries", "CustomType", "HeapHookCustomType",
+    "AllowDecrease", "Address", "Offsets", "DropDownList", "Hotkeys", "CheatEntries", "CustomType", "HeapHookCustomType", "HeapHookShowAsBinary",
 ];
 
 fn child<'a, 'i>(n: Node<'a, 'i>, name: &str) -> Option<Node<'a, 'i>> {
@@ -433,6 +468,7 @@ fn entry(n: Node, budget: &mut usize) -> Entry {
         addr: text(n, "Address").map(|a| a.trim().to_string()).unwrap_or_default(),
         signed: flag(n, "ShowAsSigned"),
         hex: flag(n, "ShowAsHex"),
+        show_binary: flag(n, "HeapHookShowAsBinary"),
         color: text(n, "Color").and_then(|c| ce_color(&c)),
         children: child(n, "CheatEntries").map(|l| entries(l, budget)).unwrap_or_default(),
         ct_extra: unknown(n, ENTRY_TAGS, budget),
@@ -661,6 +697,9 @@ fn write_entries(o: &mut String, list: &[Entry], d: usize) {
             }
             if e.signed {
                 tag(o, "ShowAsSigned", "1");
+            }
+            if e.show_binary {
+                tag(o, "HeapHookShowAsBinary", "1");
             }
             let vt = match e.vtype {
                 VType::Binary => "Binary",

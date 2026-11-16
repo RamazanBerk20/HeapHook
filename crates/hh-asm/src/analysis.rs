@@ -10,7 +10,9 @@ use iced_x86::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::disasm::{decode_at, formatter, previous_instruction};
+use crate::disasm::{
+    ValueType, decode_at, formatter, guess_value_type, mem_element, previous_instruction,
+};
 
 /// Register snapshot: lowercase names as the disassembler prints them (`rax`, `r8`, `rip`,
 /// `eflags`, ...). Sub-registers (`eax`, `al`, `ah`) are derived from the full register.
@@ -171,6 +173,27 @@ pub fn memory_accesses(p: &dyn Process, addr: Addr, regs: &Registers) -> Result<
         }
     }
     Ok(out)
+}
+
+/// The memory operand of the instruction at `addr` and a guess of what it holds. Without
+/// `regs` only absolute and RIP-relative operands have a known address. `None`: no memory
+/// operand, its address is unknown, or the memory is unreadable.
+pub fn guess_operand_type(
+    p: &dyn Process,
+    addr: Addr,
+    regs: Option<&Registers>,
+) -> Result<Option<(Addr, ValueType)>> {
+    let ins = decode_valid(p, addr)?;
+    let Some(op) = (0..ins.op_count()).find(|&i| ins.op_kind(i) == OpKind::Memory) else {
+        return Ok(None);
+    };
+    let empty = Registers::new();
+    let regs = regs.unwrap_or(&empty);
+    let Some(a) = ins.virtual_address(op, 0, |r, _, _| reg_value(regs, &ins, r)) else {
+        return Ok(None);
+    };
+    let (size, float) = mem_element(&ins);
+    Ok(guess_value_type(p, a, size, float).map(|t| (a, t)))
 }
 
 /// The instruction that ends exactly at `ip`, e.g. the one a data breakpoint (which traps

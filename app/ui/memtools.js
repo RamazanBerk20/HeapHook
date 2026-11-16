@@ -120,6 +120,35 @@ export async function copyDialog(at) {
   return !!(await attempt(async () => { await api.memCopy(s, d, n); return true; }));
 }
 
+// ---------- allocate / free ----------
+/** Allocates a block in the target; resolves to its address (hex) or null. */
+export async function allocDialog() {
+  const v = await formDialog('Allocate memory', [
+    { name: 'size', label: 'Size (hex bytes, rounded up to whole pages)', value: '1000' },
+    { name: 'prot', label: 'Protection', type: 'select', value: 'rwx', options: [['rwx', 'Read, write, execute (code caves)'], ['rw', 'Read and write'], ['r', 'Read only']] },
+  ], { ok: 'Allocate' });
+  if (!v) return null;
+  const n = hexNum(v.size);
+  if (!(n > 0)) { toast('Size must be a hex number above 0'); return null; }
+  const a = await attempt(() => api.memAlloc(n, { r: true, w: v.prot !== 'r', x: v.prot === 'rwx' }));
+  if (a) { navigator.clipboard?.writeText(fmtAddr(a)).catch(() => {}); toast(`Allocated ${fmtSize(n)} at ${fmtAddr(a)} (address copied)`, 'info'); }
+  return a || null;
+}
+
+export async function freeDialog(at) {
+  const v = await formDialog('Free memory', [
+    { name: 'addr', label: 'Address of the block', value: at ? fmtAddr(at) : '' },
+    { name: 'size', label: 'Size (hex bytes)', value: '1000' },
+  ], { ok: 'Free', text: 'Releases a block, normally one you allocated. Freeing memory the program still uses crashes it.' });
+  if (!v) return false;
+  const a = await resolve(v.addr), n = hexNum(v.size);
+  if (!a) return false;
+  if (!(n > 0)) { toast('Size must be a hex number above 0'); return false; }
+  const ok = await attempt(async () => { await api.memFree(a, n); return true; });
+  if (ok) toast(`Freed ${fmtSize(n)} at ${fmtAddr(a)}`, 'info');
+  return !!ok;
+}
+
 // ---------- save / load memory files ----------
 export async function saveRegions(ranges, what) {
   const p = await askPath({ save: true, title: `Save ${what}`, filters: [['HeapHook memory', ['hhmem']]], dflt: 'memory.hhmem' });

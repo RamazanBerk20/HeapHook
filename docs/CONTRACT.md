@@ -171,6 +171,26 @@ decreased decreased_by changed unchanged same_as_first`, plus `not: bool` to inv
 | `struct_export` / `struct_import` | `path, names` (empty = all) / `path` | – / `[name]` (`.json` `{structures}` or `.xml`/`.ct` CE `<Structures>`) |
 | `app_info` | – | `{version, license, platform, lua_allow_os}` (`lua_allow_os`: what the running Lua engine allows) |
 | settings (more) | | `scan_priority: normal/low/idle`, `scan_spill_dir` (empty = default), `hotkey_delay_ms` (a hotkey cannot fire again sooner) |
+| `mem_search` | `req: {start, end?, pattern: "48 8B ?? 05", backward?, limit?}` | `[addr]` (readable memory; forward: matches at >= start ascending, below `end`; backward: matches below start descending, at or above `end`; at most 1000) |
+| `disasm_search` | `req: {start, end, text, limit?}` | `[{addr, text}]` (linear decode of `start..end`, at most 64 MiB; instruction text contains `text`, case-insensitive) |
+| `mem_alloc` / `mem_free` | `size, prot: {r, w, x}` / `addr, size` | addr / – |
+| `process_pause` | `pause` | – (suspends / resumes every thread; refused while the debugger is attached; `close_process` and `debug_attach` resume first; `lua_poll.process.paused`) |
+| `trace_save` / `trace_load` | `path, trace` (any JSON) / `path` | – / the saved `trace` (file `{"heaphook_trace": 1, "trace"}`, at most 256 MiB) |
+| `table_export_text` | `path` | – (tab-separated listing: description indented by depth, address expression, type, live value) |
+| `table_merge` | `path` | `TableState` (entries appended with new ids, inactive; entries that run Lua arrive untrusted; a table script it brings into a table without one makes the table `ask`) |
+| `table_paste` | `entries, after?, base?` | `{version, ids}` (new ids after entry `after` in its list, or at the end; every entry that runs Lua arrives untrusted) |
+| `table_trust_entries` | `ids` | – (consent for the untrusted entries in those subtrees; refused while Settings say never; "never" withdraws it again) |
+| per-entry trust | | `TableState.untrusted: [id]`: entries whose Lua came from another table (paste, merge, `loadTable(f, true)`, a dropped file, or any put / undo that brings a script first seen in an untrusted source). Their Lua refuses on every route with `needs consent: entries: <what>: …` until `table_trust_entries`, whatever the table's own trust; their hotkeys are not registered system-wide before that |
+| `table_dirty` | – | bool (the table differs from what was last opened or saved; activation does not count) |
+| `table_open_data` | `name, data, force?` | like `table_open` for a file's text (a browser drop; `.CT` by name) |
+| `aa_load_file` / `aa_trust` | `path` / `script` | script text / – (`aa_execute` refuses `{$lua}` of a script loaded from a file or an untrusted table until `aa_trust` of that exact text; what the user types runs) |
+| `app_args` | – | `{table, pid, attach, launch: {program, args}}` or `null` (command line, handed out once) |
+| `app_quit` | `quit` | – (desktop app only: the answer to `lua_poll.window.close_seq`, a close with unsaved changes; closing again while asked closes) |
+| `lua_poll.window` | | `{close_seq, drop_seq, drops: [path]}` (window close requests and files dropped on the window) |
+| `debug_set_register` (FPU) | | also `st0`..`st7` (decimal), `xmm0`..`xmm15` (32 hex digits, `debug_context` byte order), `mxcsr`, `fcw`, `fsw` |
+| `debug_add_breakpoint` (trace) | `req.stop_when` | condition syntax; a trace breaks at the first step where it holds (reason `trace stop, breakpoint <id>`); `debug_breakpoints` rows carry `stop_when` |
+| settings (1.0) | | `app_hotkeys: [{keys, action: speed/pause, value}]` (HeapHook's own hotkeys, registered like a table's) |
+| table (1.0) | | table `bookmarks: [{address, name}]` (JSON only); entry `show_binary` (`.CT` `<HeapHookShowAsBinary>`) |
 | table (more) | | entry `custom` (CustomType) and `custom_name` (CE `<CustomType>` name; a name without a definition is kept as unsupported and written back unchanged); table `custom_types: [{name, ...CustomType}]`, `symbols: [{name, address}]` (CE `<UserdefinedSymbols>`, registered for address expressions while the table is loaded), `disasm_comments: [{address, comment}]` (CE `<DisassemblerComments>`) |
 
 `scan_first.opts`: `{start, stop, writable, executable, copy_on_write` (each `yes`/`no`/`any`)`,

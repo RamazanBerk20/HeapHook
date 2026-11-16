@@ -138,6 +138,170 @@ pub struct BpOptions {
 /// quick and must not call back into the `Debugger` (that returns an error).
 pub type Predicate = Arc<dyn Fn(&Context) -> bool + Send + Sync>;
 pub type AddressOf = Arc<dyn Fn(&Context) -> Option<Addr> + Send + Sync>;
+/// [`Hooks::value_condition`]: registers and the watched value before / after the access.
+pub type ValuePredicate = Arc<dyn Fn(&Context, &DataHit) -> bool + Send + Sync>;
+/// [`Hooks::message`]: the line a tracepoint logs.
+pub type Formatter = Arc<dyn Fn(&Context, Option<&DataHit>) -> String + Send + Sync>;
+
+/// The value a data breakpoint saw (little endian, at most 8 bytes).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DataHit {
+    /// The accessed address (hardware watch: the watched address).
+    pub address: Addr,
+    pub size: u8,
+    /// Before the access. Page watches read it right before the instruction runs (exact);
+    /// debug registers trap after the access, so it is the value seen at the previous hit
+    /// of this breakpoint, or when it was armed (a write the CPU does not report, e.g. by a
+    /// system call, makes it stale). `None` when unknown.
+    pub old: Option<u64>,
+    /// After the access; `None` when unreadable.
+    pub new: Option<u64>,
+}
+
+/// Per-breakpoint filters and options beyond [`BpOptions`]
+/// ([`Debugger::add_breakpoint_ext`], [`Debugger::set_extra`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct BpExtra {
+    /// Only hits by this thread count; other threads run past it silently.
+    pub thread: Option<Tid>,
+    /// Only hits whose instruction lies outside this module (name, case-insensitive), e.g.
+    /// "break on access from outside module X".
+    pub outside_module: Option<String>,
+    /// Tracepoint: each acting hit sends [`Event::Log`] (text from [`Hooks::message`]) and
+    /// an [`Action::Break`] does not stop. `Record` / `Trace` still do their work.
+    pub log_only: bool,
+    /// Options of an [`Action::Trace`] breakpoint.
+    pub trace: TraceOptions,
+}
+
+/// Break-and-trace options ([`BpExtra::trace`]). The step count of [`Action::Trace`] is the
+/// instruction limit (capped at [`MAX_TRACE_STEPS`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TraceOptions {
+    /// Module name patterns (`*`, `?`, case-insensitive): code in them is not traced. A call
+    /// into one (or a jump into one, e.g. through a PLT stub) runs at full speed until it
+    /// returns.
+    pub skip_modules: Vec<String>,
+    /// Only trace inside `[start, end)`; code outside it runs until it returns into it.
+    pub stay_in: Option<(Addr, Addr)>,
+    /// End the trace once the function it started in returns.
+    pub until_return: bool,
+    /// End the trace after this many milliseconds (0 = no limit; checked per instruction).
+    pub max_ms: u64,
+    /// Record what each instruction reads and writes ([`TraceStep::accesses`]).
+    pub capture_memory: bool,
+}
+
+/// Longest trace kept per breakpoint (and accepted by [`read_trace`]).
+pub const MAX_TRACE_STEPS: usize = 262_144;
+
+/// One traced instruction: the registers before it ran and the memory it touched.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TraceStep {
+    pub context: Context,
+    #[serde(default)]
+    pub accesses: Vec<TraceAccess>,
+}
+
+/// A memory operand of a traced instruction (from hh-asm's `memory_accesses`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TraceAccess {
+    pub addr: Addr,
+    pub size: u32,
+    pub read: bool,
+    pub write: bool,
+    /// Bytes before the instruction ran (at most 64; empty when unreadable).
+    pub before: Vec<u8>,
+    /// Bytes after it ran, for writes (filled in when the next step is recorded).
+    #[serde(default)]
+    pub after: Option<Vec<u8>>,
+}
+
+/// Debug events that stop the process ([`Debugger::set_break_on`]). Every one of them is
+/// reported as an event anyway ("notify"); these make it break too.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct BreakOn {
+    pub thread_created: bool,
+    pub thread_exited: bool,
+    /// Module name patterns (`*`, `?`, case-insensitive); a pattern with a `/` or `\` is
+    /// matched against the path instead.
+    pub module_loaded: Vec<String>,
+    pub module_unloaded: Vec<String>,
+}
+
+/// Why the process stopped for a debug event ([`Event::Stopped`], right before its
+/// `Event::Break { reason: Pause }`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum Trigger {
+    ThreadCreated { tid: Tid },
+    ThreadExited { tid: Tid },
+    ModuleLoaded(Module),
+    ModuleUnloaded(Module),
+    /// A launched process, before its first instruction ([`LaunchStop::FirstInstruction`]).
+    Start,
+    /// A launched process at its entry point ([`LaunchStop::Entry`]).
+    Entry,
+}
+
+/// Where [`Debugger::launch`] stops the new process.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LaunchStop {
+    /// At the main executable's entry point: libraries loaded, program code not run yet.
+    #[default]
+    Entry,
+    /// Before the first instruction (Linux: the dynamic loader's; Windows: the loader
+    /// breakpoint, before the main executable's code).
+    FirstInstruction,
+    /// Do not stop (pending breakpoints still arm as modules load).
+    Run,
+}
+
+/// A program started under the debugger ([`Debugger::launch`]).
+///
+/// The process is a child of the host process: dropping or detaching the `Debugger`
+/// releases it (it runs on, untraced and unpatched, from wherever it was, even if it was
+/// never continued); the host must reap it after it exits, as for any child.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LaunchOptions {
+    /// A path, or a name looked up in `PATH`.
+    pub program: String,
+    pub args: Vec<String>,
+    pub cwd: Option<String>,
+    /// The whole environment; `None` inherits the host's.
+    pub env: Option<Vec<(String, String)>>,
+    pub stop: LaunchStop,
+    /// Linux: file descriptors of the host given to the child as stdin / stdout / stderr;
+    /// `None` inherits. Windows: must be `None`.
+    pub stdin: Option<i32>,
+    pub stdout: Option<i32>,
+    pub stderr: Option<i32>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum StepKind {
+    Into,
+    Over,
+    Out,
+}
+
+/// Options of [`Debugger::step_with`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct StepOptions {
+    /// Breakpoints are ignored (neither counted nor acted on) until the step completes or
+    /// the process breaks for another reason.
+    pub skip_breakpoints: bool,
+    /// Module name patterns: stepping into a call into one of them steps over it, and a
+    /// step that lands in one (a jump through a PLT stub) runs until it returns.
+    pub over_modules: Vec<String>,
+}
+
+/// Most addresses [`Debugger::coverage_start`] takes.
+pub const MAX_COVERAGE: usize = 1 << 20;
 
 #[derive(Clone, Default)]
 pub struct Hooks {
@@ -151,6 +315,12 @@ pub struct Hooks {
     /// For `Trace`: break (with [`BreakReason::TraceStop`]) at the first traced step for
     /// which this returns true.
     pub stop_when: Option<Predicate>,
+    /// Data breakpoints (`Write` / `Access`): hits where this returns false for the value
+    /// before / after the access are ignored entirely, like [`Hooks::condition`].
+    pub value_condition: Option<ValuePredicate>,
+    /// Tracepoints ([`BpExtra::log_only`]): the logged line (at most 4096 bytes kept).
+    /// Default: `bp <id> hit by thread <tid> at <rip>`.
+    pub message: Option<Formatter>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -171,6 +341,14 @@ pub struct BreakpointInfo {
     /// (instruction, address) records.
     #[serde(default)]
     pub records_dropped: u64,
+    #[serde(default)]
+    pub extra: BpExtra,
+    /// Pending breakpoint ([`Debugger::add_pending_breakpoint`]): its address expression.
+    #[serde(default)]
+    pub pending: Option<String>,
+    /// A pending breakpoint's expression resolved in the current modules (`bp.address`).
+    #[serde(default)]
+    pub resolved: bool,
 }
 
 /// Most distinct hit records kept per breakpoint (a memcpy-like instruction on an
@@ -284,7 +462,28 @@ pub enum Event {
     BreakpointDisabled {
         bp: BpId,
     },
+    /// The next `Break { reason: Pause }` is for this debug event ([`BreakOn`], launch).
+    Stopped {
+        tid: Tid,
+        why: Trigger,
+    },
+    /// A tracepoint hit ([`BpExtra::log_only`]). At most [`MAX_LOG_RATE`] lines a second
+    /// are sent; `dropped` counts the ones left out since the previous line.
+    Log {
+        bp: BpId,
+        tid: Tid,
+        text: String,
+        dropped: u64,
+    },
+    /// A pending breakpoint's expression resolved and the breakpoint is armed at `address`.
+    BreakpointResolved {
+        bp: BpId,
+        address: Addr,
+    },
 }
+
+/// Most [`Event::Log`] lines sent per second.
+pub const MAX_LOG_RATE: u32 = 2000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum State {
@@ -301,6 +500,19 @@ pub enum State {
 pub struct ThreadInfo {
     pub tid: Tid,
     pub suspended: bool,
+    /// Linux: `/proc/<pid>/task/<tid>/comm`; Windows: the thread description (Windows 10
+    /// 1607+). Empty when unknown.
+    #[serde(default)]
+    pub name: String,
+    /// Linux: the kernel's state letter (`R`, `S`, `D`, `t` = stopped by the debugger, ...);
+    /// Windows: `suspended` or `running`.
+    #[serde(default)]
+    pub state: String,
+    /// CPU time spent in user / kernel mode, milliseconds.
+    #[serde(default)]
+    pub user_ms: u64,
+    #[serde(default)]
+    pub kernel_ms: u64,
 }
 
 /// One frame of [`Debugger::backtrace_frames`].
@@ -362,6 +574,13 @@ pub struct Fpu {
     /// ST0..ST7, 80-bit little endian.
     pub st: [[u8; 10]; 8],
     pub xmm: [[u8; 16]; 16],
+    /// Upper halves of YMM0..15 (AVX), valid when `has_ymm`. Only [`Debugger::context`]
+    /// fills them (hit records and break events do not); [`Debugger::set_context`] writes
+    /// them when `has_ymm` is set.
+    #[serde(default)]
+    pub ymm_hi: [[u8; 16]; 16],
+    #[serde(default)]
+    pub has_ymm: bool,
 }
 
 /// Registers as hh-asm's analysis wants them.
@@ -582,6 +801,20 @@ fn after_call(p: &dyn Process, ret: Addr) -> bool {
     allow(dead_code)
 )]
 fn walk_frames(p: &dyn Process, rip: Addr, rbp: Addr, max: usize) -> Vec<Addr> {
+    let chain = frame_chain(p, rbp, max.saturating_sub(1));
+    std::iter::once(rip)
+        .chain(chain.into_iter().map(|f| f.0))
+        .take(max)
+        .collect()
+}
+
+/// The frame-pointer walk of [`walk_frames`] as (return address, stack slot holding it):
+/// entry `k` is where frame `k` returns to.
+#[cfg_attr(
+    not(all(target_arch = "x86_64", any(target_os = "linux", windows))),
+    allow(dead_code)
+)]
+fn frame_chain(p: &dyn Process, rbp: Addr, max: usize) -> Vec<(Addr, Addr)> {
     let ps = p.pointer_size() as u64;
     let regions = p.regions().unwrap_or_default();
     let has = |a: Addr, f: fn(&Prot) -> bool| {
@@ -589,7 +822,7 @@ fn walk_frames(p: &dyn Process, rip: Addr, rbp: Addr, max: usize) -> Vec<Addr> {
             .iter()
             .any(|r| f(&r.prot) && a >= r.start && a - r.start < r.size)
     };
-    let mut out = vec![rip];
+    let mut out = Vec::new();
     let mut bp = rbp;
     while out.len() < max && bp != 0 && bp.is_multiple_of(ps) && has(bp, |p| p.r) {
         let (Ok(next), Ok(ret)) = (p.read_ptr(bp), p.read_ptr(bp + ps)) else {
@@ -598,13 +831,114 @@ fn walk_frames(p: &dyn Process, rip: Addr, rbp: Addr, max: usize) -> Vec<Addr> {
         if !has(ret, |p| p.x) || !after_call(p, ret) {
             break;
         }
-        out.push(ret);
+        out.push((ret, bp + ps));
         if next <= bp {
             break;
         }
         bp = next;
     }
     out
+}
+
+/// `*` / `?` wildcard match, ASCII case-insensitive.
+#[cfg_attr(
+    not(all(target_arch = "x86_64", any(target_os = "linux", windows))),
+    allow(dead_code)
+)]
+fn glob(pat: &str, s: &str) -> bool {
+    let (p, s) = (pat.as_bytes(), s.as_bytes());
+    let (mut i, mut j, mut star, mut mark) = (0, 0, None, 0);
+    while j < s.len() {
+        if i < p.len() && (p[i] == b'?' || p[i].eq_ignore_ascii_case(&s[j])) {
+            i += 1;
+            j += 1;
+        } else if i < p.len() && p[i] == b'*' {
+            star = Some(i);
+            mark = j;
+            i += 1;
+        } else if let Some(st) = star {
+            i = st + 1;
+            mark += 1;
+            j = mark;
+        } else {
+            return false;
+        }
+    }
+    p[i..].iter().all(|&c| c == b'*')
+}
+
+/// A module matches one of `pats` ([`BreakOn`], [`TraceOptions::skip_modules`]).
+#[cfg_attr(
+    not(all(target_arch = "x86_64", any(target_os = "linux", windows))),
+    allow(dead_code)
+)]
+fn module_matches(pats: &[String], m: &Module) -> bool {
+    pats.iter().any(|p| match p.contains(['/', '\\']) {
+        true => glob(p, &m.path),
+        false => glob(p, &m.name),
+    })
+}
+
+const TRACE_MAGIC: &str = "heaphook-trace";
+/// Largest trace file [`read_trace`] reads.
+pub const MAX_TRACE_FILE: u64 = 512 << 20;
+
+#[derive(Serialize, Deserialize)]
+struct TraceFile {
+    format: String,
+    version: u32,
+    steps: Vec<TraceStep>,
+}
+
+/// Writes a trace as JSON: `{"format": "heaphook-trace", "version": 1, "steps": [...]}`
+/// where each step is a [`TraceStep`] (registers as numbers, byte arrays as arrays).
+pub fn write_trace(w: &mut dyn std::io::Write, steps: &[TraceStep]) -> Result<()> {
+    if steps.len() > MAX_TRACE_STEPS {
+        return Err(Error::Other(format!(
+            "a trace holds at most {MAX_TRACE_STEPS} steps"
+        )));
+    }
+    let f = TraceFile {
+        format: TRACE_MAGIC.into(),
+        version: 1,
+        steps: steps.to_vec(),
+    };
+    serde_json::to_writer(std::io::BufWriter::new(w), &f)
+        .map_err(|e| Error::Other(format!("writing trace: {e}")))
+}
+
+/// Reads a trace written by [`write_trace`]. Refuses files over [`MAX_TRACE_FILE`] bytes,
+/// more than [`MAX_TRACE_STEPS`] steps, more than 64 accesses per step or access values
+/// over 64 bytes.
+pub fn read_trace(r: &mut dyn std::io::Read) -> Result<Vec<TraceStep>> {
+    use std::io::Read;
+    let mut buf = Vec::new();
+    r.take(MAX_TRACE_FILE + 1).read_to_end(&mut buf)?;
+    if buf.len() as u64 > MAX_TRACE_FILE {
+        return Err(Error::Parse(format!(
+            "trace file larger than {MAX_TRACE_FILE} bytes"
+        )));
+    }
+    let f: TraceFile =
+        serde_json::from_slice(&buf).map_err(|e| Error::Parse(format!("trace file: {e}")))?;
+    if f.format != TRACE_MAGIC || f.version != 1 {
+        return Err(Error::Parse("not a HeapHook trace (version 1)".into()));
+    }
+    if f.steps.len() > MAX_TRACE_STEPS {
+        return Err(Error::Parse(format!(
+            "trace has more than {MAX_TRACE_STEPS} steps"
+        )));
+    }
+    for s in &f.steps {
+        let bad = s.accesses.len() > 64
+            || s.accesses.iter().any(|a| {
+                a.before.len() > 64 || a.after.as_ref().is_some_and(|v| v.len() > 64)
+            });
+        if bad {
+            return Err(Error::Parse("trace step out of bounds".into()));
+        }
+    }
+    Ok(f.steps)
 }
 
 #[cfg(all(target_arch = "x86_64", any(target_os = "linux", windows)))]
@@ -657,21 +991,29 @@ mod session {
     impl Debugger {
         /// Attaches to a running process without stopping it for longer than the attach.
         pub fn attach(pid: Pid) -> Result<Debugger> {
-            let live = Arc::new(Live {
-                pid,
-                cur: RwLock::new(hh_core::open(pid)?),
-            });
-            let inner: Arc<dyn Process> = live.clone();
+            Self::start(engine::Start::Attach(pid))
+        }
+
+        /// Starts a program under the debugger ("create process"), stopped where
+        /// `opts.stop` says so breakpoints can be set before its code runs. When it stops,
+        /// [`Event::Stopped`] (`Trigger::Start` / `Trigger::Entry`) and a `Break` with
+        /// [`BreakReason::Pause`] are reported. A program that cannot be started is a clean
+        /// error (nothing left behind). Read [`LaunchOptions`] on what drop / detach do.
+        pub fn launch(opts: &LaunchOptions) -> Result<Debugger> {
+            Self::start(engine::Start::Launch(Box::new(opts.clone())))
+        }
+
+        fn start(how: engine::Start) -> Result<Debugger> {
             let shared = Arc::new(Shared::default());
             let (cmd, cmd_rx) = mpsc::channel::<Cmd>();
             let (ev_tx, ev_rx) = mpsc::channel();
             let (ok_tx, ok_rx) = mpsc::sync_channel(1);
-            let (m, s) = (live, shared.clone());
+            let s = shared.clone();
             let thread = std::thread::Builder::new()
                 .name("hh-debug".into())
-                .spawn(move || engine::run(pid, m, s, ev_tx, cmd_rx, ok_tx))?;
-            match ok_rx.recv() {
-                Ok(Ok(())) => {}
+                .spawn(move || engine::run(how, s, ev_tx, cmd_rx, ok_tx))?;
+            let live = match ok_rx.recv() {
+                Ok(Ok(live)) => live,
                 Ok(Err(e)) => {
                     let _ = thread.join();
                     return Err(e);
@@ -680,7 +1022,9 @@ mod session {
                     let _ = thread.join();
                     return Err(Error::Other("debugger thread died".into()));
                 }
-            }
+            };
+            let pid = live.pid;
+            let inner: Arc<dyn Process> = live;
             let process = Arc::new(DbgProcess {
                 inner,
                 shared,
@@ -764,7 +1108,7 @@ mod session {
             hooks: Hooks,
             opts: BpOptions,
         ) -> Result<BpId> {
-            self.call(move |e| e.add_bp(bp, hooks, opts, None))
+            self.call(move |e| e.add_bp(bp, hooks, opts, None, BpExtra::default(), None))
         }
 
         /// Page-protection watch ([`BpMethod::Page`]) of `len` bytes from `start`, for
@@ -786,7 +1130,7 @@ mod session {
                 method: BpMethod::Page,
                 action,
             };
-            self.call(move |e| e.add_bp(bp, hooks, opts, Some(len)))
+            self.call(move |e| e.add_bp(bp, hooks, opts, Some(len), BpExtra::default(), None))
         }
 
         pub fn remove_breakpoint(&self, id: BpId) -> Result<()> {
@@ -872,12 +1216,15 @@ mod session {
             self.call(|e| Ok(e.thread_list()))
         }
 
-        /// Registers of a stopped thread (process broken/suspended, or thread suspended).
+        /// Registers of a stopped thread (process broken/suspended, or thread suspended),
+        /// YMM upper halves included where the CPU and OS have them.
         pub fn context(&self, tid: Tid) -> Result<Context> {
             self.call(move |e| e.context(tid))
         }
 
-        /// Writes general, flag, segment and FPU/SSE registers (debug registers are ignored).
+        /// Writes general, flag, segment, x87, MXCSR and SSE registers, and the YMM upper
+        /// halves when `ctx.fpu.has_ymm` (debug registers are ignored; use
+        /// [`Debugger::set_ip`] for a checked instruction pointer change).
         pub fn set_context(&self, tid: Tid, ctx: Context) -> Result<()> {
             self.call(move |e| e.set_context(tid, &ctx))
         }
@@ -903,28 +1250,125 @@ mod session {
 
         /// Executes one instruction of `tid` (others stay stopped), then breaks again.
         pub fn step_into(&self, tid: Tid) -> Result<()> {
-            self.call(move |e| e.step(tid, engine::StepKind::Into))
+            self.step_with(tid, StepKind::Into, StepOptions::default())
         }
 
         /// Like `step_into`, but runs a `call` (recursion included) or a whole `rep` string
         /// instruction to completion; other threads run meanwhile.
         pub fn step_over(&self, tid: Tid) -> Result<()> {
-            self.call(move |e| e.step(tid, engine::StepKind::Over))
+            self.step_with(tid, StepKind::Over, StepOptions::default())
         }
 
         /// Runs until the current function returns (stepping over calls), then breaks.
         pub fn step_out(&self, tid: Tid) -> Result<()> {
-            self.call(move |e| e.step(tid, engine::StepKind::Out))
+            self.step_with(tid, StepKind::Out, StepOptions::default())
+        }
+
+        /// A step with options (skip breakpoints, modules to step over).
+        pub fn step_with(&self, tid: Tid, kind: StepKind, opts: StepOptions) -> Result<()> {
+            self.call(move |e| e.step(tid, kind, opts))
         }
 
         /// Continues until *any* thread reaches `addr`, then breaks with that thread.
         pub fn run_to(&self, addr: Addr) -> Result<()> {
-            self.call(move |e| e.run_to(addr, None))
+            self.call(move |e| e.run_to(addr, None, 1))
         }
 
         /// Continues until `tid` reaches `addr`; other threads pass `addr` unhindered.
         pub fn run_to_thread(&self, tid: Tid, addr: Addr) -> Result<()> {
-            self.call(move |e| e.run_to(addr, Some(tid)))
+            self.call(move |e| e.run_to(addr, Some(tid), 1))
+        }
+
+        /// Continues until `addr` has been reached `count` times (by `tid` only, or by any
+        /// thread), then breaks.
+        pub fn run_to_count(&self, addr: Addr, count: u64, tid: Option<Tid>) -> Result<()> {
+            self.call(move |e| e.run_to(addr, tid, count))
+        }
+
+        /// "Execute till return" of frame `frame` of [`Debugger::backtrace`] (0 = the
+        /// current function): continues until that function returns to its caller, on this
+        /// thread and with the stack back above that frame, then breaks. Needs the
+        /// frame-pointer walk to reach that frame.
+        pub fn run_until_return(&self, tid: Tid, frame: usize) -> Result<()> {
+            self.call(move |e| e.run_until_return(tid, frame))
+        }
+
+        /// Moves the instruction pointer of a stopped thread. The target must be in
+        /// executable memory and decode as an instruction. Continuing executes the
+        /// instruction there even if a breakpoint sits on it.
+        pub fn set_ip(&self, tid: Tid, addr: Addr) -> Result<()> {
+            self.call(move |e| e.set_ip(tid, addr))
+        }
+
+        /// Which debug events break the process (thread / module events).
+        pub fn set_break_on(&self, b: BreakOn) -> Result<()> {
+            self.call(move |e| {
+                e.break_on = b;
+                Ok(())
+            })
+        }
+
+        pub fn break_on(&self) -> Result<BreakOn> {
+            self.call(|e| Ok(e.break_on.clone()))
+        }
+
+        /// [`Debugger::add_breakpoint_with`] plus [`BpExtra`] (thread filter, outside-module
+        /// filter, tracepoint, trace options).
+        pub fn add_breakpoint_ext(
+            &self,
+            bp: Breakpoint,
+            hooks: Hooks,
+            opts: BpOptions,
+            extra: BpExtra,
+        ) -> Result<BpId> {
+            self.call(move |e| e.add_bp(bp, hooks, opts, None, extra, None))
+        }
+
+        /// A breakpoint at an address expression (`module+offset`, `module.symbol`, a
+        /// symbol; hh-asm's `resolve_address`), armed as soon as it resolves and re-resolved
+        /// whenever modules load, unload or the process execs. `bp.address` is ignored.
+        /// Until it resolves, `enabled` is false and `resolved` false.
+        pub fn add_pending_breakpoint(
+            &self,
+            expr: &str,
+            bp: Breakpoint,
+            hooks: Hooks,
+            opts: BpOptions,
+            extra: BpExtra,
+        ) -> Result<BpId> {
+            let expr = expr.trim().to_string();
+            if expr.is_empty() || expr.len() > 4096 {
+                return Err(Error::Other("bad breakpoint expression".into()));
+            }
+            self.call(move |e| e.add_bp(bp, hooks, opts, None, extra, Some(expr)))
+        }
+
+        /// Replaces the [`BpExtra`] of a breakpoint (hits and records kept).
+        pub fn set_extra(&self, id: BpId, extra: BpExtra) -> Result<()> {
+            self.call(move |e| e.set_extra(id, extra))
+        }
+
+        /// The last trace of a `Trace` breakpoint with the memory accesses of each step.
+        pub fn trace_steps(&self, id: BpId) -> Result<Vec<TraceStep>> {
+            self.call(move |e| e.trace_steps(id))
+        }
+
+        /// Starts recording which of `entries` (e.g. function entries) execute, with a
+        /// one-shot int3 on each (removed at its first hit), and the instruction of every
+        /// traced step. Entries outside executable memory are skipped; returns how many were
+        /// armed. Restarting drops the previous set. Arm only instruction starts.
+        pub fn coverage_start(&self, entries: Vec<Addr>) -> Result<usize> {
+            self.call(move |e| e.cov_start(entries))
+        }
+
+        /// Addresses executed since `coverage_start`, sorted.
+        pub fn coverage_hits(&self) -> Result<Vec<Addr>> {
+            self.call(|e| Ok(e.cov_hits()))
+        }
+
+        /// Removes the remaining coverage int3s and returns the executed set, sorted.
+        pub fn coverage_stop(&self) -> Result<Vec<Addr>> {
+            self.call(|e| e.cov_stop())
         }
 
         /// `count` stack slots starting at the thread's stack pointer.
@@ -1140,6 +1584,24 @@ mod tests {
         let p = X(MockProcess::new(0x1000, mem));
         assert_eq!(walk_frames(&p, 0x1010, 0x1080, 10), [0x1010, 0x1005]);
         assert_eq!(walk_frames(&p, 0x1010, 0x1081, 10), [0x1010]);
+    }
+
+    #[test]
+    fn glob_patterns() {
+        assert!(glob("libc.so*", "libc.so.6"));
+        assert!(glob("LIB?.dll", "libm.DLL"));
+        assert!(glob("*", ""));
+        assert!(glob("a*b*c", "aXXbYYc"));
+        assert!(!glob("a*b*c", "aXXbYY"));
+        assert!(!glob("libc", "libc.so.6"));
+        let m = Module {
+            name: "libz.so.1".into(),
+            path: "/usr/lib/libz.so.1".into(),
+            base: 0,
+            size: 1,
+        };
+        assert!(module_matches(&["/usr/*/libz*".into()], &m));
+        assert!(!module_matches(&["/opt/*".into(), "libc*".into()], &m));
     }
 
     #[test]

@@ -564,6 +564,8 @@ struct Table {
     sorted: Vec<Symbol>,
     /// Demangled names, built on the first lookup of one.
     by_demangled: OnceLock<HashMap<String, Addr>>,
+    /// `sorted[i]` demangled (None: not mangled), built on the first symbol listing.
+    demangled: OnceLock<Vec<Option<String>>>,
 }
 
 impl Table {
@@ -579,7 +581,12 @@ impl Table {
             by_name,
             sorted: syms.into_iter().map(|s| s.0).collect(),
             by_demangled: OnceLock::new(),
+            demangled: OnceLock::new(),
         }
+    }
+    fn demangled(&self) -> &[Option<String>] {
+        self.demangled
+            .get_or_init(|| self.sorted.iter().map(|s| demangle(&s.name)).collect())
     }
     /// By the mangled (stored) name, or by the demangled one shown by `symbol_at`.
     fn get(&self, name: &str) -> Option<Addr> {
@@ -610,15 +617,42 @@ impl Table {
     }
 }
 
-type Key = (u32, Addr, u64);
+/// (pid, base, size, module files are local)
+type Key = (u32, Addr, u64, bool);
 type Cache = Mutex<HashMap<Key, (String, Arc<Table>)>>;
+
+/// Pids whose module files are not on this machine (see [`set_module_files_local`]).
+static REMOTE_PIDS: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+
+/// Tells the symbol reader whether the module paths of process `pid` name files on this
+/// machine (the default). For a remote target (hh-net) call it with `false` when opening it:
+/// a path there names a file on the other machine, so symbols are parsed from target memory
+/// instead of a same-named local file. Call it with `true` again when the target is closed.
+pub fn set_module_files_local(pid: u32, local: bool) {
+    let mut v = REMOTE_PIDS.lock().unwrap_or_else(|e| e.into_inner());
+    v.retain(|p| *p != pid);
+    if !local {
+        // shortcut: a handful of remote targets per session; the oldest mark goes past 256.
+        if v.len() >= 256 {
+            v.remove(0);
+        }
+        v.push(pid);
+    }
+}
+
+fn files_local(pid: u32) -> bool {
+    !REMOTE_PIDS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains(&pid)
+}
 
 fn table(p: &dyn Process, m: &Module) -> Arc<Table> {
     // shortcut: the cache is never pruned (a few MB per hundred modules); add eviction if
     // HeapHook ever attaches to many processes in one session.
     static CACHE: OnceLock<Cache> = OnceLock::new();
     let cache = CACHE.get_or_init(Default::default);
-    let key = (p.pid(), m.base, m.size);
+    let key = (p.pid(), m.base, m.size, files_local(p.pid()));
     if let Some((path, t)) = cache.lock().unwrap_or_else(|e| e.into_inner()).get(&key)
         && *path == m.path
     {
@@ -633,6 +667,9 @@ fn table(p: &dyn Process, m: &Module) -> Arc<Table> {
 }
 
 fn load(p: &dyn Process, m: &Module) -> Result<Vec<(Symbol, bool)>> {
+    if !files_local(p.pid()) {
+        return parse_mem(p, m);
+    }
     let mut paths = vec![m.path.clone()];
     if cfg!(target_os = "linux") && m.path.starts_with('/') {
         // The target may live in another mount namespace (containers, flatpak).
@@ -652,6 +689,87 @@ fn load(p: &dyn Process, m: &Module) -> Result<Vec<(Symbol, bool)>> {
 /// All symbols of one module (parsed once, then cached).
 pub fn module_symbols(p: &dyn Process, m: &Module) -> Vec<Symbol> {
     table(p, m).sorted.clone()
+}
+
+/// One row of [`symbol_list`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SymbolRow {
+    /// Demangled when the stored name is mangled.
+    pub name: String,
+    /// Empty for user-registered symbols.
+    pub module: String,
+    pub addr: Addr,
+    pub size: u64,
+    /// Registered by the user or a script (not from a module).
+    pub user: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SymbolPage {
+    /// Rows matching the filter, over all pages.
+    pub total: usize,
+    pub rows: Vec<SymbolRow>,
+}
+
+/// Most rows one [`symbol_list`] page returns.
+pub const MAX_SYMBOL_PAGE: usize = 10_000;
+
+/// Symbols for a "symbol list" view: user symbols (by name), then each module's (by
+/// address). `module`: only that module (by name, `$process` = the main one; user symbols
+/// are left out then). `filter`: case-insensitive substring of the stored or demangled name
+/// (empty = all). Rows `offset..offset+limit` of the matches (`limit` at most
+/// [`MAX_SYMBOL_PAGE`]).
+pub fn symbol_list(
+    p: &dyn Process,
+    syms: &SymbolTable,
+    module: Option<&str>,
+    filter: &str,
+    offset: usize,
+    limit: usize,
+) -> SymbolPage {
+    let limit = limit.min(MAX_SYMBOL_PAGE);
+    let filter = filter.to_ascii_lowercase();
+    let hit = |n: &str| filter.is_empty() || n.to_ascii_lowercase().contains(&filter);
+    let mut page = SymbolPage::default();
+    let take = |page: &mut SymbolPage, row: &dyn Fn() -> SymbolRow| {
+        if page.total >= offset && page.rows.len() < limit {
+            page.rows.push(row());
+        }
+        page.total += 1;
+    };
+    let mods = p.modules().unwrap_or_default();
+    if module.is_none() {
+        let mut user: Vec<(&str, Addr)> = syms.iter().collect();
+        user.sort();
+        for (n, a) in user.into_iter().filter(|(n, _)| hit(n)) {
+            take(&mut page, &|| SymbolRow {
+                name: n.to_string(),
+                module: String::new(),
+                addr: a,
+                size: 0,
+                user: true,
+            });
+        }
+    }
+    let only = module.and_then(|n| crate::expr::find_module(&mods, n));
+    if module.is_some() && only.is_none() {
+        return page;
+    }
+    for m in mods.iter().filter(|m| only.is_none_or(|o| o.base == m.base)) {
+        let t = table(p, m);
+        for (s, d) in t.sorted.iter().zip(t.demangled()) {
+            if hit(&s.name) || d.as_deref().is_some_and(hit) {
+                take(&mut page, &|| SymbolRow {
+                    name: d.clone().unwrap_or_else(|| s.name.clone()),
+                    module: m.name.clone(),
+                    addr: s.addr,
+                    size: s.size,
+                    user: false,
+                });
+            }
+        }
+    }
+    page
 }
 
 fn stem(name: &str) -> &str {

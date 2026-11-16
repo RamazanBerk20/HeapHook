@@ -1901,6 +1901,150 @@ Object.assign(C, DBG, PTR, LIVE, TOOLS);
 C_lua_poll = C.lua_poll;
 Object.assign(C, NEW);
 
+// ---------- 1.0: search, memory, pause, per-entry trust, files ----------
+const TAINT = new Set(); // Lua script texts from untrusted sources (files, other tables)
+let PAUSED = false, SAVED = null;
+const plainJson = (t) => JSON.stringify(t, (k, v) => (k === 'frozen' ? undefined : v));
+const untrusted = () => (T.untrusted ||= []);
+function parsePattern(p) {
+  const out = [];
+  for (const tok of String(p).trim().split(/\s+/)) {
+    if (/^\?+$/.test(tok)) { for (let i = 0; i < Math.ceil(tok.length / 2); i++) out.push(null); continue; }
+    const t = tok.replace(/^0x/i, '');
+    if (t.length % 2 || !/^([0-9a-f]{2}|\?\?)+$/i.test(t)) err(`bad byte "${tok}" in the pattern`);
+    for (let i = 0; i < t.length; i += 2) out.push(t.slice(i, i + 2) === '??' ? null : parseInt(t.slice(i, i + 2), 16));
+  }
+  if (!out.some((b) => b != null)) err('the pattern needs at least one byte that is not ??');
+  return out;
+}
+/** New ids for pasted / merged entries; the ones that run Lua wait for their own consent. */
+function insertForeign(entries, after) {
+  let max = 0;
+  liveWalk(T.table.entries, (e) => { max = Math.max(max, e.id); });
+  const reid = (e) => ({ ...clone(e), id: ++max, frozen: false, ct_extra: [], children: (e.children || []).map(reid) });
+  const items = entries.map(reid);
+  pushUndo(clone(T.table));
+  const list = (() => { let r = null; liveWalk(T.table.entries, (e, p) => { if (e.id === after) r = p ? p.children : T.table.entries; }); return r; })();
+  if (list) list.splice(list.findIndex((e) => e.id === after) + 1, 0, ...items); else T.table.entries.push(...items);
+  liveWalk(items, (e) => { if (/\{\$lua\}/i.test(e.script || '')) { untrusted().push(e.id); TAINT.add(e.script); } });
+  T.version++;
+  return items.map((e) => e.id);
+}
+const RC = {
+  mem_search({ req }) {
+    need();
+    const pat = parsePattern(req.pattern), start = parseAddr(req.start), lim = Math.min(req.limit || 1, 1000);
+    const end = req.end ? parseAddr(req.end) : null, hits = [];
+    const R = P.R.filter((r) => r.prot[0] === 'r');
+    for (const r of req.backward ? [...R].reverse() : R) {
+      const lo = Math.max(r.start, req.backward ? end ?? 0 : start), hi = Math.min(r.start + r.size, req.backward ? start : end ?? Infinity);
+      if (lo >= hi) continue;
+      const v = view(lo, hi - lo);
+      if (!v) continue;
+      const found = [];
+      for (let i = 0; i + pat.length <= v.length; i++) if (pat.every((b, k) => b == null || v[i + k] === b)) found.push(lo + i);
+      for (const a of req.backward ? found.reverse() : found) { hits.push(hx(a)); if (hits.length >= lim) return hits; }
+    }
+    return hits;
+  },
+  disasm_search({ req }) {
+    need();
+    const needle = String(req.text || '').trim().toLowerCase();
+    if (!needle) err('nothing to search for');
+    const start = parseAddr(req.start), end = parseAddr(req.end), lim = Math.min(req.limit || 100, 1000), hits = [];
+    if (end <= start) err('the range is empty');
+    if (end - start > 64 * 1024 * 1024) err('the range is larger than 64 MiB; search a module or a smaller range');
+    for (let a = start, n = 0; a < end && n < 400000; n++) {
+      const d = decode(a);
+      if (!d) { a = Math.floor(a / 4096) * 4096 + 4096; continue; }
+      if (d.text.toLowerCase().includes(needle)) { hits.push({ addr: hx(a), text: d.text }); if (hits.length >= lim) break; }
+      a += d.len || 1;
+    }
+    return hits;
+  },
+  mem_alloc({ size }) { need(); if (!(size > 0)) err('size must be between 1 byte and 4 GiB'); const h = P.R.find((r) => r.path === '[heap]'); return hx(h.start + h.size - Math.ceil(size / 4096) * 4096); },
+  mem_free() { need(); return null; },
+  process_pause({ pause }) { need(); if (pause && D) err('the debugger is attached: use Break (Shift F9) and Continue (F9) instead'); PAUSED = !!pause; return null; },
+  trace_save({ path, trace }) { return C.table_save({ path, table: { heaphook_trace: 1, trace } }); },
+  trace_load({ path }) { fs ??= loadFs(); const f = fs[path] ?? err(`file not found: ${path}`); if (f.heaphook_trace !== 1) err(`${path}: not a HeapHook trace file`); return f.trace; },
+  table_export_text({ path }) {
+    const lines = ['Description\tAddress\tType\tValue'];
+    const go = (list, d) => list.forEach((e) => { lines.push(['  '.repeat(d) + e.description, e.script ? '' : e.addr, e.script ? 'script' : liveGroup(e) ? 'group' : e.vtype].join('\t')); go(e.children || [], d + 1); });
+    go(T.table.entries, 0);
+    return C.table_save({ path, table: lines.join('\n') + '\n' });
+  },
+  table_merge({ path }) {
+    fs ??= loadFs();
+    const t = fs[path] ?? err(`file not found: ${path}`);
+    insertForeign(Array.isArray(t) ? t : t.entries || [], null);
+    if (!T.table.lua_script?.trim() && t.lua_script?.trim()) T = { ...T, table: { ...T.table, lua_script: t.lua_script }, trust: 'ask' };
+    return T;
+  },
+  table_paste({ entries, after, base }) {
+    if (base != null && base !== T.version) err(`stale table version ${base} (current ${T.version})`);
+    return { ids: insertForeign(entries, after ?? null), version: T.version };
+  },
+  table_trust_entries({ ids }) {
+    if (loadSettings().table_script === 'never') err('Settings say never to run a table\'s Lua: change "Lua script in a loaded table" first');
+    const sub = new Set();
+    for (const id of ids) { const e = liveFind(id); if (e) liveWalk([e], (x) => sub.add(x.id)); }
+    T.untrusted = untrusted().filter((id) => !sub.has(id));
+    T.version++;
+    return null;
+  },
+  table_dirty: () => SAVED == null ? T.table.entries.length > 0 || !!T.table.lua_script : plainJson(T.table) !== SAVED,
+  table_open_data({ name, data }) {
+    if (/\.ct$/i.test(name)) err('Cheat Engine .CT import needs the real backend');
+    let t;
+    try { t = JSON.parse(data); } catch (e) { err(`${name}: not a table: ${e.message}`); }
+    C.table_save({ path: '\u0000drop', table: t });
+    return RC.table_open({ path: '\u0000drop' });
+  },
+  table_open(a) { const r = LIVE_open(a); T.untrusted = []; liveWalk(T.table.entries, (e) => { if (e.script) TAINT.add(e.script); }); SAVED = plainJson(T.table); return r; },
+  table_export(a) { const r = C_export(a); SAVED = plainJson(T.table); return r; },
+  table_set_active(a) {
+    if (a.active) for (const id of a.ids) {
+      const e = liveFind(id);
+      if (!e) continue;
+      let bad = null;
+      liveWalk([e], (x) => { if (!bad && untrusted().includes(x.id)) bad = x; });
+      if (bad) err(loadSettings().table_script === 'never' ? `${bad.description}: not run: it runs Lua from another table and Settings say never to run a table's Lua`
+        : `needs consent: entries: ${bad.description}: this entry came from another table (pasted, merged or dropped in) and runs Lua code, which can use your files and the process`);
+    }
+    return LIVE_active(a);
+  },
+  aa_load_file({ path }) { fs ??= loadFs(); const t = fs[path] ?? err(`file not found: ${path}`); const s = typeof t === 'string' ? t : t.script ?? err(`${path}: not a script`); if (/\{\$lua\}/i.test(s)) TAINT.add(s); return s; },
+  aa_trust({ script }) { if (loadSettings().table_script === 'never') err('Settings say never to run a table\'s Lua: change "Lua script in a loaded table" first'); TAINT.delete(script); return null; },
+  aa_execute(a) { if (/\{\$lua\}/i.test(a.script) && TAINT.has(a.script)) err('needs consent: this script: this table runs Lua code, which can use your files and the process'); return C_aa(a); },
+  app_args: () => null,
+  app_quit: () => null,
+  debug_set_register(a) {
+    const m = /^(st|xmm)(\d+)$|^(mxcsr|fcw|fsw)$/.exec(a.name);
+    if (!m) return C_setreg(a);
+    const d = dneed();
+    if (d.state !== 'broken') err(`thread ${a.tid} is running`);
+    const f = d.ctx.fpu;
+    if (m[1] === 'st') { const v = Number(a.value); if (!Number.isFinite(v) || +m[2] > 7) err(`${a.name}: "${a.value}" is not a number`); f.st[+m[2]] = { hex: f.st[+m[2]].hex, value: String(v) }; }
+    else if (m[1] === 'xmm') { const h = String(a.value).replace(/\s+/g, ''); if (!/^[0-9a-f]{32}$/i.test(h) || +m[2] > 15) err(`${a.name}: give 32 hex digits`); f.xmm[+m[2]] = h.toLowerCase(); }
+    else f[m[3]] = parseAddr(a.value).toString(16).toUpperCase().padStart(m[3] === 'mxcsr' ? 8 : 4, '0');
+    return null;
+  },
+  debug_add_breakpoint(a) { const id = C_addbp(a); const b = D.bps.find((x) => x.id === id); if (b && a.req.action === 'trace' && a.req.stop_when?.trim()) b.stop_when = checkCond(a.req.stop_when); return id; },
+  debug_breakpoints() { return C_bps().map((r) => ({ ...r, ...(D.bps.find((b) => b.id === r.id)?.stop_when ? { stop_when: D.bps.find((b) => b.id === r.id).stop_when } : {}) })); },
+  lua_poll(a) {
+    const r = C_poll(a);
+    if (r.process) r.process.paused = PAUSED;
+    r.window = { close_seq: 0, drop_seq: 0, drops: [] };
+    return r;
+  },
+};
+const LIVE_open = C.table_open, C_export = C.table_export, LIVE_active = C.table_set_active, C_aa = C.aa_execute, C_setreg = C.debug_set_register;
+const C_addbp = C.debug_add_breakpoint, C_bps = C.debug_breakpoints, C_poll = C.lua_poll;
+Object.assign(C, RC);
+// The table's get carries the untrusted list too.
+const C_get = C.table_get;
+C.table_get = () => ({ ...C_get(), untrusted: untrusted() });
+
 function loadFs() { try { return JSON.parse(localStorage.getItem('hh.mockfs')) || {}; } catch { return {}; } }
 
 /** invoke() look-alike: async, rejects with a string, returns JSON-cloned data. */

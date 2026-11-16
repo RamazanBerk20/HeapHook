@@ -1,5 +1,5 @@
 //! Scan requests and their compilation into per-position predicates.
-use hh_core::{Addr, Error, Result};
+use hh_core::{Addr, Error, RegionKind, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::hexaddr;
@@ -108,6 +108,46 @@ pub struct ScanOptions {
     pub bit_start: Option<u8>,
     /// String code page: `None`/65001 UTF-8, 1252, 28591 (ignored with `utf16`).
     pub codepage: Option<u32>,
+    /// Region kinds to scan (Cheat Engine's MEM_IMAGE / MEM_MAPPED / MEM_PRIVATE boxes);
+    /// empty = all.
+    pub kinds: Vec<RegionKind>,
+    /// Scan only inside these modules' address ranges (case-insensitive names); empty = no
+    /// restriction. An unknown name is an error.
+    pub modules: Vec<String>,
+    /// Skip these modules' address ranges.
+    pub exclude_modules: Vec<String>,
+    /// Scan only inside these address ranges (`[start, end)`, at most 4096); empty = no
+    /// restriction. Combines with `start`/`stop` and `modules` (all must hold).
+    pub ranges: Vec<AddrRange>,
+    /// Skip regions smaller / larger than this many bytes.
+    pub min_region_size: Option<u64>,
+    pub max_region_size: Option<u64>,
+    /// Float and double matches must be "simple" values: zero, or finite with a magnitude
+    /// in [1e-5, 1e15) (what Cheat Engine prints without an exponent). Cuts the noise of
+    /// float/double (and "all") scans; also applies to next scans.
+    pub simple_values: bool,
+}
+
+/// An address range `[start, end)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AddrRange {
+    #[serde(with = "hexaddr")]
+    pub start: Addr,
+    #[serde(with = "hexaddr")]
+    pub end: Addr,
+}
+
+/// Pointer-type scan ([`crate::Scanner::pointer_scan`]): pointer-sized values that point
+/// into readable memory, or only into `modules` / `ranges` when given (either matches).
+/// The results are 4- or 8-byte entries (the target's pointer size), so next scans work as
+/// for those types.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PointerScan {
+    /// Where to look (region filters, alignment: default the pointer size, threads...).
+    pub opts: ScanOptions,
+    pub modules: Vec<String>,
+    pub ranges: Vec<AddrRange>,
 }
 
 impl Default for ScanOptions {
@@ -135,6 +175,13 @@ impl Default for ScanOptions {
             bit_len: None,
             bit_start: None,
             codepage: None,
+            kinds: Vec::new(),
+            modules: Vec::new(),
+            exclude_modules: Vec::new(),
+            ranges: Vec::new(),
+            min_region_size: None,
+            max_region_size: None,
+            simple_values: false,
         }
     }
 }
@@ -360,11 +407,21 @@ pub(crate) struct Test {
     pub num: Option<(Prim, bool, NumCmp, bool)>,
 }
 
-fn num_test(prim: Prim, signed: bool, cmp: NumCmp, not: bool, bit: u8) -> Test {
+/// Zero, or finite with a magnitude Cheat Engine prints without an exponent.
+pub(crate) fn simple(x: f64) -> bool {
+    x == 0.0 || (x.is_finite() && (1e-5..1e15).contains(&x.abs()))
+}
+
+/// `simple`: float matches must also be [`simple`] values.
+fn num_test(prim: Prim, signed: bool, cmp: NumCmp, not: bool, bit: u8, simple: bool) -> Test {
+    let simple = simple && prim.is_float();
     let pred: BytePred = with_num!(prim, signed, T => Box::new(move |c: &[u8], p: &[u8], f: &[u8]| {
-        eval::<T>(&cmp, T::rd(c), T::rd(p), T::rd(f)) != not
+        let x = T::rd(c);
+        (eval::<T>(&cmp, x, T::rd(p), T::rd(f)) != not) && (!simple || self::simple(x.f()))
     }));
-    Test { bit, need: prim.width(), need_prev: prim.width(), pred, num: Some((prim, signed, cmp, not)) }
+    // The specialized loops do not know the simple-value filter.
+    let num = (!simple).then_some((prim, signed, cmp, not));
+    Test { bit, need: prim.width(), need_prev: prim.width(), pred, num }
 }
 
 fn custom_test(ct: CustomType, cmp: NumCmp, not: bool) -> Test {
@@ -491,7 +548,7 @@ fn all_tests(st: ScanType, a: Option<&str>, b: Option<&str>, o: &ScanOptions, no
     let mut tests: Vec<Test> = all_prims(o)
         .filter_map(|(bit, p)| {
             let c = num_cmp(Ty::Prim(p), st, a, b, &nopts(o)).ok()?;
-            Some(num_test(p, o.signed, c, not, bit))
+            Some(num_test(p, o.signed, c, not, bit, o.simple_values))
         })
         .collect();
     if o.all_types.contains(&VType::String) && str_len != Some(0) {
@@ -623,9 +680,10 @@ pub(crate) fn compile_first(req: &FirstScan) -> Result<(Kind, Plan)> {
                     plan.fast = match c {
                         // Exact integers are a byte search: memchr-accelerated, any alignment.
                         NumCmp::Bits(v) if !req.not => Fast::Pat(Pattern::exact(v.to_le_bytes()[..p.width()].to_vec())),
+                        _ if o.simple_values && p.is_float() => Fast::None,
                         _ => Fast::Num(p, o.signed, c, req.not),
                     };
-                    plan.tests = vec![num_test(p, o.signed, c, req.not, 1)];
+                    plan.tests = vec![num_test(p, o.signed, c, req.not, 1, o.simple_values)];
                 }
                 k.width = p.width();
                 natural = p.width().min(4);
@@ -685,7 +743,7 @@ pub(crate) fn compile_next(k: &Kind, req: &NextScan, w: usize) -> Result<(Plan, 
         },
         v => {
             let p = Prim::of(v).ok_or(Error::Unsupported("value type"))?;
-            vec![num_test(p, o.signed, num_cmp(Ty::Prim(p), st, a, b, &nopts(&o))?, not, 1)]
+            vec![num_test(p, o.signed, num_cmp(Ty::Prim(p), st, a, b, &nopts(&o))?, not, 1, o.simple_values)]
         }
     };
     let keeps_prev = st == ScanType::Unchanged && !not && !k.binary() && width == w;

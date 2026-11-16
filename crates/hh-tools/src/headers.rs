@@ -1,7 +1,7 @@
 //! PE / ELF header summaries of a loaded module: format, machine, entry point, sections,
 //! import / export counts. PE images are read from target memory (headers are mapped);
 //! ELF files are read from disk (section headers are not mapped) with a memory fallback that
-//! only knows the program headers.
+//! only knows the program headers; [`summary_with`] skips the disk for remote targets.
 use hh_core::{Addr, Error, Module, Process, Prot, Result};
 use serde::{Deserialize, Serialize};
 
@@ -87,8 +87,16 @@ fn cstr(b: &[u8]) -> String {
     String::from_utf8_lossy(&b[..n]).into_owned()
 }
 
-/// Header summary of a module (PE or ELF, 32 or 64-bit).
+/// Header summary of a module (PE or ELF, 32 or 64-bit). Module files are read from the
+/// local disk; use [`summary_with`] for a remote target.
 pub fn summary(p: &dyn Process, m: &Module) -> Result<HeaderSummary> {
+    summary_with(p, m, true)
+}
+
+/// [`summary`] with `local_files = false` for a target on another machine: the module path
+/// from its memory map names a file over there, and a same-named local file must not be
+/// parsed instead, so only target memory is read.
+pub fn summary_with(p: &dyn Process, m: &Module, local_files: bool) -> Result<HeaderSummary> {
     let mem = |o: u64, len: usize| {
         let mut b = vec![0u8; len];
         let n = p.read(m.base.checked_add(o)?, &mut b).ok()?;
@@ -98,8 +106,8 @@ pub fn summary(p: &dyn Process, m: &Module) -> Result<HeaderSummary> {
     match rd(&mem, 0, 4)?.as_slice() {
         [b'M', b'Z', ..] => parse_pe(&mem, m.base),
         [0x7f, b'E', b'L', b'F'] => {
-            let mut paths = vec![m.path.clone()];
-            if cfg!(target_os = "linux") && m.path.starts_with('/') {
+            let mut paths = if local_files { vec![m.path.clone()] } else { Vec::new() };
+            if local_files && cfg!(target_os = "linux") && m.path.starts_with('/') {
                 paths.push(format!("/proc/{}/root{}", p.pid(), m.path));
             }
             for path in paths {

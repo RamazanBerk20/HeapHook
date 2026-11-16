@@ -902,6 +902,104 @@ impl CustomType {
     pub fn write_mask(&self) -> Option<Vec<u8>> {
         (self.bit_len > 0).then(|| self.mem_bytes(self.vmask() << self.bit_start))
     }
+
+    /// The value of memory bytes in converted units (`raw * scale + offset`); `None` if `b`
+    /// is shorter than `size` or the type is invalid. Integer types without scale/offset
+    /// give [`CustomNumber::Int`], everything else [`CustomNumber::Float`].
+    pub fn number(&self, b: &[u8]) -> Option<CustomNumber> {
+        if b.len() < self.size() || self.validate().is_err() {
+            return None;
+        }
+        let v = self.decode(b);
+        Some(if v.float { CustomNumber::Float(v.f) } else { CustomNumber::Int(v.i) })
+    }
+
+    /// Memory bytes of a number in converted units (what [`Self::encode`] makes of its text).
+    pub fn encode_number(&self, n: CustomNumber) -> Result<Vec<u8>> {
+        let exact_int = self.binary || (!self.float && !self.scaled());
+        let n = match n {
+            CustomNumber::Float(f) if exact_int => {
+                if !f.is_finite() || f.fract() != 0.0 || f.abs() > 2f64.powi(64) {
+                    return Err(Error::Parse(format!("{f} is not an integer")));
+                }
+                CustomNumber::Int(f as i128)
+            }
+            n => n,
+        };
+        match n {
+            CustomNumber::Int(i) if self.binary => {
+                let u = u64::try_from(i).map_err(|_| Error::Parse(format!("{i} does not fit the bit field")))?;
+                self.encode(&format!("{u:b}"), &Fmt::default())
+            }
+            CustomNumber::Int(i) => self.encode(&i.to_string(), &Fmt::default()),
+            // Debug keeps exponents ("1e300"), which the parser reads back exactly.
+            CustomNumber::Float(f) => self.encode(&format!("{f:?}"), &Fmt::default()),
+        }
+    }
+}
+
+/// A custom-typed value in converted units (see [`CustomType::number`]).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum CustomNumber {
+    Int(i128),
+    Float(f64),
+}
+
+impl CustomNumber {
+    pub fn as_f64(self) -> f64 {
+        match self {
+            CustomNumber::Int(i) => i as f64,
+            CustomNumber::Float(f) => f,
+        }
+    }
+}
+
+impl std::fmt::Display for CustomNumber {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CustomNumber::Int(i) => write!(f, "{i}"),
+            CustomNumber::Float(x) => write!(f, "{x}"),
+        }
+    }
+}
+
+/// Reads a custom-typed value as a number in converted units (for Lua and hotkeys).
+pub fn read_custom(mem: &dyn Memory, addr: Addr, ct: &CustomType) -> Result<CustomNumber> {
+    ct.validate()?;
+    let mut buf = vec![0u8; ct.size()];
+    mem.read_exact(addr, &mut buf)?;
+    ct.number(&buf).ok_or(Error::NoAccess { addr })
+}
+
+/// Writes a number in converted units; bit fields keep the other bits.
+pub fn write_custom_number(mem: &dyn Memory, addr: Addr, ct: &CustomType, n: CustomNumber) -> Result<()> {
+    write_masked(mem, addr, ct, &ct.encode_number(n)?)
+}
+
+/// Hotkey "increase / decrease value by": adds `delta` (converted units, negative to
+/// decrease) to the value at `addr` and returns what was written. Integers stay exact when
+/// `delta` is whole; a result outside the type's range is an error, nothing is written.
+pub fn add_custom(mem: &dyn Memory, addr: Addr, ct: &CustomType, delta: f64) -> Result<CustomNumber> {
+    let new = match read_custom(mem, addr, ct)? {
+        CustomNumber::Int(i) if delta.fract() == 0.0 && delta.abs() < 2f64.powi(100) => {
+            CustomNumber::Int(i.checked_add(delta as i128).ok_or_else(|| Error::Parse("value out of range".into()))?)
+        }
+        n => CustomNumber::Float(n.as_f64() + delta),
+    };
+    let bytes = ct.encode_number(new)?;
+    write_masked(mem, addr, ct, &bytes)?;
+    ct.number(&bytes).ok_or(Error::NoAccess { addr })
+}
+
+fn write_masked(mem: &dyn Memory, addr: Addr, ct: &CustomType, new: &[u8]) -> Result<()> {
+    match ct.write_mask() {
+        None => mem.write(addr, new),
+        Some(m) => {
+            let mut old = vec![0u8; new.len()];
+            mem.read_exact(addr, &mut old)?;
+            mem.write(addr, &merge(&old, new, &m))
+        }
+    }
 }
 
 /// Merges `new` into `old` under `mask` (bit-field writes).
@@ -935,15 +1033,7 @@ pub fn read_values_ex(mem: &dyn Memory, refs: &[ValueRefEx]) -> Vec<Option<Strin
 
 /// Writes a custom-typed value; bit fields keep the other bits (read-modify-write).
 pub fn write_custom(mem: &dyn Memory, addr: Addr, ct: &CustomType, value: &str, fmt: &Fmt) -> Result<()> {
-    let new = ct.encode(value, fmt)?;
-    match ct.write_mask() {
-        None => mem.write(addr, &new),
-        Some(m) => {
-            let mut old = vec![0u8; new.len()];
-            mem.read_exact(addr, &mut old)?;
-            mem.write(addr, &merge(&old, &new, &m))
-        }
-    }
+    write_masked(mem, addr, ct, &ct.encode(value, fmt)?)
 }
 
 #[cfg(test)]

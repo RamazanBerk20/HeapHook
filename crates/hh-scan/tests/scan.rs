@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
-use hh_core::{Addr, Error, Memory, MockProcess, Pid, Process, Prot, Region, RegionKind, Result};
+use hh_core::{Addr, Error, Memory, MockProcess, Module, Pid, Process, Prot, Region, RegionKind, Result};
 use hh_scan::*;
 
 /// Several regions plus unreadable ranges that can be changed between scans.
@@ -18,6 +18,7 @@ struct Fake {
     /// Start addresses of regions reported as write-copy pages.
     cow: Vec<Addr>,
     pid: AtomicU32,
+    modules: Mutex<Vec<Module>>,
 }
 
 const RW: Prot = Prot { r: true, w: true, x: false };
@@ -33,6 +34,7 @@ impl Fake {
             read_delay: AtomicU64::new(0),
             cow: Vec::new(),
             pid: AtomicU32::new(1),
+            modules: Mutex::default(),
         }
     }
     fn region(&self, addr: Addr) -> Result<(usize, usize)> {
@@ -86,6 +88,9 @@ impl Process for Fake {
             .iter()
             .map(|(a, m, p, k)| Region { start: *a, size: m.read().unwrap().len() as u64, prot: *p, kind: *k, shared: false, cow: self.cow.contains(a), path: None })
             .collect())
+    }
+    fn modules(&self) -> Result<Vec<Module>> {
+        Ok(self.modules.lock().unwrap().clone())
     }
     fn suspend(&self) -> Result<()> {
         self.suspends.fetch_add(1, Relaxed);
@@ -1205,4 +1210,321 @@ fn pause_leaves_an_already_stopped_target_stopped() {
     let _ = child.kill();
     let _ = child.wait();
     assert_eq!(counts, (0, 0));
+}
+
+// ---------------------------------------------------------------- 1.0 feature gaps
+
+fn module(name: &str, base: Addr, size: u64) -> Module {
+    Module { name: name.into(), path: format!("/x/{name}"), base, size }
+}
+
+fn opts_in(start: Addr, stop: Addr) -> ScanOptions {
+    ScanOptions { start: Some(start), stop: Some(stop), ..ScanOptions::default() }
+}
+
+#[test]
+fn saved_values_by_address() {
+    let p = fake();
+    p.put(A + 0x10, &5u32.to_le_bytes());
+    p.put(B + 0x100, &5u32.to_le_bytes());
+    let s = scanner(&p);
+    s.first_scan(&first(VType::Bytes4, ScanType::Exact, "5")).unwrap();
+    s.save_scan("five").unwrap();
+    p.put(A + 0x10, &6u32.to_le_bytes());
+    s.next_scan(&next(ScanType::Changed, None)).unwrap();
+    assert_eq!(addrs(&s), [A + 0x10]);
+    let some = |v: &str| Some(v.to_string());
+    assert_eq!(s.saved_values("five", &[B + 0x100, A + 0x10, A + 0x14, 0]).unwrap(), [some("5"), some("5"), None, None]);
+    // "first": the first-scan value of the current results only.
+    assert_eq!(s.saved_values("first", &[A + 0x10, B + 0x100]).unwrap(), [some("5"), None]);
+    assert!(s.saved_values("nope", &[A]).is_err());
+
+    // Dense (unknown initial value) sets, plain and masked.
+    p.put(A + 3, &[7]);
+    for vt in [VType::Byte, VType::All] {
+        let f = FirstScan { opts: opts_in(A, A + 0x100), ..first(vt, ScanType::Unknown, "") };
+        s.first_scan(&f).unwrap();
+        s.save_scan("u").unwrap();
+        assert_eq!(s.saved_values("u", &[A + 0x200, A + 4, A + 3]).unwrap()[1..], [some("0"), some("7")], "{vt:?}");
+        assert_eq!(s.saved_values("u", &[A + 0x200]).unwrap(), [None]);
+    }
+}
+
+#[test]
+fn spill_dir_is_public() {
+    let dir = tempfile::tempdir_in(".").unwrap();
+    let s = scanner(&fake());
+    s.set_spill_dir(Some(dir.path().to_path_buf()));
+    assert_eq!(s.effective_spill_dir(), dir.path());
+    assert_eq!(spill_dir(Some(dir.path())), dir.path());
+    s.set_spill_dir(None);
+    assert_eq!(s.effective_spill_dir(), spill_dir(None));
+}
+
+#[test]
+fn custom_number_helpers() {
+    let p = MockProcess::new(0x1000, vec![0; 16]);
+    let fmt = Fmt::default();
+    let fixed = CustomType { scale: 0.01, ..CustomType::int(2, true) };
+    write_custom(&p, 0x1000, &fixed, "12.34", &fmt).unwrap();
+    assert_eq!(read_custom(&p, 0x1000, &fixed).unwrap(), CustomNumber::Float(12.34));
+    assert_eq!(add_custom(&p, 0x1000, &fixed, 1.5).unwrap(), CustomNumber::Float(13.84));
+    assert_eq!(fixed.format(&p.mem.read().unwrap()[..2], &fmt), "13.84");
+
+    let be = CustomType::preset("4 Byte Big Endian").unwrap();
+    write_custom_number(&p, 0x1004, &be, CustomNumber::Int(258)).unwrap();
+    assert_eq!(p.mem.read().unwrap()[4..8], [0, 0, 1, 2]);
+    assert_eq!(add_custom(&p, 0x1004, &be, -8.0).unwrap(), CustomNumber::Int(250));
+    assert_eq!(add_custom(&p, 0x1004, &be, 0.5).unwrap_err().to_string(), "parse error: 250.5 is not an integer");
+    assert!(be.encode_number(CustomNumber::Float(3.0)).is_ok());
+
+    // Bit field: bits 4..6 of a byte; the other bits stay.
+    let bits = CustomType { bit_start: 4, bit_len: 3, ..CustomType::int(1, false) };
+    p.write(0x1008, &[0xff]).unwrap();
+    assert_eq!(read_custom(&p, 0x1008, &bits).unwrap(), CustomNumber::Int(7));
+    write_custom_number(&p, 0x1008, &bits, CustomNumber::Int(2)).unwrap();
+    assert_eq!(p.mem.read().unwrap()[8], 0xaf);
+    assert_eq!(add_custom(&p, 0x1008, &bits, 1.0).unwrap(), CustomNumber::Int(3));
+    assert!(add_custom(&p, 0x1008, &bits, 10.0).is_err());
+    assert_eq!(p.mem.read().unwrap()[8], 0xbf, "a failed add writes nothing");
+
+    let bin = CustomType { binary: true, ..CustomType::int(1, false) };
+    assert_eq!(bin.encode_number(CustomNumber::Int(5)).unwrap(), [5]);
+    let fl = CustomType::preset("Float Big Endian").unwrap();
+    write_custom_number(&p, 0x100c, &fl, CustomNumber::Float(2.5)).unwrap();
+    assert_eq!(add_custom(&p, 0x100c, &fl, -1.0).unwrap(), CustomNumber::Float(1.5));
+    assert_eq!(fl.number(&[0x3f, 0xc0, 0, 0]), Some(CustomNumber::Float(1.5)));
+    assert_eq!(fl.number(&[0x3f]), None);
+    assert!(read_custom(&p, 0x2000, &fl).is_err());
+}
+
+#[test]
+fn region_kind_module_range_and_size_filters() {
+    let p = Arc::new(Fake::new(vec![
+        (0x10000, 0x1000, RW, RegionKind::Image),
+        (0x20000, 0x1000, RW, RegionKind::Image),
+        (0x30000, 0x1000, RW, RegionKind::Private),
+        (0x40000, 0x2000, RW, RegionKind::Mapped),
+    ]));
+    *p.modules.lock().unwrap() = vec![module("game.exe", 0x10000, 0x1000), module("lib.so", 0x20000, 0x1000)];
+    for a in [0x10010, 0x20010, 0x30010, 0x40010] {
+        p.put(a, &9u32.to_le_bytes());
+    }
+    let s = scanner(&p);
+    let scan = |o: ScanOptions| -> Result<Vec<Addr>> {
+        s.first_scan(&FirstScan { opts: o, ..first(VType::Bytes4, ScanType::Exact, "9") })?;
+        Ok(addrs(&s))
+    };
+    let d = ScanOptions::default;
+    let r = |start, end| AddrRange { start, end };
+    assert_eq!(scan(d()).unwrap(), [0x10010, 0x20010, 0x30010, 0x40010]);
+    assert_eq!(scan(ScanOptions { kinds: vec![RegionKind::Private], ..d() }).unwrap(), [0x30010]);
+    assert_eq!(scan(ScanOptions { kinds: vec![RegionKind::Image, RegionKind::Mapped], ..d() }).unwrap(), [0x10010, 0x20010, 0x40010]);
+    assert_eq!(scan(ScanOptions { modules: vec!["GAME.EXE".into()], ..d() }).unwrap(), [0x10010]);
+    let ex = ScanOptions { exclude_modules: vec!["game.exe".into(), "not-loaded.dll".into()], ..d() };
+    assert_eq!(scan(ex).unwrap(), [0x20010, 0x30010, 0x40010]);
+    assert!(scan(ScanOptions { modules: vec!["nope".into()], ..d() }).unwrap_err().to_string().contains("no module named"));
+    // A range only has to hold the value's start.
+    let rg = ScanOptions { ranges: vec![r(0x40000, 0x40100), r(0x20000, 0x20011)], ..d() };
+    assert_eq!(scan(rg.clone()).unwrap(), [0x20010, 0x40010]);
+    assert!(scan(ScanOptions { modules: vec!["game.exe".into()], ..rg }).unwrap().is_empty());
+    assert_eq!(scan(ScanOptions { min_region_size: Some(0x2000), ..d() }).unwrap(), [0x40010]);
+    assert_eq!(scan(ScanOptions { max_region_size: Some(0x1000), ..d() }).unwrap(), [0x10010, 0x20010, 0x30010]);
+    assert!(scan(ScanOptions { ranges: vec![r(5, 5)], ..d() }).is_err());
+    assert!(scan(ScanOptions { ranges: vec![r(0, 1); 5000], ..d() }).is_err());
+    // Excluding part of a region splits it.
+    *p.modules.lock().unwrap() = vec![module("mid", 0x40008, 0x10)];
+    p.put(0x40020, &9u32.to_le_bytes());
+    assert_eq!(scan(ScanOptions { exclude_modules: vec!["mid".into()], kinds: vec![RegionKind::Mapped], ..d() }).unwrap(), [0x40020]);
+    // JSON names.
+    let o: ScanOptions = serde_json::from_str(r#"{"kinds":["Image"],"modules":["a"],"exclude_modules":["b"],"ranges":[{"start":"0x10","end":"0x20"}],"min_region_size":1,"simple_values":true}"#).unwrap();
+    assert_eq!((o.kinds, o.ranges, o.simple_values), (vec![RegionKind::Image], vec![r(0x10, 0x20)], true));
+}
+
+#[test]
+fn freezer_per_entry_operations() {
+    let p = Arc::new(MockProcess::new(0x1000, vec![0; 64]));
+    let fz = Freezer::new(p.clone()).unwrap();
+    fz.set_interval(Duration::from_secs(3600));
+    let fast = Some(Duration::from_millis(5));
+    let ex = |addr: Addr, v: &str, mode, vtype| FrozenEntryEx { entry: FrozenEntry { addr, vtype, value: v.into(), mode, fmt: Fmt::default() }, custom: None };
+    let int = |addr, v| ex(addr, v, FreezeMode::Exact, VType::Bytes4);
+    let rd = |a: Addr| {
+        let mut b = [0u8; 4];
+        p.read_exact(a, &mut b).unwrap();
+        b
+    };
+    let num = |a| u32::from_le_bytes(rd(a));
+    let settle = || std::thread::sleep(Duration::from_millis(60));
+
+    fz.put(&int(0x1000, "7"), fast).unwrap();
+    settle();
+    assert_eq!(num(0x1000), 7);
+    p.write(0x1000, &1u32.to_le_bytes()).unwrap();
+    settle();
+    assert_eq!(num(0x1000), 7, "own 5 ms interval, not the freezer's hour");
+    fz.put(&int(0x1004, "3"), fast).unwrap();
+    fz.put(&int(0x1000, "8"), fast).unwrap();
+    settle();
+    assert_eq!((num(0x1000), num(0x1004), fz.len()), (8, 3, 2));
+    assert!(fz.remove(0x1000) && !fz.remove(0x1000));
+    p.write(0x1000, &1u32.to_le_bytes()).unwrap();
+    settle();
+    assert_eq!((num(0x1000), num(0x1004)), (1, 3));
+
+    fz.freeze_many(&[0x1010, 0x1014, 0x1018], &int(0, "42"), fast).unwrap();
+    assert!(fz.freeze_many(&[0x1020], &int(0, "x"), fast).is_err());
+    settle();
+    assert_eq!(([num(0x1010), num(0x1014), num(0x1018)], fz.len()), ([42; 3], 4));
+
+    // The freezer's own (hour-long) interval: written once, then left alone.
+    fz.put(&int(0x1020, "5"), None).unwrap();
+    settle();
+    assert_eq!(num(0x1020), 5);
+    p.write(0x1020, &1u32.to_le_bytes()).unwrap();
+    settle();
+    assert_eq!(num(0x1020), 1);
+
+    // Unwritable addresses are reported, and the report clears with the entry.
+    assert!(fz.failures().is_empty());
+    fz.put(&int(0x9000, "1"), fast).unwrap();
+    settle();
+    let f = fz.failures();
+    assert_eq!((f.len(), f[0].addr), (1, 0x9000));
+    fz.remove(0x9000);
+    assert!(fz.failures().is_empty());
+
+    // Allow increase on a float, allow decrease on a custom type.
+    fz.put(&ex(0x1028, "1.5", FreezeMode::AllowIncrease, VType::Float), fast).unwrap();
+    let be2 = CustomType::preset("2 Byte Big Endian").unwrap();
+    let mut e = ex(0x1030, "100", FreezeMode::AllowDecrease, VType::Bytes2);
+    e.custom = Some(be2);
+    fz.put(&e, fast).unwrap();
+    settle();
+    let fl = || f32::from_le_bytes(rd(0x1028));
+    let be = || u16::from_be_bytes(rd(0x1030)[..2].try_into().unwrap());
+    assert_eq!((fl(), be()), (1.5, 100));
+    p.write(0x1028, &2.5f32.to_le_bytes()).unwrap();
+    p.write(0x1030, &50u16.to_be_bytes()).unwrap();
+    settle();
+    assert_eq!((fl(), be()), (2.5, 50));
+    p.write(0x1028, &0.5f32.to_le_bytes()).unwrap();
+    p.write(0x1030, &200u16.to_be_bytes()).unwrap();
+    settle();
+    assert_eq!((fl(), be()), (2.5, 50));
+}
+
+#[test]
+fn sort_remove_export_and_stats() {
+    let p = fake();
+    for (a, v) in [(A + 0x40, 30u32), (A + 0x10, 10), (B + 0x100, 20), (B + (5 << 20), 40)] {
+        p.put(a, &v.to_le_bytes());
+    }
+    let s = scanner(&p);
+    s.first_scan(&first(VType::Bytes4, ScanType::Bigger, "5")).unwrap();
+    let natural = [A + 0x10, A + 0x40, B + 0x100, B + (5 << 20)];
+    assert_eq!(addrs(&s), natural);
+    s.sort(SortKey::Value, false).unwrap();
+    assert_eq!(addrs(&s), [A + 0x10, B + 0x100, A + 0x40, B + (5 << 20)]);
+    s.sort(SortKey::Value, true).unwrap();
+    let page: Vec<Addr> = s.results(1, 2).unwrap().iter().map(|r| r.addr).collect();
+    assert_eq!(page, [A + 0x40, B + 0x100]);
+    assert_eq!(s.results(1, 1).unwrap()[0].value.as_deref(), Some("30"));
+    s.sort(SortKey::Address, true).unwrap();
+    assert_eq!(addrs(&s), natural.iter().rev().copied().collect::<Vec<_>>());
+    s.sort(SortKey::Address, false).unwrap();
+    assert_eq!(addrs(&s), natural);
+
+    // Remove (the order resets to addresses), undo brings them back.
+    s.sort(SortKey::Value, false).unwrap();
+    assert_eq!(s.remove(&[A + 0x40, A + 0x44, A + 0x40]).unwrap(), 1);
+    assert_eq!(addrs(&s), [A + 0x10, B + 0x100, B + (5 << 20)]);
+    assert_eq!(s.remove(&[A + 0x44]).unwrap(), 0);
+    s.undo().unwrap();
+    assert_eq!(addrs(&s), natural);
+    // Next scans work on a set with removals.
+    s.remove(&[B + 0x100]).unwrap();
+    assert_eq!(s.next_scan(&next(ScanType::Unchanged, None)).unwrap().count, 3);
+
+    let mut out = Vec::new();
+    assert_eq!(s.export_addresses(&mut out).unwrap(), 3);
+    assert_eq!(String::from_utf8(out).unwrap(), format!("{:X}\n{:X}\n{:X}\n", A + 0x10, A + 0x40, B + (5 << 20)));
+
+    let st = s.result_stats().unwrap();
+    assert_eq!(st.iter().map(|x| (x.start, x.count)).collect::<Vec<_>>(), [(A, 2), (B, 1)]);
+    assert_eq!((st[0].size, st[0].kind), (0x10000, Some(RegionKind::Private)));
+
+    // Dense sets, plain and masked ("all").
+    for vt in [VType::Byte, VType::All] {
+        s.first_scan(&FirstScan { opts: opts_in(A, A + 0x100), ..first(vt, ScanType::Unknown, "") }).unwrap();
+        let n = s.count();
+        assert_eq!(s.remove(&[A + 5, A + 0xc8, A + 0x1000]).unwrap(), 2, "{vt:?}");
+        assert_eq!(s.count(), n - 2);
+        let got = addrs(&s);
+        assert!(!got.contains(&(A + 5)) && !got.contains(&(A + 0xc8)) && got.contains(&(A + 6)));
+        assert_eq!(s.saved_values("first", &[A + 5, A + 6]).unwrap()[0], None);
+        s.undo().unwrap();
+        assert_eq!(s.count(), n);
+        s.sort(SortKey::Value, true).unwrap();
+        // Bytes: the 30 is the largest; "all" rows read 4 bytes, so 30 << 24 at A+0x3d is.
+        let top = if vt == VType::Byte { A + 0x40 } else { A + 0x3d };
+        assert_eq!(s.results(0, 1).unwrap()[0].addr, top, "{vt:?}");
+    }
+}
+
+#[test]
+fn sort_refuses_huge_result_sets() {
+    let p = Arc::new(Fake::new(vec![(A, MAX_SORT as usize + 16, RW, RegionKind::Private)]));
+    let s = scanner(&p);
+    assert_eq!(s.first_scan(&first(VType::Byte, ScanType::Unknown, "")).unwrap().count, MAX_SORT + 16);
+    let e = s.sort(SortKey::Value, false).unwrap_err().to_string();
+    assert!(e.contains("too many to sort"), "{e}");
+    s.sort(SortKey::Address, false).unwrap();
+    assert!(scanner(&fake()).sort(SortKey::Value, false).is_err(), "no results yet");
+}
+
+#[test]
+fn simple_float_values() {
+    let p = fake();
+    for (i, v) in [1e-30f32, 1.5, 1e20, f32::NAN, 0.0001].into_iter().enumerate() {
+        p.put(A + 8 * i as u64, &v.to_le_bytes());
+    }
+    p.put(A + 0x80, &1e-30f64.to_le_bytes());
+    p.put(A + 0x88, &2.25f64.to_le_bytes());
+    let s = scanner(&p);
+    let scan = |vt, simple, all_types: Vec<VType>| {
+        let o = ScanOptions { simple_values: simple, all_types, ..opts_in(A, A + 0x40) };
+        s.first_scan(&FirstScan { opts: o, ..first(vt, ScanType::Bigger, "0") }).unwrap();
+        addrs(&s)
+    };
+    assert_eq!(scan(VType::Float, false, vec![]), [A, A + 8, A + 16, A + 32]);
+    assert_eq!(scan(VType::Float, true, vec![]), [A + 8, A + 32]);
+    assert_eq!(scan(VType::All, true, vec![VType::Float]), [A + 8, A + 32]);
+    // Next scans keep the filter.
+    s.first_scan(&FirstScan { opts: ScanOptions { simple_values: true, ..opts_in(A + 0x80, A + 0x90) }, ..first(VType::Double, ScanType::Unknown, "") }).unwrap();
+    s.next_scan(&next(ScanType::Unchanged, None)).unwrap();
+    assert_eq!(addrs(&s), [A + 0x88]);
+}
+
+#[test]
+fn pointer_type_scan() {
+    let p = fake();
+    *p.modules.lock().unwrap() = vec![module("img", 0x2000000, 0x1000)];
+    for (i, v) in [A + 0x100, B + 0x10, 0x2000008, 0xdead].into_iter().enumerate() {
+        p.put(A + 8 * i as u64, &v.to_le_bytes());
+    }
+    let s = scanner(&p);
+    let scan = |modules: Vec<String>, ranges: Vec<AddrRange>| {
+        s.pointer_scan(&PointerScan { opts: opts_in(A, A + 0x100), modules, ranges }).unwrap();
+        addrs(&s)
+    };
+    assert_eq!(scan(vec![], vec![]), [A, A + 8, A + 16]);
+    assert_eq!(scan(vec!["img".into()], vec![]), [A + 16]);
+    assert_eq!(scan(vec![], vec![AddrRange { start: B, end: B + 0x100 }]), [A + 8]);
+    assert!(s.pointer_scan(&PointerScan { modules: vec!["nope".into()], ..PointerScan::default() }).is_err());
+    // Results are 8-byte entries: next scans and rows work as for that type.
+    scan(vec![], vec![]);
+    p.put(A, &(A + 0x200).to_le_bytes());
+    assert_eq!(s.next_scan(&next(ScanType::Changed, None)).unwrap().count, 1);
+    assert_eq!(s.results(0, 1).unwrap()[0].vtype, VType::Bytes8);
 }

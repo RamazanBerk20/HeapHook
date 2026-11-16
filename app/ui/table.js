@@ -11,6 +11,7 @@ import { $, h, icon, fmtAddr, wire, isHexAddr, attempt, toast, contextMenu, stor
 import { listCustomTypes, editCustomType, ctLabel } from './custom.js';
 import { state, addSource, addTicker, emit, on, TICK_MS } from './core.js';
 import { comboOf, comboText, MODS } from './keys.js';
+import { attachEditor } from './editor.js';
 
 const ROW = 24;
 export const VTYPES = [['byte', 'Byte'], ['2bytes', '2 Bytes'], ['4bytes', '4 Bytes'], ['8bytes', '8 Bytes'], ['float', 'Float'],
@@ -26,6 +27,8 @@ const HK_ACTIONS = [['Toggle Activation', 'Toggle activation'], ['Toggle Activat
   ['Set Value', 'Set value to'], ['Increase Value', 'Increase value by'], ['Decrease Value', 'Decrease value by']];
 const HK_VALUE = new Set(['Set Value', 'Increase Value', 'Decrease Value']);
 const GROUP_DEFAULT = ['moActivateChildrenAsWell', 'moDeactivateChildrenAsWell'];
+/** What a system-wide registration gives on this desktop (see docs/PARITY.md, "Global hotkey capture"). */
+const GLOBAL_HOTKEYS = 'Registered system-wide (X11). Under Wayland the desktop decides: count on it only while HeapHook has focus.';
 const SCRIPT_TEMPLATE = `[ENABLE]
 // code that runs when the entry is activated
 alloc(newmem,1024)
@@ -54,6 +57,10 @@ export function initTable(root) {
   let roots = [], seq = 1, cursor = null, anchor = null, clip = null, tablePath = store.get('tablePath', 'table.json');
   let version = 0, meta = { lua_script: '', comments: '', codes: [], structures: [], ct_extra: [] };
   const sel = new Set(), collapsed = new Set();
+  // View-only order and filter (the table itself keeps its order); hidden columns are remembered.
+  let sortCol = null, sortDir = 1, filter = '';
+  const hiddenCols = new Set(store.get('tbl.hiddenCols', []));
+  let untrusted = new Set(); // entries whose Lua came from another table and waits for consent
   const rt = new Map(); // id -> {addr: BigInt|null, value, chgAt}
   const R = (id) => { let r = rt.get(id); if (!r) rt.set(id, (r = { addr: null, value: null, chgAt: 0 })); return r; };
   let flat = [];
@@ -77,11 +84,39 @@ export function initTable(root) {
   const kidsHidden = (e) => opt(e, 'moAlwaysHideChildren') || (opt(e, 'moHideChildren') && !e.frozen && !opt(e, 'moAllowManualCollapseAndExpand'));
   const showsKids = (e) => e.children.length > 0 && !kidsHidden(e);
 
+  const num = (v) => (v != null && v !== '' && !isNaN(+v) ? +v : null);
+  function sortKey(e) {
+    if (sortCol === 'description') return e.description.toLowerCase();
+    if (sortCol === 'vtype') return typeText(e).toLowerCase();
+    if (sortCol === 'addr') { const a = R(e.id).addr; return a != null ? a : null; }
+    const v = R(e.id).value;
+    return num(v) ?? (v == null ? null : String(v).toLowerCase());
+  }
+  function cmp(a, b) {
+    const x = sortKey(a), y = sortKey(b);
+    if (x == null || y == null) return (x == null) - (y == null); // unknowns last, either way
+    return (x < y ? -1 : x > y ? 1 : 0) * sortDir;
+  }
   function flatten() {
     flat = [];
-    const go = (list, depth) => list.forEach((e) => { flat.push({ e, depth }); if (showsKids(e) && !collapsed.has(e.id)) go(e.children, depth + 1); });
+    const q = filter.trim().toLowerCase();
+    const hit = new Map();
+    const keep = (e) => {
+      if (!q) return true;
+      if (!hit.has(e.id)) hit.set(e.id, e.description.toLowerCase().includes(q) || (e.addr || '').toLowerCase().includes(q) || e.children.some(keep));
+      return hit.get(e.id);
+    };
+    const order = (list) => (sortCol ? [...list].sort(cmp) : list);
+    // While filtering, groups holding a match open (their collapsed state comes back after).
+    const go = (list, depth) => order(list).forEach((e) => {
+      if (!keep(e)) return;
+      flat.push({ e, depth });
+      if (showsKids(e) && (!collapsed.has(e.id) || q)) go(e.children, depth + 1);
+    });
     go(roots, 1);
   }
+  const reordered = () => sortCol || filter.trim();
+  function noReorder() { toast('The table is sorted or filtered: clear that first (click the column again, or Esc in the filter) to move entries', 'info'); }
   /** Selected entries, ancestors only (a selected group carries its children). */
   function topSelected() {
     const out = [];
@@ -99,6 +134,8 @@ export function initTable(root) {
   function adopt(st) {
     version = st.version;
     state.tableTrust = st.trust || 'own';
+    untrusted = new Set(st.untrusted || []);
+    markDirtySoon();
     const t = st.table;
     roots = (t.entries || []).map(norm);
     // Every table field rides along in puts (custom_types, symbols, disasm_comments, ...), not only the ones edited here.
@@ -149,10 +186,19 @@ export function initTable(root) {
   const same = (a, b) => String(a).trim().toLowerCase().replace(/^0x/, '') === String(b).trim().toLowerCase().replace(/^0x/, '');
   /** The dropdown item matching the live value. */
   const itemOf = (e, v) => (v == null ? null : e.dropdown?.options.find((o) => same(o.value, v)) ?? null);
+  const SIZE_BITS = { byte: 8, '2bytes': 16, '4bytes': 32, '8bytes': 64, binary: 8 };
+  /** Integer entries can show their value in binary (the backend reads it as plain decimal). */
+  const asBinary = (e) => !!e.show_binary && SIZE_BITS[e.vtype] && !e.custom;
+  function binText(e, v) {
+    try {
+      const bits = SIZE_BITS[e.vtype], n = BigInt.asUintN(bits, BigInt(/^-?0x/i.test(v) ? v : String(v).replace(/^(-?)/, '$1')));
+      return n.toString(2).padStart(bits, '0').replace(/(.{4})(?=.)/g, '$1 ');
+    } catch { return v; }
+  }
   const shown = (e, v) => {
     if (v == null) return '??';
     const it = e.dropdown?.display_value_as_item && itemOf(e, v);
-    return it ? it.text : v;
+    return it ? it.text : asBinary(e) ? binText(e, v) : v;
   };
   const valueText = (e) => !isValue(e) ? '' : unsupported(e) ? 'unsupported' : shown(e, R(e.id).value);
 
@@ -164,6 +210,7 @@ export function initTable(root) {
     const mode = isValue(e) && e.freeze_mode !== 'exact'
       ? h('span.mode', { title: MODES.find((m) => m[0] === e.freeze_mode)[1], html: icon(e.freeze_mode === 'allow_increase' ? 'up' : 'down') }) : null;
     const marks = [
+      untrusted.has(e.id) ? h('span.mark.untrusted', { title: 'Came from another table: its Lua asks for your consent before it runs', 'aria-label': 'untrusted Lua', role: 'img', html: icon('shield') }) : null,
       e.hotkeys.length ? h('span.mark', { title: e.hotkeys.map((k) => comboText(k.keys)).join(', '), html: icon('key') }) : null,
       e.children.length && !showsKids(e) ? h('span.mark.muted', { title: `${e.children.length} hidden`, html: icon('group') }) : null,
     ];
@@ -287,7 +334,7 @@ export function initTable(root) {
         const a = R(e.id).addr;
         if (!isValue(e) || a == null || unsupported(e)) continue;
         this.ids.push(e);
-        reqs.push({ addr: wire(a), vtype: e.vtype, len: e.len || undefined, utf16: e.utf16, signed: e.signed, hex: e.hex, custom: e.custom || undefined });
+        reqs.push({ addr: wire(a), vtype: e.vtype, len: e.len || undefined, utf16: e.utf16, signed: asBinary(e) ? false : e.signed, hex: asBinary(e) ? false : e.hex, custom: e.custom || undefined });
       }
       return reqs;
     },
@@ -307,7 +354,10 @@ export function initTable(root) {
   });
 
   /** Display string -> string the backend parses (hex ints need a 0x prefix). */
-  const wireValue = (e, v) => (e.hex && INT.has(e.vtype) && !/^-?0x/i.test(v) ? '0x' + v.trim() : v.trim());
+  const wireValue = (e, v) => {
+    if (asBinary(e)) { const b = v.replace(/[\s_]/g, ''); if (/^[01]+$/.test(b)) return BigInt('0b' + b).toString(); }
+    return e.hex && INT.has(e.vtype) && !/^-?0x/i.test(v) ? '0x' + v.trim() : v.trim();
+  };
 
   // ---------- actions ----------
   async function toggleActive(targets = topSelected()) {
@@ -321,17 +371,43 @@ export function initTable(root) {
   }
   /** Activation; a loaded table's {$lua} needs the user's yes once (the backend asks via the error). */
   async function setActive(ids, on_) {
-    await withConsent(() => api.tableSetActive(ids, on_), { what: ids.map(byId).find((e) => e && hasLua(e))?.description });
+    await withConsent(() => api.tableSetActive(ids, on_), { what: ids.map(byId).find((e) => e && hasLua(e))?.description, ids });
   }
-  const NEEDS = 'needs consent:';
+  const NEEDS = 'needs consent:', NEEDS_ENTRIES = 'needs consent: entries:';
   const LUA_RE = /\{\$lua\}/i;
   const hasLua = (e) => LUA_RE.test(e.script || '') || e.children.some(hasLua);
   /** Runs `fn`; when the backend answers that the table's Lua needs consent, asks and, agreed, runs it again. */
   async function withConsent(fn, ask = {}) {
-    try { return await fn(); } catch (err) {
-      if (!String(err?.message || err).startsWith(NEEDS)) throw err;
-      if (await askTrust(ask)) return fn();
+    // Up to two questions: the entries pasted in from another table, then the table itself.
+    for (let i = 0; ; i++) {
+      try { return await fn(); } catch (err) {
+        const m = String(err?.message || err);
+        if (!m.startsWith(NEEDS) || i >= 2) throw err;
+        const yes = m.startsWith(NEEDS_ENTRIES) ? await askEntryTrust(ask, m) : await askTrust(ask);
+        if (!yes) return undefined;
+      }
     }
+  }
+  /** Entries pasted, merged or dropped in from another table: their Lua asks for itself. */
+  async function askEntryTrust({ ids = [] } = {}, msg = '') {
+    if (state.settings.table_script === 'never') { toast('Not run: it runs Lua from another table, and Settings say never to run a table\'s Lua', 'info'); return false; }
+    const under = new Set();
+    for (const id of ids) { const e = byId(id); if (e) walk([e], (x) => { if (untrusted.has(x.id)) under.add(x.id); }); }
+    const list = [...under].map(byId).filter(Boolean);
+    const body = h('div.trust-body', null,
+      h('ul.trust-facts', null, list.slice(0, 8).map((e) => h('li', null, h('q', null, excerpt(e.description, 60))))),
+      list.length > 8 ? h('p.hint', null, `and ${list.length - 8} more`) : null,
+      list[0]?.script ? h('div', null, h('p.hint', null, 'Start of the first script:'), codeView(list[0].script, 10)) : null);
+    const r = await modal({
+      title: 'Run Lua from another table?',
+      text: 'These entries came into this table from another one (pasted, merged or dropped in) and run Lua code when activated. That code runs with your user account\'s rights: it can read, change and delete your files, start programs and change the attached process. Agree only if you trust where they came from.',
+      quote: msg.slice(NEEDS_ENTRIES.length).split(':')[0].trim() || null, quoteLabel: 'Wanted by the entry', body,
+      buttons: [{ label: list.length > 1 ? `Trust these ${list.length} entries` : 'Trust this entry', value: 'trust' }, { label: 'Do not run', value: 'cancel', kbd: 'Esc', primary: true, focus: true }],
+    });
+    if (r.value !== 'trust') return false;
+    const ok = await attempt(async () => { await api.tableTrustEntries(list.length ? list.map((e) => e.id) : ids); return true; });
+    chain = chain.then(refetch);
+    return !!ok;
   }
 
   // ---------- consent for a loaded table's Lua ----------
@@ -447,17 +523,22 @@ export function initTable(root) {
     navigator.clipboard?.writeText(clip).catch(() => {});
     if (cut) deleteSelected();
   }
-  function paste() {
-    if (!clip) return;
-    const src = JSON.parse(clip), at = cursor;
-    commit(() => {
-      const reid = (e) => ({ ...norm(e), id: seq++, frozen: false, children: e.children.map(reid) });
-      const items = src.map(reid);
-      const f = at != null ? find(at) : null;
-      if (f) f.list.splice(f.index + 1, 0, ...items); else roots.push(...items);
-      sel.clear(); items.forEach((e) => sel.add(e.id));
-      cursor = anchor = items[items.length - 1].id;
-    });
+  /** Through the backend: pasted entries get new ids, and any Lua in them waits for consent. */
+  async function paste() {
+    let text = clip;
+    if (!text) text = await navigator.clipboard?.readText?.().catch(() => null);
+    let src;
+    try { src = JSON.parse(text); } catch { src = null; }
+    if (!Array.isArray(src) || !src.length) { if (text) toast('The clipboard holds no cheat-table entries', 'info'); return; }
+    await chain;
+    const r = await attempt(() => api.tablePaste(src.map(strip), cursor, version));
+    if (!r) { chain = chain.then(refetch); return; }
+    await refetch();
+    sel.clear(); r.ids.forEach((id) => sel.add(id));
+    cursor = anchor = r.ids.at(-1);
+    render(); scrollToCursor();
+    if (untrusted.size && r.ids.some((id) => { let u = false; walk([byId(id)].filter(Boolean), (x) => { if (untrusted.has(x.id)) u = true; }); return u; }))
+      toast('Pasted. Entries with Lua are marked: their Lua asks for your consent before it runs', 'info');
   }
   function groupSelected() {
     const ids = topSelected().map((e) => e.id);
@@ -475,6 +556,7 @@ export function initTable(root) {
   function move(dir) {
     const id = cursor;
     if (id == null) return;
+    if (reordered()) { noReorder(); return; }
     commit(() => {
       const at = find(id);
       const j = at ? at.index + dir : -1;
@@ -532,6 +614,35 @@ export function initTable(root) {
     select(flat[i].e.id, { extend });
   }
   function toggleCollapse(e) { collapsed.has(e.id) ? collapsed.delete(e.id) : collapsed.add(e.id); render(); }
+  function expandAll(open) {
+    collapsed.clear();
+    if (!open) walk(roots, (e) => { if (showsKids(e)) collapsed.add(e.id); });
+    render(); scrollToCursor();
+  }
+  function setSort(col) {
+    if (sortCol === col) { if (sortDir === 1) sortDir = -1; else sortCol = null; } else { sortCol = col; sortDir = 1; }
+    for (const th of root.querySelectorAll('.tbl-head [data-col]')) th.setAttribute('aria-sort', th.dataset.col !== sortCol ? 'none' : sortDir > 0 ? 'ascending' : 'descending');
+    render();
+    toast(sortCol ? `Sorted by ${col === 'addr' ? 'address' : col === 'vtype' ? 'type' : col}${sortDir < 0 ? ', descending' : ''} (view only: the saved order stays)` : 'Back to the table\'s own order', 'info');
+  }
+  function applyCols() {
+    const w = { addr: 'minmax(130px, 1.4fr)', vtype: 'minmax(90px, 0.8fr)', value: 'minmax(100px, 1.2fr)' };
+    grid.style.setProperty('--tbl-cols', ['58px', 'minmax(140px, 2fr)', ...['addr', 'vtype', 'value'].filter((c) => !hiddenCols.has(c)).map((c) => w[c])].join(' '));
+    for (const c of ['addr', 'vtype', 'value']) grid.classList.toggle('hide-' + c, hiddenCols.has(c));
+  }
+  function toggleCol(c) {
+    hiddenCols.has(c) ? hiddenCols.delete(c) : hiddenCols.add(c);
+    store.set('tbl.hiddenCols', [...hiddenCols]);
+    applyCols();
+  }
+  applyCols();
+  for (const b of root.querySelectorAll('.th-sort')) b.addEventListener('click', () => setSort(b.dataset.sort));
+  const filterEl = $('#tbl-filter');
+  filterEl.addEventListener('input', () => { filter = filterEl.value; render(); });
+  filterEl.addEventListener('keydown', (ev) => {
+    if (ev.key === 'Escape') { ev.preventDefault(); ev.stopPropagation(); filterEl.value = ''; filter = ''; render(); grid.focus(); }
+    else if (ev.key === 'Enter' || ev.key === 'ArrowDown') { ev.preventDefault(); grid.focus(); if (flat.length) select(flat[0].e.id); }
+  });
   function openEntry(e, col) {
     if (isScript(e)) editScript(e.id);
     else if (isGroup(e)) { if (showsKids(e)) toggleCollapse(e); }
@@ -550,6 +661,9 @@ export function initTable(root) {
     else if (k === 'PageUp') step(-pageN, ev.shiftKey);
     else if (k === 'Home') step(-1e9, ev.shiftKey);
     else if (k === 'End') step(1e9, ev.shiftKey);
+    else if (k === 'ArrowRight' && ctrl) expandAll(true);
+    else if (k === 'ArrowLeft' && ctrl) expandAll(false);
+    else if (ctrl && kl === 'f') { filterEl.focus(); filterEl.select(); }
     else if (k === 'ArrowRight' && cur) {
       if (showsKids(cur.e) && collapsed.has(cur.e.id)) toggleCollapse(cur.e); else if (showsKids(cur.e)) step(1);
     } else if (k === 'ArrowLeft' && cur) {
@@ -625,6 +739,7 @@ export function initTable(root) {
       '-',
       { label: 'Show as hexadecimal', checked: !!cur?.hex, disabled: !addrE, run: () => setFlag('hex') },
       { label: 'Show as signed', checked: !!cur?.signed, disabled: !addrE, run: () => setFlag('signed') },
+      { label: 'Show as binary', checked: !!cur?.show_binary, disabled: !addrE || !SIZE_BITS[cur.vtype] || !!cur.custom, run: () => setFlag('show_binary') },
       ...COLORS.map(([l, c]) => ({ label: 'Color: ' + l, swatch: c ? COLOR_VAR[c] : 'var(--text)', disabled: !any, run: () => setColor(c) })),
       '-',
       { label: 'Browse this memory region', kbd: 'Ctrl M', disabled: !addrE, run: () => browse('hex') },
@@ -642,6 +757,12 @@ export function initTable(root) {
       { label: 'Undo', kbd: 'Ctrl Z', run: () => history(false) },
       { label: 'Redo', kbd: 'Ctrl Y', run: () => history(true) },
       { label: 'Delete', kbd: 'Del', disabled: !any, run: deleteSelected },
+      '-',
+      { label: 'Expand all', kbd: 'Ctrl →', run: () => expandAll(true) },
+      { label: 'Collapse all', kbd: 'Ctrl ←', run: () => expandAll(false) },
+      { label: 'Filter…', kbd: 'Ctrl F', run: () => { filterEl.focus(); filterEl.select(); } },
+      ...['addr', 'vtype', 'value'].map((c) => ({ label: 'Column: ' + { addr: 'Address', vtype: 'Type', value: 'Value' }[c], checked: !hiddenCols.has(c), run: () => toggleCol(c) })),
+      untrusted.size ? { label: 'Trust the selected entries\' Lua…', disabled: !selectedAll().some((e) => untrusted.has(e.id) || e.children.some((c) => untrusted.has(c.id))), run: () => askEntryTrust({ ids: selIds() }) } : null,
       '-',
       { label: 'Table Lua script…', run: editTableScript },
       { label: 'Generate a trainer…', run: trainerDialog },
@@ -756,6 +877,7 @@ export function initTable(root) {
     clearDrop();
     if (!dragIds || !row) return;
     ev.preventDefault();
+    if (reordered()) { dragIds = null; noReorder(); return; }
     const tid = +row.dataset.id, z = zone(ev, row), ids = dragIds;
     dragIds = null;
     commit(() => {
@@ -837,20 +959,8 @@ export function initTable(root) {
   function addScript() {
     add([{ description: 'Auto Assembler script', script: SCRIPT_TEMPLATE }], { then: (e) => e && editScript(e.id) });
   }
-  /** Line-numbered editor; `gut` follows the textarea. */
-  function gutter(ta, gut) {
-    const lines = () => {
-      const n = ta.value.split('\n').length;
-      gut.textContent = Array.from({ length: n }, (_, i) => i + 1).join('\n');
-      gut.scrollTop = ta.scrollTop;
-    };
-    ta.onscroll = () => { gut.scrollTop = ta.scrollTop; };
-    return lines;
-  }
-  const indentTab = (ta, ev, after) => {
-    if (ev.key === 'Tab' && !ev.shiftKey && !ev.ctrlKey) { ev.preventDefault(); ta.setRangeText('  ', ta.selectionStart, ta.selectionEnd, 'end'); after(); return true; }
-    return false;
-  };
+  // Highlighting, find / replace, undo, completion (editor.js). Symbols: the table's labels.
+  const aaEd = attachEditor($('#aa-text'), { lang: 'aa', gutter: $('#aa-gutter'), symbols: () => (meta.symbols || []).map((x) => x.name) });
   function editScript(id) {
     const e = byId(id);
     if (!e) return;
@@ -858,18 +968,18 @@ export function initTable(root) {
     ta.value = e.script ?? '';
     $('#aa-title').textContent = `Auto Assembler script · ${e.description}`;
     let checkT = 0, errLine = 0;
-    const lines = gutter(ta, $('#aa-gutter'));
+    aaEd.refresh();
     const check = async () => {
       try {
         const r = await api.aaCheck(ta.value);
         errLine = r ? r.line : 0;
+        aaEd.markError(errLine, r?.message);
         status.textContent = r ? `Line ${r.line}: ${r.message}` : 'No errors';
         status.className = 'aa-status ' + (r ? 'err' : 'ok');
       } catch (err) { status.textContent = String(err); status.className = 'aa-status err'; }
     };
-    ta.oninput = () => { lines(); clearTimeout(checkT); checkT = setTimeout(check, 300); };
+    ta.oninput = () => { clearTimeout(checkT); checkT = setTimeout(check, 300); };
     ta.onkeydown = (ev) => {
-      if (indentTab(ta, ev, ta.oninput)) return;
       if ((ev.ctrlKey || ev.metaKey) && ev.key === 's') { ev.preventDefault(); ev.stopPropagation(); d.close('ok'); }
     };
     status.onclick = () => {
@@ -879,7 +989,7 @@ export function initTable(root) {
     };
     $('#aa-check').onclick = check;
     d.onclose = () => { clearTimeout(checkT); if (d.returnValue === 'ok') { const v = ta.value; edit([id], (x) => { x.script = v; }); } grid.focus(); };
-    lines(); check();
+    check();
     d.returnValue = '';
     grid.focus(); // the dialog restores focus to this on close, not to the toolbar button
     d.showModal();
@@ -894,16 +1004,13 @@ export function initTable(root) {
     $('#tx-run').hidden = !runnable;
     ta.classList.toggle('mono', mono);
     ta.value = value;
-    const lines = gutter(ta, $('#tx-gutter'));
-    ta.oninput = lines;
+    attachEditor(ta, { lang: mono ? 'lua' : 'text', gutter: $('#tx-gutter') }).refresh();
     ta.onkeydown = (ev) => {
-      if (indentTab(ta, ev, lines)) return;
       const ctrl = ev.ctrlKey || ev.metaKey;
       if (ctrl && ev.key === 's') { ev.preventDefault(); ev.stopPropagation(); d.close('ok'); }
       else if (ctrl && ev.key === 'Enter' && runnable) { ev.preventDefault(); ev.stopPropagation(); d.close('run'); }
     };
     d.onclose = () => { if (d.returnValue === 'ok' || d.returnValue === 'run') onSave(ta.value, d.returnValue === 'run'); grid.focus(); };
-    lines();
     d.returnValue = '';
     d.showModal();
     ta.focus();
@@ -924,6 +1031,14 @@ export function initTable(root) {
   }
 
   const keyOf = (keys) => [...(keys || [])].sort((a, b) => a - b).join('+');
+  /** Where a hotkey works: never system-wide without a modifier, nor before the table (or entry) is trusted. */
+  function hkScope(keys, id) {
+    if (!keys.length) return '';
+    if (!keys.some((k) => MODS.has(k) || (k >= 160 && k <= 165))) return 'Works only while HeapHook has focus: a key without Ctrl, Shift, Alt or Win is never taken from other programs.';
+    if (state.tableTrust === 'ask' || state.tableTrust === 'declined') return 'Works only while HeapHook has focus until you trust this table.';
+    if (untrusted.has(id)) return 'Works only while HeapHook has focus until you trust this entry\'s Lua.';
+    return GLOBAL_HOTKEYS;
+  }
   function hotkeyDialog(id) {
     const e = byId(id);
     if (!e) return;
@@ -938,8 +1053,10 @@ export function initTable(root) {
       const val = h('input.mono', { value: hk.value ?? '', 'aria-label': 'Value', spellcheck: 'false', autocomplete: 'off' });
       const desc = h('input', { value: hk.description ?? '', 'aria-label': 'Description', autocomplete: 'off' });
       const warn = h('p.hk-warn', { role: 'status', hidden: true });
+      const scope = h('p.hk-scope.hint', { role: 'status' });
       const sync = () => {
         val.disabled = !HK_VALUE.has(act.value); keyBtn.textContent = keys.length ? comboText(keys) : 'Press keys…';
+        scope.textContent = hkScope(keys, id);
         // Same combination on another entry: allowed (CE fires both), but worth knowing.
         const k = keyOf(keys), clash = k ? all().filter((x) => x.id !== id && x.hotkeys.some((hk2) => keyOf(hk2.keys) === k)) : [];
         warn.hidden = !clash.length;
@@ -956,10 +1073,10 @@ export function initTable(root) {
       };
       keyBtn.onblur = sync;
       const row = h('div.hk-row', null, act, keyBtn, val, desc,
-        h('button.btn.icon', { type: 'button', 'aria-label': 'Remove hotkey', html: icon('x'), onclick: () => { row.remove(); warn.remove(); } }));
+        h('button.btn.icon', { type: 'button', 'aria-label': 'Remove hotkey', html: icon('x'), onclick: () => { row.remove(); warn.remove(); scope.remove(); } }));
       // The id stays: Lua's MemoryRecordHotkey objects find their hotkey by it.
       row.read = () => ({ ...(hk.id != null ? { id: hk.id } : {}), action: act.value, keys, value: HK_VALUE.has(act.value) ? val.value.trim() : null, description: desc.value.trim() || null });
-      rows.append(row, warn);
+      rows.append(row, scope, warn);
       sync();
       return keyBtn;
     };
@@ -1133,21 +1250,40 @@ export function initTable(root) {
     titleI.select();
   }
 
-  // ---------- save / load ----------
+  // ---------- save / load / merge / recent ----------
   const FILTERS = [['Cheat tables', ['CT', 'ct', 'json']], ['Cheat Engine table', ['CT', 'ct']], ['HeapHook table', ['json']], ['All files', ['*']]];
+  const recent = () => store.get('recentTables', []);
+  function remember(p) { store.set('recentTables', [p, ...recent().filter((x) => x !== p)].slice(0, 10)); }
+  // "Unsaved changes": the backend compares the table with what was last opened or saved.
+  let dirty = false, dirtyT = 0;
+  function markDirtySoon() { clearTimeout(dirtyT); dirtyT = setTimeout(() => api.tableDirty().then((d) => { dirty = d; }, () => {}), 600); }
+  /** True when it is fine to replace the table now: nothing unsaved, or the user saved or discarded it. */
+  async function confirmDiscard(what = 'Opening another table') {
+    await chain;
+    if (!await api.tableDirty().catch(() => false)) return true;
+    const r = await modal({
+      title: 'Save the cheat table?',
+      text: `The cheat table has changes that are not saved. ${what} replaces it.`,
+      buttons: [{ label: 'Save…', value: 'save', kbd: 'Enter', primary: true, focus: true }, { label: 'Discard changes', value: 'discard' }, { label: 'Cancel', value: 'cancel', kbd: 'Esc' }],
+    });
+    if (r.value === 'save') return save();
+    return r.value === 'discard';
+  }
   async function save() {
     const p = await askPath({ save: true, title: 'Save table', filters: [['Cheat Engine table', ['CT']], ['HeapHook table', ['json']]], dflt: tablePath });
-    if (!p) return;
+    if (!p) return false;
     await chain;
     const ok = await attempt(async () => { await api.tableExport(p); return true; });
-    if (ok) { tablePath = p; store.set('tablePath', p); toast(`Saved ${p}`, 'info'); }
+    if (ok) { tablePath = p; store.set('tablePath', p); remember(p); dirty = false; toast(`Saved ${p}`, 'info'); }
+    return !!ok;
   }
-  async function load() {
-    const p = await askPath({ save: false, title: 'Open table', filters: FILTERS, dflt: tablePath });
-    if (!p) return;
+  /** Opens a table file: the same question about unsaved changes and the same consent whatever the route (button, recent list, drop, command line). */
+  async function openPath(p, { asked = false, data = null } = {}) {
+    if (!asked && !await confirmDiscard()) return;
     await chain;
+    const open = (force) => (data != null ? api.tableOpenData(p, data, force) : api.tableOpen(p, force));
     let st;
-    try { st = await api.tableOpen(p); } catch (e) {
+    try { st = await open(false); } catch (e) {
       const m = String(e?.message || e);
       if (!/could not be disabled/.test(m)) { toast(m); return; }
       // The details name entries (table text): after HeapHook's own words, in a scroll box.
@@ -1155,13 +1291,45 @@ export function initTable(root) {
         text: 'Some active scripts of the current table could not be disabled, so their changes are still in the process. Open anyway to keep them, still active, in a group of the new table, where you can disable them later.',
         pre: m, buttons: [{ label: 'Open anyway', value: 'force' }, { label: 'Cancel', value: 'cancel', kbd: 'Esc', primary: true, focus: true }] });
       if (r.value !== 'force') return;
-      st = await attempt(() => api.tableOpen(p, true));
+      st = await attempt(() => open(true));
     }
     if (!st) return;
-    rt.clear(); sel.clear(); collapsed.clear(); cursor = anchor = null; tablePath = p; store.set('tablePath', p);
+    rt.clear(); sel.clear(); collapsed.clear(); cursor = anchor = null;
+    if (data == null) { tablePath = p; store.set('tablePath', p); remember(p); }
     adopt(st);
+    dirty = false;
     toast(`Loaded ${p}`, 'info');
     await offerTrust();
+  }
+  async function load() {
+    if (!await confirmDiscard()) return;
+    const p = await askPath({ save: false, title: 'Open table', filters: FILTERS, dflt: tablePath });
+    if (p) await openPath(p, { asked: true });
+  }
+  /** Appends another table's entries; whatever runs Lua among them asks before it runs. */
+  async function merge() {
+    const p = await askPath({ save: false, title: 'Merge a table into this one', filters: FILTERS, dflt: tablePath });
+    if (!p) return;
+    await chain;
+    const before = state.tableTrust;
+    const st = await attempt(() => api.tableMerge(p));
+    if (!st) return;
+    adopt(st);
+    const n = (st.untrusted || []).length;
+    toast(`Merged ${p}` + (n ? `: ${n} entr${n === 1 ? 'y runs' : 'ies run'} Lua and will ask before running it` : ''), 'info');
+    if (before !== state.tableTrust) await offerTrust();
+  }
+  async function saveText() {
+    const p = await askPath({ save: true, title: 'Save the table as text', filters: [['Text', ['txt']]], dflt: tablePath.replace(/\.[^.\/\\]*$/, '') + '.txt' });
+    if (!p) return;
+    await chain;
+    if (await attempt(async () => { await api.tableExportText(p); return true; })) toast(`Saved the listing to ${p}`, 'info');
+  }
+  function recentMenu(btn) {
+    const r = btn.getBoundingClientRect(), list = recent();
+    contextMenu(r.left, r.bottom + 4, list.length
+      ? [...list.map((p) => ({ label: excerpt(p, 70), run: () => openPath(p) })), '-', { label: 'Clear the list', run: () => store.set('recentTables', []) }]
+      : [{ label: 'No recent tables', disabled: true, run: () => {} }], btn);
   }
   /** Never runs code from a file, nor lets its hotkeys work system-wide, without asking (Settings can turn the question into "no"). */
   async function offerTrust() {
@@ -1196,5 +1364,6 @@ export function initTable(root) {
   editMetaHook = (fn) => commit(() => { fn(meta); }).then(() => emit('table:meta', meta));
   refetch();
 
-  return { addDialog: () => entryDialog(), save, load, focus: () => grid.focus(), editTableScript };
+  $('#tbl-recent').addEventListener('click', (ev) => recentMenu(ev.currentTarget));
+  return { addDialog: () => entryDialog(), save, load, merge, saveText, openPath, recentMenu, confirmDiscard, isDirty: () => dirty, focus: () => grid.focus(), editTableScript };
 }

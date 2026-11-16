@@ -133,6 +133,13 @@ fn wait(tid: Tid, flags: i32) -> io::Result<Option<i32>> {
     }
 }
 
+/// XSTATE_BV of an XSAVE image (header at 512).
+fn xstate_bv(buf: &[u8]) -> u64 {
+    buf.get(512..520)
+        .and_then(|b| b.try_into().ok())
+        .map_or(0, u64::from_le_bytes)
+}
+
 fn words_to_bytes(w: &[u32]) -> Vec<u8> {
     w.iter().flat_map(|x| x.to_le_bytes()).collect()
 }
@@ -246,6 +253,163 @@ impl Os {
                 Err(e)
             }
         }
+    }
+
+    /// Starts `o.program` as a traced child, stopped at its exec (before the loader's first
+    /// instruction). The child waits on a pipe until it is seized, so nothing runs untraced
+    /// after the fork but async-signal-safe setup; a failure anywhere leaves no child
+    /// behind (it is killed and reaped).
+    pub fn launch(o: &crate::LaunchOptions) -> Result<Os> {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        let path = find_program(&o.program)?;
+        let cstr = |b: &[u8]| {
+            CString::new(b).map_err(|_| Error::Other("launch: argument contains a NUL byte".into()))
+        };
+        let cpath = cstr(path.as_os_str().as_bytes())?;
+        let mut args = vec![cstr(o.program.as_bytes())?];
+        for a in &o.args {
+            args.push(cstr(a.as_bytes())?);
+        }
+        let env: Vec<CString> = match &o.env {
+            Some(v) => v
+                .iter()
+                .map(|(k, v)| cstr(format!("{k}={v}").as_bytes()))
+                .collect::<Result<_>>()?,
+            None => std::env::vars_os()
+                .filter_map(|(k, v)| {
+                    let mut b = k.as_bytes().to_vec();
+                    b.push(b'=');
+                    b.extend_from_slice(v.as_bytes());
+                    CString::new(b).ok()
+                })
+                .collect(),
+        };
+        let cwd = o.cwd.as_deref().map(|c| cstr(c.as_bytes())).transpose()?;
+        let argv: Vec<*const libc::c_char> = args
+            .iter()
+            .map(|c| c.as_ptr())
+            .chain(std::iter::once(std::ptr::null()))
+            .collect();
+        let envp: Vec<*const libc::c_char> = env
+            .iter()
+            .map(|c| c.as_ptr())
+            .chain(std::iter::once(std::ptr::null()))
+            .collect();
+        let fds = [o.stdin, o.stdout, o.stderr];
+        let (mut go, mut err) = ([0i32; 2], [0i32; 2]);
+        unsafe {
+            if libc::pipe2(go.as_mut_ptr(), libc::O_CLOEXEC) != 0 {
+                return Err(Error::Io(io::Error::last_os_error()));
+            }
+            if libc::pipe2(err.as_mut_ptr(), libc::O_CLOEXEC) != 0 {
+                let e = io::Error::last_os_error();
+                libc::close(go[0]);
+                libc::close(go[1]);
+                return Err(Error::Io(e));
+            }
+        }
+        let cwd_p = cwd.as_ref().map_or(std::ptr::null(), |c| c.as_ptr());
+        let pid = unsafe { libc::fork() };
+        if pid == 0 {
+            unsafe { launch_child(go[0], err[1], fds, cwd_p, cpath.as_ptr(), &argv, &envp) }
+        }
+        unsafe {
+            libc::close(go[0]);
+            libc::close(err[1]);
+        }
+        let close = |fd: i32| unsafe {
+            libc::close(fd);
+        };
+        if pid < 0 {
+            let e = io::Error::last_os_error();
+            close(go[1]);
+            close(err[0]);
+            return Err(Error::Io(e));
+        }
+        let pid = pid as Pid;
+        if let Err(e) = pt(libc::PTRACE_SEIZE, pid, 0, OPTS) {
+            close(go[1]);
+            close(err[0]);
+            kill_reap(pid);
+            return Err(perr(e));
+        }
+        let one = 1u8;
+        let wrote = unsafe { libc::write(go[1], (&one as *const u8).cast(), 1) };
+        close(go[1]);
+        let r = match wrote {
+            1 => wait_exec(pid),
+            _ => Err(Error::Io(io::Error::last_os_error())),
+        };
+        let mut code = [0u8; 4];
+        let n = unsafe { libc::read(err[0], code.as_mut_ptr().cast(), 4) };
+        close(err[0]);
+        match r {
+            Ok(true) => {}
+            Ok(false) => {
+                // Exited (and reaped) before exec: the child reported why.
+                let e = match n {
+                    4 => io::Error::from_raw_os_error(i32::from_ne_bytes(code)),
+                    _ => io::Error::other("the child exited before exec"),
+                };
+                return Err(Error::Io(io::Error::new(
+                    e.kind(),
+                    format!("cannot run {}: {e}", path.display()),
+                )));
+            }
+            Err(e) => {
+                kill_reap(pid);
+                return Err(e);
+            }
+        }
+        let mut th = BTreeMap::new();
+        th.insert(
+            pid,
+            T {
+                stopped: true,
+                ..T::default()
+            },
+        );
+        Ok(Os {
+            pid,
+            th,
+            dr: ([0; 4], 0),
+            gadget: None,
+            cursor: 0,
+            backlog: Vec::new(),
+            notes: Vec::new(),
+        })
+    }
+
+    /// Kills the (launched) process and reaps it.
+    pub fn kill(&mut self) {
+        kill_reap(self.pid);
+        self.th.clear();
+    }
+
+    /// Name, kernel state letter, user and system CPU milliseconds of a thread.
+    pub fn thread_info(&self, tid: Tid) -> (String, String, u64, u64) {
+        let dir = format!("/proc/{}/task/{tid}", self.pid);
+        let name = std::fs::read_to_string(format!("{dir}/comm"))
+            .map(|s| s.trim_end_matches('\n').to_string())
+            .unwrap_or_default();
+        let stat = std::fs::read_to_string(format!("{dir}/stat")).unwrap_or_default();
+        // Fields after the `(comm)`: state is the first, utime / stime the 12th / 13th.
+        let rest: Vec<&str> = stat
+            .rfind(')')
+            .map(|i| stat[i + 1..].split_whitespace().collect())
+            .unwrap_or_default();
+        let tick = match unsafe { libc::sysconf(libc::_SC_CLK_TCK) } {
+            t if t > 0 => t as u64,
+            _ => 100,
+        };
+        let ms = |i: usize| {
+            rest.get(i)
+                .and_then(|v| v.parse::<u64>().ok())
+                .map_or(0, |t| t.saturating_mul(1000) / tick)
+        };
+        let state = rest.first().map(|s| s.to_string()).unwrap_or_default();
+        (name, state, ms(11), ms(12))
     }
 
     /// Address of the dynamic loader's r_brk (called on every dlopen/dlclose), from the
@@ -897,6 +1061,81 @@ impl Os {
         })
     }
 
+    /// `context` plus the YMM upper halves (PTRACE_GETREGSET NT_X86_XSTATE) when the CPU
+    /// and kernel have AVX.
+    pub fn context_full(&self, tid: Tid) -> Result<Context> {
+        let mut c = self.context(tid)?;
+        if let Some((buf, off)) = self.xstate(tid) {
+            c.fpu.has_ymm = true;
+            // Component in its init state (XSTATE_BV bit 2 clear): all zero.
+            if xstate_bv(&buf) & 4 != 0 {
+                for (i, y) in c.fpu.ymm_hi.iter_mut().enumerate() {
+                    y.copy_from_slice(&buf[off + 16 * i..off + 16 * i + 16]);
+                }
+            }
+        }
+        Ok(c)
+    }
+
+    /// The thread's XSAVE image and the offset of its YMM_Hi128 component, if it has AVX.
+    fn xstate(&self, tid: Tid) -> Option<(Vec<u8>, usize)> {
+        const NT_X86_XSTATE: usize = 0x202;
+        // CPUID.(EAX=0DH, ECX=2): size and (standard format) offset of YMM_Hi128.
+        #[allow(unused_unsafe)]
+        let r = unsafe { std::arch::x86_64::__cpuid_count(0xd, 2) };
+        let off = r.ebx as usize;
+        if r.eax != 256 || off < 576 {
+            return None;
+        }
+        let mut buf = vec![0u8; 16384];
+        let mut iov = libc::iovec {
+            iov_base: buf.as_mut_ptr().cast(),
+            iov_len: buf.len(),
+        };
+        pt(
+            libc::PTRACE_GETREGSET,
+            tid,
+            NT_X86_XSTATE,
+            &mut iov as *mut libc::iovec as usize,
+        )
+        .ok()?;
+        buf.truncate(iov.iov_len);
+        // ptrace puts XCR0 in xstate_fx_sw[0] (offset 464): it must include AVX.
+        let xfeatures = u64::from_le_bytes(buf.get(464..472)?.try_into().ok()?);
+        (xfeatures & 4 != 0 && buf.len() >= off + 256).then_some((buf, off))
+    }
+
+    fn set_ymm(&self, tid: Tid, ymm: &[[u8; 16]; 16]) -> Result<()> {
+        const NT_X86_XSTATE: usize = 0x202;
+        let Some((mut buf, off)) = self.xstate(tid) else {
+            return Err(Error::Unsupported("YMM registers (no AVX state)"));
+        };
+        let live = xstate_bv(&buf) & 4 != 0;
+        let cur: Vec<u8> = match live {
+            true => buf[off..off + 256].to_vec(),
+            false => vec![0; 256],
+        };
+        let new = ymm.concat();
+        if cur == new {
+            return Ok(());
+        }
+        buf[off..off + 256].copy_from_slice(&new);
+        let bv = xstate_bv(&buf) | 4;
+        buf[512..520].copy_from_slice(&bv.to_le_bytes());
+        let mut iov = libc::iovec {
+            iov_base: buf.as_mut_ptr().cast(),
+            iov_len: buf.len(),
+        };
+        pt(
+            libc::PTRACE_SETREGSET,
+            tid,
+            NT_X86_XSTATE,
+            &mut iov as *mut libc::iovec as usize,
+        )
+        .map_err(perr)
+        .map(|_| ())
+    }
+
     pub fn set_context(&mut self, tid: Tid, c: &Context) -> Result<()> {
         let mut r = self.regs(tid)?;
         if c.rip != r.rip {
@@ -933,8 +1172,12 @@ impl Os {
             0,
             &f as *const libc::user_fpregs_struct as usize,
         )
-        .map_err(perr)
-        .map(|_| ())
+        .map_err(perr)?;
+        // After SETFPREGS: the XSAVE image read back carries the new legacy area.
+        if p.has_ymm {
+            self.set_ymm(tid, &p.ymm_hi)?;
+        }
+        Ok(())
     }
 
     /// DR6 (low 4 bits: which slots fired), cleared afterwards.
@@ -1275,6 +1518,128 @@ impl Os {
             [start, len, prot_bits(prot), 0, 0, 0],
         )?;
         Ok(old)
+    }
+}
+
+/// `program` itself when it holds a `/`, else the first executable match in `PATH`.
+fn find_program(program: &str) -> Result<std::path::PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+    let runnable = |p: &std::path::Path| {
+        std::fs::metadata(p).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+    };
+    let not_found = || {
+        Error::Io(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("program not found or not executable: {program}"),
+        ))
+    };
+    if program.is_empty() {
+        return Err(not_found());
+    }
+    if program.contains('/') {
+        let p = std::path::PathBuf::from(program);
+        return if runnable(&p) { Ok(p) } else { Err(not_found()) };
+    }
+    let path = std::env::var_os("PATH").unwrap_or_else(|| "/usr/local/bin:/usr/bin:/bin".into());
+    std::env::split_paths(&path)
+        .map(|d| d.join(program))
+        .find(|p| runnable(p))
+        .ok_or_else(not_found)
+}
+
+/// The forked child of `Os::launch`: only async-signal-safe calls (the parent may have had
+/// other threads holding locks). Waits for the go byte, then execs; on failure writes errno
+/// to `err` and exits 127.
+unsafe fn launch_child(
+    go: i32,
+    err: i32,
+    fds: [Option<i32>; 3],
+    cwd: *const libc::c_char,
+    path: *const libc::c_char,
+    argv: &[*const libc::c_char],
+    envp: &[*const libc::c_char],
+) -> ! {
+    unsafe {
+        let fail = || -> ! {
+            let e = *libc::__errno_location();
+            let b = e.to_ne_bytes();
+            libc::write(err, b.as_ptr().cast(), 4);
+            libc::_exit(127)
+        };
+        for (i, fd) in fds.iter().enumerate() {
+            let Some(fd) = *fd else { continue };
+            let to = i as i32;
+            let r = match fd == to {
+                // dup2 onto itself keeps FD_CLOEXEC: clear it instead.
+                true => libc::fcntl(fd, libc::F_SETFD, 0),
+                false => libc::dup2(fd, to),
+            };
+            if r < 0 {
+                fail();
+            }
+        }
+        // The host's signal mask and ignored signals (Rust ignores SIGPIPE) are inherited
+        // through exec; give the program the defaults.
+        let mut set: libc::sigset_t = zeroed();
+        libc::sigemptyset(&mut set);
+        libc::sigprocmask(libc::SIG_SETMASK, &set, std::ptr::null_mut());
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+        if !cwd.is_null() && libc::chdir(cwd) != 0 {
+            fail();
+        }
+        let mut b = 0u8;
+        loop {
+            let r = libc::read(go, (&mut b as *mut u8).cast(), 1);
+            if r == 1 {
+                break;
+            }
+            if r < 0 && *libc::__errno_location() == libc::EINTR {
+                continue;
+            }
+            libc::_exit(127); // the parent gave up
+        }
+        libc::execve(path, argv.as_ptr(), envp.as_ptr());
+        fail()
+    }
+}
+
+/// Waits (bounded) for the seized child's exec stop: Ok(true) at the exec stop, Ok(false)
+/// when it exited first (reaped). Other stops before the exec are passed on.
+fn wait_exec(pid: Pid) -> Result<bool> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        match wait(pid, libc::WNOHANG) {
+            Ok(Some(st)) if libc::WIFEXITED(st) || libc::WIFSIGNALED(st) => return Ok(false),
+            Ok(Some(st)) if libc::WIFSTOPPED(st) && st >> 16 == libc::PTRACE_EVENT_EXEC => {
+                return Ok(true);
+            }
+            Ok(Some(st)) if libc::WIFSTOPPED(st) => {
+                // A signal (delivered as usual) or an event stop (e.g. its exit).
+                let sig = if st >> 16 == 0 { libc::WSTOPSIG(st) } else { 0 };
+                let _ = pt(libc::PTRACE_CONT, pid, 0, sig as usize);
+            }
+            Ok(_) if std::time::Instant::now() > deadline => {
+                return Err(Error::Other("the launched program did not start".into()));
+            }
+            Ok(_) => std::thread::sleep(std::time::Duration::from_millis(1)),
+            Err(e) => return Err(Error::Io(e)),
+        }
+    }
+}
+
+/// SIGKILLs a child of ours (traced or not) and reaps it, bounded.
+fn kill_reap(pid: Pid) {
+    unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+    let deadline = std::time::Instant::now() + HALT_WAIT;
+    while std::time::Instant::now() < deadline {
+        match wait(pid, libc::WNOHANG) {
+            Ok(Some(st)) if libc::WIFEXITED(st) || libc::WIFSIGNALED(st) => return,
+            Ok(Some(_)) => {
+                let _ = pt(libc::PTRACE_CONT, pid, 0, 0);
+            }
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(1)),
+            Err(_) => return, // not ours to wait for (or already reaped)
+        }
     }
 }
 

@@ -85,7 +85,7 @@ impl Spill {
 /// Where spill files go: `explicit`, else `$HEAPHOOK_TMPDIR`, else the system temp dir unless
 /// it is RAM-backed (tmpfs, the default /tmp on most Linux desktops, where "spilling" would
 /// consume the very memory it should save): then `/var/tmp` or `~/.cache/heaphook`.
-pub(crate) fn spill_dir(explicit: Option<&Path>) -> PathBuf {
+pub fn spill_dir(explicit: Option<&Path>) -> PathBuf {
     if let Some(d) = explicit {
         return d.to_path_buf();
     }
@@ -345,6 +345,30 @@ impl<'a> View<'a> {
     /// Whether this is a dense chunk (slots are positions `0..npos`).
     pub fn dense_geometry(&self) -> Option<(usize, usize, usize)> {
         self.dense.as_ref().map(|d| (d.p0, d.align, d.npos))
+    }
+
+    /// Slot of the entry at chunk offset `off`, if there is one.
+    pub fn find(&self, off: usize) -> Option<usize> {
+        match &self.dense {
+            Some(d) => {
+                let k = off.checked_sub(d.p0)?;
+                let k = (k % d.align == 0).then_some(k / d.align).filter(|&k| k < d.npos)?;
+                match d.bits {
+                    None => Some(k),
+                    Some(b) if self.masked => (*b.get(k)? != 0).then_some(k),
+                    Some(b) => (b.get(k / 8)? >> (k % 8) & 1 == 1).then_some(k),
+                }
+            }
+            None => {
+                // Packed offsets are ascending.
+                let (mut lo, mut hi) = (0, self.n);
+                while lo < hi {
+                    let mid = (lo + hi) / 2;
+                    if self.off(mid) < off { lo = mid + 1 } else { hi = mid }
+                }
+                (lo < self.n && self.off(lo) == off).then_some(lo)
+            }
+        }
     }
 
     /// Entry offset from the chunk base.

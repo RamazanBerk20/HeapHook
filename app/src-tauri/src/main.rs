@@ -59,7 +59,7 @@ macro_rules! commands {
         )*
 
         fn handler() -> impl Fn(tauri::ipc::Invoke) -> bool + Send + Sync + 'static {
-            tauri::generate_handler![pick_path $(, $name)*]
+            tauri::generate_handler![pick_path, app_quit $(, $name)*]
         }
 
         /// Runs command `cmd` with Tauri-style `args` (a JSON object keyed by camelCase
@@ -221,6 +221,32 @@ commands! {
     run struct_export(path: String, names: Vec<String>) -> () = |a| a.struct_export(&path, &names);
     run struct_import(path: String) -> Vec<String> = |a| a.struct_import(&path);
     now app_info() -> Value = |a| a.app_info();
+    run mem_search(req: heaphook::search::SearchReq) -> Vec<String> = |a| a.mem_search(&req);
+    run disasm_search(req: heaphook::search::DisasmSearchReq) -> Vec<heaphook::search::DisasmHit> = |a| a.disasm_search(&req);
+    run mem_alloc(size: u64, prot: hh_core::Prot) -> String = |a| a.mem_alloc(size, prot);
+    run mem_free(addr: String, size: u64) -> () = |a| a.mem_free(&addr, size);
+    run process_pause(pause: bool) -> () = |a| a.process_pause(pause);
+    run trace_save(path: String, trace: Value) -> () = |a| a.trace_save(&path, &trace);
+    run trace_load(path: String) -> Value = |a| a.trace_load(&path);
+    run table_export_text(path: String) -> () = |a| a.table_export_text(&path);
+    run table_merge(path: String) -> TableState = |a| a.table_merge(&path);
+    run table_paste(entries: Vec<heaphook::table::Entry>, after: Option<i64>, base: Option<u64>) -> heaphook::cheat::PasteOut = |a| a.table_paste(entries, after, base);
+    run table_trust_entries(ids: Vec<i64>) -> () = |a| a.table_trust_entries(&ids);
+    run table_dirty() -> bool = |a| a.table_dirty();
+    run table_open_data(name: String, data: String, force: Option<bool>) -> TableState = |a| a.table_open_data(&name, &data, force.unwrap_or(false));
+    run aa_load_file(path: String) -> String = |a| a.aa_load_file(&path);
+    run aa_trust(script: String) -> () = |a| a.aa_trust(&script);
+    now app_args() -> Option<heaphook::cli::StartArgs> = |a| a.app_args();
+}
+
+/// The UI's answer to a close request with unsaved changes (`lua_poll.window.close_seq`):
+/// quit, or keep the window open.
+#[tauri::command]
+async fn app_quit(handle: tauri::AppHandle, app: St<'_>, quit: bool) -> R<()> {
+    if app.app_close_answer(quit) {
+        handle.exit(0);
+    }
+    Ok(())
 }
 
 /// CE virtual-key code -> the key's `Code` name (modifiers excluded).
@@ -332,6 +358,18 @@ fn main() {
     if let Some(port) = bridge::port_arg() {
         return bridge::serve(port, dispatch);
     }
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    let start = match heaphook::cli::parse(&argv) {
+        Ok(Some(a)) => a,
+        Ok(None) => {
+            println!("{}", heaphook::cli::USAGE);
+            return;
+        }
+        Err(e) => {
+            eprintln!("heaphook: {e}");
+            std::process::exit(2);
+        }
+    };
     // Registered shortcut id -> its CE key combo.
     let combos: Arc<Mutex<HashMap<u32, Vec<u32>>>> = Arc::default();
     let pressed = combos.clone();
@@ -344,6 +382,9 @@ fn main() {
                         return;
                     }
                     let keys = pressed.lock().unwrap_or_else(|e| e.into_inner()).get(&sc.id()).cloned();
+                    if std::env::var_os("HEAPHOOK_HOTKEY_LOG").is_some() {
+                        eprintln!("heaphook: global hotkey pressed: {keys:?}");
+                    }
                     if let Some(keys) = keys {
                         let app = h.state::<App>().inner().clone();
                         // Off the event-loop thread: hotkeys may run Lua and Auto Assembler.
@@ -355,6 +396,7 @@ fn main() {
         .manage(App::default())
         .setup(move |tapp| {
             let app = tapp.state::<App>().inner().clone();
+            app.set_args(start);
             if let Ok(dir) = tapp.path().app_config_dir() {
                 app.set_config_dir(&dir);
                 if let Some(w) = tapp.get_webview_window("main") {
@@ -367,25 +409,43 @@ fn main() {
                 let _ = gs.unregister_all();
                 let mut m = combos.lock().unwrap_or_else(|e| e.into_inner());
                 m.clear();
+                // HEAPHOOK_HOTKEY_LOG=1: report each registration on stderr (diagnosing a desktop).
+                let log = std::env::var_os("HEAPHOOK_HOTKEY_LOG").is_some();
                 list.iter()
-                    .map(|keys| match shortcut_of(keys) {
-                        Some(sc) if gs.register(sc).is_ok() => {
-                            m.insert(sc.id(), keys.clone());
-                            true
+                    .map(|keys| {
+                        let r = shortcut_of(keys).ok_or_else(|| "not a combination with one key".to_string()).and_then(|sc| gs.register(sc).map(|_| sc).map_err(|e| e.to_string()));
+                        if log {
+                            eprintln!("heaphook: global hotkey {keys:?}: {}", r.as_ref().map_or_else(|e| format!("not registered: {e}"), |_| "registered".into()));
                         }
-                        _ => false,
+                        match r {
+                            Ok(sc) => {
+                                m.insert(sc.id(), keys.clone());
+                                true
+                            }
+                            Err(_) => false,
+                        }
                     })
                     .collect()
             }));
             app.start_driver();
             Ok(())
         })
-        .on_window_event(|w, ev| {
-            if let tauri::WindowEvent::CloseRequested { .. } = ev
-                && let Ok(dir) = w.app_handle().path().app_config_dir()
-            {
-                save_window(w, &dir.join("window.json"));
+        .on_window_event(|w, ev| match ev {
+            tauri::WindowEvent::CloseRequested { api, .. } => {
+                // Unsaved table changes: the UI asks first (and calls app_quit).
+                if !w.app_handle().state::<App>().window_close_requested() {
+                    api.prevent_close();
+                    return;
+                }
+                if let Ok(dir) = w.app_handle().path().app_config_dir() {
+                    save_window(w, &dir.join("window.json"));
+                }
             }
+            tauri::WindowEvent::DragDrop(tauri::DragDropEvent::Drop { paths, .. }) => {
+                let paths = paths.iter().map(|p| p.to_string_lossy().into_owned()).collect();
+                w.app_handle().state::<App>().window_dropped(paths);
+            }
+            _ => {}
         })
         .invoke_handler(handler())
         .build(tauri::generate_context!())

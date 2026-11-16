@@ -8,6 +8,7 @@ edition.workspace = true
 hh-core.workspace = true
 hh-asm.workspace = true
 serde.workspace = true
+serde_json = "1"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
@@ -15,6 +16,7 @@ libc = "0.2"
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
+    "Win32_Security",
     "Win32_Storage_FileSystem",
     "Win32_System_Diagnostics_Debug",
     "Win32_System_Kernel",
@@ -22,8 +24,6 @@ windows-sys = { version = "0.61", features = [
     "Win32_System_Threading",
 ] }
 
-[dev-dependencies]
-serde_json = "1"
 
 # Test target for the integration tests (known code addresses, threads, dlopen).
 [[bin]]

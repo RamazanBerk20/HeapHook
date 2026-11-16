@@ -2,6 +2,7 @@
 use std::path::Path;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+use std::time::{Duration, Instant};
 
 use hh_core::{Addr, Error, Result};
 use rayon::prelude::*;
@@ -47,6 +48,17 @@ pub struct ScanOptions {
     pub max_results: u64,
     /// Worker threads; 0 = all cores.
     pub threads: usize,
+    /// The path must start with exactly these offsets (the ones applied first, from the
+    /// base); Cheat Engine's "must start with offsets".
+    pub starts_with: Vec<i64>,
+    /// Every offset must be one of these; empty = any ("same offsets only").
+    pub allowed_offsets: Vec<i64>,
+    /// Do not search further back from a node that is already a static base (shorter
+    /// paths only through it).
+    pub stop_at_static: bool,
+    /// Stop after this many seconds, keeping what was found (time paused does not count);
+    /// 0 = no limit.
+    pub time_limit_secs: u64,
 }
 
 impl Default for ScanOptions {
@@ -67,6 +79,10 @@ impl Default for ScanOptions {
             heap_only: false,
             max_results: 0,
             threads: 0,
+            starts_with: Vec::new(),
+            allowed_offsets: Vec::new(),
+            stop_at_static: false,
+            time_limit_secs: 0,
         }
     }
 }
@@ -91,6 +107,7 @@ struct Ctx<'a> {
     out: Mutex<(Writer, Option<Error>)>,
     progress: &'a Progress,
     stop: AtomicBool,
+    deadline: Option<Instant>,
 }
 
 impl Ctx<'_> {
@@ -112,6 +129,7 @@ impl Ctx<'_> {
         let ew = &self.o.ends_with;
         (k != 0 || self.o.last_offsets.is_empty() || self.o.last_offsets.contains(&off))
             && (k >= ew.len() || ew[ew.len() - 1 - k] == off)
+            && (self.o.allowed_offsets.is_empty() || self.o.allowed_offsets.contains(&off))
     }
 
     fn children(&self, target: u64, k: usize) -> impl Iterator<Item = (u64, i64)> + '_ {
@@ -142,6 +160,14 @@ impl Ctx<'_> {
     }
 
     fn dfs(&self, target: u64, rev: &mut Vec<i64>, nodes: &mut Vec<u64>, buf: &mut Vec<u8>) {
+        self.progress.wait_if_paused();
+        // The pause total (a lock) is only looked at once the plain deadline has passed.
+        if self.deadline.is_some_and(|d| {
+            let now = Instant::now();
+            now > d && now > d + self.progress.paused_for()
+        }) {
+            self.stop.store(true, Relaxed);
+        }
         if self.stop.load(Relaxed) || self.progress.is_cancelled() {
             return;
         }
@@ -185,12 +211,14 @@ impl Ctx<'_> {
             return;
         }
         rev.push(off);
+        let base = self.base_of(a);
         if rev.len() >= self.o.ends_with.len()
-            && let Some((b, bo)) = self.base_of(a)
+            && let Some((b, bo)) = base
         {
             self.emit(b, bo, rev, buf);
         }
-        if rev.len() < self.o.max_level && self.node_ok(a) {
+        let at_static = self.o.stop_at_static && base.is_some_and(|(b, _)| b != ABS);
+        if rev.len() < self.o.max_level && self.node_ok(a) && !at_static {
             nodes.push(a);
             self.dfs(a, rev, nodes, buf);
             nodes.pop();
@@ -199,6 +227,10 @@ impl Ctx<'_> {
     }
 
     fn emit(&self, base: u32, bo: i64, rev: &[i64], buf: &mut Vec<u8>) {
+        let sw = &self.o.starts_with;
+        if rev.len() < sw.len() || !rev.iter().rev().zip(sw).all(|(a, b)| a == b) {
+            return;
+        }
         if !self.compare.is_empty() {
             let offs: Vec<i64> = rev.iter().rev().copied().collect();
             let ok = self.compare.iter().all(|(m, addrs, tgt)| {
@@ -219,7 +251,7 @@ impl Ctx<'_> {
             self.stop.store(true, Relaxed);
             return;
         }
-        encode(buf, self.o.max_level, base, bo, rev.iter().rev().copied());
+        encode(buf, base, bo, rev.iter().rev().copied());
         if buf.len() >= FLUSH {
             self.flush(buf);
         }
@@ -231,7 +263,7 @@ impl Ctx<'_> {
         }
         let mut out = self.out.lock().unwrap_or_else(|e| e.into_inner());
         if out.1.is_none()
-            && let Err(e) = out.0.write_raw(buf)
+            && let Err(e) = out.0.write_encoded(buf)
         {
             out.1 = Some(e);
             self.stop.store(true, Relaxed);
@@ -258,9 +290,9 @@ impl PointerMap {
         if o.max_offset > i32::MAX as u64 {
             return Err(Error::Other("max offset too large".into()));
         }
-        if o.ends_with.len() > o.max_level || o.ends_with.iter().any(|&x| i32::try_from(x).is_err())
-        {
-            return Err(Error::Other("bad ends_with offsets".into()));
+        let bad_offs = |v: &[i64]| v.len() > o.max_level || v.iter().any(|&x| i32::try_from(x).is_err());
+        if bad_offs(&o.ends_with) || bad_offs(&o.starts_with) {
+            return Err(Error::Other("bad ends_with / starts_with offsets".into()));
         }
         let mut names: Vec<String> = self.modules.iter().map(|m| m.name.clone()).collect();
         let wanted = |n: &str| {
@@ -278,11 +310,11 @@ impl PointerMap {
                 origin: m.base,
             })
             .collect();
-        for (j, r) in self.regions.iter().filter(|r| is_stack(r)).enumerate() {
-            let top = r.start.saturating_add(r.size);
+        let stacks = self.stack_ranges();
+        for (j, &(start, top)) in stacks.iter().enumerate() {
             if o.thread_stacks {
                 statics.push(Static {
-                    start: top.saturating_sub(o.stack_max).max(r.start),
+                    start: top.saturating_sub(o.stack_max).max(start),
                     end: top,
                     base: names.len() as u32,
                     origin: top,
@@ -295,6 +327,7 @@ impl PointerMap {
             .regions
             .iter()
             .filter(|r| r.kind == hh_core::RegionKind::Private && !is_stack(r))
+            .filter(|r| !stacks.iter().any(|s| s.0 < r.start.saturating_add(r.size) && r.start < s.1))
             .map(|r| (r.start, r.start.saturating_add(r.size)))
             .collect();
         let compare: Vec<_> = compare
@@ -320,6 +353,7 @@ impl PointerMap {
             out: Mutex::new((Writer::create(out, &header)?, None)),
             progress,
             stop: AtomicBool::new(false),
+            deadline: (o.time_limit_secs > 0).then(|| Instant::now().checked_add(Duration::from_secs(o.time_limit_secs))).flatten(),
         };
         let run = || {
             let mut buf = Vec::new();
