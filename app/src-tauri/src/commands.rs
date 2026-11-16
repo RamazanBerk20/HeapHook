@@ -374,7 +374,7 @@ impl App {
     fn apply_settings(&self, s: &Settings) {
         // "Never" withdraws every consent given, and stops what it started.
         if self.x.live.set_never(s.table_script == "never") {
-            self.stop_table_lua();
+            self.reset_lua("Settings now say never to run a loaded table's Lua: the consent you gave the table, its entries and Auto Assemble files was withdrawn");
         }
         self.x.lua.engine.set_budget((s.lua_budget_ms > 0).then(|| Duration::from_millis(s.lua_budget_ms)));
         {
@@ -900,6 +900,7 @@ impl App {
         let (origin, agreed) = self.x.live.aa_origin(session)?;
         let e = table::Entry { description: description.into(), script: Some(script.into()), ..table::Entry::default() };
         let (version, ids) = self.x.live.insert(vec![e], after, base, origin, agreed)?;
+        self.x.live.came(&ids, "its script came from a file loaded into the Auto Assemble window");
         Ok(crate::cheat::PasteOut { version, ids })
     }
 

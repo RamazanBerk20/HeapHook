@@ -186,13 +186,15 @@
     <section id="table" class="panel table" aria-labelledby="tbl-title">
       <div class="panel-head">
         <h2 id="tbl-title">Cheat table <span id="tbl-count" class="count mono"></span></h2>
+        <span id="tbl-trust" class="trust-state" role="status" hidden></span>
+        <button id="tbl-withdraw" class="btn ghost" type="button" hidden title="Stop this table's Lua: Lua restarts, and globals defined in the console are lost">Withdraw trust</button>
         <div class="tbl-search search" data-icon="search"><input id="tbl-filter" type="search" placeholder="Filter (Ctrl F)" aria-label="Filter the cheat table by description or address" spellcheck="false" autocomplete="off"></div>
         <div class="toolbar">
-          <button id="tb-add" class="btn ghost" type="button" data-icon="plus">Address <kbd>Ctrl Shift A</kbd></button>
-          <button id="tb-script" class="btn ghost" type="button" data-icon="code">Script</button>
-          <button id="tb-group" class="btn ghost" type="button" data-icon="group">Group <kbd>Ctrl G</kbd></button>
-          <button id="tb-lua" class="btn ghost" type="button" data-icon="terminal" title="The table's Lua script">Table script</button>
-          <button id="tb-trainer" class="btn ghost" type="button" data-icon="trainer" title="Generate a trainer (a Lua form with toggles and hotkeys) into the table script">Trainer</button>
+          <button id="tb-add" class="btn ghost" type="button" data-icon="plus" title="Add an address (Ctrl Shift A)"><span class="bl">Address</span> <kbd>Ctrl Shift A</kbd></button>
+          <button id="tb-script" class="btn ghost" type="button" data-icon="code" title="New Auto Assembler script entry"><span class="bl">Script</span></button>
+          <button id="tb-group" class="btn ghost" type="button" data-icon="group" title="Group the selected entries (Ctrl G)"><span class="bl">Group</span> <kbd>Ctrl G</kbd></button>
+          <button id="tb-lua" class="btn ghost" type="button" data-icon="terminal" title="The table's Lua script"><span class="bl">Table script</span></button>
+          <button id="tb-trainer" class="btn ghost" type="button" data-icon="trainer" title="Generate a trainer (a Lua form with toggles and hotkeys) into the table script"><span class="bl">Trainer</span></button>
           <button id="tb-comments" class="btn ghost icon" type="button" aria-label="Table comments" title="Table comments" data-icon="note"></button>
           <button id="tb-delete" class="btn ghost icon" type="button" aria-label="Delete selected (Del)" title="Delete selected (Del)" data-icon="trash"></button>
         </div>

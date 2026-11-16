@@ -960,8 +960,8 @@ const trusted = () => T.trust === 'own' || T.trust === 'agreed';
 const runsLua = (e) => /\{\$lua\}/i.test(e.script || '') || (e.children || []).some(runsLua);
 function gate(what) {
   if (trusted()) return;
-  if (loadSettings().table_script === 'never') err(`${what}: not run: it runs Lua from a loaded table and Settings say never to run a table's Lua`);
-  err(T.trust === 'declined' ? `${what}: not run: you chose not to run this table's Lua (open the table again to be asked again)` : `needs consent: ${what}: this table runs Lua code, which can use your files and the process`);
+  if (loadSettings().table_script === 'never') err(`${what}: not run: it needs Lua or file access from a loaded table and Settings say never to run a table's Lua`);
+  err(T.trust === 'declined' ? `${what}: not run: you chose not to run this table's Lua (open the table again to be asked again)` : `needs consent: ${what}: this table runs Lua code or reads files, which can use your files and the process`);
 }
 const fvals = new Map(); // id -> value the entry is frozen to
 const liveWalk = (list, f, parent = null) => list.forEach((e) => { f(e, parent); liveWalk(e.children || [], f, e); });
@@ -1300,7 +1300,10 @@ const LIVE = {
   settings_set({ settings }) {
     const s = { ...SETTINGS, ...settings };
     try { localStorage.setItem('hh.mocksettings', JSON.stringify(s)); } catch { /* storage blocked: session only */ }
-    if (s.table_script === 'never' && T.trust === 'agreed') T = { ...T, version: T.version + 1, trust: 'declined' };
+    // "Never" withdraws every consent given (the table's and each entry's), like the backend.
+    if (s.table_script === 'never' && (T.trust === 'agreed' || T.agreed?.length)) {
+      T = { ...T, version: T.version + 1, trust: T.trust === 'agreed' ? 'declined' : T.trust, untrusted: [...(T.untrusted || []), ...(T.agreed || [])], agreed: [] };
+    }
     return s;
   },
 };
@@ -1924,6 +1927,10 @@ let SESS_NEXT = 0;
 let PAUSED = false, SAVED = null;
 const plainJson = (t) => JSON.stringify(t, (k, v) => (k === 'frozen' ? undefined : v));
 const untrusted = () => (T.untrusted ||= []);
+const agreed = () => (T.agreed ||= []);
+const came = () => (T.came ||= {});
+const STALE = 'not granted: the table changed since you were asked; ask again';
+const subtree = (ids) => { const sub = new Set(); for (const id of ids) { const e = liveFind(id); if (e) liveWalk([e], (x) => sub.add(x.id)); } return sub; };
 function parsePattern(p) {
   const out = [];
   for (const tok of String(p).trim().split(/\s+/)) {
@@ -1935,8 +1942,8 @@ function parsePattern(p) {
   if (!out.some((b) => b != null)) err('the pattern needs at least one byte that is not ??');
   return out;
 }
-/** New ids for pasted / merged entries; every one waits for its own consent (foreign false: the user's own). */
-function insertForeign(entries, after, foreign = true) {
+/** New ids for pasted / merged entries; every one waits for its own consent (foreign false: the user's own). `how`: where they came from, in plain words. */
+function insertForeign(entries, after, foreign = true, how = 'pasted or dropped in from another table') {
   let max = 0;
   liveWalk(T.table.entries, (e) => { max = Math.max(max, e.id); });
   const reid = (e) => ({ ...clone(e), id: ++max, frozen: false, ct_extra: [], children: (e.children || []).map(reid) });
@@ -1944,7 +1951,7 @@ function insertForeign(entries, after, foreign = true) {
   pushUndo(clone(T.table));
   const list = (() => { let r = null; liveWalk(T.table.entries, (e, p) => { if (e.id === after) r = p ? p.children : T.table.entries; }); return r; })();
   if (list) list.splice(list.findIndex((e) => e.id === after) + 1, 0, ...items); else T.table.entries.push(...items);
-  if (foreign) liveWalk(items, (e) => { untrusted().push(e.id); });
+  if (foreign) liveWalk(items, (e) => { untrusted().push(e.id); came()[e.id] = how; });
   T.version++;
   return items.map((e) => e.id);
 }
@@ -1994,7 +2001,7 @@ const RC = {
   table_merge({ path }) {
     fs ??= loadFs();
     const t = fs[path] ?? err(`file not found: ${path}`);
-    insertForeign(Array.isArray(t) ? t : t.entries || [], null);
+    insertForeign(Array.isArray(t) ? t : t.entries || [], null, true, 'merged in from another table file');
     if (!T.table.lua_script?.trim() && t.lua_script?.trim()) T = { ...T, table: { ...T.table, lua_script: t.lua_script }, trust: 'ask' };
     return T;
   },
@@ -2002,11 +2009,24 @@ const RC = {
     if (base != null && base !== T.version) err(`stale table version ${base} (current ${T.version})`);
     return { ids: insertForeign(entries, after ?? null), version: T.version };
   },
-  table_trust_entries({ ids }) {
+  // Exactly the listed entries: refused when what waits for consent under `roots` is not that list.
+  table_trust_entries({ roots, ids, generation }) {
     if (loadSettings().table_script === 'never') err('Settings say never to run a table\'s Lua: change "Lua script in a loaded table" first');
-    const sub = new Set();
-    for (const id of ids) { const e = liveFind(id); if (e) liveWalk([e], (x) => sub.add(x.id)); }
-    T.untrusted = untrusted().filter((id) => !sub.has(id));
+    if (generation != null && generation !== (T.generation || 0)) err(STALE);
+    const covered = [...subtree(roots ?? ids)].filter((id) => untrusted().includes(id)).sort((a, b) => a - b);
+    const listed = [...new Set(ids)].sort((a, b) => a - b);
+    if (covered.join() !== listed.join()) err(`${STALE} (the entries waiting for consent are not the ones listed)`);
+    T.untrusted = untrusted().filter((id) => !listed.includes(id));
+    T.agreed = [...new Set([...agreed(), ...listed])];
+    T.version++;
+    return null;
+  },
+  table_distrust_entries({ ids, generation }) {
+    if (generation != null && generation !== (T.generation || 0)) err(STALE);
+    const sub = subtree(ids);
+    const back = agreed().filter((id) => sub.has(id));
+    T.agreed = agreed().filter((id) => !sub.has(id));
+    T.untrusted = [...untrusted(), ...back];
     T.version++;
     return null;
   },
@@ -2018,7 +2038,7 @@ const RC = {
     C.table_save({ path: '\u0000drop', table: t });
     return RC.table_open({ path: '\u0000drop' });
   },
-  table_open(a) { const r = LIVE_open(a); T.untrusted = []; T.generation = (T.generation || 0) + 1; SAVED = plainJson(T.table); return { ...r, generation: T.generation }; },
+  table_open(a) { const r = LIVE_open(a); T.untrusted = []; T.agreed = []; T.came = {}; T.generation = (T.generation || 0) + 1; SAVED = plainJson(T.table); return { ...r, generation: T.generation }; },
   table_export(a) { const r = C_export(a); SAVED = plainJson(T.table); return r; },
   table_set_active(a) {
     if (a.active) for (const id of a.ids) {
@@ -2027,8 +2047,9 @@ const RC = {
       let bad = null;
       // The mock runs no Lua: an untrusted script entry always asks (the real backend runs plain Auto Assembler).
       liveWalk([e], (x) => { if (!bad && x.script && untrusted().includes(x.id)) bad = x; });
-      if (bad) err(loadSettings().table_script === 'never' ? `${bad.description}: not run: it runs Lua from another table and Settings say never to run a table's Lua`
-        : `needs consent: entries: ${bad.description}: this entry came from another table (pasted, merged or dropped in) and runs Lua code, which can use your files and the process`);
+      const from = /^made or scripted/.test(came()[bad?.id] || '') ? 'it was made or scripted by Lua after a table\'s or an entry\'s Lua had run' : 'it came from another table (pasted, merged or dropped in)';
+      if (bad) err(loadSettings().table_script === 'never' ? `${bad.description}: not run: it needs Lua or file access, ${from} and Settings say never to run a table's Lua`
+        : `needs consent: entries: ${bad.description}: ${from}; it runs Lua code or reads files, which can use your files and the process`);
     }
     return LIVE_active(a);
   },
@@ -2055,8 +2076,8 @@ const RC = {
   aa_assign({ session, script, description, after, base }) {
     if (base != null && base !== T.version) err(`stale table version ${base} (current ${T.version})`);
     const s = SESS.get(session) ?? err(`no Auto Assemble session ${session}`);
-    const ids = insertForeign([{ description, script, addr: '', offsets: [], children: [], hotkeys: [], options: [] }], after ?? null, s !== 'typed');
-    if (s === 'agreed') T.untrusted = untrusted().filter((id) => !ids.includes(id));
+    const ids = insertForeign([{ description, script, addr: '', offsets: [], children: [], hotkeys: [], options: [] }], after ?? null, s !== 'typed', 'its script came from a file loaded into the Auto Assemble window');
+    if (s === 'agreed') { T.untrusted = untrusted().filter((id) => !ids.includes(id)); T.agreed = [...agreed(), ...ids]; }
     return { ids, version: T.version };
   },
   table_new({ entries, after, base }) {
@@ -2098,7 +2119,11 @@ const C_addbp = C.debug_add_breakpoint, C_bps = C.debug_breakpoints, C_poll = C.
 Object.assign(C, RC);
 // The table's get carries the untrusted list too.
 const C_get = C.table_get;
-C.table_get = () => ({ ...C_get(), untrusted: untrusted(), generation: T.generation || 0 });
+C.table_get = () => {
+  const live = new Set(); liveWalk(T.table.entries, (e) => live.add(e.id));
+  return { ...C_get(), untrusted: untrusted(), waiting: untrusted().map((id) => ({ id, from: came()[id] || 'came from another table' })),
+    agreed: agreed().filter((id) => live.has(id)), generation: T.generation || 0 };
+};
 
 function loadFs() { try { return JSON.parse(localStorage.getItem('hh.mockfs')) || {}; } catch { return {}; } }
 

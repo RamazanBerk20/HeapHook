@@ -182,10 +182,11 @@ decreased decreased_by changed unchanged same_as_first`, plus `not: bool` to inv
 | `table_export_text` | `path` | – (tab-separated listing: description indented by depth, address expression, type, live value) |
 | `table_merge` | `path` | `TableState` (entries appended with new ids, inactive, every one untrusted; a table script it brings into a table without one makes the table `ask`) |
 | `table_paste` | `entries, after?, base?` | `{version, ids}` (new ids after entry `after` in its list, or at the end; every entry arrives untrusted) |
-| `table_trust_entries` | `ids, generation` | – (refused when the table changed or an id is not in it; consent for the untrusted entries in those subtrees; refused while Settings say never; "never" withdraws it again) |
+| `table_trust_entries` | `roots?, ids, generation` | – (consent for exactly `ids`: the entries the prompt listed as waiting for consent under the selected `roots` (default: `ids`); refused when the table changed, an id is not in it, or the entries waiting under `roots` are no longer exactly `ids`; refused while Settings say never; "never" withdraws it again) |
+| `table_distrust_entries` | `ids, generation` | – (withdraws the consent given to the entries in those subtrees; refused when the table changed; if their Lua has run, Lua is reset) |
 | `table_add_template` | `addr, kind, description, after?, base?` | `{version, ids}`: `aa_template` inserted as a new script entry by the backend; untrusted when the target is remote (its text embeds names the server reported) |
 | `table_resolve` | `ids` | `[addr or null]`: entries' addresses, each resolved with the lookups its origin allows (the table rows use this, not `resolve_many`) |
-| per-entry trust | | `TableState.untrusted: [id]`: entries that came from elsewhere (paste, merge, `loadTable(f, true)`, a remote template, a script assigned from an Auto Assemble window a file was loaded into) and wait for their own consent (`table_trust_entries`), whatever the table's own trust; their hotkeys are not registered system-wide before that |
+| per-entry trust | | `TableState.untrusted: [id]`: entries that came from elsewhere (paste, merge, `loadTable(f, true)`, a remote template, a script assigned from an Auto Assemble window a file was loaded into) and wait for their own consent (`table_trust_entries`), whatever the table's own trust; their hotkeys are not registered system-wide before that. `TableState.waiting: [{id, from}]`: for each of them, where it came from in plain words (for the prompt). `TableState.agreed: [id]`: entries with consent of their own (what `table_distrust_entries` withdraws) |
 | `table_dirty` | – | bool (the table differs from what was last opened or saved; activation does not count) |
 | `table_open_data` | `name, data, force?` | like `table_open` for a file's text (a browser drop; `.CT` by name) |
 | `aa_session` | | `id`: a new Auto Assemble window session; what is typed into it is the user's own |
@@ -309,7 +310,11 @@ Trust is decided by origin, never by content, and the engine fails closed.
 - **Finalizers.** Scripts cannot install `__gc`. A discarded interpreter in which only the user's
   own Lua ran is closed; any other is parked unclosed (its host functions refuse, it cannot run
   again). At most `max_parked` (16) are parked, `max_parked_bytes` (512 MiB) in all; beyond that
-  the oldest is closed after its allocator is capped at its current size. `app_info` reports
+  the oldest is closed after the `__gc` / `__close` of its `FILE*` metatable are removed (open
+  files and `io.popen` pipes are leaked, never flushed, closed or waited for) and its allocator
+  is capped at its current size. Every close runs on a reaper thread, one state at a time, never
+  on the reset path; a close that runs past 3 s is abandoned to a fresh reaper (at most 4 in
+  all), after which states are only kept and the console says so once. `app_info` reports
   `lua_parked` and `lua_parked_bytes`.
 - **Taint.** A script trusted Lua takes from an untrusted entry (`memrec.Script`) stays
   untrusted: `autoAssemble` of text containing it runs without capabilities, and assigning it

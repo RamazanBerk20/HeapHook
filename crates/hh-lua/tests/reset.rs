@@ -206,7 +206,7 @@ fn scripts_cannot_install_finalizers() {
     assert!(!rec.out.lock().unwrap().iter().any(|l| l == "gc"));
 }
 
-/// A clean interpreter (only the user's own code ran) is closed, not kept.
+/// A clean interpreter (only the user's own code ran) is closed (in the background), not kept.
 #[test]
 fn a_clean_reset_keeps_nothing() {
     let e = Engine::new(EngineOptions { max_parked: 1000, ..EngineOptions::default() }).unwrap();
@@ -226,6 +226,11 @@ fn a_clean_reset_keeps_nothing() {
     drop(lua);
     e.exec("y = 1", "console").unwrap();
     e.reset().unwrap();
+    // Closed on the reaper thread, off the reset path.
+    let t = std::time::Instant::now();
+    while *marker.lock().unwrap() == 0 && t.elapsed() < std::time::Duration::from_secs(3) {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
     assert_eq!(*marker.lock().unwrap(), 1, "the clean state was not closed");
 }
 
@@ -254,5 +259,7 @@ fn the_cap_closes_the_oldest_and_its_host_functions_refuse() {
     e.reset().unwrap();
     // (+1: a test running alongside may have kept one since)
     assert!(hh_lua::parked_stats().0 <= 4, "the cap: {:?}", hh_lua::parked_stats());
+    // Closes run on the reaper thread: give them time before looking.
+    std::thread::sleep(std::time::Duration::from_millis(300));
     assert!(rec.out.lock().unwrap().is_empty(), "a closed state's finalizer reached the host: {:?}", rec.out.lock().unwrap());
 }

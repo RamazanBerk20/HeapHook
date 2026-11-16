@@ -64,6 +64,9 @@ enum AaSess {
 pub(crate) enum Grant<'a> {
     Table,
     Entries(&'a [i64]),
+    /// Exactly `ids`, the entries a prompt listed as waiting for consent under `roots`;
+    /// refused when that set is no longer the same.
+    Listed { roots: &'a [i64], ids: &'a [i64] },
     AaSession(u64),
 }
 
@@ -88,6 +91,8 @@ struct Inner {
     agreed: HashSet<i64>,
     /// [`Origin::Derived`] entry id -> the principals its content depends on.
     derived: HashMap<i64, std::collections::BTreeSet<Owner>>,
+    /// [`Origin::Foreign`] entry id -> how it came in, in plain words (consent prompts).
+    came: HashMap<i64, &'static str>,
     /// Settings say never to run a loaded table's Lua: nothing but the user's own runs Lua.
     never: bool,
     /// Auto Assemble window sessions (`aa_session`).
@@ -191,14 +196,40 @@ impl Inner {
         }
     }
 
+    /// Entry `id` came from elsewhere (or depends on others' consent) and waits for its own.
+    fn waits(&self, id: i64) -> bool {
+        matches!(self.origin.get(&id), Some(Origin::Foreign | Origin::Derived)) && !self.agreed.contains(&id) && self.caps(id) == Caps::None
+    }
+
     fn st(&self) -> TableState {
-        let mut untrusted: Vec<i64> = all(&self.table.entries)
-            .into_iter()
-            .filter(|(e, _)| matches!(self.origin.get(&e.id), Some(Origin::Foreign | Origin::Derived)) && !self.agreed.contains(&e.id) && self.caps(e.id) == Caps::None)
-            .map(|(e, _)| e.id)
-            .collect();
+        let mut untrusted: Vec<i64> = all(&self.table.entries).into_iter().filter(|(e, _)| self.waits(e.id)).map(|(e, _)| e.id).collect();
         untrusted.sort_unstable();
-        TableState { version: self.version, table: self.table.clone(), trust: self.trust, untrusted, generation: self.generation }
+        let waiting = untrusted.iter().map(|&id| Waiting { id, from: self.came_from(id) }).collect();
+        let mut agreed: Vec<i64> = all(&self.table.entries).into_iter().map(|(e, _)| e.id).filter(|id| self.agreed.contains(id)).collect();
+        agreed.sort_unstable();
+        TableState { version: self.version, table: self.table.clone(), trust: self.trust, untrusted, waiting, agreed, generation: self.generation }
+    }
+
+    /// Where entry `id` came from, in plain words.
+    fn came_from(&self, id: i64) -> String {
+        if self.origin.get(&id) != Some(&Origin::Derived) {
+            return self.came.get(&id).copied().unwrap_or("came from another table").into();
+        }
+        let names: Vec<String> = self
+            .derived
+            .get(&id)
+            .into_iter()
+            .flatten()
+            .map(|o| match *o {
+                Owner::Table(_) => "the table's Lua".to_string(),
+                Owner::Entry(n) => all(&self.table.entries)
+                    .into_iter()
+                    .find(|(e, _)| e.id == n as i64)
+                    .map_or_else(|| format!("entry {n} (since deleted)"), |(e, _)| format!("the Lua of \"{}\"", e.description.lines().next().unwrap_or(""))),
+                Owner::Session(_) => "a file in the Auto Assemble window".to_string(),
+            })
+            .collect();
+        format!("made or scripted by Lua after {} had run", if names.is_empty() { "other Lua".into() } else { names.join(" and ") })
     }
 }
 
@@ -280,9 +311,21 @@ pub struct TableState {
     /// Entries that came from another table (paste, merge, ...) and still need the user's
     /// consent before their script gets Lua or file access, or their callbacks run.
     pub untrusted: Vec<i64>,
+    /// Where each of `untrusted` came from, in plain words (the per-entry prompt).
+    pub waiting: Vec<Waiting>,
+    /// Entries from elsewhere (or made by Lua) the user consented to: consent that
+    /// `table_distrust_entries` withdraws.
+    pub agreed: Vec<i64>,
     /// The table's generation: consent answers (`table_trust`, `table_trust_entries`,
     /// `table_run_script`) name it and are refused once another table was opened.
     pub generation: u64,
+}
+
+/// An entry waiting for its own consent, and where it came from.
+#[derive(Debug, Clone, Serialize)]
+pub struct Waiting {
+    pub id: i64,
+    pub from: String,
 }
 
 pub fn is_group(e: &Entry) -> bool {
@@ -441,6 +484,28 @@ impl Live {
         was
     }
 
+    /// Withdraws the consent given to the entries in the subtrees of `ids` (asked about table
+    /// `generation`). True when some was withdrawn.
+    pub(crate) fn withdraw(&self, ids: &[i64], generation: u64) -> R<bool> {
+        let mut g = lock(&self.0);
+        if generation != g.generation {
+            return Err(STALE.into());
+        }
+        let under: Vec<i64> = all(&g.table.entries)
+            .into_iter()
+            .filter(|(e, _)| ids.contains(&e.id))
+            .flat_map(|(e, _)| all(std::slice::from_ref(e)).into_iter().map(|(c, _)| c.id))
+            .collect();
+        let mut any = false;
+        for id in under {
+            any |= g.agreed.remove(&id);
+        }
+        if any {
+            g.bump();
+        }
+        Ok(any)
+    }
+
     /// THE one place trust is granted: the user consented to the table (its script and the
     /// entries that came with it), to entries from elsewhere, or to what was loaded into an
     /// Auto Assemble window. Refused while Settings say never. Editing never grants it.
@@ -463,7 +528,7 @@ impl Live {
             if asked != now {
                 return Err(STALE.into());
             }
-            if let Grant::Entries(ids) = &what {
+            if let Grant::Entries(ids) | Grant::Listed { ids, .. } = &what {
                 let have: HashSet<i64> = all(&g.table.entries).into_iter().map(|(e, _)| e.id).collect();
                 if let Some(id) = ids.iter().find(|i| !have.contains(i)) {
                     return Err(format!("{STALE} (no entry {id})"));
@@ -482,6 +547,23 @@ impl Live {
                     under.extend(all(std::slice::from_ref(e)).into_iter().map(|(c, _)| c.id).filter(|c| matches!(g.origin.get(c), Some(Origin::Foreign | Origin::Derived))));
                 }
                 g.agreed.extend(under);
+            }
+            Grant::Listed { roots, ids } => {
+                let mut covered: Vec<i64> = all(&g.table.entries)
+                    .into_iter()
+                    .filter(|(e, _)| roots.contains(&e.id))
+                    .flat_map(|(e, _)| all(std::slice::from_ref(e)).into_iter().map(|(c, _)| c.id))
+                    .filter(|&c| g.waits(c))
+                    .collect();
+                covered.sort_unstable();
+                covered.dedup();
+                let mut listed = ids.to_vec();
+                listed.sort_unstable();
+                listed.dedup();
+                if covered != listed {
+                    return Err(format!("{STALE} (the entries waiting for consent are not the ones listed)"));
+                }
+                g.agreed.extend(listed);
             }
             Grant::AaSession(s) => match g.aa.get_mut(&s) {
                 Some(x @ AaSess::File { .. }) => *x = AaSess::File { agreed: true },
@@ -587,6 +669,20 @@ impl Live {
             Owner::Table(_) => "the table".into(),
             Owner::Entry(n) => self.entry(n as i64).map_or_else(|| format!("entry {n}"), |e| format!("the entry \"{}\"", e.description)),
             Owner::Session(_) => "a script file in the Auto Assemble window".into(),
+        }
+    }
+
+    /// Records how the [`Origin::Foreign`] entries in the subtrees of `ids` came in.
+    pub(crate) fn came(&self, ids: &[i64], how: &'static str) {
+        let mut g = lock(&self.0);
+        let under: Vec<i64> = all(&g.table.entries)
+            .into_iter()
+            .filter(|(e, _)| ids.contains(&e.id))
+            .flat_map(|(e, _)| all(std::slice::from_ref(e)).into_iter().map(|(c, _)| c.id))
+            .filter(|c| g.origin.get(c) == Some(&Origin::Foreign))
+            .collect();
+        for id in under {
+            g.came.insert(id, how);
         }
     }
 
@@ -711,7 +807,7 @@ impl Live {
         let (mut rt, mut carried) = (HashMap::new(), Vec::new());
         // Every entry of the file is under the table's consent; carried ones keep theirs.
         let mut origin: HashMap<i64, Origin> = all(&t.entries).into_iter().map(|(e, _)| (e.id, Origin::Table)).collect();
-        let mut agreed = HashSet::new();
+        let (mut agreed, mut came) = (HashSet::new(), HashMap::new());
         for &id in keep {
             let Some(mut e) = find_mut(&mut g.table.entries, id).map(|e| e.clone()) else { continue };
             e.children.clear();
@@ -719,6 +815,7 @@ impl Live {
                 origin.insert(next, Origin::Own);
             } else {
                 origin.insert(next, Origin::Foreign);
+                came.insert(next, "still active from the previous table when you chose to open this one anyway");
                 if g.caps(id) == Caps::Full {
                     agreed.insert(next);
                 }
@@ -743,6 +840,7 @@ impl Live {
         g.trust = Trust::Ask;
         g.origin = origin;
         g.agreed = agreed;
+        g.came = came;
         g.derived.clear();
         g.next_id = next;
         g.generation += 1;
@@ -1088,6 +1186,7 @@ impl TableHost for Live {
     fn mark_untrusted(&self, id: RecId) -> bool {
         let mut g = lock(&self.0);
         g.origin.insert(id as i64, Origin::Foreign);
+        g.came.insert(id as i64, "its script was taken from an entry that waits for consent");
         g.agreed.remove(&(id as i64));
         g.bump();
         true
@@ -1180,7 +1279,8 @@ the table was not opened: these active scripts could not be disabled (open anywa
         if script {
             self.x.live.distrust_keeping_current();
         }
-        self.x.live.insert(add.entries, None, None, Origin::Foreign, false)?;
+        let (_, ids) = self.x.live.insert(add.entries, None, None, Origin::Foreign, false)?;
+        self.x.live.came(&ids, "merged in from another table file");
         if script {
             let cur = self.x.live.state();
             let mut t = cur.table;
@@ -1340,6 +1440,22 @@ the table was not opened: these active scripts could not be disabled (open anywa
         self.x.live.grant_at(Grant::Entries(ids), Some(generation))
     }
 
+    /// The answer to the per-entry prompt (IPC): exactly `ids`, the entries it listed as
+    /// waiting for consent under the selected `roots`, for table `generation`; refused when
+    /// another table was opened, or that set changed since the prompt was built.
+    pub fn table_trust_listed(&self, roots: &[i64], ids: &[i64], generation: u64) -> R<()> {
+        self.x.live.grant_at(Grant::Listed { roots, ids }, Some(generation))
+    }
+
+    /// Withdraws the consent given to the entries in the subtrees of `ids` (IPC, for table
+    /// `generation`): if their Lua has run, Lua restarts.
+    pub fn table_distrust_entries(&self, ids: &[i64], generation: u64) -> R<()> {
+        if self.x.live.withdraw(ids, generation)? {
+            self.lua_settle();
+        }
+        Ok(())
+    }
+
     /// [`App::table_trust`] for the question asked about table `generation` (IPC).
     pub fn table_trust_at(&self, trust: bool, generation: u64) -> R<()> {
         if generation != self.x.live.generation() {
@@ -1355,6 +1471,7 @@ the table was not opened: these active scripts could not be disabled (open anywa
     /// untrusted until its own consent. `base`: the table version the UI saw.
     pub fn table_paste(&self, entries: Vec<Entry>, after: Option<i64>, base: Option<u64>) -> R<PasteOut> {
         let (version, ids) = self.x.live.insert(entries, after, base, Origin::Foreign, false)?;
+        self.x.live.came(&ids, "pasted or dropped in from another table");
         Ok(PasteOut { version, ids })
     }
 
@@ -1382,6 +1499,7 @@ the table was not opened: these active scripts could not be disabled (open anywa
         let remote = sess.info.remote.is_some();
         let e = Entry { description: description.into(), script: Some(script), ..Entry::default() };
         let (version, ids) = self.x.live.insert(vec![e], after, base, if remote { Origin::Foreign } else { Origin::Own }, false)?;
+        self.x.live.came(&ids, "an injection template built from names the remote machine reported");
         Ok(PasteOut { version, ids })
     }
 

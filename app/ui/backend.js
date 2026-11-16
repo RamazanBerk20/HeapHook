@@ -281,7 +281,9 @@ export const api = {
   /** The user's new entries (new address, script, group, from results / structures / pointers / disassembler): the backend issues their ids -> {version, ids}. A put cannot add entries. */
   tableNew: (entries, after, base) => call('table_new', { entries, after: after ?? null, base: base ?? null }),
   /** Consent for the Lua of these entries (and their children) that arrived from another table */
-  tableTrustEntries: (ids, generation) => call('table_trust_entries', { ids, generation }),
+  /** Withdraws consent from these entries (and their children); if their Lua ran, Lua restarts */
+  tableDistrustEntries: (ids, generation) => call('table_distrust_entries', { ids, generation }),
+  tableTrustEntries: (ids, generation, roots = ids) => call('table_trust_entries', { roots, ids, generation }),
   /** -> true when the table changed since it was opened or saved */
   tableDirty: () => call('table_dirty', {}),
   /** A dropped file's text (browser drop) opened like table_open -> {version, table, trust, untrusted} */

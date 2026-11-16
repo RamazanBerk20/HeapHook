@@ -62,6 +62,8 @@ export function initTable(root) {
   let sortCol = null, sortDir = 1, filter = '';
   const hiddenCols = new Set(store.get('tbl.hiddenCols', []));
   let untrusted = new Set(); // entries whose Lua came from another table and waits for consent
+  let waitingFrom = new Map(); // untrusted id -> where it came from, in the backend's plain words
+  let agreedIds = new Set(); // entries from elsewhere the user consented to
   let tableGen = null; // TableState.generation: consent answers name the table they were asked about
   let failing = new Map(); // id -> why freezing it fails now (lua_poll.freeze_failures)
   const rt = new Map(); // id -> {addr: BigInt|null, value, chgAt}
@@ -141,6 +143,9 @@ export function initTable(root) {
     if (tableGen != null && st.generation !== tableGen) cancelConsent();
     tableGen = st.generation ?? 0;
     untrusted = new Set(st.untrusted || []);
+    waitingFrom = new Map((st.waiting || []).map((w) => [w.id, w.from]));
+    agreedIds = new Set(st.agreed || []);
+    showTrust();
     markDirtySoon();
     const t = st.table;
     roots = (t.entries || []).map(norm);
@@ -404,28 +409,84 @@ export function initTable(root) {
       }
     }
   }
-  /** Entries pasted, merged or dropped in from another table, or made by Lua that depends on others' consent: their Lua asks for itself. */
+  /**
+   * Entries pasted, merged or dropped in from another table, or made by Lua that depends on
+   * others' consent: their Lua asks for itself. The prompt lists every entry the answer covers
+   * (description, where it came from, hotkeys, full script); the backend grants exactly those.
+   */
   async function askEntryTrust({ ids = [] } = {}, msg = '') {
-    const gen = tableGen;
     if (state.settings.table_script === 'never') { toast('Not run: it runs Lua that needs your consent, and Settings say never to run a table\'s Lua', 'info'); return false; }
+    await (chain = chain.then(refetch)); // the covered set as the backend has it now
+    const gen = tableGen;
+    const roots = ids.filter((id) => byId(id));
     const under = new Set();
-    for (const id of ids) { const e = byId(id); if (e) walk([e], (x) => { if (untrusted.has(x.id)) under.add(x.id); }); }
+    for (const id of roots) walk([byId(id)], (x) => { if (untrusted.has(x.id)) under.add(x.id); });
     const list = [...under].map(byId).filter(Boolean);
+    if (!list.length) { toast('None of these entries waits for your consent now', 'info'); return false; }
+    const n = list.length;
+    const derived = (e) => /^made or scripted by Lua/.test(waitingFrom.get(e.id) || '');
+    const row = (e) => h('li.trust-entry', null,
+      h('div.te-head', null, h('q', { title: excerpt(e.description, 300) }, excerpt(e.description, 80) || '(no description)'),
+        e.script ? h('button.btn.ghost', { type: 'button', onclick: () => viewScript(e.script, `Script of "${excerpt(e.description, 40)}"`) }, 'View full script') : null),
+      h('div.te-from.muted', null, ((f) => f[0].toUpperCase() + f.slice(1))(excerpt(waitingFrom.get(e.id) || 'came from another table', 200)) + '.'),
+      derived(e) ? h('div.te-own', null, 'After you agree, this entry counts as yours: its Lua keeps running whatever happens to the table or entry that made it.') : null,
+      e.hotkeys.length
+        ? h('div.te-hks', null, 'Hotkeys: ', e.hotkeys.map((k, i) => h('span', null, i ? ', ' : '', h('span.mono', null, comboText(k.keys) || 'no keys'), ' ', HK_ACTIONS.find((a) => a[0] === k.action)?.[1] || excerpt(k.action, 30))))
+        : h('div.te-hks.muted', null, 'No hotkeys'),
+      e.script ? null : h('div.te-hks.muted', null, 'No script of its own'));
     const body = h('div.trust-body', null,
-      h('ul.trust-facts', null, list.slice(0, 8).map((e) => h('li', null, h('q', null, excerpt(e.description, 60))))),
-      list.length > 8 ? h('p.hint', null, `and ${list.length - 8} more`) : null,
-      list[0]?.script ? h('div', null, h('p.hint', null, 'Start of the first script:'), codeView(list[0].script, 10)) : null);
+      h('p.te-count', null, n > 1 ? `Agreeing covers the ${n} entries listed, and only them.` : 'Agreeing covers only the entry listed.'),
+      h('ul.trust-entries', { 'aria-label': `Entries this answer covers (${n})`, tabindex: '0' }, list.map(row)));
     const r = await modal({
-      title: 'Run Lua of these entries?',
-      text: 'These entries came into this table from another one (pasted, merged or dropped in), or Lua made or scripted them after a table\'s or an entry\'s Lua had run, and they run Lua code when activated. That code runs with your user account\'s rights: it can read, change and delete your files, start programs and change the attached process. Agree only if you trust where they came from and what they contain.',
+      title: n > 1 ? `Run Lua of these ${n} entries?` : 'Run Lua of this entry?',
+      text: 'These entries came into this table from another one (pasted, merged or dropped in), or Lua made or scripted them after a table\'s or an entry\'s Lua had run, and they run Lua code when activated. That code runs with your user account\'s rights: it can read, change and delete your files, start programs and change the attached process. Read each script and agree only if you trust where they came from and what they contain.',
       quote: msg.slice(NEEDS_ENTRIES.length).split(':')[0].trim() || null, quoteLabel: 'Wanted by the entry', body,
-      buttons: [{ label: list.length > 1 ? `Trust these ${list.length} entries` : 'Trust this entry', value: 'trust' }, { label: 'Do not run', value: 'cancel', kbd: 'Esc', primary: true, focus: true }],
+      buttons: [{ label: n > 1 ? `Trust these ${n} entries` : 'Trust this entry', value: 'trust' }, { label: 'Do not run', value: 'cancel', kbd: 'Esc', primary: true, focus: true }],
       consent: true,
     });
     if (r.value !== 'trust') return false;
-    const ok = await attempt(async () => { await api.tableTrustEntries(list.length ? list.map((e) => e.id) : ids, gen); return true; });
+    // Exactly what was listed: refused if what waits under the selection changed meanwhile.
+    const ok = await attempt(async () => { await api.tableTrustEntries(list.map((e) => e.id), gen, roots); return true; });
     chain = chain.then(refetch);
     return !!ok;
+  }
+
+  /** The header's consent state: the table's, and how many entries have their own. */
+  function showTrust() {
+    const t = state.tableTrust, n = agreedIds.size;
+    const what = { agreed: 'Table trusted', ask: 'Table not trusted yet', declined: 'Table not trusted' }[t] || '';
+    const ents = n ? `${n} trusted entr${n === 1 ? 'y' : 'ies'}` : '';
+    const el = $('#tbl-trust');
+    el.textContent = [what, ents].filter(Boolean).join(' · ');
+    el.title = el.textContent;
+    el.hidden = !el.textContent;
+    el.dataset.trust = t;
+    $('#tbl-withdraw').hidden = t !== 'agreed';
+  }
+  /** Withdraws the table's consent ("Do not trust" after a yes): its Lua stops. */
+  async function withdrawTableTrust() {
+    const gen = tableGen;
+    const r = await modal({ title: 'Withdraw trust from this table?',
+      text: 'Its Lua stops: Lua restarts, so the table\'s timers, forms, hotkeys and callbacks, and every global defined in the console, are lost. Entries you trusted one by one keep their own consent. You are asked again only when you open the table again.',
+      buttons: [{ label: 'Withdraw trust', value: 'yes' }, { label: 'Cancel', value: 'cancel', kbd: 'Esc', primary: true, focus: true }] });
+    if (r.value !== 'yes') return;
+    await attempt(() => api.tableTrust(false, gen));
+    chain = chain.then(refetch);
+  }
+  /** Withdraws the consent given to the selected entries (and their children). */
+  async function withdrawEntryTrust() {
+    const gen = tableGen, ids = selIds();
+    const under = new Set();
+    for (const id of ids) { const e = byId(id); if (e) walk([e], (x) => { if (agreedIds.has(x.id)) under.add(x.id); }); }
+    if (!under.size) return;
+    const n = under.size;
+    const r = await modal({ title: `Withdraw trust from ${n > 1 ? `${n} entries` : 'this entry'}?`,
+      text: `${n > 1 ? 'Their' : 'Its'} Lua and file access need your consent again. If ${n > 1 ? 'their' : 'its'} Lua has run, Lua restarts: timers, forms, hotkeys and callbacks, and every global defined in the console, are lost.`,
+      body: h('ul.trust-facts', null, [...under].map(byId).filter(Boolean).slice(0, 50).map((e) => h('li', null, h('q', null, excerpt(e.description, 80))))),
+      buttons: [{ label: 'Withdraw trust', value: 'yes' }, { label: 'Cancel', value: 'cancel', kbd: 'Esc', primary: true, focus: true }] });
+    if (r.value !== 'yes') return;
+    await attempt(() => api.tableDistrustEntries(ids, gen));
+    chain = chain.then(refetch);
   }
 
   // ---------- consent for a loaded table's Lua ----------
@@ -483,10 +544,10 @@ export function initTable(root) {
     chain = chain.then(refetch);
     return yes && !!ok && gen === tableGen;
   }
-  /** The whole table script, before any choice: line numbers, wrapped, hidden characters shown. */
-  function viewScript(script) {
+  /** A whole script, before any choice: line numbers, wrapped, hidden characters shown. */
+  function viewScript(script, title = 'Table script') {
     const lines = script.split('\n').length;
-    return modal({ title: 'Table script', text: `The complete script: ${lines} lines, ${script.length} characters. Long runs of blanks and invisible characters are marked.`,
+    return modal({ title, text: `The complete script: ${lines} lines, ${script.length} characters. Long runs of blanks and invisible characters are marked.`,
       body: codeView(script), buttons: [{ label: 'Close', value: 'cancel', kbd: 'Esc', primary: true }] });
   }
   const edit = (ids, f) => commit(() => ids.forEach((id) => { const e = byId(id); if (e) f(e); }));
@@ -804,6 +865,7 @@ export function initTable(root) {
       { label: 'Collapse all', kbd: 'Ctrl ←', run: () => expandAll(false) },
       { label: 'Filter…', kbd: 'Ctrl F', run: () => { filterEl.focus(); filterEl.select(); } },
       ...['addr', 'vtype', 'value'].map((c) => ({ label: 'Column: ' + { addr: 'Address', vtype: 'Type', value: 'Value' }[c], checked: !hiddenCols.has(c), run: () => toggleCol(c) })),
+      agreedIds.size ? { label: 'Withdraw trust from the selected entries…', disabled: !selectedAll().some((e) => { let a = false; walk([e], (x) => { if (agreedIds.has(x.id)) a = true; }); return a; }), run: withdrawEntryTrust } : null,
       untrusted.size ? { label: 'Trust the selected entries\' Lua…', disabled: !selectedAll().some((e) => untrusted.has(e.id) || e.children.some((c) => untrusted.has(c.id))), run: () => askEntryTrust({ ids: selIds() }) } : null,
       '-',
       { label: 'Table Lua script…', run: editTableScript },
@@ -1428,5 +1490,6 @@ export function initTable(root) {
   refetch();
 
   $('#tbl-recent').addEventListener('click', (ev) => recentMenu(ev.currentTarget));
+  $('#tbl-withdraw').addEventListener('click', withdrawTableTrust);
   return { addDialog: () => entryDialog(), save, load, merge, saveText, openPath, recentMenu, confirmDiscard, isDirty: () => dirty, focus: () => grid.focus(), editTableScript };
 }

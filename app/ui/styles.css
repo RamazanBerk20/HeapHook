@@ -549,6 +549,18 @@ fieldset.group > .btn { align-self: flex-start; }
 .trust-hks q { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
 .code-view { max-height: 50vh; overflow: auto; padding: 6px 0; font-size: var(--fs-xs); line-height: 16px; background: var(--canvas-2); border: var(--line); border-radius: var(--r); }
 .trust-body .code-view { max-height: 140px; }
+.trust-state { font-size: var(--fs-xs); color: var(--muted); white-space: nowrap; }
+.trust-state[data-trust="agreed"] { color: var(--yellow); }
+#tbl-withdraw { height: 22px; padding: 0 6px; font-size: var(--fs-xs); }
+.te-count { margin: 0; font-size: var(--fs-sm); font-weight: 600; }
+.trust-entries { margin: 0; padding: 0; list-style: none; border: var(--line); border-radius: var(--r); max-height: 46vh; overflow: auto; }
+.trust-entry { padding: 6px 8px; border-bottom: var(--line); display: flex; flex-direction: column; gap: 2px; font-size: var(--fs-sm); }
+.trust-entry:last-child { border-bottom: 0; }
+.te-head { display: flex; align-items: center; gap: var(--s2); min-width: 0; }
+.te-head q { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text); }
+.te-head .btn { flex: none; height: 22px; padding: 0 6px; }
+.te-from, .te-hks { font-size: var(--fs-xs); overflow-wrap: anywhere; }
+.te-own { font-size: var(--fs-xs); color: var(--yellow); }
 .cv-line { display: flex; }
 .cv-num { flex: none; width: 5ch; padding-right: 8px; text-align: right; color: var(--muted); user-select: none; }
 .cv-text { flex: 1; min-width: 0; padding-right: 8px; white-space: pre-wrap; overflow-wrap: anywhere; color: var(--text-2); }
@@ -578,6 +590,8 @@ fieldset.group > .btn { align-self: flex-start; }
   .panel .bl { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
   .dbg-main .toolbar kbd, .ptr-pane .toolbar kbd, #disasm-pane .toolbar kbd { display: none; }
   .ptr-pane .toolbar .btn:not(.icon) { padding: 0 8px; }
+  #table .toolbar kbd { display: none; }
+  .trust-state { min-width: 0; max-width: 200px; overflow: hidden; text-overflow: ellipsis; }
 }
 @media (max-width: 1000px) {
   .topbar .bl { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }

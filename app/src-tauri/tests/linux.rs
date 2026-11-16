@@ -4182,3 +4182,69 @@ fn records_made_after_table_or_entry_code_ran_depend_on_its_consent() {
         }
     }
 }
+
+/// The audit's W1 reproduction: a trusted table keeps an `io.popen` child; once its discarded
+/// interpreter is evicted from the kept ones (more than 16), closing it must not wait for the
+/// child, nor block the reset, and nothing of the table runs then.
+#[test]
+fn closing_an_evicted_interpreter_waits_for_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let marker = dir.path().join("gc");
+    let first = dir.path().join("first.json");
+    let lua = format!(
+        "keep = io.popen('sleep 6')\npcall(setmetatable, {{}}, {{__gc = function() io.open({:?}, 'w'):write('gc') end}})\nkeep2 = coroutine.create(function() end)",
+        marker.to_str().unwrap()
+    );
+    heaphook::table::save(&first, &Table { lua_script: lua, ..Table::default() }).unwrap();
+    let other = dir.path().join("other.json");
+    heaphook::table::save(&other, &Table { lua_script: "x = 1".into(), ..Table::default() }).unwrap();
+    let app = App::default();
+    let start = Instant::now();
+    let mut slowest = Duration::ZERO;
+    for i in 0..=hh_lua::EngineOptions::default().max_parked + 2 {
+        let t = Instant::now();
+        app.table_open(if i == 0 { first.to_str().unwrap() } else { other.to_str().unwrap() }, false).unwrap();
+        slowest = slowest.max(t.elapsed());
+        app.table_trust(true).unwrap();
+        app.table_run_script().unwrap();
+    }
+    let t = Instant::now();
+    app.table_open(other.to_str().unwrap(), false).unwrap();
+    slowest = slowest.max(t.elapsed());
+    assert!(slowest < Duration::from_secs(2), "a table_open waited {slowest:?}");
+    assert!(start.elapsed() < Duration::from_secs(5), "the cycles waited for the child: {:?}", start.elapsed());
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(!marker.exists(), "a finalizer of the table ran");
+    assert_memory_bounded("evicted interpreters");
+}
+
+/// The per-entry prompt's answer grants exactly the entries it listed, and is refused when
+/// the entries waiting for consent under the selection are no longer those.
+#[test]
+fn entry_consent_grants_exactly_the_listed_entries() {
+    let app = App::default();
+    let lua = |d: &str| Entry { description: d.into(), script: Some("[ENABLE]\n{$lua}\nreturn ''\n{$asm}\n[DISABLE]\n".into()), ..Entry::default() };
+    let group = Entry { description: "g".into(), children: vec![lua("a"), lua("b")], ..Entry::default() };
+    let g = app.table_paste(vec![group], None, None).unwrap().ids[0];
+    let (a, b) = (find_desc(&app, "a"), find_desc(&app, "b"));
+    let now = app.table_get().unwrap().generation;
+    let waiting = |app: &App| app.table_get().unwrap().untrusted;
+    assert!(waiting(&app).contains(&a) && waiting(&app).contains(&b));
+    // Listing fewer (or more) than what waits under the selection is refused.
+    let mut want = waiting(&app);
+    want.retain(|&i| i != b);
+    assert!(app.table_trust_listed(&[g], &want, now).unwrap_err().contains("not the ones listed"));
+    let all = waiting(&app);
+    // Something new under the selection since the prompt was built: refused.
+    let c = app.table_paste(vec![lua("c")], None, None).unwrap().ids[0];
+    let cur = app.table_get().unwrap();
+    let mut tb = cur.table.clone();
+    let e = take_entry(&mut tb.entries, c).unwrap();
+    tb.entries.iter_mut().find(|x| x.id == g).unwrap().children.push(e);
+    app.table_put(tb, cur.version).unwrap();
+    assert!(app.table_trust_listed(&[g], &all, now).unwrap_err().contains("not the ones listed"));
+    // The exact list is granted, and only it.
+    app.table_trust_listed(&[a, b], &[a, b], now).unwrap();
+    assert!(!waiting(&app).contains(&a) && !waiting(&app).contains(&b));
+    assert!(waiting(&app).contains(&c), "an entry that was not listed was granted");
+}

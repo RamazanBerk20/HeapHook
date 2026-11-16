@@ -431,14 +431,16 @@ struct Parked {
 /// every pending `__gc` finalizer, and Lua 5.3 runs finalizers with hooks off, so such code's
 /// finalizer would run exactly when its consent is withdrawn. So they are kept, collector
 /// stopped, host functions refusing, an error hook on every call and instruction. A clean
-/// interpreter (only the user's own code ran) is closed at once.
+/// interpreter (only the user's own code ran) is closed at once (on the reaper thread).
 ///
 /// Bounded ([`EngineOptions::max_parked`], [`EngineOptions::max_parked_bytes`]): beyond the
-/// cap the oldest kept state is closed. Residual risk, stated: closing runs its pending
-/// finalizers. Scripts cannot install `__gc` (the prelude's `setmetatable` refuses it, host
-/// userdata metatables are locked, there is no `debug.setmetatable`), host functions refuse
-/// on a dead state, and its allocator is capped at what it already uses, so a finalizer that
-/// slipped through could run plain Lua only, without HeapHook's API and without allocating.
+/// cap the oldest kept state is closed, by [`reap`], after [`neutralize`]. What closing can
+/// still run, stated: Lua code cannot have a finalizer (the prelude's `setmetatable` refuses
+/// `__gc`, host userdata metatables are locked, there is no `debug.setmetatable`); the C
+/// finalizers left are mlua's for Rust values (closures holding a `Weak` of the engine, a
+/// discard flag and copies of small values; Auto Assembler states, plain data), whose drops
+/// neither block nor reach the host. Open files and `io.popen` pipes are not closed (their
+/// finalizer is removed): the descriptor, or the child's zombie, is leaked.
 static PARKED: Mutex<std::collections::VecDeque<Parked>> = Mutex::new(std::collections::VecDeque::new());
 
 static RESETS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -454,8 +456,9 @@ pub fn parked_stats() -> (usize, usize) {
     (p.len(), p.iter().map(|x| x.bytes).sum())
 }
 
-/// Keeps `lua` (see [`PARKED`]) and closes the oldest kept ones beyond the caps.
-fn park(lua: Lua, max: usize, max_bytes: usize) {
+/// Keeps `lua` (see [`PARKED`]) and hands the oldest kept ones beyond the caps to the reaper.
+/// True when the reaper gave up just now (see [`reap`]).
+fn park(lua: Lua, max: usize, max_bytes: usize) -> bool {
     let bytes = lua.used_memory();
     let mut gone = Vec::new();
     {
@@ -465,10 +468,117 @@ fn park(lua: Lua, max: usize, max_bytes: usize) {
             gone.extend(p.pop_front());
         }
     }
+    let mut gave_up = false;
     for old in gone {
+        neutralize(&old.lua);
         // Nothing may grow: a finalizer that slipped through cannot allocate.
         let _ = old.lua.set_memory_limit(old.lua.used_memory().max(1));
-        drop(old);
+        gave_up |= reap(old.lua);
+    }
+    gave_up
+}
+
+/// Removes the C finalizers of the standard library that can block or act outside the state:
+/// `__gc` (and `__close`) of the `FILE*` metatable, so closing neither flushes, `fclose`s nor
+/// `pclose`s (which waits for an `io.popen` child). Lua 5.3 looks the finalizer up when it
+/// runs, so this covers every file handle already made. Raw API only: no Lua code runs. The
+/// state's hooks are removed first (the raw edit runs as a protected C call). The C library
+/// table's finalizer is left: `package.loadlib` and the C searchers are removed by the prelude,
+/// so it holds no library.
+pub(crate) fn neutralize(lua: &Lua) {
+    lua.remove_global_hook();
+    // SAFETY: balanced stack use inside mlua's protected call; keys are only read, and only
+    // existing keys are set (to nil), so the edit cannot run code.
+    let _ = unsafe {
+        lua.exec_raw::<()>((), |l| {
+            use mlua::ffi;
+            ffi::lua_pushstring(l, c"FILE*".as_ptr());
+            if ffi::lua_rawget(l, ffi::LUA_REGISTRYINDEX) == ffi::LUA_TTABLE {
+                for k in [c"__gc", c"__close"] {
+                    ffi::lua_pushstring(l, k.as_ptr());
+                    if ffi::lua_rawget(l, -2) != ffi::LUA_TNIL {
+                        ffi::lua_pop(l, 1);
+                        ffi::lua_pushstring(l, k.as_ptr());
+                        ffi::lua_pushnil(l);
+                        ffi::lua_rawset(l, -3);
+                    } else {
+                        ffi::lua_pop(l, 1);
+                    }
+                }
+            }
+            ffi::lua_pop(l, 1);
+        })
+    };
+}
+
+/// Interpreters waiting to be closed, closed one at a time on a reaper thread so that no
+/// finalizer can stall a reset (and the locks it holds).
+struct Reaper {
+    queue: std::collections::VecDeque<Lua>,
+    /// When the current close started (None while idle).
+    busy_since: Option<Instant>,
+    /// The live reaper's number; an older (stuck) one exits when its close returns.
+    current: u32,
+    /// Reapers started so far.
+    spawned: u32,
+    /// Too many got stuck: states are no longer closed, only kept.
+    gave_up: bool,
+}
+
+static REAPER: Mutex<Reaper> =
+    Mutex::new(Reaper { queue: std::collections::VecDeque::new(), busy_since: None, current: 0, spawned: 0, gave_up: false });
+static REAP_WAKE: Condvar = Condvar::new();
+/// A close running longer than this counts as stuck.
+const REAP_STUCK: Duration = Duration::from_secs(3);
+/// Reapers started at most (the first and its replacements).
+const MAX_REAPERS: u32 = 4;
+
+/// Hands `lua` to the reaper (see [`Reaper`]). Watchdog: a reaper whose close has run past
+/// [`REAP_STUCK`] is left behind and a fresh one takes the queue, at most [`MAX_REAPERS`]
+/// times; after that states are only kept. True when that happened just now.
+fn reap(lua: Lua) -> bool {
+    let mut r = REAPER.lock().unwrap();
+    r.queue.push_back(lua);
+    if r.gave_up {
+        return false;
+    }
+    let stuck = r.busy_since.is_some_and(|t| t.elapsed() > REAP_STUCK);
+    if r.spawned == 0 || stuck {
+        if r.spawned >= MAX_REAPERS {
+            r.gave_up = true;
+            return true;
+        }
+        r.spawned += 1;
+        r.current = r.spawned;
+        r.busy_since = None;
+        let me = r.current;
+        let ok = std::thread::Builder::new().name("hh-lua-reaper".into()).spawn(move || reaper(me)).is_ok();
+        if !ok {
+            r.gave_up = true;
+            return true;
+        }
+    }
+    REAP_WAKE.notify_all();
+    false
+}
+
+fn reaper(me: u32) {
+    let mut r = REAPER.lock().unwrap();
+    loop {
+        if r.current != me || r.gave_up {
+            return;
+        }
+        let Some(lua) = r.queue.pop_front() else {
+            r = REAP_WAKE.wait(r).unwrap();
+            continue;
+        };
+        r.busy_since = Some(Instant::now());
+        drop(r);
+        drop(lua);
+        r = REAPER.lock().unwrap();
+        if r.current == me {
+            r.busy_since = None;
+        }
     }
 }
 
@@ -519,12 +629,16 @@ fn do_reset(st: &Arc<State>, slot: &Arc<Mutex<Core>>) -> Result<()> {
     // Only the Lua handle is kept: the prelude's functions and every Rust-side handle go now.
     let Core { lua, i, dead: _ } = old;
     drop(i);
-    if clean {
-        // Only the user's own code ran in it: closed like any state.
-        drop(lua);
+    let gave_up = if clean {
+        // Only the user's own code ran in it: closed like any state (off this path: closing a
+        // file the user's code opened with `io.popen` waits for its child).
+        reap(lua)
     } else {
         // Kept, not closed: closing would run its finalizers.
-        park(lua, st.max_parked, st.max_parked_bytes);
+        park(lua, st.max_parked, st.max_parked_bytes)
+    };
+    if gave_up {
+        st.host().error("-- discarded Lua interpreters did not close in time: HeapHook keeps them in memory from now on (until it exits)");
     }
     *st.abort.lock().unwrap() = None;
     Ok(())
@@ -973,5 +1087,31 @@ impl Engine {
     /// `addr`, and the base address it suggests instead of `addr` (if any).
     pub fn structure_name(&self, addr: Addr) -> Option<(String, Option<Addr>)> {
         hooks::structure_name(&self.lua(), &self.st, addr)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Closing a state after `neutralize` neither waits for an `io.popen` child nor runs a
+    /// file finalizer.
+    #[test]
+    fn neutralize_removes_the_file_finalizers() {
+        let lua = Lua::new();
+        lua.load("keep = io.popen('sleep 5'); f = io.tmpfile()").exec().unwrap();
+        neutralize(&lua);
+        let gc: bool = lua.load("return rawget(getmetatable(keep), '__gc') == nil and rawget(getmetatable(f), '__gc') == nil").eval().unwrap();
+        assert!(gc, "FILE* still has a finalizer");
+        let t = Instant::now();
+        drop(lua);
+        assert!(t.elapsed() < Duration::from_secs(2), "closing waited for the child: {:?}", t.elapsed());
+
+        // Without it closing waits for the child (the hazard this guards against).
+        let lua = Lua::new();
+        lua.load("keep = io.popen('sleep 1')").exec().unwrap();
+        let t = Instant::now();
+        drop(lua);
+        assert!(t.elapsed() >= Duration::from_millis(500), "{:?}", t.elapsed());
     }
 }

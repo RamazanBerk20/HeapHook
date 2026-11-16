@@ -144,7 +144,8 @@ The capability lets the application read and write the memory of any process of 
 A cheat table can carry Lua. Lua in a table has full access to your files and can run programs once it is allowed to run. Treat a table like a program you downloaded.
 
 - HeapHook asks before any Lua of a table runs. The question names what wants to run and shows the start of the script and the hotkeys the table defines.
-- Entries pasted or merged into a table, or dropped in from another table, are marked and ask again, per entry, even if the table itself was trusted.
+- Entries pasted or merged into a table, or dropped in from another table, are marked and ask again, per entry, even if the table itself was trusted. That question lists every entry the answer covers, with where it came from, its hotkeys and its full script; agreeing covers exactly those.
+- The cheat table header shows whether the table and how many entries are trusted. "Withdraw trust" there (for the table) and in the entry menu (for entries) takes consent back; Lua restarts if their Lua has run, and globals typed in the console are lost.
 - Until you agree, the Lua of the table refuses to run by every route: clicking, hotkeys, group options, forms and timers. Hotkeys with Ctrl, Shift or Alt are registered system-wide only after you agree.
 - Settings > Lua > "Lua script in a loaded table" has a "Never run" choice. With it, tables never run Lua and the question is not shown.
 - Settings > Lua > "Allow Lua scripts to access files and run programs" turns off file and program access for Lua. Scripts can still read and change the attached process. It applies after a restart.
@@ -159,7 +160,9 @@ Limits to know:
 5. Once Lua from a trusted table or from an entry you agreed to has run, every record Lua creates or scripts in that session, also from the Lua console, depends on that consent (and on every other one whose Lua has run). Such a record works only while all of them are consented, or once you agree to the record itself ("Trust this entry"). When one of those consents ends (you withdraw it, switch to "Never run", open another table, or delete an agreed entry whose Lua ran), Lua restarts and the record loses Lua, file access and hotkeys outside HeapHook. The console says when this starts to apply.
 6. A `{$lua}` block you type in the Auto Assemble window counts as your own code, but what it creates follows point 5.
 7. Programs a trusted script started keep running after its consent ends: HeapHook cannot stop them.
-8. When Lua restarts after a trusted table's or an entry's Lua has run, HeapHook keeps the old interpreter in memory instead of closing it (closing could run code it left behind): it keeps up to 16 withdrawn interpreters (512 MiB in all) and frees older ones, which are first cut off from memory and from HeapHook. A restart when only your own Lua had run frees the old interpreter at once.
+8. When Lua restarts after a trusted table's or an entry's Lua has run, HeapHook keeps the old interpreter in memory instead of closing it (closing could run code it left behind). It keeps up to 16 such interpreters (512 MiB in all) and closes older ones in the background. Files and programs they opened with `io.open` or `io.popen` are not closed then: they stay open, and the programs keep running, until HeapHook exits. If closing ever takes too long, HeapHook stops closing them and keeps them until it exits (the console says so once). After a restart when only your own Lua had run, the old interpreter is closed in the background at once.
+9. Agreeing to an entry ("Trust this entry") makes that entry yours from then on, whoever made it: it keeps its Lua and file access even after the table or entry that made it loses consent. Read its whole script first ("View full script" in the question).
+10. If scripts could not be disabled when you open another table and you choose "Open anyway", the entries still active go into a group of the new table. Those that could run before stay runnable there under their own consent, whatever you answer for the new table.
 
 Open tables only from sources you trust.
 
