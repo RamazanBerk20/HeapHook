@@ -4,10 +4,10 @@ Statuses are `done`, `engine only`, `partial`, `planned`, `needs decision`.
 
 | Status | Rows |
 |---|---|
-| done | 393 |
+| done | 428 |
 | engine only | 2 |
-| partial | 71 |
-| planned | 213 |
+| partial | 68 |
+| planned | 181 |
 | needs decision | 33 |
 
 Row counts per section:
@@ -101,7 +101,7 @@ Total: 712
 | Case sensitive string scan | Toggles case sensitivity for string scans | hh-scan | done | linux+windows |
 | Unicode (UTF-16) string scan | Scans wide strings | hh-scan | done | linux+windows |
 | Pause the game while scanning | Suspends the target during a scan for consistency | hh-scan | done | linux+windows |
-| Memory scan options: scan image / mapped / private | Choose which memory types (MEM_IMAGE, MEM_MAPPED, MEM_PRIVATE) to scan | hh-scan | planned | linux+windows |
+| Memory scan options: scan image / mapped / private | Choose which memory types (MEM_IMAGE, MEM_MAPPED, MEM_PRIVATE) to scan | hh-scan | done | linux+windows |
 | Compare to saved scan | Compares current memory with a named saved scan | hh-scan | done | linux+windows |
 | Save scan as snapshot | Stores a named result set for later comparison | hh-scan | done | linux+windows |
 | Next scan | Filters previous results with a new condition | hh-scan | done | linux+windows |
@@ -183,7 +183,7 @@ Total: 712
 | Find out what accesses/writes this address | Start debugger watch on entry | hh-debug | done | linux+windows |
 | Pointer scan for this address | Launch pointer scan for an entry | hh-ptr | done | linux+windows |
 | Generate pointermap shortcut | Create a pointermap from the entry | hh-ptr | partial | linux+windows |
-| Show as ... group | Submenu for display formats | app | partial | linux+windows |
+| Show as ... group | Submenu for display formats | app | done | linux+windows |
 | Change record type: group | Convert entry into group | app | planned | linux+windows |
 | Add address to cheat table by dissect | Add selected structure elements as entries | app | done | linux+windows |
 | Set/change hotkey dialog | Edit hotkey list for an entry | app | done | linux+windows |
@@ -283,14 +283,14 @@ Total: 712
 | Disassembler: jump lines | Draws arrows between jump source and target | app | done | linux+windows |
 | Disassembler: comments | Per-address user comments | app | done | linux+windows |
 | Disassembler: header lines | User-defined headers (HeapHook: function-start separators from labels and code analysis; no free-text headers) | app | partial | linux+windows |
-| Disassembler: syntax (Intel/AT&T) | Intel syntax display, AT&T option | hh-asm | partial | linux+windows |
+| Disassembler: syntax (Intel/AT&T) | Intel syntax display, AT&T option | hh-asm | done | linux+windows |
 | Disassembler: color highlighting | Colors for jumps, calls, registers | app | done | linux+windows |
 | Disassembler: goto address | Jump to address/expression | app | done | linux+windows |
 | Disassembler: follow jump/call | Navigate to target of branch | app | done | linux+windows |
 | Disassembler: go back | Navigation history | app | done | linux+windows |
 | Disassembler: set breakpoint (F5) | Toggle breakpoint at instruction | hh-debug | done | linux+windows |
 | Disassembler: run to here | Run until selected address | hh-debug | done | linux+windows |
-| Disassembler: set current instruction (new EIP) | Redirect execution | hh-debug | partial | linux+windows |
+| Disassembler: set current instruction (new EIP) | Redirect execution | hh-debug | done | linux+windows |
 | Disassembler: find what addresses this code accesses | Trace memory accessed by instruction | hh-debug | done | linux+windows |
 | Disassembler: replace with NOPs | Overwrites selection with NOP | hh-asm | done | linux+windows |
 | Disassembler: assemble/edit instruction | Type asm to patch bytes | hh-asm | done | linux+windows |
@@ -303,7 +303,7 @@ Total: 712
 | Disassembler: go to function start | Detects function start heuristic | hh-asm | done | linux+windows |
 | Disassembler: sync with hex view | Selection mirrors in hex view | app | done | linux+windows |
 | Disassembler: add to code list | Record the address in the code list | app | done | linux+windows |
-| Disassembler: auto-guess value type | Guess data type used by instruction | hh-asm | planned | linux+windows |
+| Disassembler: auto-guess value type | Guess data type used by instruction | hh-asm | partial | linux+windows |
 | Disassembler: custom override via Lua | Lua can extend disassembler output | hh-lua | planned | linux+windows |
 | Disassembler: DBVM watch / cloak | Right-click DBVM watch options | hh-debug | needs decision | windows |
 | Inline assembler | Single-instruction assembler with x86/x64 syntax | hh-asm | done | linux+windows |
@@ -318,7 +318,7 @@ Total: 712
 | Symbol handler: ELF symbols / DWARF | Reads ELF symtab and DWARF info | hh-asm | partial | linux |
 | Symbol handler: user-defined symbols | Register names for addresses | hh-asm | done | linux+windows |
 | Symbol handler: reinitialize | Refresh module and symbol lists | hh-asm | planned | linux+windows |
-| Symbol handler: Lua registerSymbolLookup | Scripts add symbol resolvers | hh-lua | planned | linux+windows |
+| Symbol handler: Lua registerSymbolLookup | Scripts add symbol resolvers | hh-lua | done | linux+windows |
 | Symbol handler: dotnet/mono symbols | Managed method names in disassembly | hh-inject | planned | linux+windows |
 | Expression evaluator | Evaluate `[base+10]+8` style expressions | hh-asm | done | linux+windows |
 
@@ -333,7 +333,7 @@ Total: 712
 | `dealloc(name)` | Frees an allocation | hh-asm | done | linux+windows |
 | `label(name)` | Declares a label | hh-asm | done | linux+windows |
 | `define(name,value)` | Declares a text replacement | hh-asm | done | linux+windows |
-| `undefine(name)` | Removes a define | hh-asm | planned | linux+windows |
+| `undefine(name)` | Removes a define | hh-asm | done | linux+windows |
 | `registersymbol(name)` | Makes a symbol available globally | hh-asm | done | linux+windows |
 | `unregistersymbol(name)` | Removes a global symbol | hh-asm | done | linux+windows |
 | `aobscan(name,pattern)` | Scans for a byte pattern and defines a symbol | hh-asm | done | linux+windows |
@@ -341,20 +341,20 @@ Total: 712
 | `aobscanregion(name,start,stop,pattern)` | AOB scan restricted to a range | hh-asm | done | linux+windows |
 | `assert(address,bytes)` | Aborts if the bytes at address differ | hh-asm | done | linux+windows |
 | `readmem(address,size)` | Copies target bytes into the script as data | hh-asm | done | linux+windows |
-| `loadbinary(address,filename)` | Writes a file's contents to memory | hh-asm | planned | linux+windows |
+| `loadbinary(address,filename)` | Writes a file's contents to memory | hh-asm | done | linux+windows |
 | `loadlibrary(dllname)` | Loads a library into the target | hh-inject | planned | windows |
 | `createthread(address)` | Starts a thread in the target | hh-inject | planned | linux+windows |
 | `createthreadandwait(address,timeout)` | Starts a thread and waits for it | hh-inject | planned | linux+windows |
 | `fullaccess(address,size)` | Makes a range readable, writable, executable | hh-asm | done | linux+windows |
 | `include(file)` | Includes another script from the table | hh-asm | partial | linux+windows |
-| `luacall(code)` | Runs Lua code during assembly | hh-lua | planned | linux+windows |
+| `luacall(code)` | Runs Lua code during assembly | hh-lua | done | linux+windows |
 | `{$lua}` / `{$asm}` blocks | Embeds Lua code executed at assembly time | hh-lua | done | linux+windows |
 | `{$luacode}` blocks | Compiles Lua to run inside the target process | hh-inject | planned | linux+windows |
 | `{$c}` / `{$ccode}` blocks | Compiles C code with the built-in compiler | hh-asm | planned | linux+windows |
 | `{$strict}` | Makes the assembler strict about operand sizes | hh-asm | partial | linux+windows |
-| `{$nostrict}` | Disables strict mode | hh-asm | planned | linux+windows |
-| `{$define}` / `{$ifdef}` / `{$ifndef}` / `{$else}` / `{$endif}` | Conditional assembly | hh-asm | planned | linux+windows |
-| `{$ifdef}` with 64-bit/32-bit target flags | Branches on target bitness | hh-asm | planned | linux+windows |
+| `{$nostrict}` | Disables strict mode | hh-asm | done | linux+windows |
+| `{$define}` / `{$ifdef}` / `{$ifndef}` / `{$else}` / `{$endif}` | Conditional assembly | hh-asm | done | linux+windows |
+| `{$ifdef}` with 64-bit/32-bit target flags | Branches on target bitness | hh-asm | done | linux+windows |
 | `{$try}` / `{$except}` | Error-tolerant sections that fall back on failure | hh-asm | partial | linux+windows |
 | `{$ccode}` symbol import | C code can use script symbols | hh-asm | planned | linux+windows |
 | `{$dotnet}`/`cscompile` | Compiles C# and loads it into a .NET target | hh-inject | planned | windows |
@@ -364,8 +364,8 @@ Total: 712
 | `prefer(32/64)` hints | Prefers a code size for ambiguous instructions | hh-asm | planned | linux+windows |
 | `db`/`dw`/`dd`/`dq` | Emits raw data | hh-asm | done | linux+windows |
 | `dw`/`dd` with floats (`dd (float)1.5`) | Emits float data | hh-asm | done | linux+windows |
-| `org address` | Moves the assembly pointer | hh-asm | planned | linux+windows |
-| `align n[,byte]` | Pads to alignment | hh-asm | planned | linux+windows |
+| `org address` | Moves the assembly pointer | hh-asm | done | linux+windows |
+| `align n[,byte]` | Pads to alignment | hh-asm | done | linux+windows |
 | `nop n` | Emits N NOP bytes | hh-asm | done | linux+windows |
 | `{$lua}` return values / `[ENABLE]` error handling | Lua can abort the script | hh-lua | done | linux+windows |
 | Address-based code patch (`address:` + bytes) | Writes assembled code at a given address | hh-asm | done | linux+windows |
@@ -374,23 +374,23 @@ Total: 712
 | Code injection template | Generates full injection script template | app | done | linux+windows |
 | AOB injection template | Generates AOB-based injection script | app | done | linux+windows |
 | Full injection template | Template with allocated code cave and return jump | app | done | linux+windows |
-| API hook template | Template hooking a Windows API by name | hh-asm | planned | windows |
+| API hook template | Template hooking a Windows API by name | hh-asm | done | windows |
 | Cheat table framework code template | Generates framework code for tables | app | planned | linux+windows |
 | Lua-registered templates | `registerAutoAssemblerTemplate` adds templates | hh-lua | planned | linux+windows |
-| Custom AA commands from Lua | `registerAutoAssemblerCommand` adds commands | hh-lua | planned | linux+windows |
+| Custom AA commands from Lua | `registerAutoAssemblerCommand` adds commands | hh-lua | done | linux+windows |
 | Script editor with syntax highlighting | Editor with highlighting for AA and Lua | app | done | linux+windows |
 | Script editor: find/replace | Search text in the script | app | done | linux+windows |
 | Script editor: assign to current cheat table | Saves script into a table entry | app | done | linux+windows |
-| Script editor: execute | Run the script immediately | app | partial | linux+windows |
+| Script editor: execute | Run the script immediately | app | done | linux+windows |
 | Script editor: undo/redo | Edit history | app | done | linux+windows |
 | Script editor: auto-complete | Completion for symbols and commands | app | done | linux+windows |
-| Script editor: tab/ F9 hotkeys | Shortcuts for running and checking | app | partial | linux+windows |
+| Script editor: tab/ F9 hotkeys | Shortcuts for running and checking | app | done | linux+windows |
 | Mono AA commands (`monopipe`, `mono_*`) | Mono-specific script commands | hh-inject | planned | linux+windows |
 | Script disable via checkbox | Toggling the entry runs `[DISABLE]` | hh-asm | done | linux+windows |
 | Script error reporting with line | Reports syntax errors with line number | hh-asm | done | linux+windows |
 | Code cave finder | Locate unused executable space | hh-asm | done | linux+windows |
 | Near allocation (within +-2GB) | Allocates close to a given address for relative jumps | hh-asm | done | linux+windows |
-| Scan hooks: `aobscanmodule` unique check | Fails when pattern is not unique | hh-asm | planned | linux+windows |
+| Scan hooks: `aobscanmodule` unique check | Fails when pattern is not unique | hh-asm | done | linux+windows |
 
 ## Debugger
 
@@ -416,7 +416,7 @@ Total: 712
 | Trace: max count | Limits number of traced instructions | hh-debug | done | linux+windows |
 | Trace: step over calls | Do not trace into calls | hh-debug | done | linux+windows |
 | Trace: stop condition | Stop on a given condition | hh-debug | done | linux+windows |
-| Trace: step over system modules | Skip traces inside system DLLs | hh-debug | planned | windows |
+| Trace: step over system modules | Skip traces inside system DLLs | hh-debug | done | windows |
 | Trace window | Tree of traced instructions with registers | app | done | linux+windows |
 | Trace: save/load trace | Persist trace to file | hh-debug | done | linux+windows |
 | Trace: search | Search in traced instructions | app | done | linux+windows |
@@ -449,11 +449,11 @@ Total: 712
 | Stack trace / call stack | Walks frames of the current thread | hh-debug | done | linux+windows |
 | Stack: follow pointer in disassembler/hex | Navigate from a stack slot | app | done | linux+windows |
 | Thread list | Lists threads with state | hh-debug | done | linux+windows |
-| Thread list: break thread | Break on a specific thread | hh-debug | planned | linux+windows |
+| Thread list: break thread | Break on a specific thread | hh-debug | done | linux+windows |
 | Thread list: suspend/resume thread | Control individual threads | hh-debug | done | linux+windows |
 | Thread list: show context | View registers of a thread | app | done | linux+windows |
-| Break on thread creation | Break when a thread starts | hh-debug | planned | windows |
-| Break on module load | Break when a library loads | hh-debug | planned | windows |
+| Break on thread creation | Break when a thread starts | hh-debug | done | windows |
+| Break on module load | Break when a library loads | hh-debug | done | windows |
 | Debug-print output (OutputDebugString) | Shows target debug strings | hh-debug | planned | windows |
 | Debug output window | Log of events | app | done | linux+windows |
 | Debugger Lua API | debug_* functions and breakpoint callbacks | hh-lua | done | linux+windows |
@@ -463,9 +463,9 @@ Total: 712
 | Stealth: hide debugger | Hides debug registers and flags from the target | hh-debug | needs decision | windows |
 | Remote debugging via ceserver | Debug a remote target | hh-debug | planned | linux+windows |
 | Hardware breakpoint conflicts | Handles limited debug registers | hh-debug | partial | linux+windows |
-| Breakpoint on API calls by name | Resolve and break on exported functions | hh-debug | planned | linux+windows |
+| Breakpoint on API calls by name | Resolve and break on exported functions | hh-debug | partial | linux+windows |
 | Break on memory allocation / free (heap) | Logs heap events | hh-debug | planned | windows |
-| Auto-attach debugger on process start | Debugs a spawned process from the first instruction | hh-debug | planned | linux+windows |
+| Auto-attach debugger on process start | Debugs a spawned process from the first instruction | hh-debug | done | linux+windows |
 | Debug child processes | Follows forks/child creation | hh-debug | planned | linux+windows |
 | DBVM breakpoints (hypervisor) | Invisible breakpoints via DBVM | hh-debug | needs decision | windows |
 
@@ -480,7 +480,7 @@ Total: 712
 | Allow stack addresses as base | Includes stack bases | hh-ptr | done | linux+windows |
 | Pointer must end with offset | Requires specific final offsets | hh-ptr | done | linux+windows |
 | Pointer alignment | Only aligned pointers | hh-ptr | done | linux+windows |
-| Same-offsets-only mode | Restricts chains to a given offset list | hh-ptr | partial | linux+windows |
+| Same-offsets-only mode | Restricts chains to a given offset list | hh-ptr | done | linux+windows |
 | No looping pointers | Prevents cyclic paths | hh-ptr | done | linux+windows |
 | Compare results with other saved pointer scans | Intersects scan files | hh-ptr | done | linux+windows |
 | Stop at module address only | Base must be a module-relative address | hh-ptr | done | linux+windows |
@@ -502,10 +502,10 @@ Total: 712
 | Pointer scan: compressed paths | Prefix-shared path storage | hh-ptr | planned | linux+windows |
 | Pointer scan: reverse scan from base | Search from candidate bases | hh-ptr | planned | linux+windows |
 | Pointer scan: scan region limit | Restrict regions scanned | hh-ptr | done | linux+windows |
-| Pointer scan: pause and resume | Pause scan; continue later | hh-ptr | planned | linux+windows |
+| Pointer scan: pause and resume | Pause scan; continue later | hh-ptr | done | linux+windows |
 | Pointer scan: progress and ETA | Progress display | app | partial | linux+windows |
 | Distributed pointer scan | Offload scanning to other machines | hh-ptr | planned | linux+windows |
-| Pointer scan: Lua API | Scripts drive pointer scans | hh-lua | planned | linux+windows |
+| Pointer scan: Lua API | Scripts drive pointer scans | hh-lua | done | linux+windows |
 | Pointer scan: default settings page | Settings defaults for the scanner | app | planned | linux+windows |
 | Auto-guess structure from pointer chain | Names levels from known structures | hh-ptr | planned | linux+windows |
 | Instant "Find what accesses" pointer helper | Walks accessor instructions to build chains | hh-ptr | planned | linux+windows |
@@ -532,11 +532,11 @@ Total: 712
 | Structure: show hex/decimal/signed | Display options | app | done | linux+windows |
 | Structure: highlight changes | Highlights elements that changed | app | done | linux+windows |
 | Structure: auto-refresh | Periodic update | app | done | linux+windows |
-| Structure: generate C/C# definition | Export to code | app | planned | linux+windows |
-| Structure: RTTI/class name detection | Reads vtable RTTI names | hh-core | planned | linux+windows |
-| Structure: Lua override registration | Scripts customize structure naming | hh-lua | planned | linux+windows |
+| Structure: generate C/C# definition | Export to code | app | done | linux+windows |
+| Structure: RTTI/class name detection | Reads vtable RTTI names | hh-core | done | linux+windows |
+| Structure: Lua override registration | Scripts customize structure naming | hh-lua | done | linux+windows |
 | Structure: Mono/.NET class import | Fill structure from managed classes | hh-inject | planned | linux+windows |
-| Structure: bit fields | Show bit-level view of an element | app | planned | linux+windows |
+| Structure: bit fields | Show bit-level view of an element | app | done | linux+windows |
 
 ## Code tools
 
@@ -555,13 +555,13 @@ Total: 712
 | Dissect code: referenced functions | Lists called functions and call counts | hh-asm | done | linux+windows |
 | Dissect code: show references | Shows callers of an address | hh-asm | done | linux+windows |
 | Dissect code: module selection | Choose modules to scan | app | done | linux+windows |
-| Dissect code: save/load results | Persist results | app | planned | linux+windows |
+| Dissect code: save/load results | Persist results | app | done | linux+windows |
 | Dissect code: Lua access | Scripts use dissected data | hh-lua | done | linux+windows |
-| Find assembly instruction | Search code for text/pattern | hh-asm | planned | linux+windows |
-| Find assembly instruction: range and options | Limit range, case, jumps | hh-asm | planned | linux+windows |
-| Code filter | Records which code ran during an interval | hh-debug | planned | linux+windows |
-| Code filter: add module | Select modules to filter | hh-debug | planned | linux+windows |
-| Code filter: mark as ran / not ran | Narrow code addresses by action | hh-debug | planned | linux+windows |
+| Find assembly instruction | Search code for text/pattern | hh-asm | done | linux+windows |
+| Find assembly instruction: range and options | Limit range, case, jumps | hh-asm | done | linux+windows |
+| Code filter | Records which code ran during an interval | hh-debug | done | linux+windows |
+| Code filter: add module | Select modules to filter | hh-debug | done | linux+windows |
+| Code filter: mark as ran / not ran | Narrow code addresses by action | hh-debug | done | linux+windows |
 | Code filter: save results | Persist filtered code set | app | planned | linux+windows |
 | Ultimap 1 | Uses branch trace store to record executed code | hh-debug | planned | windows |
 | Ultimap 2 | Uses Intel PT to record execution | hh-debug | planned | windows |
@@ -579,7 +579,7 @@ Total: 712
 |---|---|---|---|---|
 | Speedhack enable | Injects a DLL scaling time functions | hh-inject | partial | linux+windows |
 | Speed multiplier | User sets speed factor (0.1x to many x) | hh-inject | partial | linux+windows |
-| Speedhack presets | Stored speed values with hotkeys | app | done | linux+windows |
+| Speedhack presets | Stored speed values with hotkeys | app | partial | linux+windows |
 | Speedhack hotkeys | Global keys to apply speeds | app | partial | linux+windows |
 | Hooked time APIs: QueryPerformanceCounter | Scales performance counter | hh-inject | planned | windows |
 | Hooked time APIs: GetTickCount/GetTickCount64 | Scales tick counts | hh-inject | planned | windows |
