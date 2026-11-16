@@ -235,30 +235,7 @@ impl Process for LinuxProcess {
     }
 
     fn modules(&self) -> Result<Vec<Module>> {
-        let mut out: Vec<Module> = Vec::new();
-        for r in self
-            .regions()?
-            .into_iter()
-            .filter(|r| r.kind == RegionKind::Image)
-        {
-            let path = r.path.unwrap_or_default();
-            let end = r.start + r.size;
-            match out.iter_mut().find(|m| m.path == path) {
-                Some(m) => {
-                    let m_end = (m.base + m.size).max(end);
-                    m.base = m.base.min(r.start);
-                    m.size = m_end - m.base;
-                }
-                None => out.push(Module {
-                    name: path.rsplit('/').next().unwrap_or(&path).to_owned(),
-                    path,
-                    base: r.start,
-                    size: r.size,
-                }),
-            }
-        }
-        out.sort_by_key(|m| m.base);
-        Ok(out)
+        Ok(modules_of(&self.regions()?))
     }
 
     fn threads(&self) -> Result<Vec<u32>> {
@@ -380,11 +357,44 @@ fn prot_bits(p: Prot) -> u64 {
     b as u64
 }
 
+/// Modules from [`parse_maps`] regions (address order): each run of image regions of one
+/// file is one module, so the same file loaded twice is two modules.
+fn modules_of(regions: &[Region]) -> Vec<Module> {
+    let mut out: Vec<Module> = Vec::new();
+    // A plain file mapping ends a run; anonymous gaps (.bss) do not.
+    let mut open = false;
+    for r in regions {
+        match r.kind {
+            RegionKind::Image => {}
+            RegionKind::Mapped => {
+                open = false;
+                continue;
+            }
+            RegionKind::Private => continue,
+        }
+        let path = r.path.clone().unwrap_or_default();
+        let end = r.start.saturating_add(r.size);
+        let last = out.last_mut().filter(|m| open && m.path == path && r.start >= m.base);
+        open = true;
+        match last {
+            Some(m) => m.size = end - m.base,
+            _ => out.push(Module {
+                name: path.rsplit('/').next().unwrap_or(&path).to_owned(),
+                path,
+                base: r.start,
+                size: r.size,
+            }),
+        }
+    }
+    out
+}
+
 fn parse_maps(maps: &str) -> Vec<Region> {
     struct Line<'a> {
         start: u64,
         end: u64,
         perms: &'a str,
+        offset: u64,
         inode: &'a str,
         path: &'a str,
     }
@@ -405,32 +415,51 @@ fn parse_maps(maps: &str) -> Vec<Region> {
                 start: u64::from_str_radix(s, 16).ok()?,
                 end: u64::from_str_radix(e, 16).ok()?,
                 perms: f[1],
+                offset: u64::from_str_radix(f[2], 16).unwrap_or(0),
                 inode: f[4],
                 path: rest.trim_start(),
             })
         })
         .collect();
-    // A file with an executable mapping is a loaded image (exe or shared object); its data
-    // and read-only segments belong to it too. Other file mappings are plain mmaps.
-    let images: HashSet<&str> = lines
+    // A loaded image (exe or shared object) is a run of mappings of one file at strictly
+    // rising file
+    // offsets (anonymous gaps such as .bss may sit in between) that includes an executable
+    // one. Any other mapping of the same file (a crash reporter mapping the library again,
+    // read-only, somewhere else) is a plain mmap, not part of the module.
+    let mut group = vec![0usize; lines.len()];
+    let mut cur: Option<(&str, &str, u64)> = None;
+    let mut gid = 0;
+    for (i, l) in lines.iter().enumerate() {
+        if l.inode == "0" {
+            continue;
+        }
+        if !cur.is_some_and(|(p, n, off)| p == l.path && n == l.inode && l.offset > off) {
+            gid += 1;
+        }
+        cur = Some((l.path, l.inode, l.offset));
+        group[i] = gid;
+    }
+    let images: HashSet<usize> = lines
         .iter()
-        .filter(|l| l.inode != "0" && l.perms.contains('x'))
-        .map(|l| l.path)
+        .zip(&group)
+        .filter(|(l, _)| l.inode != "0" && l.perms.contains('x'))
+        .map(|(_, &g)| g)
         .collect();
     lines
         .iter()
-        .map(|l| {
+        .zip(&group)
+        .map(|(l, g)| {
             let bytes = l.perms.as_bytes();
             let kind = if l.inode == "0" {
                 RegionKind::Private
-            } else if images.contains(l.path) {
+            } else if images.contains(g) {
                 RegionKind::Image
             } else {
                 RegionKind::Mapped
             };
             Region {
                 start: l.start,
-                size: l.end - l.start,
+                size: l.end.saturating_sub(l.start),
                 prot: Prot {
                     r: bytes.first() == Some(&b'r'),
                     w: bytes.get(1) == Some(&b'w'),
@@ -748,5 +777,29 @@ mod tests {
         assert_eq!(r[3].kind, RegionKind::Mapped);
         assert!(r[3].shared && !r[2].shared);
         assert_eq!((r[4].path.as_deref(), r[4].size), (None, 0x21000));
+    }
+
+    #[test]
+    fn second_mapping_of_a_library_is_not_part_of_it() {
+        // The library mapped again read-only below it (a crash reporter), then loaded.
+        let maps = "\
+7f0000000000-7f0000003000 r--p 00000000 08:01 77         /lib/libx.so
+7f1000000000-7f1000001000 r--p 00000000 08:01 77         /lib/libx.so
+7f1000001000-7f1000002000 r-xp 00001000 08:01 77         /lib/libx.so
+7f1000002000-7f1000003000 rw-p 00002000 08:01 77         /lib/libx.so
+7f1000003000-7f1000004000 rw-p 00000000 00:00 0
+7f1000004000-7f1000005000 r--p 00000000 08:01 77         /lib/libx.so
+";
+        let r = parse_maps(maps);
+        let kinds: Vec<RegionKind> = r.iter().map(|r| r.kind).collect();
+        use RegionKind::*;
+        assert_eq!(kinds, [Mapped, Image, Image, Image, Private, Mapped]);
+        let m = modules_of(&r);
+        assert_eq!(m.len(), 1, "{m:?}");
+        assert_eq!((m[0].base, m[0].size), (0x7f10_0000_0000, 0x3000));
+        // Loaded twice (two runs with code): two modules.
+        let twice = format!("{maps}7f2000000000-7f2000001000 r--p 00000000 08:01 77 /lib/libx.so\n7f2000001000-7f2000002000 r-xp 00001000 08:01 77 /lib/libx.so\n");
+        let m = modules_of(&parse_maps(&twice));
+        assert_eq!(m.iter().map(|m| m.base).collect::<Vec<_>>(), [0x7f10_0000_0000, 0x7f20_0000_0000]);
     }
 }

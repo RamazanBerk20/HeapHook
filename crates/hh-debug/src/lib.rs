@@ -303,6 +303,15 @@ pub struct StepOptions {
 /// Most addresses [`Debugger::coverage_start`] takes.
 pub const MAX_COVERAGE: usize = 1 << 20;
 
+/// What [`Debugger::coverage_start_checked`] armed.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CoverageArm {
+    pub armed: usize,
+    /// Entries refused (not an instruction start in a live executable mapping of one of the
+    /// given modules), sorted.
+    pub rejected: Vec<Addr>,
+}
+
 #[derive(Clone, Default)]
 pub struct Hooks {
     /// Conditional breakpoint: hits where this returns false are ignored entirely.
@@ -1355,10 +1364,21 @@ mod session {
 
         /// Starts recording which of `entries` (e.g. function entries) execute, with a
         /// one-shot int3 on each (removed at its first hit), and the instruction of every
-        /// traced step. Entries outside executable memory are skipped; returns how many were
-        /// armed. Restarting drops the previous set. Arm only instruction starts.
+        /// traced step. Entries outside executable memory or not at an instruction start (see
+        /// [`Debugger::coverage_start_checked`]) are skipped; returns how many were armed.
+        /// Restarting drops the previous set.
         pub fn coverage_start(&self, entries: Vec<Addr>) -> Result<usize> {
-            self.call(move |e| e.cov_start(entries))
+            self.call(move |e| e.cov_start(entries, None).map(|c| c.armed))
+        }
+
+        /// [`Debugger::coverage_start`] for addresses taken from elsewhere (a saved code
+        /// dissection): an entry is armed only inside one of `modules` that is still loaded
+        /// with the same path, base and size, and only where decoding its executable mapping
+        /// linearly from the mapping's start reaches it as the start of a valid instruction
+        /// that overlaps no armed int3. [`Debugger::coverage_start`] makes the same
+        /// instruction checks.
+        pub fn coverage_start_checked(&self, entries: Vec<Addr>, modules: Vec<Module>) -> Result<CoverageArm> {
+            self.call(move |e| e.cov_start(entries, Some(modules)))
         }
 
         /// Addresses executed since `coverage_start`, sorted.

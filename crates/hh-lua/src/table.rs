@@ -1,5 +1,6 @@
 //! Memory records (cheat table entries) as the Lua engine sees them, and the seam the app
 //! implements to own them.
+use std::collections::HashSet;
 use std::sync::Mutex;
 
 use hh_asm::AaState;
@@ -8,6 +9,21 @@ use hh_scan::{CustomType, Fmt, VType};
 use hh_tools::structure::Structure;
 
 pub type RecId = u32;
+
+/// What a record's script may do beyond plain Auto Assembler. The host decides it per record
+/// by where the record came from ([`TableHost::caps`]), never by what its text says.
+///
+/// `None` (the default, and what a host that has not vouched for a record gets): the hooks
+/// handed to hh-asm have no `{$lua}`, `luacall`, `loadbinary`, `include`, custom commands,
+/// prologues, epilogues or symbol lookup callbacks, so a script that needs one fails with
+/// `hh_asm::NOT_AVAILABLE`; the record's Lua callbacks (`OnActivate`, ...) do not run and its
+/// address never reaches a lookup callback. `Full`: all of it, like Cheat Engine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Caps {
+    #[default]
+    None,
+    Full,
+}
 
 /// One cheat table entry. The engine reads/writes these through [`TableHost`]; everything
 /// the engine computes (current value, address) is derived from these fields.
@@ -126,18 +142,29 @@ pub trait TableHost: Send + Sync {
     fn set_structures(&self, _s: Vec<Structure>) -> bool {
         false
     }
+    /// What record `id`'s script and callbacks may do (see [`Caps`]). Default `None`: a host
+    /// that does not say otherwise vouches for nothing.
+    fn caps(&self, _id: RecId) -> Caps {
+        Caps::None
+    }
 }
 
-/// In-memory [`TableHost`] for headless use and tests.
+/// In-memory [`TableHost`] for headless use and tests. Whoever fills it vouches for its
+/// records: they have [`Caps::Full`] unless [`MemTable::set_caps`] says otherwise.
 #[derive(Default)]
 pub struct MemTable {
     inner: Mutex<(Vec<Record>, RecId)>,
     selection: Mutex<Vec<RecId>>,
+    untrusted: Mutex<HashSet<RecId>>,
 }
 
 impl MemTable {
     pub fn new() -> Self {
         Self::default()
+    }
+    pub fn set_caps(&self, id: RecId, caps: Caps) {
+        let mut u = self.untrusted.lock().unwrap();
+        if caps == Caps::Full { u.remove(&id) } else { u.insert(id) };
     }
 }
 
@@ -185,5 +212,8 @@ impl TableHost for MemTable {
     }
     fn set_selected(&self, ids: &[RecId]) {
         *self.selection.lock().unwrap() = ids.to_vec();
+    }
+    fn caps(&self, id: RecId) -> Caps {
+        if self.untrusted.lock().unwrap().contains(&id) { Caps::None } else { Caps::Full }
     }
 }

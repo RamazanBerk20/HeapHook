@@ -46,8 +46,10 @@ export const api = {
   /** opts: {att?: AT&T syntax, typed?: typed operand comments} */
   disassemble: (addr, count, opts = null) => call('disassemble', { addr, count, opts }),
   assemble: (addr, text) => call('assemble', { addr, text }),
-  aaCheck: (script) => call('aa_check', { script }),
-  aaExecute: (script, enable, state) => call('aa_execute', { script, enable, state: state ?? null }),
+  /** where: {session} (Auto Assemble window) or {entry} (a table entry's script): the capabilities it is checked with; none without */
+  aaCheck: (script, where = {}) => call('aa_check', { script, session: where.session ?? null, entry: where.entry ?? null }),
+  /** session: the Auto Assemble window's (aaSession); without one the script gets no Lua or file access */
+  aaExecute: (script, enable, state, session = null) => call('aa_execute', { script, enable, state: state ?? null, session }),
   tableLoad: (path) => call('table_load', { path }),
   tableSave: (path, table) => call('table_save', { path, table }),
   // ---------- live cheat table (the backend owns it) ----------
@@ -273,7 +275,7 @@ export const api = {
   tableExportText: (path) => call('table_export_text', { path }),
   /** Appends a table file's entries (they arrive untrusted) -> {version, table, trust, untrusted} */
   tableMerge: (path) => call('table_merge', { path }),
-  /** Inserts entries (new ids) after entry `after` (null: at the end); entries with Lua arrive untrusted -> {version, ids} */
+  /** Inserts entries (new ids) after entry `after` (null: at the end); every one arrives untrusted -> {version, ids} */
   tablePaste: (entries, after, base) => call('table_paste', { entries, after, base }),
   /** Consent for the Lua of these entries (and their children) that arrived from another table */
   tableTrustEntries: (ids) => call('table_trust_entries', { ids }),
@@ -281,9 +283,18 @@ export const api = {
   tableDirty: () => call('table_dirty', {}),
   /** A dropped file's text (browser drop) opened like table_open -> {version, table, trust, untrusted} */
   tableOpenData: (name, data, force = false) => call('table_open_data', { name, data, force }),
-  /** Reads an Auto Assembler script from a file; its Lua needs consent (aaTrust) before aaExecute runs it */
-  aaLoadFile: (path) => call('aa_load_file', { path }),
-  aaTrust: (script) => call('aa_trust', { script }),
+  /** A new Auto Assemble window session -> id: typed text is the user's own */
+  aaSession: () => call('aa_session', {}),
+  /** Reads an Auto Assembler script file into session `session`: from now on its content gets Lua and file access only after aaTrust */
+  aaLoadFile: (path, session) => call('aa_load_file', { path, session }),
+  /** Consent for what was loaded into the session */
+  aaTrust: (session) => call('aa_trust', { session }),
+  /** "Assign to table": the session's script as a new entry (a loaded file stays untrusted) -> {version, ids} */
+  aaAssign: (session, script, description, after, base) => call('aa_assign', { session, script, description, after: after ?? null, base: base ?? null }),
+  /** An injection template (kind aob | code | full | api) at addr as a new entry; untrusted for a remote target -> {version, ids} */
+  tableAddTemplate: (addr, kind, description, after, base) => call('table_add_template', { addr, kind, description, after: after ?? null, base: base ?? null }),
+  /** ids: [entry id] -> [hex addr | null], each resolved with the lookups its origin allows */
+  tableResolve: (ids) => call('table_resolve', { ids }),
   /** Command-line arguments, once: {table, pid, attach, launch: {program, args}|null} */
   appArgs: () => call('app_args', {}),
   /** Quits (after the unsaved-changes question) */

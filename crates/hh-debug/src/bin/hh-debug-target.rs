@@ -37,6 +37,7 @@
 //! sleeps `ms` and exits, the thread waits for it. `vforks` answers `vforks <done>`.
 //! `dlopen <path>` keeps the handle; `dlclose` closes the last one (`ok`); `libcall <n>`
 //! calls `hh_lib_add(n)` of the last library (`lib <result>`).
+//! `mapfile <path>` maps the file again read-only and keeps it (`mapped <address>`).
 //! `named <name>` (`ok`): a thread with that name waits until `bgstop`.
 //! `deep` (value += 1 via `f1 -> f2 -> f3`, all with frame pointers; `f1` calls at +4 and
 //! `f2` at +4, both return to +9; `f3` stores at +4).
@@ -512,6 +513,13 @@ fn linux_command(st: &State, cmd: &str, line: &str, num: &mut dyn FnMut() -> u64
                 "ok".into()
             }
             "vforks" => format!("vforks {}", lx::VFORKS.load(Ordering::SeqCst)),
+            "mapfile" => {
+                // Maps a file again, read-only, and keeps it (what crash reporters do).
+                let Ok(f) = std::fs::File::open(line[8..].trim()) else { return "error".into() };
+                let len = f.metadata().map_or(0, |m| m.len()) as usize;
+                let m = libc::mmap(std::ptr::null_mut(), len, libc::PROT_READ, libc::MAP_PRIVATE, std::os::fd::AsRawFd::as_raw_fd(&f), 0);
+                if m == libc::MAP_FAILED { "error".into() } else { format!("mapped {m:p}") }
+            }
             "dlclose" => {
                 let h = std::mem::take(&mut *lx::LIB.lock().unwrap());
                 if h != 0 {

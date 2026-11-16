@@ -9,7 +9,7 @@ use hh_core::{Addr, Error, Process, Prot, Region, RegionKind, Result};
 use hh_scan::{CustomType, FirstScan, NextScan, NextScanEx, Rounding, ScanOptions, ScanType, Scanner, Tri, VType};
 use mlua::{AnyUserData, FromLuaMulti, Function, IntoLuaMulti, Lua, MultiValue, Table, Value, Variadic};
 
-use crate::{Internals, RecId, Record, STUBS, State, guard, stub_message};
+use crate::{Caps, Internals, RecId, Record, STUBS, State, guard, stub_message};
 
 type LR<T> = mlua::Result<T>;
 
@@ -127,9 +127,15 @@ pub(crate) fn arg(a: &[Value], i: usize) -> Value {
 }
 
 pub(crate) fn resolve(st: &State, expr: &str, local: bool) -> Result<Addr> {
+    resolve_caps(st, expr, local, Caps::Full)
+}
+
+/// [`resolve`] of an expression with `caps`: without them the lookup callbacks are not asked
+/// (a record's address must not reach Lua the record has no right to).
+pub(crate) fn resolve_caps(st: &State, expr: &str, local: bool, caps: Caps) -> Result<Addr> {
     let syms = if local { SymbolTable::default() } else { st.syms.lock().unwrap().clone() };
     // registerSymbolLookupCallback functions are asked last (not for HeapHook's own memory).
-    let lua = if local { None } else { crate::hooks::symbol_lua(st) };
+    let lua = if local || caps == Caps::None { None } else { crate::hooks::symbol_lua(st) };
     let extra = |n: &str| lua.as_ref().and_then(|l| crate::hooks::symbol_now(l, st, n));
     match st.target(local) {
         Some(p) => hh_asm::resolve_address_with(&*p, &syms, expr, &extra),
@@ -810,11 +816,12 @@ fn aa_run(
     script: &str,
     enable: bool,
     prev: Option<&AaState>,
-    memrec: Option<RecId>,
+    // The record running it (`memrec` in `{$lua}`), and the capabilities it has.
+    (memrec, caps): (Option<RecId>, Caps),
 ) -> Result<AaState> {
     let before = st.syms.lock().unwrap().clone();
     let mut work = before.clone();
-    let mut hooks = crate::hooks::full(lua, st, memrec, false);
+    let mut hooks = crate::hooks::for_caps(lua, st, memrec, crate::hooks::Mode::Run, caps);
     let r = hh_asm::aa_execute(p, &mut work, script, enable, prev, &mut hooks);
     let mut cur = st.syms.lock().unwrap();
     for (n, a) in work.iter() {
@@ -859,6 +866,49 @@ pub(crate) fn lua_block_hook(
     })
 }
 
+/// Most script texts remembered as read from records without capabilities.
+const MAX_TAINTED: usize = 64;
+
+/// Lua read `text` from a record without capabilities (`memrec.Script`).
+fn taint(st: &State, text: &str) {
+    if text.trim().is_empty() {
+        return;
+    }
+    let mut t = st.tainted.lock().unwrap();
+    if !t.iter().any(|x| x == text) {
+        if t.len() >= MAX_TAINTED {
+            t.pop_front();
+        }
+        t.push_back(text.to_string());
+    }
+}
+
+/// Capabilities of a script Lua hands to `autoAssemble`: the Lua is trusted (untrusted Lua
+/// never runs), but text it took from a record without capabilities keeps that record's
+/// origin. Provenance, not inspection: the text is compared with what Lua read from such
+/// records, never searched for directives. shortcut: text the trusted Lua rewrote (not
+/// just embedded) is not followed; full taint tracking would need tagged Lua strings.
+fn text_caps(st: &State, text: &str) -> Caps {
+    if st.tainted.lock().unwrap().iter().any(|t| text.contains(t.trim())) { Caps::None } else { Caps::Full }
+}
+
+/// An `autoAssemble` error of text from a record without capabilities, saying so when the
+/// missing capabilities may be why.
+fn untrusted_note(st: &State, text: &str, e: String) -> String {
+    if text_caps(st, text) == Caps::None && (e.contains(hh_asm::NOT_AVAILABLE) || crate::hooks::has_symbol_lookup(st)) {
+        format!("{e} (needs your consent: the text came from a memory record without it)")
+    } else {
+        e
+    }
+}
+
+/// Records a refusal for want of capabilities (see `Engine::take_denied`); the message.
+pub(crate) fn deny(st: &State, id: RecId, what: &str) -> String {
+    let msg = format!("{what}: needs your consent (without it Lua and file access are not available to it)");
+    st.denied.lock().unwrap().push((id, msg.clone()));
+    msg
+}
+
 fn install_asm(b: &B) -> LR<()> {
     b.f("autoAssemble", |lua, st, (text, a2, a3): (String, Value, Value)| {
         let (local, info) = match (a2, a3) {
@@ -875,7 +925,7 @@ fn install_asm(b: &B) -> LR<()> {
             _ => None,
         };
         let enable = prev.is_none();
-        match aa_run(lua, st, &*p, &text, enable, prev.as_ref(), None) {
+        match aa_run(lua, st, &*p, &text, enable, prev.as_ref(), (None, text_caps(st, &text))) {
             Ok(s) if enable => {
                 let t = lua.create_table()?;
                 let allocs = lua.create_table()?;
@@ -891,7 +941,7 @@ fn install_asm(b: &B) -> LR<()> {
                 (true, t).into_lua_multi(lua)
             }
             Ok(_) => true.into_lua_multi(lua),
-            Err(e) => (false, e.to_string()).into_lua_multi(lua),
+            Err(e) => (false, untrusted_note(st, &text, e.to_string())).into_lua_multi(lua),
         }
     })?;
     b.f("autoAssembleCheck", |lua, st, (text, _enable, local): (String, Option<bool>, Option<bool>)| {
@@ -900,10 +950,10 @@ fn install_asm(b: &B) -> LR<()> {
             return (false, "no process opened").into_lua_multi(lua);
         };
         let syms = st.syms.lock().unwrap().clone();
-        let mut hooks = crate::hooks::full(lua, st, None, true);
+        let mut hooks = crate::hooks::for_caps(lua, st, None, crate::hooks::Mode::Check, text_caps(st, &text));
         match hh_asm::aa_check(&*p, &syms, &text, &mut hooks) {
             None => true.into_lua_multi(lua),
-            Some(e) => (false, format!("line {}: {}", e.line, e.message)).into_lua_multi(lua),
+            Some(e) => (false, untrusted_note(st, &text, format!("line {}: {}", e.line, e.message))).into_lua_multi(lua),
         }
     })?;
     b.f("assemble", |lua, st, (text, a): (String, Option<Value>)| {
@@ -950,7 +1000,7 @@ fn install_asm(b: &B) -> LR<()> {
 
 pub(crate) fn rec_addr(st: &State, r: &Record) -> Result<Addr> {
     let p = st.proc().ok_or(Error::Other("no process opened".into()))?;
-    let mut a = resolve(st, &r.address, false)?;
+    let mut a = resolve_caps(st, &r.address, false, st.table().caps(r.id))?;
     for o in &r.offsets {
         a = p.read_ptr(a)?.wrapping_add(*o as u64);
     }
@@ -1083,7 +1133,17 @@ fn install_records(h: &B) -> LR<()> {
             "Address" => s(&r.address)?,
             "Type" => Value::Integer(rec_type(&r)),
             "Value" => s(&rec_value(st, &r).unwrap_or_else(|_| "??".into()))?,
-            "Script" => r.script.as_deref().map(s).transpose()?.unwrap_or(Value::Nil),
+            "Script" => {
+                if let Some(x) = r.script.as_deref() {
+                    if t.caps(id) == Caps::None {
+                        taint(st, x);
+                    } else {
+                        // Consented since: the same text is the user's to run.
+                        st.tainted.lock().unwrap().retain(|t| t != x);
+                    }
+                }
+                r.script.as_deref().map(s).transpose()?.unwrap_or(Value::Nil)
+            }
             "Color" => Value::Integer(r.color as i64),
             "Active" => Value::Boolean(r.active),
             "Parent" => r.parent.map_or(Value::Nil, |p| Value::Integer(p as i64)),
@@ -1210,6 +1270,13 @@ fn install_records(h: &B) -> LR<()> {
         }
         t.set(r).map_err(rt)
     })?;
+    // Whether the record's Lua callbacks may run (its capabilities).
+    h.f("mr_trusted", |_, st, id: RecId| Ok(st.table().caps(id) == Caps::Full))?;
+    // (id, what) -> message: a callback of a record without capabilities was not run.
+    h.f("mr_denied", |_, st, (id, what): (RecId, String)| {
+        let d = st.table().get(id).map(|r| r.description).unwrap_or_default();
+        Ok(deny(st, id, &format!("{d}: {what}")))
+    })?;
     // Hotkey increase / decrease of a custom-typed record, in converted units: (id, delta)
     // -> the new value text.
     h.f("mr_add", |_, st, (id, delta): (RecId, f64)| {
@@ -1239,20 +1306,31 @@ fn install_records(h: &B) -> LR<()> {
         }
         let mut new_state = None;
         let mut frozen = None;
+        let caps = t.caps(id);
+        // Without capabilities a failure may be the missing capability: the host hears of it
+        // (`take_denied`) to ask the user. An unknown name may be one only a lookup knew.
+        let denied = |e: &dyn std::fmt::Display| -> String {
+            let e = e.to_string();
+            if caps == Caps::None && (e.contains(hh_asm::NOT_AVAILABLE) || crate::hooks::has_symbol_lookup(st)) {
+                format!("{}: {e}", deny(st, id, &r.description))
+            } else {
+                format!("{}: {e}", r.description)
+            }
+        };
         if r.group_header {
             // A header only changes state; its children follow the group options.
         } else if let Some(script) = &r.script {
             if execute && !script.trim().is_empty() {
                 let Some(p) = st.proc() else { return Ok((false, Some("no process opened".to_string()))) };
-                match aa_run(lua, st, &*p, script, active, r.aa_state.as_ref(), Some(id)) {
+                match aa_run(lua, st, &*p, script, active, r.aa_state.as_ref(), (Some(id), caps)) {
                     Ok(s) => new_state = active.then_some(s),
-                    Err(e) => return Ok((false, Some(format!("{}: {e}", r.description)))),
+                    Err(e) => return Ok((false, Some(denied(&e)))),
                 }
             }
         } else if active {
             match rec_value(st, &r) {
                 Ok(v) => frozen = Some(v),
-                Err(e) => return Ok((false, Some(format!("{}: {e}", r.description)))),
+                Err(e) => return Ok((false, Some(denied(&e)))),
             }
         }
         // Re-read: a {$lua} block may have changed the record meanwhile.

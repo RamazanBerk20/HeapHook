@@ -538,9 +538,8 @@ export function initMemview() {
     toast(`References ${what} · R next, Shift R previous`, 'info');
   }
 
-  async function apiHook(a) {
-    const script = await attempt(() => api.aaTemplate(a, 'api'));
-    if (script) emit('table:script', { description: `API hook at ${relName(a)}`, script });
+  function apiHook(a) {
+    emit('table:template', { addr: a, kind: 'api', description: `API hook at ${relName(a)}` });
   }
 
   /** Instruction patterns (? one character, * any run, ; chains) over a module, a region or all code. */

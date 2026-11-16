@@ -226,6 +226,11 @@ pub const MAX_FILE: u64 = 64 << 20;
 
 /// Refuses trees deeper than [`MAX_DEPTH`] or larger than [`MAX_ENTRIES`] (iterative, so it
 /// is safe on any input).
+/// The structure limits (`.CT` import checks them while parsing; JSON and puts here).
+pub fn check_structures(t: &Table) -> Result<(), String> {
+    hh_tools::structure::validate_structures(&t.structures).map_err(|e| e.to_string())
+}
+
 pub fn check_limits(entries: &[Entry]) -> Result<(), String> {
     let (mut stack, mut n) = (vec![(entries, 1usize)], 0usize);
     while let Some((list, d)) = stack.pop() {
@@ -326,6 +331,7 @@ pub fn load(path: &Path) -> Result<Table, String> {
         // A bare entry array is accepted too. serde_json's recursion limit keeps this shallow.
         let mut t = serde_json::from_str::<TableIn>(&text).map(Table::from).map_err(|e| format!("{}: {e}", path.display()))?;
         check_limits(&t.entries).map_err(|e| format!("{}: {e}", path.display()))?;
+        check_structures(&t).map_err(|e| format!("{}: {e}", path.display()))?;
         clean_json(&mut t);
         t
     };

@@ -940,3 +940,33 @@ fn bench_throughput() {
     }
     println!("single 8-byte reads: {:.0} round trips/s", n as f64 / t.elapsed().as_secs_f64());
 }
+
+#[test]
+fn hostile_server_region_lists_are_normalized() {
+    let r = |start: Addr, size: u64| Region { start, size, prot: Prot { r: true, w: true, x: false }, kind: RegionKind::Private, shared: false, cow: false, path: None };
+    let list = vec![r(0x5000, 0x2000), r(0x1000, 0x1000), r(0x5800, 0x400), r(0x6000, 0x3000), r(0x9000, 0), r(u64::MAX - 0xfff, 0x2000)];
+    let mods = vec![
+        Module { name: "ok".into(), path: "/ok".into(), base: 0x1000, size: 0x1000 },
+        Module { name: "wrap".into(), path: "/wrap".into(), base: u64::MAX, size: 2 },
+    ];
+    let addr = hostile_server(4096, move |mut s| {
+        let f = next_req(&mut s); // OPEN
+        s.write_all(&proto::frame(f.id, proto::STATUS_OK, |e| {
+            e.u32(1);
+            e.u8(8);
+        }))
+        .unwrap();
+        let f = next_req(&mut s); // REGIONS
+        s.write_all(&proto::frame(f.id, proto::STATUS_OK, |e| proto::enc_list(e, &list, proto::enc_region))).unwrap();
+        let f = next_req(&mut s); // MODULES
+        s.write_all(&proto::frame(f.id, proto::STATUS_OK, |e| proto::enc_list(e, &mods, proto::enc_module))).unwrap();
+        while proto::read_frame(&mut s, 1 << 20).is_ok() {}
+    });
+    let c = connect(addr, TOKEN).unwrap();
+    let p = c.open(1).unwrap();
+    let got: Vec<(Addr, u64)> = p.regions().unwrap().iter().map(|r| (r.start, r.size)).collect();
+    assert_eq!(got, [(0x1000, 0x1000), (0x5000, 0x2000), (0x7000, 0x2000)]);
+    let m = p.modules().unwrap();
+    assert_eq!(m.len(), 1);
+    assert_eq!(m[0].name, "ok");
+}

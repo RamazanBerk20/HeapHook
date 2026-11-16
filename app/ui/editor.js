@@ -3,7 +3,7 @@
 // The textarea stays the real input; the mirror behind it only paints (aria-hidden, no events).
 import { h, icon, modal, codeView, helpAdd, excerpt, fmtAddr } from './util.js';
 import { api, askPath } from './backend.js';
-import { state } from './core.js';
+import { state, emit } from './core.js';
 
 // ---------- word lists ----------
 const AA_DIR = ('alloc allocnx allocxo globalalloc kalloc sharedallocate dealloc label registersymbol unregistersymbol define undefine '
@@ -33,6 +33,16 @@ const LUA_FN = ('readByte readSmallInteger readShortInteger readInteger readQwor
   + 'string.find string.match string.gsub string.rep table.insert table.remove table.concat table.sort math.floor math.ceil '
   + 'math.abs math.min math.max math.random').split(' ');
 const LUA_FN_SET = new Set(LUA_FN);
+/**
+ * Highlighting budget. A line longer than HL_LINE is painted and lexed as plain text; a
+ * document longer than HL_DOC is not highlighted at all (the textarea paints itself), so a
+ * huge script cannot freeze the window on every keystroke.
+ */
+const HL_LINE = 2000, HL_DOC = 512 * 1024;
+/** Largest script the editor takes: the Auto Assembler's own limit (hh-asm MAX_SCRIPT_BYTES). */
+export const EDIT_MAX = 8 << 20;
+/** Why a script is not opened in the editor, or null. */
+export const tooBig = (text) => (text.length > EDIT_MAX ? `The script is ${(text.length / 1048576).toFixed(1)} MiB: the editor and the Auto Assembler take at most ${EDIT_MAX >> 20} MiB` : null);
 /** Characters that hide or reorder text (as util.js codeView marks them); tab and newline excluded. */
 const HIDDEN = /[\u0000-\u0008\u000b-\u001f\u007f-\u009f​-‏‪-‮⁠-⁩﻿]/g;
 
@@ -191,7 +201,7 @@ export function attachEditor(ta, { lang = 'aa', gutter = null, symbols = null } 
   ta.setAttribute('aria-describedby', [describedBy, errNote.id].filter(Boolean).join(' '));
 
   // ---------- model ----------
-  let text = '', lines = [''], starts = [0], states = [], validTo = 0, version = 0;
+  let text = '', lines = [''], starts = [0], states = [], validTo = 0, version = 0, plain = false;
   let errLine = 0, errMsg = '';
   let m = { lh: 18, pt: 8, pl: 10, tab: 2, font: '' };
   const cvs = document.createElement('canvas').getContext('2d');
@@ -213,6 +223,7 @@ export function attachEditor(ta, { lang = 'aa', gutter = null, symbols = null } 
     const countChanged = nl.length !== lines.length;
     text = v; lines = nl; version++;
     validTo = Math.min(validTo, k);
+    if (plain !== v.length > HL_DOC) { plain = !plain; wrap.classList.toggle('ed-plain', plain); painted = ''; }
     starts = new Array(nl.length);
     for (let i = 0, o = 0; i < nl.length; i++) { starts[i] = o; o += nl[i].length + 1; }
     if (countChanged) paintGutter();
@@ -229,13 +240,15 @@ export function attachEditor(ta, { lang = 'aa', gutter = null, symbols = null } 
   };
   function stateAt(line) {
     if (validTo === 0) states[0] = startState(opts.lang);
-    for (; validTo < line; validTo++) states[validTo + 1] = lex(opts.lang, lines[validTo], states[validTo], noop);
+    // A line past the budget is not lexed: the state carries over it unchanged.
+    for (; validTo < line; validTo++) states[validTo + 1] = lines[validTo].length > HL_LINE ? states[validTo] : lex(opts.lang, lines[validTo], states[validTo], noop);
     return states[line];
   }
   /** 'lua' | 'aa' | 'text' at a line: AA scripts switch to Lua inside {$lua} blocks. */
-  const langAt = (line) => (opts.lang === 'aa' ? (stateAt(line)[0] === 'l' ? 'lua' : 'aa') : opts.lang === 'lua' ? 'lua' : 'text');
+  const langAt = (line) => (opts.lang === 'aa' ? (!plain && stateAt(line)[0] === 'l' ? 'lua' : 'aa') : opts.lang === 'lua' ? 'lua' : 'text');
   function tokensOf(line) {
     const out = [];
+    if (plain || lines[line].length > HL_LINE) return out;
     lex(opts.lang, lines[line], stateAt(line), (a, b, c) => out.push([a, b, c]));
     return out;
   }
@@ -253,7 +266,8 @@ export function attachEditor(ta, { lang = 'aa', gutter = null, symbols = null } 
     const first = Math.max(0, Math.floor((top - m.pt) / m.lh) - 2);
     const last = Math.min(lines.length, Math.ceil((top + ta.clientHeight) / m.lh) + 2);
     const key = [first, last, version, errLine, find.version, find.cur].join();
-    if (key !== painted) {
+    if (plain) { if (painted !== 'plain') { painted = 'plain'; inner.replaceChildren(); } }
+    else if (key !== painted) {
       painted = key;
       const frag = document.createDocumentFragment();
       for (let i = first; i < last; i++) frag.append(renderLine(i));
@@ -726,22 +740,28 @@ function buildAaWindow() {
   const bUndo = btn('Run [DISABLE]', 'Ctrl Shift Enter', () => run(false));
   const bCheck = btn('Check', 'Ctrl K', () => check(true));
   const bOpen = h('button.btn.ghost', { type: 'button', onclick: () => openFile(), html: icon('folder') }, 'Open file ', h('kbd', null, 'Ctrl O'));
+  const bNew = h('button.btn.ghost', { type: 'button', onclick: () => newScript(), title: 'Start over with an empty script of your own (a loaded file stays untrusted until you start over)' }, 'New');
+  const bAssign = btn('Assign to table', 'Ctrl Shift A', () => assign());
   const dlg = h('dialog.dlg.dlg-script.ed-aawin', { 'aria-labelledby': id + '-title' },
     h('form', { method: 'dialog' },
       h('div.dlg-head', null,
         h('div.ed-aawin-title', null, h('h2', { id: id + '-title' }, 'Auto Assemble'), src),
-        bOpen),
+        bNew, bOpen),
       h('div.aa-editor', null, gut, ta),
       status, scansEl,
-      h('div.dlg-actions', null, bExec, bUndo, bCheck,
+      h('div.dlg-actions', null, bExec, bUndo, bCheck, bAssign,
         h('button.btn', { value: 'cancel', formnovalidate: true }, 'Close ', h('kbd', null, 'Esc')))));
   document.body.append(dlg);
   ta.value = '[ENABLE]\n\n[DISABLE]\n';
   const ed = attachEditor(ta, { lang: 'aa', gutter: gut });
   let path = null, loaded = null, execState = null, executed = false, errLine = 0, checkT = 0;
+  // The backend's session for this window: it knows whether a file was loaded into it (then its
+  // content gets Lua and file access only after consent). The text sent along proves nothing.
+  let session = null;
+  const sess = async () => (session ??= await api.aaSession());
 
   const show = (msg, kind) => { status.textContent = msg; status.className = 'aa-status ' + kind; };
-  const syncSrc = () => { src.textContent = path ? `From file: ${excerpt(path, 90)}${ta.value !== loaded ? ' (edited)' : ''}` : 'Typed here, not saved in the table'; };
+  const syncSrc = () => { src.textContent = path ? `From file: ${excerpt(path, 90)}${ta.value !== loaded ? ' (edited, still from the file)' : ''}` : 'Typed here, not saved in the table'; };
   const syncBtns = () => { bUndo.disabled = !executed; };
   const errText = (e) => String(e?.message || e);
   function fail(msg) {
@@ -751,27 +771,24 @@ function buildAaWindow() {
   }
   async function check(explicit) {
     try {
-      const r = await api.aaCheck(ta.value);
+      const r = await api.aaCheck(ta.value, { session: await sess() });
       errLine = r ? r.line : 0;
       ed.markError(errLine, r?.message);
       if (r) show(`Line ${r.line}: ${r.message}`, 'err'); else if (explicit || status.classList.contains('err')) show('No errors', 'ok');
     } catch (e) { fail(errText(e)); }
   }
-  async function askLua(script) {
+  async function askLua(script, msg) {
     const info = await api.appInfo().catch(() => null);
-    const lua = /\{\$lua\}/i.test(script), bin = /loadbinary/i.test(script);
     const r = await modal({
-      title: lua ? 'Run this script\'s Lua?' : 'Let this script read a file?',
-      text: (lua
-        ? 'This Auto Assembler script came from a file and has {$lua} blocks. Lua runs with your user account\'s rights. '
-          + (info?.lua_allow_os === false
-            ? 'Settings turn off Lua\'s access to files and programs: it can still read and change the attached process and run Auto Assembler in it.'
-            : 'It can read, change and delete your files, start programs, use the network, and read and change the attached process.')
-        : '')
-        + (bin ? (lua ? ' ' : 'This Auto Assembler script came from a file. ') + 'Its loadbinary reads a file from this computer (up to 64 MiB, any file your account can read) and writes it into the attached process.' : '')
-        + ' Run it only if you trust where the file came from.',
+      title: 'Let this script run Lua and read files?',
+      text: 'This Auto Assembler script came from a file (or was loaded into this window before you edited it), and it wants what such a script only gets with your consent: '
+        + 'Lua ({$lua}, luacall, commands and callbacks a table registered) or reading a file from this computer into the process (loadbinary). Lua runs with your user account\'s rights. '
+        + (info?.lua_allow_os === false
+          ? 'Settings turn off Lua\'s access to files and programs: it can still read and change the attached process and run Auto Assembler in it.'
+          : 'It can read, change and delete your files, start programs, use the network, and read and change the attached process.')
+        + ' Agree only if you trust where the file came from.',
       quote: path, quoteLabel: 'File',
-      body: h('div', null, h('p.hint', null, 'Start of the script:'), codeView(script, 12)),
+      body: h('div', null, h('p.hint', null, String(msg).split('\n').slice(1).join(' ') || 'Start of the script:'), codeView(script, 12)),
       buttons: [
         { label: 'Trust and run', value: 'trust' },
         { label: 'Do not run', value: 'cancel', kbd: 'Esc', primary: true, focus: true },
@@ -782,14 +799,15 @@ function buildAaWindow() {
   async function run(enable) {
     if (!enable && !executed) return;
     const script = ta.value;
-    const go = () => api.aaExecute(script, enable, enable ? null : execState);
+    const s_ = await sess();
+    const go = () => api.aaExecute(script, enable, enable ? null : execState, s_);
     let r;
     showScans(null);
     try { r = await go(); } catch (e) {
       const msg = errText(e);
       if (!msg.startsWith(NEEDS) || msg.includes('Settings say never')) return failRun(msg);
-      if (!(await askLua(script))) { ta.focus(); return show(/\{\$lua\}/i.test(script) ? 'Not run: its Lua needs your consent' : 'Not run: its loadbinary needs your consent', 'err'); }
-      try { await api.aaTrust(script); r = await go(); } catch (e2) { ta.focus(); return failRun(errText(e2)); }
+      if (!(await askLua(script, msg))) { ta.focus(); return show('Not run: it needs your consent for Lua or file access', 'err'); }
+      try { await api.aaTrust(s_); r = await go(); } catch (e2) { ta.focus(); return failRun(errText(e2)); }
       ta.focus();
     }
     execState = enable ? r : null;
@@ -818,14 +836,31 @@ function buildAaWindow() {
     const p = await askPath({ save: false, title: 'Open Auto Assembler script', filters: [['Auto Assembler script', ['cea', 'aa', 'txt']], ['All files', ['*']]] });
     if (!p) return ta.focus();
     try {
-      const r = await api.aaLoadFile(p);
-      ta.value = typeof r === 'string' ? r : r?.script ?? '';
+      const r = await api.aaLoadFile(p, await sess());
+      const text = typeof r === 'string' ? r : r?.script ?? '';
+      const big = tooBig(text);
+      if (big) { fail(big); ta.focus(); return; }
+      ta.value = text;
       path = p; loaded = ta.value;
       ed.refresh(); ed.markError(0); errLine = 0;
       show('', '');
       syncSrc(); check(false);
     } catch (e) { fail(errText(e)); }
     ta.focus();
+  }
+  /** A fresh session: what is typed from now on is the user's own again. */
+  function newScript() {
+    session = null; path = null; loaded = null; execState = null; executed = false;
+    ta.value = '[ENABLE]\n\n[DISABLE]\n';
+    ed.refresh(); ed.markError(0); errLine = 0;
+    show('', ''); showScans(null); syncSrc(); syncBtns();
+    ta.focus();
+  }
+  /** "Assign to table": the backend adds it with this window's origin (a loaded file stays untrusted). */
+  async function assign() {
+    const description = path ? path.split(/[\\/]/).pop() : 'Auto Assembler script';
+    emit('table:assign', { session: await sess(), script: ta.value, description });
+    show('Added to the table' + (path ? ': it came from a file, so its Lua and file access ask for your consent first' : ''), 'ok');
   }
   ta.addEventListener('input', () => { syncSrc(); clearTimeout(checkT); checkT = setTimeout(() => check(false), 400); });
   status.addEventListener('click', () => {
@@ -836,6 +871,7 @@ function buildAaWindow() {
   dlg.addEventListener('keydown', (e) => {
     const ctrl = e.ctrlKey || e.metaKey, k = e.key.toLowerCase();
     if (ctrl && k === 'enter') run(!e.shiftKey);
+    else if (ctrl && e.shiftKey && k === 'a') assign();
     else if (ctrl && k === 'o') openFile();
     else if (ctrl && k === 'k') check(true);
     else return;

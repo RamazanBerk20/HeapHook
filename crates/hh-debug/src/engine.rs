@@ -233,6 +233,55 @@ struct Page {
 }
 
 const STEP_OUT_LIMIT: u32 = 1_000_000;
+/// Longest a "skip breakpoints" step may keep every breakpoint quiet.
+const QUIET_MAX: Duration = Duration::from_secs(30);
+
+/// Lengths of the instructions starting exactly at `want` (sorted, inside `[start, end)`)
+/// when `[start, end)` is decoded linearly from `start`; `None` where an address lies inside
+/// an instruction, in unreadable memory, or starts an invalid one.
+fn linear_starts(p: &dyn Process, bits: u32, start: Addr, end: Addr, want: &[Addr]) -> Vec<Option<u64>> {
+    use iced_x86::{Decoder, DecoderOptions, Instruction};
+    const CH: u64 = 1 << 20;
+    let mut out = vec![None; want.len()];
+    let stop = want.last().map_or(start, |&w| w.saturating_add(1)).min(end);
+    let (mut pos, mut j) = (start, 0);
+    let mut buf = vec![0u8; CH as usize + 15];
+    let mut ins = Instruction::default();
+    while pos < stop && j < want.len() {
+        let n = (end - pos).min(CH + 15) as usize;
+        let Ok(got) = p.read(pos, &mut buf[..n]) else { break };
+        let chunk_end = pos + (got as u64).min(CH);
+        let mut d = Decoder::with_ip(bits, &buf[..got], pos, DecoderOptions::NONE);
+        while d.can_decode() && d.ip() < chunk_end && j < want.len() {
+            let s = d.ip();
+            d.decode_out(&mut ins);
+            while j < want.len() && want[j] < s {
+                j += 1; // stepped over: inside the previous instruction
+            }
+            if j < want.len() && want[j] == s {
+                if !ins.is_invalid() {
+                    out[j] = Some(ins.len() as u64);
+                }
+                j += 1;
+            }
+        }
+        if d.ip() <= pos {
+            break;
+        }
+        pos = d.ip();
+    }
+    out
+}
+
+/// Puts `orig` back at `a` only where our int3 still is: the target may have unmapped the
+/// address and mapped something else there itself.
+fn restore_byte(mem: &dyn Process, a: Addr, orig: u8) -> Result<()> {
+    let mut cur = [0u8];
+    match mem.read(a, &mut cur) {
+        Ok(1) if cur[0] == 0xcc => mem.write(a, &[orig]),
+        _ => Ok(()),
+    }
+}
 
 thread_local! {
     static ENGINE_THREAD: Cell<bool> = const { Cell::new(false) };
@@ -332,8 +381,8 @@ pub(crate) struct Engine {
     pub(crate) break_on: BreakOn,
     /// Why the coming break happens, when a debug event asked for it.
     trigger: Option<Trigger>,
-    /// Breakpoints are ignored until the current step completes.
-    quiet: bool,
+    /// Breakpoints are ignored until this thread's step completes (or the deadline).
+    quiet: Option<(Tid, Instant)>,
     cov: Option<Cov>,
     /// A launched process breaks at its entry point.
     break_entry: bool,
@@ -417,7 +466,7 @@ impl Engine {
             recoveries: 0,
             break_on: BreakOn::default(),
             trigger: None,
-            quiet: false,
+            quiet: None,
             cov: None,
             break_entry: false,
             log_rate: (Instant::now(), 0, 0),
@@ -764,6 +813,9 @@ impl Engine {
         if self.exclusive == Some(tid) {
             self.exclusive = None;
         }
+        if self.quiet.is_some_and(|q| q.0 == tid) {
+            self.quiet = None;
+        }
         let Some(th) = th else { return false };
         // It died mid-step: put its lifted breakpoints back.
         if let Some(a) = th.lift_sw {
@@ -782,13 +834,32 @@ impl Engine {
         !th.guest
     }
 
+    /// Forgets temporary breakpoints whose int3 is gone: a step waiting on one can never
+    /// complete, so its goal ends and a "skip breakpoints" step stops silencing the others.
+    fn drop_temps(&mut self, gone: impl Fn(&Temp) -> bool) {
+        let (dropped, keep): (Vec<Temp>, Vec<Temp>) = std::mem::take(&mut self.temps).into_iter().partition(|t| gone(t));
+        self.temps = keep;
+        for t in dropped.iter().filter(|t| !t.run_to) {
+            if let Some(tid) = t.tid {
+                if let Some(th) = self.threads.get_mut(&tid) {
+                    th.goal = Goal::Idle;
+                    th.fence = None;
+                    th.trace = None;
+                }
+                if self.quiet.is_some_and(|q| q.0 == tid) {
+                    self.quiet = None;
+                }
+            }
+        }
+    }
+
     /// Breakpoints a process-wrapper write landed inside of were dropped from the patch
     /// table (their int3 is already overwritten): forget them here and disable their users.
     fn take_dropped(&mut self) {
         let dropped = std::mem::take(&mut self.shared.lock().dropped);
         for a in dropped {
             self.sw.remove(&a);
-            self.temps.retain(|t| t.addr != a);
+            self.drop_temps(|t| t.addr == a);
             if let Some(c) = &mut self.cov {
                 c.armed.remove(&a);
             }
@@ -1154,8 +1225,12 @@ impl Engine {
         accessed: Option<Addr>,
         data: Option<DataHit>,
     ) -> Result<()> {
-        if self.quiet {
-            return Ok(());
+        if let Some((t, since)) = self.quiet {
+            // Only while that thread still exists and still has its step to finish.
+            if since.elapsed() < QUIET_MAX && self.threads.get(&t).is_some_and(|th| th.goal != Goal::Idle) {
+                return Ok(());
+            }
+            self.quiet = None;
         }
         let Some(bp) = self.bps.get(&id) else {
             return Ok(());
@@ -1611,8 +1686,12 @@ impl Engine {
     /// breakpoints that resolve now and sets the trigger of a [`BreakOn`] match.
     fn modules_changed(&mut self) {
         let Ok(now) = self.mem.modules() else { return };
+        // Same path and base: the same mapping of that image (hh-core derives the base from
+        // the run of mappings holding its code, so another mapping of the file elsewhere
+        // does not move it).
+        let same = |a: &Module, b: &Module| a.base == b.base && a.path == b.path;
         for m in &now {
-            if !self.modules.iter().any(|o| o.base == m.base) {
+            if !self.modules.iter().any(|o| same(o, m)) {
                 self.emit(Event::ModuleLoaded(m.clone()));
                 if module_matches(&self.break_on.module_loaded, m) {
                     self.trigger.get_or_insert(Trigger::ModuleLoaded(m.clone()));
@@ -1622,7 +1701,7 @@ impl Engine {
         let gone: Vec<Module> = self
             .modules
             .iter()
-            .filter(|o| !now.iter().any(|m| m.base == o.base))
+            .filter(|o| !now.iter().any(|m| same(m, o)))
             .cloned()
             .collect();
         for o in gone {
@@ -1640,20 +1719,31 @@ impl Engine {
     /// writing (the bytes are gone, and something else may be mapped there next), forget
     /// page protections, and disable the breakpoints in it. Pending ones wait for the next
     /// resolve.
+    ///
+    /// The maps are read again first: where the address is still mapped and still holds our
+    /// int3 the original byte goes back, and a page still carrying our protection stays
+    /// known so disabling its watch restores it. Only what is really gone is forgotten.
     fn forget_range(&mut self, start: Addr, end: Addr) {
         let inside = |a: Addr| a >= start && a < end;
+        let regions = self.mem.regions().unwrap_or_default();
+        let region = |a: Addr| regions.iter().find(|r| a >= r.start && a - r.start < r.size);
         let addrs: Vec<Addr> = self.sw.keys().copied().filter(|&a| inside(a)).collect();
         if !addrs.is_empty() {
             let mut p = self.shared.lock();
             for a in &addrs {
-                p.orig.remove(a);
-                p.lifted.remove(a);
+                let lifted = p.lifted.remove(a).is_some();
+                if let Some(b) = p.orig.remove(a)
+                    && !lifted
+                    && region(*a).is_some()
+                {
+                    let _ = restore_byte(&*self.mem, *a, b);
+                }
             }
         }
         for a in &addrs {
             self.sw.remove(a);
         }
-        self.temps.retain(|t| !inside(t.addr));
+        self.drop_temps(|t| inside(t.addr));
         if self.loader.is_some_and(inside) {
             self.loader = None;
         }
@@ -1670,7 +1760,8 @@ impl Engine {
         }
         let pages: Vec<Addr> = self.pages.range(start & !(PAGE - 1)..end).map(|(&a, _)| a).collect();
         for p in pages {
-            if p >= start & !(PAGE - 1) && p + PAGE <= end.next_multiple_of(PAGE) {
+            let ours = self.pages.get(&p).is_some_and(|pg| region(p).is_some_and(|r| r.prot == pg.applied));
+            if !ours && p >= start & !(PAGE - 1) && p.saturating_add(PAGE) <= end.saturating_add(PAGE - 1) & !(PAGE - 1) {
                 self.pages.remove(&p);
             }
         }
@@ -2121,7 +2212,7 @@ impl Engine {
             th.fence = None;
             th.trace = None;
         }
-        self.quiet = false;
+        self.quiet = None;
         for t in std::mem::take(&mut self.temps) {
             self.disarm_sw(t.addr)?;
         }
@@ -2198,7 +2289,7 @@ impl Engine {
         if let Some(b) = p.orig.remove(&addr)
             && !lifted
         {
-            self.mem.write(addr, &[b])?;
+            restore_byte(&*self.mem, addr, b)?;
         }
         Ok(())
     }
@@ -2519,7 +2610,7 @@ impl Engine {
 
     // ---- coverage ("executed instruction set") ---------------------------------------------
 
-    pub(crate) fn cov_start(&mut self, entries: Vec<Addr>) -> Result<usize> {
+    pub(crate) fn cov_start(&mut self, entries: Vec<Addr>, modules: Option<Vec<Module>>) -> Result<crate::CoverageArm> {
         self.note(format!("cmd coverage start ({} entries)", entries.len()));
         self.live()?;
         if entries.len() > MAX_COVERAGE {
@@ -2528,14 +2619,55 @@ impl Engine {
             )));
         }
         let regions = self.mem.regions()?;
-        let exec = |a: Addr| {
-            regions
-                .iter()
-                .any(|r| r.prot.x && a >= r.start && a - r.start < r.size)
+        // Module ranges the caller expects that are still loaded exactly so.
+        let mods: Option<Vec<(Addr, Addr)>> = match &modules {
+            None => None,
+            Some(want) => {
+                let live = self.mem.modules()?;
+                Some(
+                    want.iter()
+                        .filter(|m| live.iter().any(|l| l.path == m.path && l.base == m.base && l.size == m.size))
+                        .map(|m| (m.base, m.base.saturating_add(m.size)))
+                        .collect(),
+                )
+            }
         };
-        let mut entries: Vec<Addr> = entries.into_iter().filter(|&a| exec(a)).collect();
+        let mut entries = entries;
         entries.sort_unstable();
         entries.dedup();
+        // Int3s that stay armed (the previous coverage set is about to go).
+        let old: HashSet<Addr> = self.cov.as_ref().map(|c| c.armed.clone()).unwrap_or_default();
+        let armed: BTreeSet<Addr> = self.sw.keys().copied().filter(|a| !old.contains(a)).collect();
+        // Instruction starts: the code of each executable mapping holding entries, decoded
+        // linearly from the mapping's start. An address the sweep steps over is inside an
+        // instruction (or in data); refusing a real start the sweep missed only loses a hit.
+        let bits = if self.mem.pointer_size() == 4 { 32 } else { 64 };
+        let mut lens: HashMap<Addr, u64> = HashMap::new();
+        for r in regions.iter().filter(|r| r.prot.x) {
+            let r_end = r.start.saturating_add(r.size);
+            let lo = entries.partition_point(|&a| a < r.start);
+            let hi = entries.partition_point(|&a| a < r_end);
+            if lo < hi {
+                let found = linear_starts(&*self.view, bits, r.start, r_end, &entries[lo..hi]);
+                lens.extend(entries[lo..hi].iter().zip(found).filter_map(|(&a, l)| Some((a, l?))));
+            }
+        }
+        // End of the instruction at `a` when we may arm it.
+        let check = |a: Addr| -> Option<Addr> {
+            if let Some(m) = &mods {
+                m.iter().find(|&&(s, e)| a >= s && a < e)?;
+            }
+            let end = a.checked_add(*lens.get(&a)?)?;
+            if armed.range(a + 1..end).next().is_some() {
+                return None;
+            }
+            Some(end)
+        };
+        // Starts found by one linear decode never overlap each other.
+        let (good, rejected): (Vec<Addr>, Vec<Addr>) = entries.iter().partition(|&&a| check(a).is_some());
+        if !rejected.is_empty() {
+            self.note(format!("coverage: {} entries rejected", rejected.len()));
+        }
         self.with_halted(|e| {
             if let Some(old) = e.cov.take() {
                 for a in old.armed {
@@ -2543,14 +2675,14 @@ impl Engine {
                 }
             }
             let mut cov = Cov::default();
-            for a in entries {
+            for a in good {
                 if e.arm_sw(a).is_ok() {
                     cov.armed.insert(a);
                 }
             }
             let n = cov.armed.len();
             e.cov = Some(cov);
-            Ok(n)
+            Ok(crate::CoverageArm { armed: n, rejected })
         })
     }
 
@@ -2774,7 +2906,7 @@ impl Engine {
             th.fence = None;
             return Err(e);
         }
-        self.quiet = opts.skip_breakpoints;
+        self.quiet = opts.skip_breakpoints.then(|| (tid, Instant::now()));
         self.take_break()?;
         self.resume_all()
     }
@@ -2905,9 +3037,11 @@ impl Engine {
             }
         }
         self.alive = false;
+        self.quiet = None;
         let mut p = self.shared.lock();
         for (a, b) in std::mem::take(&mut p.orig) {
-            let _ = self.mem.write(a, &[b]);
+            // Only where our int3 still is (a lifted byte already is the original).
+            let _ = restore_byte(&*self.mem, a, b);
         }
         p.lifted.clear();
         drop(p);

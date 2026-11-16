@@ -52,13 +52,13 @@ impl Fake {
     fn find(&self, addr: Addr) -> Option<&(Region, Vec<u8>)> {
         self.regions
             .iter()
-            .find(|(r, _)| r.start <= addr && addr < r.start + r.size)
+            .find(|(r, _)| r.start <= addr && addr - r.start < r.size)
     }
     fn put_bytes(&mut self, addr: Addr, b: &[u8]) {
         let (r, mem) = self
             .regions
             .iter_mut()
-            .find(|(r, _)| r.start <= addr && addr < r.start + r.size)
+            .find(|(r, _)| r.start <= addr && addr - r.start < r.size)
             .expect("planted address is mapped");
         let o = (addr - r.start) as usize;
         mem[o..o + b.len()].copy_from_slice(b);
@@ -927,11 +927,11 @@ fn external_merge_sort_matches_in_memory_sort() {
     };
     want.sort_by_key(key);
     want.dedup();
-    let in_memory = results::merge_runs(&[&fa, &fb], &tmp("merge-mem"), usize::MAX).unwrap();
+    let in_memory = results::merge_runs(&[&fa, &fb], &tmp("merge-mem"), usize::MAX, &Progress::new()).unwrap();
     assert_eq!(paths(&in_memory), want);
     // Runs of 1 record: 500 run files, merged 64 at a time.
     for run in [1, 3, 64] {
-        let ext = results::merge_runs(&[&fa, &fb], &tmp("merge-ext"), run).unwrap();
+        let ext = results::merge_runs(&[&fa, &fb], &tmp("merge-ext"), run, &Progress::new()).unwrap();
         assert_eq!(paths(&ext), want, "run {run}");
         assert_eq!(ext.header.bases, ["a.exe", "m.dll", "z.so"]);
         assert_eq!(ext.header.max_level, 3);
@@ -1040,4 +1040,103 @@ fn script_job_runs_in_the_background() {
     for n in ["job", "job2"] {
         std::fs::remove_file(tmp(n)).unwrap();
     }
+}
+
+#[test]
+fn sparse_pointer_map_is_refused_without_reserving() {
+    // A header claiming more pointers than the cap, backed by a sparse file of the matching
+    // length: refused up front instead of reserving count × 16 bytes.
+    let img = image();
+    let f = tmp("sparse.pmap");
+    collect(&img.fake, &CollectOptions::default()).save(&f).unwrap();
+    let mut b = std::fs::read(&f).unwrap();
+    let hlen = u32::from_le_bytes(b[8..12].try_into().unwrap()) as u64;
+    let count = map::MAX_ENTRIES + 1;
+    b.truncate(20 + hlen as usize);
+    b[12 + hlen as usize..].copy_from_slice(&count.to_le_bytes());
+    std::fs::write(&f, &b).unwrap();
+    std::fs::OpenOptions::new().write(true).open(&f).unwrap().set_len(20 + hlen + count * 16).unwrap();
+    let e = PointerMap::load(&f).unwrap_err();
+    assert!(e.to_string().contains("limit"), "{e}");
+    // A huge JSON header length is refused too.
+    let mut b = std::fs::read(&f).unwrap();
+    b.truncate(20 + hlen as usize);
+    b[8..12].copy_from_slice(&u32::MAX.to_le_bytes());
+    std::fs::write(&f, &b).unwrap();
+    std::fs::OpenOptions::new().write(true).open(&f).unwrap().set_len(u32::MAX as u64 + 64).unwrap();
+    assert!(PointerMap::load(&f).is_err());
+    std::fs::remove_file(f).unwrap();
+}
+
+#[test]
+fn hostile_regions_do_not_break_collection() {
+    // Overlapping, unsorted and wrapping regions (a hostile remote peer).
+    let mut f = Fake::new(8);
+    f.module("game.exe", 0x400000, 0x1000, true);
+    f.region(0x1000_0000, 0x2000, true, RegionKind::Private, None);
+    f.region(0x1000_1000, 0x2000, true, RegionKind::Private, None);
+    f.region(u64::MAX - 0xfff, 0x2000, true, RegionKind::Private, None);
+    // Ends exactly at the top of the address space.
+    f.region(u64::MAX - 0x2fff, 0x2fff, true, RegionKind::Private, None);
+    f.put(0x400010, 0x1000_1800);
+    let map = collect(&f, &CollectOptions::default());
+    assert_eq!(map.read_ptr(0x400010), Some(0x1000_1800));
+    let n = map.entries.iter().filter(|e| e.addr == 0x400010).count();
+    assert_eq!(n, 1, "overlap duplicated an entry");
+}
+
+#[test]
+fn huge_result_index_and_header_are_refused() {
+    let out = tmp("huge-index");
+    let h = serde_json::to_vec(&header(&["a.exe"], 2)).unwrap();
+    let data_start = 12 + h.len() as u64;
+    // count = 2^35 paths -> 2^23 index entries (64 MiB), all in a sparse file.
+    let count: u64 = 1 << 35;
+    let entries = count / 4096;
+    let index_off = count * 3;
+    let len = data_start + index_off + entries * 8 + 16;
+    let mut b = b"HHPTRS02".to_vec();
+    b.extend_from_slice(&(h.len() as u32).to_le_bytes());
+    b.extend_from_slice(&h);
+    std::fs::write(&out, &b).unwrap();
+    let file = std::fs::OpenOptions::new().write(true).open(&out).unwrap();
+    file.set_len(len).unwrap();
+    use std::io::{Seek, Write};
+    let mut file = file;
+    file.seek(std::io::SeekFrom::Start(len - 16)).unwrap();
+    file.write_all(&count.to_le_bytes()).unwrap();
+    file.write_all(&index_off.to_le_bytes()).unwrap();
+    drop(file);
+    let e = ResultFile::open(&out).unwrap_err();
+    assert!(e.to_string().contains("too many"), "{e}");
+    // A header length beyond the cap.
+    let mut b = b"HHPTRS02".to_vec();
+    b.extend_from_slice(&u32::MAX.to_le_bytes());
+    std::fs::write(&out, &b).unwrap();
+    std::fs::OpenOptions::new().write(true).open(&out).unwrap().set_len(u32::MAX as u64 + 64).unwrap();
+    assert!(ResultFile::open(&out).is_err());
+    std::fs::remove_file(out).unwrap();
+}
+
+#[test]
+fn cancelled_sort_errors_and_leaves_nothing() {
+    let paths: Vec<(u32, i64, Vec<i64>)> = (0..500i64).map(|i| (0, (i * 7919) % 101, vec![i % 3])).collect();
+    let fa = write_v2(&tmp("cancel-in"), &header(&["a.exe"], 2), &paths);
+    let p = Progress::new();
+    p.cancel();
+    for run in [usize::MAX, 7] {
+        let out = tmp("cancel-out");
+        assert!(results::merge_runs(&[&fa], &out, run, &p).is_err());
+        assert!(!out.exists(), "output left behind");
+    }
+    assert!(fa.sorted_ex(&tmp("cancel-out"), &p).is_err());
+    let left = std::fs::read_dir(std::env::temp_dir()).unwrap().flatten().filter(|e| e.file_name().to_string_lossy().contains("cancel-out.run")).count();
+    assert_eq!(left, 0, "run files left behind");
+    // The same progress object, not cancelled, reports the work done.
+    let p = Progress::new();
+    let s = fa.sorted_ex(&tmp("cancel-out"), &p).unwrap();
+    assert_eq!(p.snapshot().total, 500);
+    assert!(!s.is_empty());
+    std::fs::remove_file(tmp("cancel-in")).unwrap();
+    std::fs::remove_file(tmp("cancel-out")).unwrap();
 }

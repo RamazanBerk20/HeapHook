@@ -2625,9 +2625,9 @@ fn aa_custom_commands_symbol_lookup_and_luacall() {
         .unwrap();
     assert_eq!(resolve_address_with(&p, &syms, "magic+4", &*lookup).unwrap(), 0x2000_0024);
     assert!(resolve_address(&p, &syms, "magic").is_err());
-    // luacall without any Lua is an error when running, nothing when checking.
+    // luacall without any Lua is an error, when checking too (the capability is missing).
     let s = "[ENABLE]\nluacall(x())\n[DISABLE]\n";
-    assert_eq!(check_msg(&p, s, &mut AaHooks::default()), "");
+    assert!(check_msg(&p, s, &mut AaHooks::default()).contains(NOT_AVAILABLE));
     let e = aa_execute(&p, &mut syms, s, true, None, &mut AaHooks::default()).unwrap_err();
     assert!(e.to_string().contains("luacall"), "{e}");
     // ... and falls back to the {$lua} hook, its output ignored.
@@ -2648,7 +2648,7 @@ fn aa_loadbinary_and_fullaccess_errors() {
     let p = game64();
     let h = &mut AaHooks::default();
     let s = "[ENABLE]\nalloc(m,10)\nloadbinary(m,x.bin)\n[DISABLE]\n";
-    assert!(check_msg(&p, s, h).contains("file access is not enabled"));
+    assert!(check_msg(&p, s, h).contains(NOT_AVAILABLE));
     let mut syms = SymbolTable::default();
     let mut hooks = AaHooks {
         read_file: Some(Box::new(|_| Err(Error::Other("denied by consent".into())))),
@@ -2980,4 +2980,69 @@ fn remote_targets_read_symbols_from_memory() {
     assert!(resolve_address(&p, &syms, "malloc").is_err());
     set_module_files_local(31337, true);
     assert_eq!(resolve_address(&p, &syms, "malloc").unwrap(), base + 0x1100);
+}
+
+/// Hooks without capabilities: every route to Lua or to local files is an error carrying
+/// `NOT_AVAILABLE`, when checking and when running, whatever the spelling hh-asm accepts.
+#[test]
+fn aa_without_capabilities_runs_nothing() {
+    let p = game64();
+    let mut syms = SymbolTable::default();
+    let scripts = [
+        "[ENABLE]\n{$lua}\nreturn ''\n{$asm}\n[DISABLE]\n",
+        "[ENABLE]\n  {$LUA}  \nreturn ''\n{$asm}\n[DISABLE]\n",
+        "[ENABLE]\nluacall(x())\n[DISABLE]\n",
+        "[ENABLE]\nLUACALL (x())\n[DISABLE]\n",
+        "[ENABLE]\nalloc(m,10)\nloadbinary(m,/etc/hostname)\n[DISABLE]\n",
+        "[ENABLE]\nalloc(m,10)\nload{}binary(m,/etc/hostname)\n[DISABLE]\n",
+        "[ENABLE]\nalloc(m,10)\nload/* x */binary(m,/etc/hostname)\n[DISABLE]\n",
+        "[ENABLE]\nalloc(m,10)\nLoadBinary  (m,/etc/hostname)\n[DISABLE]\n",
+        "[ENABLE]\nalloc(m,10)\ndefine(lb,loadbinary)\nlb(m,/etc/hostname)\n[DISABLE]\n",
+        "[ENABLE]\ninclude(x.cea)\n[DISABLE]\n",
+    ];
+    for s in scripts {
+        let m = check_msg(&p, s, &mut AaHooks::default());
+        assert!(m.contains(NOT_AVAILABLE), "check of {s:?}: {m}");
+        let e = aa_execute(&p, &mut syms, s, true, None, &mut AaHooks::default()).unwrap_err();
+        assert!(e.to_string().contains(NOT_AVAILABLE), "run of {s:?}: {e}");
+    }
+}
+
+/// `loadbinary` stops at the file that crosses the total, before reading the rest.
+#[test]
+fn aa_loadbinary_total_is_capped_while_reading() {
+    let p = game64();
+    let mut syms = SymbolTable::default();
+    let reads = std::sync::Arc::new(Mutex::new(0usize));
+    let r = reads.clone();
+    let mut hooks = AaHooks {
+        read_file: Some(Box::new(move |_| {
+            *r.lock().unwrap() += 1;
+            Ok(vec![0; MAX_ASSEMBLED_BYTES / 2 + 1])
+        })),
+        ..Default::default()
+    };
+    let mut s = String::from("[ENABLE]\nalloc(m,10)\n");
+    for _ in 0..10 {
+        s.push_str("loadbinary(m,x.bin)\n");
+    }
+    s.push_str("[DISABLE]\n");
+    let e = aa_execute(&p, &mut syms, &s, true, None, &mut hooks).unwrap_err();
+    assert!(e.to_string().contains("in all"), "{e}");
+    assert_eq!(*reads.lock().unwrap(), 2, "read past the limit");
+}
+
+/// A module name the target (or a remote server) controls never lands in the script text
+/// unless it is a plain name.
+#[test]
+fn aa_template_never_embeds_hostile_module_names() {
+    for name in ["a\"\n{$lua}\nluacall(os.exit())\n", "x{", "a//b", "a,b", "a b", "a)"] {
+        let mut p = game64();
+        p.mods.iter_mut().for_each(|m| m.name = name.into());
+        for kind in [Template::CodeInjection, Template::AobInjection, Template::FullInjection, Template::ApiHook] {
+            let s = injection_template(&p, GAME64 + 0x1005, kind).unwrap();
+            assert!(!s.contains(name), "{kind:?} embedded {name:?}:\n{s}");
+            assert!(!s.to_ascii_lowercase().contains("{$lua}") && !s.contains("luacall"), "{s}");
+        }
+    }
 }

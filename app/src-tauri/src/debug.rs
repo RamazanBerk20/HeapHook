@@ -881,22 +881,30 @@ impl App {
         };
         let d = Debugger::launch(&o).map_err(s)?;
         let pid = d.pid();
-        lock(&self.x.launched).push(pid);
         let name = std::path::Path::new(program).file_name().map_or_else(|| program.to_string(), |n| n.to_string_lossy().into_owned());
-        let opened = hh_core::open(pid).map_err(s).and_then(|raw| self.install_process(raw, pid, name, None));
-        let info = match opened {
-            Ok(i) => i,
+        let opened = hh_core::open(pid)
+            .map_err(s)
+            .and_then(|raw| self.install_process(raw, pid, name, None))
+            .and_then(|info| Ok((info, self.session()?)));
+        let (info, sess) = match opened {
+            Ok(x) => x,
             Err(e) => {
-                // Nothing half-started stays behind.
+                // Nothing half-started stays behind (and no pid is left to reap: a reused
+                // one would be another process's).
                 drop(d);
                 kill_pid(pid);
                 return Err(e);
             }
         };
-        let sess = self.session()?;
         sess.switch.set(d.process());
         apply_signals(&d, &lock(&self.x.settings).signals);
-        *lock(&sess.dbg) = Some(Dbg::new(d));
+        // Only once the session's debugger owns it may `reap_children` know the pid: it waits
+        // on launched pids that are not the traced target, and a wait on a tracee steals the
+        // debugger's ptrace stops. Same lock order as `reap_children` (dbg, then launched).
+        let mut dbg = lock(&sess.dbg);
+        *dbg = Some(Dbg::new(d));
+        lock(&self.x.launched).push(pid);
+        drop(dbg);
         Ok(info)
     }
 
@@ -932,9 +940,10 @@ impl App {
         Ok(())
     }
 
-    /// Code filter: arms coverage on `entries` (function entries from a dissection only).
-    pub(crate) fn coverage_start(&self, entries: Vec<Addr>) -> R<usize> {
-        self.with_dbg(|d, _| d.d.coverage_start(entries).map_err(s))
+    /// Code filter: arms coverage on `entries` (function entries from a validated
+    /// dissection only) inside `modules` (where the dissection says they are loaded).
+    pub(crate) fn coverage_start(&self, entries: Vec<Addr>, modules: Vec<hh_core::Module>) -> R<hh_debug::CoverageArm> {
+        self.with_dbg(|d, _| d.d.coverage_start_checked(entries, modules).map_err(s))
     }
 
     pub(crate) fn coverage_stop(&self) -> R<Vec<Addr>> {

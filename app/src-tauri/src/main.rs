@@ -99,8 +99,8 @@ commands! {
     run set_frozen(entries: Vec<FrozenEntryEx>) -> () = |a| a.set_frozen(&entries);
     run disassemble(addr: String, count: usize, opts: Option<heaphook::commands::DisasmOpts>) -> Vec<DisasmOut> = |a| a.disassemble_ex(&addr, count, &opts.unwrap_or_default());
     run assemble(addr: String, text: String) -> String = |a| a.assemble(&addr, &text);
-    run aa_check(script: String) -> Option<AaError> = |a| a.aa_check(&script);
-    run aa_execute(script: String, enable: bool, state: Option<AaState>) -> AaState = |a| a.aa_execute(&script, enable, state.as_ref());
+    run aa_check(script: String, session: Option<u64>, entry: Option<i64>) -> Option<AaError> = |a| a.aa_check(&script, session, entry);
+    run aa_execute(script: String, enable: bool, state: Option<AaState>, session: Option<u64>) -> AaState = |a| a.aa_execute(&script, enable, state.as_ref(), session);
     run table_load(path: String) -> Table = |a| a.table_load(&path);
     run table_save(path: String, table: TableIn) -> () = |a| a.table_save(&path, table);
     now table_get() -> TableState = |a| a.table_get();
@@ -235,8 +235,12 @@ commands! {
     run table_trust_entries(ids: Vec<i64>) -> () = |a| a.table_trust_entries(&ids);
     run table_dirty() -> bool = |a| a.table_dirty();
     run table_open_data(name: String, data: String, force: Option<bool>) -> TableState = |a| a.table_open_data(&name, &data, force.unwrap_or(false));
-    run aa_load_file(path: String) -> String = |a| a.aa_load_file(&path);
-    run aa_trust(script: String) -> () = |a| a.aa_trust(&script);
+    run aa_load_file(path: String, session: u64) -> String = |a| a.aa_load_file(&path, session);
+    run aa_trust(session: u64) -> () = |a| a.aa_trust(session);
+    now aa_session() -> u64 = |a| a.aa_session();
+    run aa_assign(session: u64, script: String, description: String, after: Option<i64>, base: Option<u64>) -> heaphook::cheat::PasteOut = |a| a.aa_assign(session, &script, &description, after, base);
+    run table_add_template(addr: String, kind: String, description: String, after: Option<i64>, base: Option<u64>) -> heaphook::cheat::PasteOut = |a| a.table_add_template(&addr, &kind, &description, after, base);
+    run table_resolve(ids: Vec<i64>) -> Vec<Option<String>> = |a| a.table_resolve(&ids);
     now app_args() -> Option<heaphook::cli::StartArgs> = |a| a.app_args();
     // 1.0 release candidate: engine features of the last wave.
     run scan_sort(key: hh_scan::SortKey, desc: bool) -> () = |a| a.scan_sort(key, desc);

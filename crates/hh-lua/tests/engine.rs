@@ -390,9 +390,9 @@ fn check_only_hooks_do_not_run_lua() {
     let (e, p, _) = engine();
     let syms = e.symbols().lock().unwrap().clone();
     let script = "[ENABLE]\n{$lua}\nran = true\n{$asm}\n[DISABLE]\n";
-    assert_eq!(hh_asm::aa_check(&*p, &syms, script, &mut e.aa_hooks_check_only()), None);
+    assert_eq!(hh_asm::aa_check(&*p, &syms, script, &mut e.aa_hooks_check_only_with(hh_lua::Caps::Full)), None);
     assert_eq!(run(&e, "return ran"), ["nil"]);
     // the executing hooks still run it
-    assert_eq!(hh_asm::aa_check(&*p, &syms, script, &mut e.aa_hooks(None, true)), None);
+    assert_eq!(hh_asm::aa_check(&*p, &syms, script, &mut e.aa_hooks_with(None, true, hh_lua::Caps::Full)), None);
     assert_eq!(run(&e, "return ran"), ["true"]);
 }

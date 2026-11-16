@@ -490,9 +490,9 @@ export async function headerDialog(mod) {
 // ---------- AOB signature / injection script ----------
 const INJECT = { aob: 'AOB injection', code: 'Code injection', full: 'Full injection' };
 /** Auto Assembler template at addr (kind aob | code | full) as a new table script entry. */
-export async function injectScript(addr, kind = 'aob') {
-  const script = await attempt(() => api.aaTemplate(addr, kind));
-  if (script) emit('table:script', { description: `${INJECT[kind]} at ${fmtAddr(addr)}`, script });
+export function injectScript(addr, kind = 'aob') {
+  // The backend makes and inserts it: a template that embeds a remote target's names keeps that origin.
+  emit('table:template', { addr, kind, description: `${INJECT[kind]} at ${fmtAddr(addr)}` });
 }
 export const aobScript = (addr) => injectScript(addr, 'aob');
 

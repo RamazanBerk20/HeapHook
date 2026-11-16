@@ -111,6 +111,9 @@ pub struct Scanner {
     prog: Progress,
     mem_limit: AtomicU64,
     spill_dir: Mutex<Option<std::path::PathBuf>>,
+    /// The process runs on this machine (its `/proc` entry is its own); see
+    /// [`Scanner::set_local`].
+    local: AtomicBool,
 }
 
 struct Running<'a>(&'a Progress);
@@ -140,8 +143,8 @@ fn already_stopped(p: &dyn Process) -> bool {
     false
 }
 
-fn suspend(p: &dyn Process, on: bool) -> Result<Option<Suspended<'_>>> {
-    if !on || already_stopped(p) {
+fn suspend(p: &dyn Process, on: bool, local: bool) -> Result<Option<Suspended<'_>>> {
+    if !on || (local && already_stopped(p)) {
         return Ok(None);
     }
     match p.suspend() {
@@ -277,7 +280,15 @@ impl Scanner {
             prog: Progress::default(),
             mem_limit: AtomicU64::new(DEFAULT_MEM_LIMIT),
             spill_dir: Mutex::new(None),
+            local: AtomicBool::new(true),
         }
+    }
+
+    /// Whether the process runs on this machine (default true). Set false for a remote
+    /// target: its pid means nothing here, so "pause while scanning" cannot see that it is
+    /// already stopped and always suspends / resumes it.
+    pub fn set_local(&self, local: bool) {
+        self.local.store(local, Relaxed);
     }
 
     /// RAM a result set may use before chunks spill to a temp file.
@@ -473,7 +484,7 @@ impl Scanner {
     fn run_first(&self, kind: Kind, plan: Plan) -> Result<ScanCount> {
         let (_busy, run) = self.start(0);
         let generation = self.lock().generation;
-        let _s = suspend(&*self.proc, kind.opts.pause_while_scanning)?;
+        let _s = suspend(&*self.proc, kind.opts.pause_while_scanning, self.local.load(Relaxed))?;
         let units = self.units(&kind)?;
         self.prog.total.store(units.iter().map(|u| u.end - u.start).sum(), Relaxed);
         let spill = self.spill();
@@ -522,7 +533,7 @@ impl Scanner {
         };
         let keep = plan.keeps_prev && matches!(src, Src::Prev);
         self.prog.total.store(cur.count, Relaxed);
-        let _s = suspend(&*self.proc, kind.opts.pause_while_scanning)?;
+        let _s = suspend(&*self.proc, kind.opts.pause_while_scanning, self.local.load(Relaxed))?;
         let spill = self.spill();
         let groups = read_groups(&cur.chunks);
         let chunks: Vec<Vec<Chunk>> = Self::par(kind.opts.threads, || {
@@ -558,8 +569,14 @@ impl Scanner {
         let mut regs = self.proc.regions()?;
         regs.sort_by_key(|r| r.start);
         let mut out = Vec::new();
+        // Units must be sorted and disjoint (next scans compute offsets from a group's first
+        // entry): a remote peer's overlapping regions are clipped, wrapping ones dropped.
+        let mut covered = 0u64;
         for r in regs {
             let cow = r.cow;
+            if r.size == 0 || r.start.checked_add(r.size).is_none() {
+                continue;
+            }
             if !r.prot.r
                 || !o.writable.ok(r.prot.w)
                 || !o.executable.ok(r.prot.x)
@@ -571,7 +588,11 @@ impl Scanner {
                 continue;
             }
             let rend = r.start.saturating_add(r.size);
-            let (lo, hi) = (r.start.max(o.start.unwrap_or(0)), rend.min(o.stop.unwrap_or(u64::MAX)));
+            let (lo, hi) = (r.start.max(o.start.unwrap_or(0)).max(covered), rend.min(o.stop.unwrap_or(u64::MAX)));
+            if lo >= hi {
+                continue;
+            }
+            covered = hi;
             let mut parts = clip(lo, hi, inc.as_deref(), &exc);
             if let Some(rg) = &ranges {
                 parts = parts.into_iter().flat_map(|(s, e)| clip(s, e, Some(rg), &[])).collect();

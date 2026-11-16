@@ -1059,3 +1059,121 @@ fn thread_info_and_register_writes() {
     d.detach().unwrap();
     assert_released(&mut t, &[(getfp, 0xc5)]);
 }
+
+// ---- third audit ---------------------------------------------------------------------------
+
+/// D2: the target maps one of its libraries a second time (read-only, elsewhere), then a
+/// dlopen / dlclose makes the debugger re-read the modules. The library's breakpoint must
+/// stay armed and working, and nothing of ours may be left behind.
+#[test]
+fn second_mapping_of_a_library_keeps_its_breakpoint() {
+    let lib = test_lib();
+    let mut t = Target::spawn();
+    let pid = t.pid;
+    let d = Debugger::attach(pid).unwrap();
+    assert_eq!(t.cmd(&format!("dlopen {}", lib.display())), "ok 100 200");
+    let id = d
+        .add_pending_breakpoint(
+            "libhhtest.hh_lib_add",
+            Breakpoint::execute(0),
+            Hooks::default(),
+            BpOptions::default(),
+            BpExtra::default(),
+        )
+        .unwrap();
+    let a = info(&d, id).bp.address;
+    assert!(info(&d, id).resolved && raw_byte(pid, a) == 0xcc);
+    let orig = masked_byte(&d, a);
+    let base = |d: &Debugger| d.process().modules().unwrap().into_iter().find(|m| m.name == "libhhtest.so").map(|m| m.base);
+    let before = base(&d);
+    assert!(t.cmd(&format!("mapfile {}", lib.display())).starts_with("mapped"));
+    assert_eq!(t.cmd("dlopen libm.so.6"), "ok 100 200");
+    assert_eq!(t.cmd("dlclose"), "ok");
+    assert_eq!(base(&d), before, "the second mapping moved the module");
+    // dlopen again only to get the handle back for `libcall`.
+    assert_eq!(t.cmd(&format!("dlopen {}", lib.display())), "ok 100 200");
+    for n in [41, 7] {
+        t.send(&format!("libcall {n}"));
+        let (_, r, c) = wait_break(&d);
+        assert_eq!((r, c.rip), (BreakReason::Breakpoint(id), a));
+        d.cont(false).unwrap();
+        assert_eq!(t.recv(), format!("lib {}", n + 1));
+    }
+    assert!(info(&d, id).enabled);
+    assert_no_stuck(&d, pid);
+    d.detach().unwrap();
+    assert_released(&mut t, &[(a, orig)]);
+    assert_eq!(t.cmd("libcall 1"), "lib 2");
+}
+
+/// D3: a "skip breakpoints" step over a call whose temporary breakpoint disappears (here a
+/// write over it) can never finish; the other breakpoints must not stay silenced.
+#[test]
+fn skip_breakpoints_ends_when_its_step_cannot_finish() {
+    let mut t = Target::spawn();
+    let pid = t.pid;
+    let d = Debugger::attach(pid).unwrap();
+    let (call, store) = (t.addr("call"), t.addr("store"));
+    let bc = d.add_breakpoint(Breakpoint::execute(call), Hooks::default()).unwrap();
+    let bs = d.add_breakpoint(Breakpoint::execute(store), Hooks::default()).unwrap();
+    t.send("callsleep 300");
+    let (tid, _, _) = wait_break(&d);
+    let skip = StepOptions {
+        skip_breakpoints: true,
+        ..StepOptions::default()
+    };
+    d.step_with(tid, StepKind::Over, skip).unwrap();
+    // The thread sleeps inside the call: a write over the step's int3 after it (strictly
+    // inside the written range) drops it.
+    let same = [masked_byte(&d, call + 1), masked_byte(&d, call + 2)];
+    d.process().write(call + 1, &same).unwrap();
+    assert_eq!(t.recv(), "ok");
+    t.send("store");
+    let (_, r, _) = wait_break(&d);
+    assert_eq!(r, BreakReason::Breakpoint(bs));
+    d.cont(false).unwrap();
+    assert_eq!(t.recv(), "ok 101 200");
+    d.remove_breakpoint(bc).unwrap();
+    d.remove_breakpoint(bs).unwrap();
+    assert_no_stuck(&d, pid);
+    d.detach().unwrap();
+    assert_released(&mut t, &[(call, 0xff), (store, 0x48)]);
+}
+
+/// D1: coverage addresses taken from a stale or hostile dissection arm nothing.
+#[test]
+fn coverage_refuses_what_is_not_an_instruction_start() {
+    let mut t = Target::spawn();
+    let pid = t.pid;
+    let d = Debugger::attach(pid).unwrap();
+    let (store, load) = (t.addr("store"), t.addr("load"));
+    let exe = d
+        .process()
+        .modules()
+        .unwrap()
+        .into_iter()
+        .find(|m| store >= m.base && store < m.base + m.size)
+        .unwrap();
+    // An entry inside another entry's instruction: only the real start is armed.
+    let c = d.coverage_start_checked(vec![store + 1, store], vec![exe.clone()]).unwrap();
+    assert_eq!((c.armed, c.rejected), (1, vec![store + 1]));
+    d.coverage_stop().unwrap();
+    // One byte into `mov [rdi], rsi` decodes as `mov [rdi], esi`: still not a start.
+    let c = d.coverage_start_checked(vec![store + 1, load + 2], vec![exe.clone()]).unwrap();
+    assert_eq!(c.armed, 0);
+    // A dissection of an earlier run (module elsewhere): nothing armed.
+    let mut moved = exe.clone();
+    moved.base += 0x1000;
+    let c = d.coverage_start_checked(vec![store + 0x1000, load + 0x1000], vec![moved]).unwrap();
+    assert_eq!(c.armed, 0);
+    // Not code at all.
+    assert_eq!(d.coverage_start(vec![t.addr("value")]).unwrap(), 0);
+    assert_ne!(raw_byte(pid, store), 0xcc);
+    let c = d.coverage_start_checked(vec![store, load], vec![exe]).unwrap();
+    assert_eq!((c.armed, c.rejected.len()), (2, 0));
+    assert_eq!(t.cmd("store"), "ok 101 200");
+    assert_eq!(d.coverage_stop().unwrap(), [store, load]);
+    assert_no_stuck(&d, pid);
+    d.detach().unwrap();
+    assert_released(&mut t, &[(store, 0x48), (load, 0x48)]);
+}

@@ -372,8 +372,9 @@ impl App {
 
     /// The settings the backend enforces itself; the UI applies the rest.
     fn apply_settings(&self, s: &Settings) {
-        if s.table_script == "never" {
-            self.x.live.revoke_agreed();
+        // "Never" withdraws every consent given, and stops what it started.
+        if self.x.live.set_never(s.table_script == "never") {
+            self.stop_table_lua();
         }
         self.x.lua.engine.set_budget((s.lua_budget_ms > 0).then(|| Duration::from_millis(s.lua_budget_ms)));
         {
@@ -412,6 +413,8 @@ impl App {
         let syms = self.x.lua.engine.symbols();
         *lock(&syms) = SymbolTable::default();
         let scanner = Arc::new(Scanner::new(proc.clone()));
+        // A remote target's pid names a process on the other machine, never a local /proc.
+        scanner.set_local(info.remote.is_none());
         scanner.set_spill_dir(spill_dir(&lock(&self.x.settings)));
         let sess = Session {
             paused: Default::default(),
@@ -572,10 +575,15 @@ impl App {
     }
 
     pub fn resolve_address(&self, expr: &str) -> R<String> {
+        self.resolve_with(expr, self.lua_hooks_ok())
+    }
+
+    /// [`App::resolve_address`]; `lookups`: ask the symbol lookup callbacks Lua registered.
+    pub(crate) fn resolve_with(&self, expr: &str, lookups: bool) -> R<String> {
         let sess = self.session()?;
         self.sync_user_symbols(&sess);
         let syms = lock(&sess.syms).clone();
-        let extra = if self.lua_hooks_ok() { self.x.lua.engine.symbol_lookup() } else { None };
+        let extra = if lookups { self.x.lua.engine.symbol_lookup() } else { None };
         let r = match &extra {
             Some(f) => hh_asm::resolve_address_with(&*sess.proc, &syms, expr, &|n: &str| f(n)),
             None => hh_asm::resolve_address(&*sess.proc, &syms, expr),
@@ -768,25 +776,41 @@ impl App {
         Ok(hex_bytes(&b, "").to_lowercase())
     }
 
-    /// Never runs code: the editor checks on every keystroke and the script may come from an
-    /// untrusted table, so `{$lua}` blocks count as producing no text here.
-    pub fn aa_check(&self, script: &str) -> R<Option<AaError>> {
+    /// Never runs code (the editor checks on every keystroke). The script has the
+    /// capabilities of where it is being edited: table entry `entry`, Auto Assemble session
+    /// `session`, else none. With them `{$lua}` blocks count as producing no text; without
+    /// them each directive that needs one is an error naming `hh_asm::NOT_AVAILABLE`.
+    pub fn aa_check(&self, script: &str, session: Option<u64>, entry: Option<i64>) -> R<Option<AaError>> {
         let sess = self.session()?;
         let syms = lock(&sess.syms).clone();
-        Ok(hh_asm::aa_check(&*sess.proc, &syms, script, &mut self.x.lua.engine.aa_hooks_check_only()))
+        let caps = match entry {
+            Some(id) => self.x.live.caps(id),
+            None => self.x.live.aa_caps(session),
+        };
+        let r = hh_asm::aa_check(&*sess.proc, &syms, script, &mut self.x.lua.engine.aa_hooks_check_only_with(caps));
+        Ok(r.map(|mut e| {
+            if caps == hh_lua::Caps::None && !e.message.contains(hh_asm::NOT_AVAILABLE) && self.x.lua.engine.has_symbol_lookup() {
+                e.message.push_str(" (needs your consent: the symbol lookup callbacks Lua registered are not asked for this script)");
+            }
+            e
+        }))
     }
 
-    /// Symbols the script registers stay registered for later expressions. `{$lua}` blocks
-    /// run in the app's engine (so they cannot hold the symbol lock: work on a copy, merge).
-    pub fn aa_execute(&self, script: &str, enable: bool, state: Option<&AaState>) -> R<AaState> {
-        // Same gate as table entries: `{$lua}` and `loadbinary` from an untrusted source (a
-        // loaded table not agreed to, a pasted entry, a script file) ask first; what the user
-        // typed runs.
-        let reads = crate::cheat::script_reads_files(script);
-        if (crate::cheat::script_runs_lua(script) || reads) && self.x.live.is_tainted(script) {
-            return Err(self.consent_error("this script"));
-        }
+    /// A new Auto Assemble window session: its text is the user's own until a file is loaded
+    /// into it (`aa_load_file`).
+    pub fn aa_session(&self) -> R<u64> {
+        Ok(self.x.live.aa_new())
+    }
+
+    /// Runs the Auto Assemble window's script. It gets Lua and file access only as session
+    /// `session`'s own typed text or after consent to what was loaded into it (`aa_trust`);
+    /// without a session nothing proves the user typed it, so it gets neither. A script
+    /// refused for want of them answers with the consent question. Symbols the script
+    /// registers stay registered for later expressions. `{$lua}` blocks run in the app's
+    /// engine (so they cannot hold the symbol lock: work on a copy, merge).
+    pub fn aa_execute(&self, script: &str, enable: bool, state: Option<&AaState>, session: Option<u64>) -> R<AaState> {
         let sess = self.session()?;
+        let caps = self.x.live.aa_caps(session);
         let (unique, files) = {
             let st = lock(&self.x.settings);
             let u = match st.aob_unique.as_str() {
@@ -796,20 +820,19 @@ impl App {
             };
             (u, st.lua_allow_os && self.x.lua.engine.allow_os())
         };
-        if reads && !files {
-            return Err("loadbinary reads a file, and Settings do not allow Lua and scripts to access files".into());
-        }
         let before = lock(&sess.syms).clone();
         let mut work = before.clone();
         let r = {
             let _g = self.x.lua.enter();
-            let mut hooks = self.x.lua.engine.aa_hooks(None, false);
+            let mut hooks = self.x.lua.engine.aa_hooks_with(None, false, caps);
             hooks.aob_unique = unique;
-            // Only for a trusted script (checked above) with file access allowed.
-            if reads && files {
-                hooks.read_file = Some(Box::new(|p: String| {
-                    crate::table::read_capped(Path::new(p.trim()), hh_asm::MAX_ASSEMBLED_BYTES as u64).map_err(hh_core::Error::Other)
-                }));
+            // With capabilities: file reads as Settings allow them.
+            if caps == hh_lua::Caps::Full {
+                hooks.read_file = Some(if files {
+                    Box::new(|p: String| crate::table::read_capped(Path::new(p.trim()), hh_asm::MAX_ASSEMBLED_BYTES as u64).map_err(hh_core::Error::Other))
+                } else {
+                    Box::new(|_: String| Err(hh_core::Error::Other("loadbinary reads a file, and Settings do not allow Lua and scripts to access files".into())))
+                });
             }
             hh_asm::aa_execute(&*sess.proc, &mut work, script, enable, state, &mut hooks)
         };
@@ -822,26 +845,43 @@ impl App {
         for (n, _) in before.iter().filter(|(n, _)| work.get(n).is_none()) {
             cur.unregister(n);
         }
-        r.map_err(s)
+        drop(cur);
+        r.map_err(|e| {
+            let e = e.to_string();
+            if caps == hh_lua::Caps::None && (e.contains(hh_asm::NOT_AVAILABLE) || self.x.lua.engine.has_symbol_lookup()) {
+                let why = if lock(&self.x.settings).table_script == "never" {
+                    "this script: not run: it was loaded from a file, needs Lua or file access, and Settings say never to run a table's Lua".to_string()
+                } else {
+                    format!("{} this script: it was loaded from a file and needs Lua or file access, which can use your files and the process", crate::cheat::NEEDS_CONSENT)
+                };
+                format!("{why}\n{e}")
+            } else {
+                e
+            }
+        })
     }
 
-    /// An Auto Assembler script file for the Auto Assemble window: its Lua asks before it runs.
-    pub fn aa_load_file(&self, path: &str) -> R<String> {
+    /// An Auto Assembler script file loaded into session `session`: the session's content is
+    /// untrusted from now on (whatever is typed into it later) until `aa_trust`.
+    pub fn aa_load_file(&self, path: &str, session: u64) -> R<String> {
+        self.x.live.aa_loaded(session)?;
         let b = table::read_capped(Path::new(path), table::MAX_FILE)?;
-        let t = String::from_utf8(b).map_err(|e| format!("{path}: {e}"))?;
-        if crate::cheat::script_runs_lua(&t) || crate::cheat::script_reads_files(&t) {
-            self.x.live.taint_script(&t);
-        }
-        Ok(t)
+        String::from_utf8(b).map_err(|e| format!("{path}: {e}"))
     }
 
-    /// The user's yes for the `{$lua}` of this exact script (refused while Settings say never).
-    pub fn aa_trust(&self, script: &str) -> R<()> {
-        if lock(&self.x.settings).table_script == "never" {
-            return Err("Settings say never to run a table's Lua: change \"Lua script in a loaded table\" first".into());
-        }
-        self.x.live.untaint_script(script);
-        Ok(())
+    /// The user's yes for what was loaded into session `session` (refused while Settings say
+    /// never; "never" withdraws it again).
+    pub fn aa_trust(&self, session: u64) -> R<()> {
+        self.x.live.grant(crate::cheat::Grant::AaSession(session))
+    }
+
+    /// "Assign to table": the session's script as a new entry after `after`, keeping the
+    /// session's origin (a loaded file stays untrusted, agreed or not as the session is).
+    pub fn aa_assign(&self, session: u64, script: &str, description: &str, after: Option<i64>, base: Option<u64>) -> R<crate::cheat::PasteOut> {
+        let (origin, agreed) = self.x.live.aa_origin(session)?;
+        let e = table::Entry { description: description.into(), script: Some(script.into()), ..table::Entry::default() };
+        let (version, ids) = self.x.live.insert(vec![e], after, base, origin, agreed)?;
+        Ok(crate::cheat::PasteOut { version, ids })
     }
 
     /// Registers the table's user-defined symbols (CE `UserdefinedSymbols`) in the session's

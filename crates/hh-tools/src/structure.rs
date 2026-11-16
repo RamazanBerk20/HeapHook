@@ -1582,7 +1582,7 @@ pub fn to_c(structs: &[Structure], ptr_size: usize) -> String {
                 if bit < storage {
                     x += &format!("    {} : {};\n", int(e), storage - bit);
                 }
-                cur += (storage / 8) as u64;
+                cur = cur.saturating_add((storage / 8) as u64);
                 continue;
             }
             let item = d.item_size(e, ptr_size, 0);
@@ -1669,19 +1669,20 @@ pub fn to_csharp(structs: &[Structure], ptr_size: usize) -> String {
             let n = e.count.max(1);
             let child = e.child.as_deref().and_then(|c| names.get(c));
             match e.vtype {
-                ElemType::String if e.utf16 => x += &format!("{at} fixed char {name}[{}];\n", (item / 2).max(1) * n),
-                ElemType::String | ElemType::Aob => x += &format!("{at} fixed byte {name}[{}];\n", item.max(1) * n),
+                // Sizes from nested definitions can be huge: saturate, never overflow.
+                ElemType::String if e.utf16 => x += &format!("{at} fixed char {name}[{}];\n", (item / 2).max(1).saturating_mul(n)),
+                ElemType::String | ElemType::Aob => x += &format!("{at} fixed byte {name}[{}];\n", item.max(1).saturating_mul(n)),
                 ElemType::Struct => match child {
                     Some(c) if e.size == 0 => {
                         for k in 0..n.min(64) {
                             let nm = if n > 1 { format!("{name}_{k}") } else { name.clone() };
-                            x += &format!("    [FieldOffset(0x{:X})] public {c} {nm};\n", off + (k * item) as u64);
+                            x += &format!("    [FieldOffset(0x{:X})] public {c} {nm};\n", off.saturating_add(k.saturating_mul(item) as u64));
                         }
                         if n > 64 {
                             x += &format!("    // {name}: {} more items not listed\n", n - 64);
                         }
                     }
-                    _ => x += &format!("{at} fixed byte {name}[{}];\n", item.max(1) * n),
+                    _ => x += &format!("{at} fixed byte {name}[{}];\n", item.max(1).saturating_mul(n)),
                 },
                 ElemType::Pointer if n == 1 => {
                     let note = child.map(|c| format!(" // {c}*")).unwrap_or_default();

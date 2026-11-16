@@ -62,6 +62,10 @@ pub const MAX_IF_DEPTH: usize = 64;
 pub const MAX_CUSTOM_COMMANDS: usize = 1024;
 /// Largest `align` boundary.
 pub const MAX_ALIGN: u64 = 0x10000;
+/// Part of every error for a directive whose hook is missing (`{$lua}`, `luacall`,
+/// `loadbinary`, `include`): the host did not hand this script that capability. Hosts that
+/// withhold capabilities from untrusted scripts look for it to ask the user instead.
+pub const NOT_AVAILABLE: &str = "is not available to this script";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AaError {
@@ -73,7 +77,10 @@ pub struct AaError {
 type Hook<A, O> = Option<Box<dyn FnMut(A) -> Result<O>>>;
 
 /// Seams for things the assembler cannot do itself. An unset hook makes the command that
-/// needs it an error (also in `aa_check`); `aa_check` never calls hooks with side effects.
+/// needs it an error (also in `aa_check`; for `{$lua}`, `luacall`, `loadbinary` and
+/// `include` one containing [`NOT_AVAILABLE`]); `aa_check` never calls hooks with side
+/// effects. The hooks are the script's capabilities: a host that does not trust a script
+/// leaves out everything that runs Lua or reads local files.
 ///
 /// | Script feature | Hook | When it runs |
 /// |---|---|---|
@@ -83,7 +90,7 @@ type Hook<A, O> = Option<Box<dyn FnMut(A) -> Result<O>>>;
 /// | `createthread(addr)` | `create_thread` | after all writes succeeded; an error rolls the enable back |
 /// | `{$try}` ... `{$except}` | `try_except` | after all writes; gets (start of guarded code, handler address) and must install a handler in the target that resumes at the handler on an exception |
 /// | `sharedallocate(name,size)` | `shared_alloc` | in script order; returns the address of named memory shared between processes; registered like `globalalloc` |
-/// | `luacall(code)` | `lua_call`, else `lua` (output ignored) | while preprocessing, in script order; never while checking |
+/// | `luacall(code)` | `lua_call`, else `lua` (output ignored) | while preprocessing, in script order; never while checking, but required |
 /// | `loadbinary(addr,file)` | `read_file` | while assembling; returns the file's bytes (the host applies its consent / file-access rules); not called while checking, but required |
 /// | `name(args)` not built in | `command` | while preprocessing (also while checking, with `true`); `Some(text)` replaces the line, `None` = not a custom command |
 /// | whole script | `prologue` | first, on every section run; returns the script to use |
@@ -494,7 +501,7 @@ fn preprocess(
                         .cloned()
                         .unwrap_or_default();
                     let Some(lua) = cx.hooks.lua.as_mut() else {
-                        return err(ln, "{$lua} blocks need a Lua engine");
+                        return err(ln, format!("{{$lua}}: Lua {NOT_AVAILABLE}"));
                     };
                     let text = lua(src).map_err(at(ln))?;
                     let new = cx.lines_of(&text, ln)?;
@@ -542,16 +549,19 @@ fn preprocess(
             }
             Some((name, _)) if name == "luacall" => {
                 let code = raw_args(&line).to_string();
+                let h = &mut cx.hooks;
+                if h.lua_call.is_none() && h.lua.is_none() {
+                    return err(ln, format!("luacall: Lua {NOT_AVAILABLE}"));
+                }
                 if cx.dry {
                     continue;
                 }
-                let h = &mut cx.hooks;
                 match (h.lua_call.as_mut(), h.lua.as_mut()) {
                     (Some(f), _) => f(code).map_err(at(ln))?,
                     (None, Some(f)) => {
                         f(code).map_err(at(ln))?;
                     }
-                    (None, None) => return err(ln, "luacall needs a Lua engine"),
+                    (None, None) => unreachable!("checked above"),
                 }
             }
             Some((name, args)) if name == "include" => {
@@ -563,7 +573,7 @@ fn preprocess(
                     return err(ln, format!("more than {MAX_INCLUDES} includes"));
                 }
                 let Some(inc) = cx.hooks.include.as_mut() else {
-                    return err(ln, "include needs a file loader");
+                    return err(ln, format!("include: file access {NOT_AVAILABLE}"));
                 };
                 let text = inc(args.join(",")).map_err(at(ln))?;
                 let new = cx.lines_of(&text, ln)?;
@@ -953,6 +963,7 @@ fn run(
     let result = (|| -> R<()> {
         let mut in_struct: Option<(usize, String, u64)> = None;
         let mut readmem_total = 0u64;
+        let mut loaded_total = 0usize;
         for (ln, line) in &lines {
             let ln = *ln;
             let lower = line.to_ascii_lowercase();
@@ -1216,13 +1227,16 @@ fn run(
                     need(2)?;
                     let file = args[1..].join(",").trim().trim_matches('"').to_string();
                     let Some(h) = hooks.read_file.as_mut() else {
-                        return err(ln, "loadbinary: file access is not enabled");
+                        return err(ln, format!("loadbinary: file access {NOT_AVAILABLE}"));
                     };
                     let data = if dry { Vec::new() } else { h(file).map_err(at(ln))? };
-                    if data.len() > MAX_ASSEMBLED_BYTES {
+                    // Running total: stop at the file that crosses the limit, not after all
+                    // of them are in memory.
+                    loaded_total = loaded_total.saturating_add(data.len());
+                    if loaded_total > MAX_ASSEMBLED_BYTES {
                         return err(
                             ln,
-                            format!("loadbinary: file larger than {MAX_ASSEMBLED_BYTES} bytes"),
+                            format!("loadbinary: files larger than {MAX_ASSEMBLED_BYTES} bytes in all"),
                         );
                     }
                     items.push((ln, Item::Load(args[0].clone(), data)));
@@ -1719,7 +1733,15 @@ pub fn injection_template(p: &dyn Process, addr: Addr, kind: Template) -> Result
         code.push_str(&format!("  {t}\n"));
         orig.extend(bytes);
     }
-    let name = module_offset(&mods, addr).unwrap_or_else(|| format!("{addr:X}"));
+    // Module names come from the target (or a remote server): only a plain one goes into the
+    // script text, never one that could close a quote, open a comment or start a line.
+    let name = module_offset(&mods, addr)
+        .filter(|_| {
+            mods.iter()
+                .find(|m| addr >= m.base && addr - m.base < m.size)
+                .is_some_and(|m| plain_name(&m.name))
+        })
+        .unwrap_or_else(|| format!("{addr:X}"));
     let nops = if orig.len() > 5 {
         format!("  nop {:X}\n", orig.len() - 5)
     } else {
@@ -1754,7 +1776,7 @@ pub fn injection_template(p: &dyn Process, addr: Addr, kind: Template) -> Result
                 });
                 pat.push(b[0]);
             }
-            let scan = match m {
+            let scan = match m.filter(|m| plain_name(&m.name)) {
                 Some(m) => format!("aobscanmodule(INJECT,{},{})", m.name, hex(&pat)),
                 None => format!("aobscan(INJECT,{})", hex(&pat)),
             };
@@ -1769,6 +1791,12 @@ pub fn injection_template(p: &dyn Process, addr: Addr, kind: Template) -> Result
             "define(address,{name})\ndefine(bytes,{origb})\n\n[ENABLE]\nassert(address,bytes)\nalloc(newfunction,$1000,address)\nlabel(originalcall)\nlabel(returnhere)\nregistersymbol(originalcall)\n\nnewfunction:\n  // Replacement for the function. Call or jump to originalcall to run the original.\n  jmp originalcall\n\noriginalcall:\n{code}  jmp returnhere\n\naddress:\n  jmp newfunction\n{nops}returnhere:\n\n[DISABLE]\naddress:\n  db bytes\n\nunregistersymbol(originalcall)\ndealloc(newfunction)\n"
         ),
     })
+}
+
+/// A name safe to place into generated script text: letters, digits and `_ . - + @` only (no
+/// quotes, braces, slashes, commas, parentheses, spaces or control characters).
+fn plain_name(n: &str) -> bool {
+    !n.is_empty() && n.len() <= 255 && n.chars().all(|c| c.is_ascii_alphanumeric() || "_.-+@".contains(c))
 }
 
 /// A "replace with code that does nothing" patch.

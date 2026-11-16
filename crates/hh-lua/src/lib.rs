@@ -55,7 +55,7 @@ mod ui;
 
 pub use api::button_result;
 pub use debug::{BpMethod, BpTrigger, BreakEvent, BreakResult, BreakpointSpec, ContinueMode, DebugHost, RegContext};
-pub use table::{MemTable, RecId, Record, RecordHotkey, TableHost};
+pub use table::{Caps, MemTable, RecId, Record, RecordHotkey, TableHost};
 pub use ui::{ChangeLog, Control, ControlId, ControlNode, MAX_CONTROLS, MAX_DEPTH, MAX_PROP_BYTES, MAX_UI_BYTES, Prop, UiChange, UiHost, UiSnapshot, change_size};
 
 /// Cheat Engine functions that exist as names but are not available: calling one raises a
@@ -275,6 +275,12 @@ pub(crate) struct State {
     hooks: Mutex<hooks::Regs>,
     /// Set while a symbol lookup callback runs (no recursion into the callbacks).
     in_symlookup: AtomicBool,
+    /// Records refused for want of capabilities since the host last asked
+    /// ([`Engine::take_denied`]): (record, message).
+    denied: Mutex<Vec<(RecId, String)>>,
+    /// Script texts Lua read from records without capabilities (`memrec.Script`): an
+    /// `autoAssemble` of text containing one runs without capabilities too.
+    tainted: Mutex<std::collections::VecDeque<String>>,
     /// The engine's Lua state, for address resolution deep inside Rust helpers (weak: the
     /// state owns closures holding this struct).
     weak: OnceLock<mlua::WeakLua>,
@@ -414,6 +420,8 @@ impl Engine {
             allow_os: opts.allow_os,
             hooks: Mutex::new(hooks::Regs::default()),
             in_symlookup: AtomicBool::new(false),
+            denied: Mutex::new(Vec::new()),
+            tainted: Mutex::new(Default::default()),
             weak: OnceLock::new(),
             ui: ui::UiState::default(),
             dbg: debug::DebugState::default(),
@@ -555,7 +563,23 @@ impl Engine {
     /// Ownership is by time: everything created since the previous clear belongs to the
     /// current table, including objects created from the console.
     pub fn clear_table_state(&self) -> Result<()> {
-        self.call_internal(&self.i.clear, ()).map(|_| ())
+        self.call_internal(&self.i.clear, false).map(|_| ())
+    }
+
+    /// Like [`Engine::clear_table_state`], for consent the user withdrew: everything goes
+    /// without running any of it once more (no `OnDestroy` of records or forms), and a script
+    /// running on another thread is interrupted first.
+    pub fn stop_table_state(&self) -> Result<()> {
+        self.st.interrupt.store(true, Ordering::SeqCst);
+        self.call_internal(&self.i.clear, true).map(|_| ())
+    }
+
+    /// Records refused since the last call because they lack the capabilities their script
+    /// or callbacks need (see [`Caps`]): (record, message). Activation routes report these
+    /// to the host this way, also when the refusal happened deep inside a group cascade,
+    /// a hotkey or a script's `memrec.Active = true`.
+    pub fn take_denied(&self) -> Vec<(RecId, String)> {
+        std::mem::take(&mut *self.st.denied.lock().unwrap())
     }
 
     /// Delivers a user event to control `id` (`OnClick`, `OnClose`, `OnKeyPress`, `OnChange`,
@@ -634,14 +658,21 @@ impl Engine {
         })
     }
 
-    /// Hooks for `hh_asm::aa_check` that run NO Lua at all, for live syntax checks while the
-    /// user types (the script may come from an untrusted table): `{$lua}` blocks yield an
-    /// empty string, custom commands registered with `registerAutoAssemblerCommand` expand
-    /// to nothing, prologues are skipped, and while a `registerSymbolLookupCallback` is
-    /// registered an otherwise unknown symbol resolves to a placeholder address.
-    /// `loadbinary` is accepted when OS access is on (checking never reads the file).
+    /// [`Engine::aa_hooks_check_only_with`] without capabilities (the safe default: the
+    /// caller did not say the script is trusted).
     pub fn aa_hooks_check_only(&self) -> AaHooks {
-        hooks::check_only(&self.st)
+        self.aa_hooks_check_only_with(Caps::None)
+    }
+
+    /// Hooks for `hh_asm::aa_check` that run NO Lua at all, for live syntax checks while the
+    /// user types. With [`Caps::Full`]: `{$lua}` blocks yield an empty string, custom
+    /// commands registered with `registerAutoAssemblerCommand` expand to nothing, prologues
+    /// are skipped, and while a `registerSymbolLookupCallback` is registered an otherwise
+    /// unknown symbol resolves to a placeholder address; `loadbinary` is accepted when OS
+    /// access is on (checking never reads the file). With [`Caps::None`] each of those is an
+    /// error naming `hh_asm::NOT_AVAILABLE`.
+    pub fn aa_hooks_check_only_with(&self, caps: Caps) -> AaHooks {
+        hooks::for_caps(&self.lua, &self.st, None, hooks::Mode::CheckNoLua, caps)
     }
 
     /// Hooks for `hh_asm::aa_execute` / `aa_check` so `{$lua}` blocks and `luacall` run in
@@ -651,8 +682,25 @@ impl Engine {
     /// (all of them told `syntax_check`). `loadbinary` reads files only with
     /// [`EngineOptions::allow_os`] and when [`Host::allow_aa_file`] agrees. `aob_unique` is
     /// left at its default for the host to set.
+    ///
+    /// Capabilities: those [`TableHost::caps`] gives `memrec`, and none without a record
+    /// (the safe default). Say what the script may do with [`Engine::aa_hooks_with`].
     pub fn aa_hooks(&self, memrec: Option<RecId>, syntax_check: bool) -> AaHooks {
-        hooks::full(&self.lua, &self.st, memrec, syntax_check)
+        let caps = memrec.map_or(Caps::None, |id| self.st.table().caps(id));
+        self.aa_hooks_with(memrec, syntax_check, caps)
+    }
+
+    /// [`Engine::aa_hooks`] with the capabilities stated: `Caps::Full` only for a script the
+    /// host knows the user typed or agreed to.
+    pub fn aa_hooks_with(&self, memrec: Option<RecId>, syntax_check: bool, caps: Caps) -> AaHooks {
+        let mode = if syntax_check { hooks::Mode::Check } else { hooks::Mode::Run };
+        hooks::for_caps(&self.lua, &self.st, memrec, mode, caps)
+    }
+
+    /// Whether `registerSymbolLookupCallback` functions are registered: a script run without
+    /// capabilities that failed may have needed them (they were not asked).
+    pub fn has_symbol_lookup(&self) -> bool {
+        hooks::has_symbol_lookup(&self.st)
     }
 
     /// The `registerAddressLookupCallback` functions as a disassembler naming hook (put it in

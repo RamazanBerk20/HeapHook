@@ -1,7 +1,6 @@
 //! HeapHook's own Lua pointer scan (`hhCreatePointerScan`, see the prelude): background
 //! `hh_ptr::PointerScanJob`s, their results in a temporary file deleted with the job.
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -23,16 +22,17 @@ const MAX_JOBS: usize = 16;
 
 struct Job {
     job: Option<Arc<PointerScanJob>>,
-    path: PathBuf,
+    /// Private (0700, unpredictable name) directory holding the result file; removed with
+    /// the job after it was cancelled and joined.
+    _dir: tempfile::TempDir,
 }
 
 impl Drop for Job {
     fn drop(&mut self) {
-        // Cancel and join (PointerScanJob's own drop) before the file goes.
+        // Cancel and join (PointerScanJob's own drop) before the directory goes.
         if let Some(j) = self.job.take() {
             j.cancel();
         }
-        let _ = std::fs::remove_file(&self.path);
     }
 }
 
@@ -104,9 +104,9 @@ pub(crate) fn install(h: &B) -> LR<()> {
         let id = st.next_id.fetch_add(1, Ordering::SeqCst);
         let dir = hh_scan::spill_dir(None);
         std::fs::create_dir_all(&dir).map_err(|e| mlua::Error::runtime(format!("{}: {e}", dir.display())))?;
-        let path = dir.join(format!("heaphook-lua-ptr-{}-{id}.hhptr", std::process::id()));
-        let j = PointerScanJob::start(p, target, o, c, false, path.clone()).map_err(rt)?;
-        jobs.insert(id, Job { job: Some(Arc::new(j)), path });
+        let tmp = tempfile::Builder::new().prefix("heaphook-lua-ptr-").tempdir_in(&dir).map_err(|e| mlua::Error::runtime(format!("{}: {e}", dir.display())))?;
+        let j = PointerScanJob::start(p, target, o, c, false, tmp.path().join("scan.hhptr")).map_err(rt)?;
+        jobs.insert(id, Job { job: Some(Arc::new(j)), _dir: tmp });
         Ok(id)
     })?;
     h.f("ps_progress", |lua, st, id: i64| {

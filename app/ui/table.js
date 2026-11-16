@@ -11,7 +11,7 @@ import { $, h, icon, fmtAddr, wire, isHexAddr, attempt, toast, contextMenu, stor
 import { listCustomTypes, editCustomType, ctLabel } from './custom.js';
 import { state, addSource, addTicker, emit, on, TICK_MS } from './core.js';
 import { comboOf, comboText, MODS } from './keys.js';
-import { attachEditor } from './editor.js';
+import { attachEditor, tooBig } from './editor.js';
 import { formDialog } from './memtools.js';
 
 const ROW = 24;
@@ -212,7 +212,7 @@ export function initTable(root) {
     const mode = isValue(e) && e.freeze_mode !== 'exact'
       ? h('span.mode', { title: MODES.find((m) => m[0] === e.freeze_mode)[1], html: icon(e.freeze_mode === 'allow_increase' ? 'up' : 'down') }) : null;
     const marks = [
-      untrusted.has(e.id) ? h('span.mark.untrusted', { title: 'Came from another table: its Lua asks for your consent before it runs', 'aria-label': 'untrusted Lua', role: 'img', html: icon('shield') }) : null,
+      untrusted.has(e.id) ? h('span.mark.untrusted', { title: 'Came from another table: its Lua, file access and callbacks wait for your consent', 'aria-label': 'untrusted entry', role: 'img', html: icon('shield') }) : null,
       failing.has(e.id) ? h('span.mark.freeze-fail', { role: 'img', 'aria-label': 'Freezing fails: ' + failing.get(e.id), title: `Freezing fails: ${failing.get(e.id)} (HeapHook keeps retrying)`, html: icon('info') }) : null,
       isValue(e) && e.freeze_interval_ms ? h('span.mark', { role: 'img', 'aria-label': `Own freeze interval ${e.freeze_interval_ms} ms`, title: `Freezes every ${e.freeze_interval_ms} ms (its own interval)`, html: icon('clock') }) : null,
       e.hotkeys.length ? h('span.mark', { title: e.hotkeys.map((k) => comboText(k.keys)).join(', '), html: icon('key') }) : null,
@@ -318,7 +318,8 @@ export function initTable(root) {
       for (let i = first; i < Math.min(flat.length, first + layer.childElementCount); i++) if (isValue(flat[i].e)) es.push(flat[i].e);
       const lit = (e) => !e.offsets.length && isHexAddr(e.addr);
       const ask = es.filter((e) => !lit(e));
-      const got = ask.length ? await api.resolveMany(ask.map(exprOf)).catch(() => ask.map(() => null)) : [];
+      // By id: the backend resolves each with the lookups its origin allows.
+      const got = ask.length ? await api.tableResolve(ask.map((e) => e.id)).catch(() => ask.map(() => null)) : [];
       const res = new Map(ask.map((e, i) => [e, got[i]]));
       for (const e of es) {
         const r = R(e.id), s = lit(e) ? '0x' + e.addr.trim().replace(/^0x/i, '') : res.get(e);
@@ -563,7 +564,7 @@ export function initTable(root) {
     cursor = anchor = r.ids.at(-1);
     render(); scrollToCursor();
     if (untrusted.size && r.ids.some((id) => { let u = false; walk([byId(id)].filter(Boolean), (x) => { if (untrusted.has(x.id)) u = true; }); return u; }))
-      toast('Pasted. Entries with Lua are marked: their Lua asks for your consent before it runs', 'info');
+      toast('Pasted. The new entries are marked: their Lua and file access ask for your consent first', 'info');
   }
   function groupSelected() {
     const ids = topSelected().map((e) => e.id);
@@ -990,6 +991,8 @@ export function initTable(root) {
   function editScript(id) {
     const e = byId(id);
     if (!e) return;
+    const big = tooBig(e.script ?? '');
+    if (big) { toast(big); return; }
     const d = $('#dlg-script'), ta = $('#aa-text'), status = $('#aa-status');
     ta.value = e.script ?? '';
     $('#aa-title').textContent = `Auto Assembler script · ${e.description}`;
@@ -997,7 +1000,9 @@ export function initTable(root) {
     aaEd.refresh();
     const check = async () => {
       try {
-        const r = await api.aaCheck(ta.value);
+        // Checked with the entry's own capabilities: a script that came from elsewhere shows
+        // which directives wait for consent.
+        const r = await api.aaCheck(ta.value, { entry: id });
         errLine = r ? r.line : 0;
         aaEd.markError(errLine, r?.message);
         status.textContent = r ? `Line ${r.line}: ${r.message}` : 'No errors';
@@ -1024,6 +1029,8 @@ export function initTable(root) {
 
   /** Shared text editor dialog: table Lua script (with "save and run") and comments. */
   function textDialog({ title, hint, value, runnable, mono = true, onSave }) {
+    const big = tooBig(value ?? '');
+    if (big) { toast(big); return; }
     const d = $('#dlg-text'), ta = $('#tx-text');
     $('#tx-title').textContent = title;
     $('#tx-hint').textContent = hint;
@@ -1371,6 +1378,20 @@ export function initTable(root) {
 
   // The code list is backend-owned (the debugger view shows it); meta.codes only rides along in puts.
   on('table:script', ({ description, script }) => add([{ description, script }], { then: (e) => e && editScript(e.id) }));
+  /** A backend-made entry (a template, an Auto Assemble window script): the backend inserts it with its origin. */
+  async function insertMade(fn) {
+    await chain;
+    const r = await attempt(() => fn(cursor, version));
+    if (!r) { chain = chain.then(refetch); return; }
+    await refetch();
+    sel.clear(); r.ids.forEach((x) => sel.add(x));
+    cursor = anchor = r.ids.at(-1);
+    render(); scrollToCursor();
+    if (untrusted.has(cursor)) toast('Added. It is marked as untrusted: its Lua and file access ask for your consent first', 'info');
+    editScript(cursor);
+  }
+  on('table:template', ({ addr, kind, description }) => insertMade((after, base) => api.tableAddTemplate(addr, kind, description, after, base)));
+  on('table:assign', ({ session, script, description }) => insertMade((after, base) => api.aaAssign(session, script, description, after, base)));
   // Pointer entries come with an id from the backend; the table assigns its own.
   on('table:add', (items) => add(items.map(({ id, ...x }) => ({ ...x, len: x.len || 0 }))));
   // A hotkey pressed (lua.js) for an entry whose Lua needs consent.

@@ -56,6 +56,8 @@ struct CodeFilter {
     armed: usize,
     /// Executed entries of the last recording.
     last: usize,
+    /// Entries the debugger refused to arm in the running recording.
+    rejected: usize,
 }
 
 /// Code filter state for the UI.
@@ -71,6 +73,9 @@ pub struct FilterState {
     pub last_hits: usize,
     /// Functions in every ran set and in no did-not-run set.
     pub matches: usize,
+    /// Function entries of the running recording the debugger refused to arm (not an
+    /// instruction start in a module loaded as dissected).
+    pub rejected: usize,
 }
 
 /// One structure view (`struct_view`).
@@ -243,7 +248,7 @@ fn dump_file(path: &str) -> R<()> {
 }
 
 /// A user-picked file the crate's loader opens itself: regular, at most `max` bytes.
-fn user_file(path: &str, max: u64) -> R<&Path> {
+pub(crate) fn user_file(path: &str, max: u64) -> R<&Path> {
     let p = crate::ptr::regular_file(path)?;
     let n = std::fs::metadata(p).map_err(|e| format!("{path}: {e}"))?.len();
     if n > max {
@@ -377,8 +382,7 @@ impl App {
                 return Err(format!("structure names must be unique and not empty ({:?})", st.name));
             }
         }
-        self.x.live.set_structures(structs);
-        Ok(())
+        self.x.live.set_structures(structs)
     }
 
     /// Auto-guesses `size` bytes at `addr` into structure `name` (replacing one of that name).
@@ -395,7 +399,7 @@ impl App {
             Some(x) => *x = st.clone(),
             None => all.push(st.clone()),
         }
-        self.x.live.set_structures(all);
+        self.x.live.set_structures(all)?;
         Ok(st)
     }
 
@@ -422,7 +426,7 @@ impl App {
         let ov: Option<&structure::StructOverride> = if self.lua_hooks_ok() { Some(&ov) } else { None };
         let (name, a) = guard(structure::expand_pointer_with(&*sess.proc, &mut all, owner, index, parse_addr(field_addr)?, size.clamp(8, 0x10000), &self.guess_options(), ov))?;
         if all != before {
-            self.x.live.set_structures(all);
+            self.x.live.set_structures(all)?;
         }
         Ok(EvalReq { name, addr: hex_addr(a) })
     }
@@ -526,6 +530,8 @@ impl App {
         if list.is_empty() {
             return Err("no structure to export".into());
         }
+        // Table loads are not checked here; a hostile table must not reach the generators.
+        guard(structure::validate_structures(&list))?;
         let ps = self.session().map_or(8, |s| s.proc.pointer_size());
         match lang {
             "c" => Ok(structure::to_c(&list, ps)),
@@ -601,10 +607,17 @@ impl App {
         self.job("save", |_, prog| d.save(Path::new(path), prog))
     }
 
-    /// Loads an `.hhdis` file (validated) as the current dissection.
+    /// Loads an `.hhdis` file (checked) as the current dissection. Its addresses are of the
+    /// run it was made in: it is matched against the opened process (modules that moved
+    /// are rebased, changed ones dropped); one that cannot be matched (an old file) can be
+    /// browsed, but the code filter refuses it.
     pub fn dissect_load(&self, path: &str) -> R<DissectSummary> {
         let p = user_file(path, MAX_DISSECTION)?;
-        let d = self.job("load", |_, prog| Dissection::load(p, prog))?;
+        let d = self.job("load", |proc, prog| {
+            let mut d = Dissection::load(p, prog)?;
+            let _ = d.validate(proc);
+            Ok(d)
+        })?;
         let sum = d.summary();
         let sess = self.session()?;
         *lock(&sess.tools.dissection) = Some(Arc::new(d));
@@ -617,22 +630,41 @@ impl App {
     fn filter_state(&self, f: &CodeFilter) -> FilterState {
         let last_hits = f.last;
         let matches = self.dissection().map_or(0, |d| d.code_filter(&f.ran, &f.not_ran).len());
-        FilterState { recording: f.armed > 0, armed: f.armed, ran_sets: f.ran.len(), not_ran_sets: f.not_ran.len(), last_hits, matches }
+        FilterState { recording: f.armed > 0, armed: f.armed, ran_sets: f.ran.len(), not_ran_sets: f.not_ran.len(), last_hits, matches, rejected: f.rejected }
     }
 
     /// Starts recording which functions of the current dissection run: a one-shot int3 on
     /// every internal function entry (only addresses the dissection found; nothing else is
     /// ever armed). Needs the debugger attached. Returns how many were armed.
+    ///
+    /// The dissection's addresses are first matched against the process as it is now
+    /// (modules may have moved or been replaced since, e.g. after an exec or a reload), and
+    /// the debugger arms an entry only at an instruction start inside a module still loaded
+    /// as matched. A dissection that cannot be matched is refused.
     pub fn code_filter_start(&self) -> R<FilterState> {
-        let d = self.dissection()?;
-        let entries: Vec<Addr> = d.functions(0, usize::MAX).into_iter().filter(|f| f.internal).map(|f| f.addr).take(hh_debug::MAX_COVERAGE).collect();
-        if entries.is_empty() {
-            return Err("the dissection has no functions to watch".into());
-        }
-        let armed = self.coverage_start(entries)?;
         let sess = self.session()?;
+        let (entries, modules, moved) = {
+            let mut g = lock(&sess.tools.dissection);
+            let d = g.as_mut().ok_or("no code dissection yet")?;
+            let v = Arc::make_mut(d).validate(&*sess.proc).map_err(|e| format!("cannot use this dissection to set breakpoints: {e}"))?;
+            let entries: Vec<Addr> = d.functions(0, usize::MAX).into_iter().filter(|f| f.internal).map(|f| f.addr).take(hh_debug::MAX_COVERAGE).collect();
+            (entries, d.module_idents().iter().map(|i| i.module()).collect::<Vec<_>>(), !v.unchanged())
+        };
+        if moved {
+            // Recorded sets hold addresses of the old layout.
+            *lock(&sess.tools.filter) = CodeFilter::default();
+        }
+        if entries.is_empty() {
+            return Err("the dissection has no functions to watch (none of its modules is loaded as dissected)".into());
+        }
+        let arm = self.coverage_start(entries, modules)?;
+        if arm.armed == 0 {
+            let _ = self.coverage_stop();
+            return Err(format!("none of the dissection's {} function entries is an instruction start in the loaded code; dissect again", arm.rejected.len()));
+        }
         let mut f = lock(&sess.tools.filter);
-        f.armed = armed.max(1);
+        f.armed = arm.armed;
+        f.rejected = arm.rejected.len();
         Ok(self.filter_state(&f))
     }
 
@@ -643,6 +675,7 @@ impl App {
         let sess = self.session()?;
         let mut f = lock(&sess.tools.filter);
         f.armed = 0;
+        f.rejected = 0;
         f.last = hits.len();
         if ran { f.ran.push(hits) } else { f.not_ran.push(hits) }
         Ok(self.filter_state(&f))

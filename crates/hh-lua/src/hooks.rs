@@ -13,7 +13,7 @@ use hh_core::{Addr, Error, Result};
 use mlua::{Function, IntoLuaMulti, Lua, Table, Value};
 
 use crate::api::{err_text, int_of, lua_block_hook, str_of};
-use crate::{RecId, State, guard};
+use crate::{Caps, RecId, State, guard};
 
 /// What the scripts registered (names of AA commands in lowercase, counts of the others).
 #[derive(Default, Clone)]
@@ -130,9 +130,63 @@ fn read_file(st: &Arc<State>) -> Option<ReadFile> {
     }))
 }
 
+/// How a script is processed.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Mode {
+    /// Execute (hooks run Lua, `syntaxcheck` false).
+    Run,
+    /// Check with Lua running, told `syntaxcheck` (Cheat Engine's own check).
+    Check,
+    /// Check without running any Lua at all (live checks while typing).
+    CheckNoLua,
+}
+
+/// THE way to build `AaHooks`: every place in hh-lua that hands a script to hh-asm (records,
+/// `autoAssemble`, `autoAssembleCheck`, the host's [`crate::Engine::aa_hooks_with`]) comes
+/// here with the capabilities it was given. `Caps::None` gets [`denied`]; only `Caps::Full`
+/// reaches anything that runs Lua or reads a file.
+pub(crate) fn for_caps(lua: &Lua, st: &Arc<State>, memrec: Option<RecId>, mode: Mode, caps: Caps) -> AaHooks {
+    match (caps, mode) {
+        (Caps::None, _) => denied(st),
+        (Caps::Full, Mode::Run) => full(lua, st, memrec, false),
+        (Caps::Full, Mode::Check) => full(lua, st, memrec, true),
+        (Caps::Full, Mode::CheckNoLua) => check_only(st),
+    }
+}
+
+/// Hooks for a script without capabilities: nothing that runs Lua, reads a local file or
+/// hands the script's text to Lua a table registered. hh-asm fails `{$lua}`, `luacall`,
+/// `loadbinary` and `include` with `hh_asm::NOT_AVAILABLE`; the two stubs below hold no Lua
+/// and no state (a snapshot of names), they only make a registered custom command or
+/// prologue fail the same way instead of the script being assembled without it.
+pub(crate) fn denied(st: &State) -> AaHooks {
+    let r = regs(st);
+    let mut h = AaHooks::default();
+    if !r.commands.is_empty() {
+        let names = r.commands;
+        h.command = Some(Box::new(move |(name, _, _): (String, String, bool)| {
+            if names.contains(&name) {
+                Err(Error::Other(format!("{name}: a command registered from Lua {}", hh_asm::NOT_AVAILABLE)))
+            } else {
+                Ok(None)
+            }
+        }));
+    }
+    if r.prologues > 0 {
+        h.prologue = Some(Box::new(|_: (String, bool)| Err(Error::Other(format!("the prologue registered from Lua {}", hh_asm::NOT_AVAILABLE)))));
+    }
+    h
+}
+
+/// Whether a script without capabilities could have failed for want of the symbol lookup
+/// callbacks (they are not asked for it, and an unknown name says nothing more).
+pub(crate) fn has_symbol_lookup(st: &State) -> bool {
+    regs(st).symbol > 0
+}
+
 /// Every hook, running Lua: `{$lua}` blocks, `luacall`, custom commands, prologues and the
 /// symbol lookup callbacks, `loadbinary` (see [`read_file`]).
-pub(crate) fn full(lua: &Lua, st: &Arc<State>, memrec: Option<RecId>, check: bool) -> AaHooks {
+fn full(lua: &Lua, st: &Arc<State>, memrec: Option<RecId>, check: bool) -> AaHooks {
     let r = regs(st);
     let mut call = lua_block_hook(lua.clone(), st.clone(), memrec, check);
     let mut h = AaHooks {
@@ -163,7 +217,7 @@ pub(crate) fn full(lua: &Lua, st: &Arc<State>, memrec: Option<RecId>, check: boo
 /// registered custom commands expand to nothing, prologues are skipped, and when a symbol
 /// lookup callback is registered every otherwise unknown name resolves to a placeholder
 /// (the callback might know it).
-pub(crate) fn check_only(st: &Arc<State>) -> AaHooks {
+fn check_only(st: &Arc<State>) -> AaHooks {
     let r = regs(st);
     let mut h = AaHooks {
         lua: Some(Box::new(|_src: String| Ok(String::new()))),

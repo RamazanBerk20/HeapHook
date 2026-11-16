@@ -7,7 +7,7 @@ import { state, emit, on, addTicker } from './core.js';
 import { VTYPES } from './table.js';
 
 const ROW = 22, MAXPX = 4_000_000;
-const PHASE = { collect: 'Collecting pointers', scan: 'Scanning paths', rescan: 'Rescanning' };
+const PHASE = { collect: 'Collecting pointers', scan: 'Scanning paths', sort: 'Sorting results', rescan: 'Rescanning' };
 const MAP_FILTER = [['HeapHook pointer map', ['hhpmap']], ['All files', ['*']]];
 const RES_FILTER = [['HeapHook pointer results', ['hhptr']], ['All files', ['*']]];
 

@@ -85,14 +85,14 @@ fn table_registers_aa_command_and_symbol_lookup() {
     // The app's route (Engine::aa_hooks) sees the same registrations.
     let script = INJECT.replace("luacall(luacalled = (luacalled or 0) + 1)\n", "");
     let mut syms = SymbolTable::default();
-    let st = hh_asm::aa_execute(&*p, &mut syms, &script, true, None, &mut e.aa_hooks(None, false)).unwrap();
+    let st = hh_asm::aa_execute(&*p, &mut syms, &script, true, None, &mut e.aa_hooks_with(None, false, hh_lua::Caps::Full)).unwrap();
     assert_eq!(read_u32(&*p, GAME + 0x1005) & 0xFF, 0xE9);
-    hh_asm::aa_execute(&*p, &mut syms, &script, false, Some(&st), &mut e.aa_hooks(None, false)).unwrap();
+    hh_asm::aa_execute(&*p, &mut syms, &script, false, Some(&st), &mut e.aa_hooks_with(None, false, hh_lua::Caps::Full)).unwrap();
     assert_eq!(p.snapshot(), before);
 
     // clear_table_state forgets every registration.
     e.clear_table_state().unwrap();
-    let err = hh_asm::aa_check(&*p, &SymbolTable::default(), &script, &mut e.aa_hooks(None, true)).expect("unknown now");
+    let err = hh_asm::aa_check(&*p, &SymbolTable::default(), &script, &mut e.aa_hooks_with(None, true, hh_lua::Caps::Full)).expect("unknown now");
     assert!(err.message.to_lowercase().contains("targetsym") || err.message.contains("padnops"), "{err:?}");
     run(&e, "assert(getAddressSafe('healthcode') == nil)");
     run(&e, "assert(unregisterSymbolLookupCallback(lookup) == false)");
@@ -104,12 +104,12 @@ fn check_only_runs_no_registered_callback() {
     e.lua().globals().set("INJECT", INJECT).unwrap();
     run(&e, REGISTER);
     let script = INJECT.replace("luacall(luacalled = (luacalled or 0) + 1)\n", "{$lua}\nluaran = true\n{$asm}\n");
-    let r = hh_asm::aa_check(&*p, &SymbolTable::default(), &script, &mut e.aa_hooks_check_only());
+    let r = hh_asm::aa_check(&*p, &SymbolTable::default(), &script, &mut e.aa_hooks_check_only_with(hh_lua::Caps::Full));
     // The prologue cannot rename TARGETSYM without running; the placeholder lookup accepts it.
     assert!(r.is_none(), "{r:?}");
     run(&e, "assert(#calls == 0, table.concat(calls, ' ')) assert(luaran == nil)");
     // A syntax check through Engine::aa_hooks does run them (told it is a check).
-    assert!(hh_asm::aa_check(&*p, &SymbolTable::default(), &script, &mut e.aa_hooks(None, true)).is_none());
+    assert!(hh_asm::aa_check(&*p, &SymbolTable::default(), &script, &mut e.aa_hooks_with(None, true, hh_lua::Caps::Full)).is_none());
     run(
         &e,
         "local j = table.concat(calls, ' ') assert(j:find('prologue:true') and j:find('cmd:true') and luaran, j)",
@@ -155,14 +155,14 @@ fn loadbinary_needs_os_access_and_host_consent() {
     e.set_host(Arc::new(Files(false)));
     let (_, p, _) = engine();
     let mut syms = SymbolTable::default();
-    let r = hh_asm::aa_execute(&*p, &mut syms, &script(&file), true, None, &mut e.aa_hooks(None, false));
+    let r = hh_asm::aa_execute(&*p, &mut syms, &script(&file), true, None, &mut e.aa_hooks_with(None, false, hh_lua::Caps::Full));
     assert!(r.unwrap_err().to_string().contains("not allowed"));
     // no OS access: no file reads at all, whatever the host says
     let e = Engine::new(EngineOptions { allow_os: false, ..Default::default() }).unwrap();
     e.set_process(Some(game())).unwrap();
     e.set_host(Arc::new(Files(true)));
     let err = go(&e, &script(&file)).unwrap_err();
-    assert!(err.contains("file access is not enabled"), "{err}");
+    assert!(err.contains(hh_asm::NOT_AVAILABLE), "{err}");
     std::fs::remove_dir_all(&dir).unwrap();
 }
 

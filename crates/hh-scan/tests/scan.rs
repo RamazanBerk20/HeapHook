@@ -40,7 +40,7 @@ impl Fake {
     fn region(&self, addr: Addr) -> Result<(usize, usize)> {
         for (i, (a, m, _, _)) in self.regions.iter().enumerate() {
             let n = m.read().unwrap().len() as u64;
-            if addr >= *a && addr < a + n {
+            if addr >= *a && addr - a < n {
                 return Ok((i, (addr - a) as usize));
             }
         }
@@ -1207,9 +1207,14 @@ fn pause_leaves_an_already_stopped_target_stopped() {
     f.opts.pause_while_scanning = true;
     s.first_scan(&f).unwrap();
     let counts = (p.suspends.load(Relaxed), p.resumes.load(Relaxed));
+    // A remote target with the same pid: this machine's /proc says nothing about it.
+    s.set_local(false);
+    s.first_scan(&f).unwrap();
+    let remote = (p.suspends.load(Relaxed), p.resumes.load(Relaxed));
     let _ = child.kill();
     let _ = child.wait();
     assert_eq!(counts, (0, 0));
+    assert_eq!(remote, (1, 1));
 }
 
 // ---------------------------------------------------------------- 1.0 feature gaps
@@ -1527,4 +1532,28 @@ fn pointer_type_scan() {
     p.put(A, &(A + 0x200).to_le_bytes());
     assert_eq!(s.next_scan(&next(ScanType::Changed, None)).unwrap().count, 1);
     assert_eq!(s.results(0, 1).unwrap()[0].vtype, VType::Bytes8);
+}
+
+#[test]
+fn hostile_region_lists_scan_cleanly() {
+    // Unsorted, overlapping, empty and wrapping regions (a hostile remote server).
+    let p = Arc::new(Fake::new(vec![
+        (A + 0x8000, 0x10000, RW, RegionKind::Private),
+        (A, 0x10000, RW, RegionKind::Private),
+        (A + 0x2000, 0x1000, RW, RegionKind::Private),
+        (A + 0x40000, 0, RW, RegionKind::Private),
+        (u64::MAX - 0xfff, 0x2000, RW, RegionKind::Private),
+    ]));
+    // Reads go to the first listed region holding the address.
+    p.put(A + 0x11000, &777777u32.to_le_bytes());
+    p.put(A + 0x100, &777777u32.to_le_bytes());
+    let s = scanner(&p);
+    assert_eq!(s.first_scan(&first(VType::Bytes4, ScanType::Exact, "777777")).unwrap().count, 2);
+    assert_eq!(addrs(&s), [A + 0x100, A + 0x11000]);
+    assert_eq!(s.next_scan(&next(ScanType::Unchanged, None)).unwrap().count, 2);
+    let mut f = first(VType::Bytes4, ScanType::Unknown, "");
+    f.value = None;
+    let n = s.first_scan(&f).unwrap().count;
+    assert_eq!(n, (0x18000 / 4) as u64, "every aligned slot once");
+    assert_eq!(s.next_scan(&next(ScanType::Unchanged, None)).unwrap().count, n);
 }

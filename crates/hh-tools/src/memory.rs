@@ -522,6 +522,9 @@ pub fn search_file(path: &Path, pattern: &[Option<u8>], max: usize, progress: &P
     let matches = |w: &[u8]| pattern.iter().zip(w).all(|(p, b)| p.is_none_or(|p| p == *b));
     let mut out = Vec::new();
     let mut buf: Vec<u8> = Vec::new();
+    // Candidate positions tried; cancel is checked every 1024 (a candidate costs up to
+    // MAX_PATTERN byte compares).
+    let mut tried = 0u32;
     for b in &idx {
         r.seek(SeekFrom::Start(b.data_at))?;
         buf.clear();
@@ -537,6 +540,10 @@ pub fn search_file(path: &Path, pattern: &[Option<u8>], max: usize, progress: &P
             off += n as u64;
             let mut i = 0;
             while i + m <= buf.len() {
+                tried = tried.wrapping_add(1);
+                if tried.is_multiple_of(1024) {
+                    progress.check()?;
+                }
                 let hit = match anchor {
                     Some(k) => match buf[i + k..].iter().position(|&c| Some(c) == pattern[k]) {
                         Some(j) if i + j + m <= buf.len() => {
@@ -659,7 +666,10 @@ pub fn change_map(old: &Snapshot, new: &Snapshot, start: Addr, end: Addr, cells:
         return Err(Error::Other("empty change map range".into()));
     }
     let cells = cells.min(MAX_MAP_CELLS) as u64;
-    let cell_size = (end - start).div_ceil(cells).next_multiple_of(PAGE);
+    let cell_size = (end - start)
+        .div_ceil(cells)
+        .checked_next_multiple_of(PAGE)
+        .ok_or_else(|| Error::Other("change map range too large for that few cells".into()))?;
     let n = (end - start).div_ceil(cell_size) as usize;
     let mut m = ChangeMap { start, cell_size, compared: vec![0; n], changed: vec![0; n] };
     // Pieces come in address order, so a page split over blocks is counted once.

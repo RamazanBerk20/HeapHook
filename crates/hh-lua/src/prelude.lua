@@ -575,6 +575,8 @@ rechotkey = function(id, hid)
   if not h then error('memory record ' .. tostring(id) .. ' has no hotkey ' .. tostring(hid), 2) end
   local o = rhk(id, hid)
   local c = hkcbs[id .. ':' .. hid]
+  -- A record without capabilities never runs Lua callbacks (whoever registered them).
+  if c and (c.OnHotkey or c.OnPostHotkey) and not H.mr_trusted(id) then H.report(H.mr_denied(id, 'hotkey callback')); return end
   if c and c.OnHotkey and c.OnHotkey(o) == false then return end
   local rec, a = mr(id), toint(h.Action)
   local function act(v)
@@ -609,7 +611,7 @@ end
 
 local function del_record(id)
   local c = cbs[id]
-  if c and c.OnDestroy then c.OnDestroy(recs[id] or mr(id)) end
+  if c and c.OnDestroy and H.mr_trusted(id) then c.OnDestroy(recs[id] or mr(id)) end
   H.mr_delete(id); recs[id] = nil; cbs[id] = nil; lastval[id] = nil
 end
 
@@ -711,6 +713,7 @@ setactive = function(id, v, noexec)
   if cur == v then return true end
   local name = v and 'OnActivate' or 'OnDeactivate'
   local f = cbs[id] and cbs[id][name]
+  if f and not H.mr_trusted(id) then return false, H.mr_denied(id, name) end
   local rec = mr(id)
   if f and f(rec, true, cur) == false then return false end
   local ok, err = H.mr_apply(id, v, not noexec)
@@ -1444,7 +1447,7 @@ function I.tick()
   for id, c in pairs(cbs) do if c.OnValueChanged then list[#list + 1] = id end end
   for _, id in ipairs(list) do
     local f, v = cbs[id] and cbs[id].OnValueChanged, H.mr_get(id, 'Value')
-    if f and v ~= nil then
+    if f and v ~= nil and H.mr_trusted(id) then
       local old = lastval[id]
       lastval[id] = v
       if old ~= nil and old ~= v then
@@ -1487,7 +1490,8 @@ function I.breakpoint(addr)
   return f()
 end
 
-function I.clear()
+-- quiet: consent was withdrawn, so none of the table's Lua runs once more (no OnDestroy).
+function I.clear(quiet)
   local errs = {}
   local function try(f, ...)
     local ok, err = xpcall(f, traceback, ...)
@@ -1495,7 +1499,7 @@ function I.clear()
     if not ok then errs[#errs + 1] = tostring(err) end
   end
   for id, c in pairs(cbs) do
-    if c.OnDestroy then try(c.OnDestroy, recs[id] or mr(id)) end
+    if c.OnDestroy and not quiet and H.mr_trusted(id) then try(c.OnDestroy, recs[id] or mr(id)) end
   end
   cbs, lastval, hkcbs = {}, {}, {}
   for k in pairs(recs) do recs[k] = nil end
@@ -1505,6 +1509,7 @@ function I.clear()
   for id in pairs(hotkeys) do H.hotkey_unregister(id) end
   hotkeys = {}
   for _, id in ipairs(H.ui_children(nil)) do
+    if quiet then uievents[id] = nil end
     if uiobj[id] then try(uidestroy, id) else H.ui_destroy(id) end
   end
   H.dbg_clear()

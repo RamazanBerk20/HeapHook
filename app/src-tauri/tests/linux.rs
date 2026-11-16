@@ -189,16 +189,17 @@ fn commands_against_live_target() {
 
     // Auto Assembler: alloc + write + registersymbol, then disable.
     let script = "[ENABLE]\nalloc(hhmem,$100)\nregistersymbol(hhmem)\nhhmem:\n  db 11 22 33 44\n  mov eax,1\n  ret\n\n[DISABLE]\nunregistersymbol(hhmem)\ndealloc(hhmem)\n";
-    assert!(app.aa_check(script).unwrap().is_none());
-    let bad = app.aa_check("[ENABLE]\nfoo bar\n[DISABLE]\n").unwrap().expect("syntax error");
+    assert!(app.aa_check(script, None, None).unwrap().is_none());
+    let bad = app.aa_check("[ENABLE]\nfoo bar\n[DISABLE]\n", None, None).unwrap().expect("syntax error");
     assert_eq!(bad.line, 2);
-    let st = app.aa_execute(script, true, None).unwrap();
+    // A plain script runs without a session (no capabilities needed).
+    let st = app.aa_execute(script, true, None, None).unwrap();
     let mem = app.resolve_address("hhmem").unwrap();
     assert_eq!(app.read_memory(&mem, 4).unwrap(), "11223344");
     assert_eq!(app.disassemble(&app.resolve_address("hhmem+4").unwrap(), 2).unwrap()[0].text, "mov eax,1");
     // The state crosses IPC as JSON and comes back for disable.
     let st: hh_asm::AaState = de(serde_json::to_value(&st).unwrap());
-    app.aa_execute(script, false, Some(&st)).unwrap();
+    app.aa_execute(script, false, Some(&st), None).unwrap();
     assert!(app.resolve_address("hhmem").is_err(), "symbol still registered after disable");
     assert_eq!(app.read_memory(&mem, 4).unwrap(), "????????", "alloc not freed");
 
@@ -555,10 +556,11 @@ fn aa_entry_with_lua_block_enables_and_disables() {
         format!("{{$lua}}\nif syntaxcheck then return nil end\nprint('{what} ' .. memrec.Description)\nreturn string.format('%X:\\ndd %X', {a:#x}, {v})\n{{$asm}}\n")
     };
     let script = format!("[ENABLE]\n{}[DISABLE]\n{}", block(4321, "enable"), block(123456, "disable"));
-    assert!(app.aa_check(&script).unwrap().is_none(), "{:?}", app.aa_check(&script));
+    let s = app.aa_session().unwrap();
+    assert!(app.aa_check(&script, Some(s), None).unwrap().is_none(), "{:?}", app.aa_check(&script, Some(s), None));
     let bad = "[ENABLE]\n{$lua}\nerror('lua says no')\n{$asm}\n[DISABLE]\n";
     // The live check never runs Lua (it would run untrusted code on every keystroke).
-    assert!(app.aa_check(bad).unwrap().is_none(), "aa_check ran the {{$lua}} block");
+    assert!(app.aa_check(bad, Some(s), None).unwrap().is_none(), "aa_check ran the {{$lua}} block");
     put(&app, vec![Entry { id: 1, description: "lua patch".into(), script: Some(script), ..Entry::default() }]);
 
     app.table_set_active(&[1], true).unwrap();
@@ -1012,7 +1014,8 @@ fn aa_check_never_runs_lua() {
     let mut t = Target::spawn();
     let app = App::default();
     app.open_process(t.child.id()).unwrap();
-    assert!(app.aa_check(&lua_writes(&t.addr("i32"), 777)).unwrap().is_none());
+    let s = app.aa_session().unwrap();
+    assert!(app.aa_check(&lua_writes(&t.addr("i32"), 777), Some(s), None).unwrap().is_none());
     assert_eq!(t.cmd("get")["i32"], 123456, "the syntax check executed the {{$lua}} block");
 }
 
@@ -1805,14 +1808,6 @@ fn created_and_debugged_process_is_never_reaped_from_under_the_debugger() {
 
 // ---------------------------------------------------------------- the consent gate (rc.1 audit)
 
-/// An entry whose `{$lua}` appends `on` / `off` to `marker` when it enables / disables.
-fn marker_script(marker: &std::path::Path) -> String {
-    let m = format!("{:?}", marker.to_str().unwrap());
-    format!(
-        "[ENABLE]\n{{$lua}}\nlocal f = io.open({m}, 'a') f:write('on\\n') f:close()\nreturn ''\n{{$asm}}\n[DISABLE]\n{{$lua}}\nlocal f = io.open({m}, 'a') f:write('off\\n') f:close()\nreturn ''\n{{$asm}}\n"
-    )
-}
-
 /// A writable 4-byte slot of either test target.
 fn slot(t: &Target) -> String {
     t.info.get("i32").or_else(|| t.info.get("value")).and_then(Value::as_str).unwrap().to_string()
@@ -1822,296 +1817,660 @@ fn marks(marker: &std::path::Path) -> String {
     std::fs::read_to_string(marker).unwrap_or_default()
 }
 
-/// The hostile table of the audit: a `{$lua}` entry with a plain F1 hotkey, a group that
-/// cascades into a second one, a table script and a value entry with a Ctrl hotkey.
-fn hostile_table(marker: &std::path::Path, t: &Target) -> Table {
-    let hk = |action: &str, keys: Vec<u32>| Hotkey { action: action.into(), keys, value: None, description: None, id: None };
-    let lua = Entry { id: 1, description: "Infinite HP".into(), script: Some(marker_script(marker)), hotkeys: vec![hk("Toggle Activation", vec![112]), hk("Activate", vec![17, 113])], ..Entry::default() };
-    let kid = Entry { id: 3, description: "kid".into(), script: Some(marker_script(marker)), ..Entry::default() };
-    let group = Entry { id: 2, description: "grp".into(), options: vec!["moActivateChildrenAsWell".into()], children: vec![kid], ..Entry::default() };
-    let mut value = Entry { id: 4, description: "hp".into(), addr: slot(t), ..Entry::default() };
-    value.hotkeys = vec![hk("Toggle Activation", vec![17, 114])];
-    let script = format!("local f = io.open({:?}, 'a') f:write('script\\n') f:close()", marker.to_str().unwrap());
-    Table { entries: vec![lua, group, value], lua_script: script, ..Table::default() }
-}
-
 fn needs_consent(r: Result<impl std::fmt::Debug, String>) -> String {
     let e = r.expect_err("must be refused");
     assert!(e.contains(heaphook::cheat::NEEDS_CONSENT), "{e}");
     e
 }
 
-/// Every route by which a record of a loaded table can become active, or its script run,
-/// while the user has not agreed: none runs Lua. Then, agreed, each one works.
+// ---------- the consent matrix: entry routes x payloads x execution routes ----------
+//
+// Trust is decided by origin, never by content: an entry that arrived from outside gets no
+// capabilities (no Lua, no file reads, no callbacks a trusted table registered) on any
+// route until the user consents, and none at all under Settings "never".
+
+/// How untrusted content arrives.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Route {
+    OpenCt,
+    OpenJson,
+    MergeUi,
+    Paste,
+    Dropped,
+    LoadTable,
+    LoadTableMerge,
+    UndoRedoRestore,
+    PutFromUi,
+    AaFileLf,
+    AaFileCrlf,
+    AaAssign,
+    RemoteTemplate,
+}
+
+const ROUTES: [Route; 13] = [
+    Route::OpenCt,
+    Route::OpenJson,
+    Route::MergeUi,
+    Route::Paste,
+    Route::Dropped,
+    Route::LoadTable,
+    Route::LoadTableMerge,
+    Route::UndoRedoRestore,
+    Route::PutFromUi,
+    Route::AaFileLf,
+    Route::AaFileCrlf,
+    Route::AaAssign,
+    Route::RemoteTemplate,
+];
+
+/// What the content tries to do (each kind leaves its own trace when it runs).
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Kind {
+    Lua,
+    LuaCall,
+    File,
+    Command,
+    Prologue,
+    Symbol,
+    TableScript,
+    Callback,
+}
+
+/// How the content is run.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Exec {
+    Click,
+    HotkeyPress,
+    TableHotkey,
+    Cascade,
+    LuaActive,
+    LuaAutoAssemble,
+    Check,
+    UndoRedo,
+    TableScript,
+    AaWindow,
+}
+
+const ENTRY_EXECS: [Exec; 8] = [Exec::Click, Exec::HotkeyPress, Exec::TableHotkey, Exec::Cascade, Exec::LuaActive, Exec::LuaAutoAssemble, Exec::Check, Exec::UndoRedo];
+
+struct Payload {
+    name: String,
+    kind: Kind,
+    /// The entry's (or the Auto Assemble window's) script.
+    script: String,
+    /// The table's Lua script (only `Kind::TableScript`).
+    table_script: String,
+}
+
+/// Spellings of directive `name` hh-asm's parser takes for it: `{...}` and `/*...*/`
+/// comments are stripped first, the text before `(` is trimmed, must be ASCII alphanumerics
+/// and is compared lowercased (`aa.rs`: `strip_comments`, `directive`). Each is checked
+/// against hh-asm itself before use (`spelling_is_directive`), so a spelling the parser
+/// does not take fails the test instead of passing it vacuously.
+fn spellings(name: &str) -> Vec<String> {
+    let (a, b) = name.split_at(name.len() / 2);
+    let alt: String = name.chars().enumerate().map(|(i, c)| if i % 2 == 0 { c.to_ascii_uppercase() } else { c }).collect();
+    vec![
+        name.into(),
+        name.to_ascii_uppercase(),
+        alt,
+        format!("{a}{{}}{b}"),
+        format!("{a}{{ x }}{b}"),
+        format!("{a}/**/{b}"),
+        format!("{a}/* x */{b}"),
+        format!("  {name} "),
+        format!("\t{}{{}}{b} ", a.to_ascii_uppercase()),
+    ]
+}
+
+/// `{$lua}` opens a block when it is the whole trimmed line, any case (`extract_lua`).
+fn lua_spellings() -> Vec<String> {
+    vec!["{$lua}".into(), "{$LUA}".into(), "  {$Lua}  ".into(), "\t{$lUa}".into()]
+}
+
+fn spelling_is_directive(pid: u32, script: &str) {
+    let p = hh_core::open(pid).unwrap();
+    let e = hh_asm::aa_check(&*p, &hh_asm::SymbolTable::default(), script, &mut hh_asm::AaHooks::default()).expect("hh-asm accepted it without hooks");
+    assert!(e.message.contains(hh_asm::NOT_AVAILABLE), "hh-asm does not take this as the directive: {script:?}: {e:?}");
+}
+
+fn payloads(pid: u32, marker: &std::path::Path, secret: &std::path::Path, slot: &str) -> Vec<Payload> {
+    let m = format!("{:?}", marker.to_str().unwrap());
+    let mark = |what: &str| format!("local f = io.open({m}, 'a') f:write('{what}\\n') f:close()");
+    let at = slot.trim_start_matches("0x");
+    let file = secret.display();
+    let plain = "[ENABLE]\n[DISABLE]\n".to_string();
+    let p = |name: String, kind, script: String| Payload { name, kind, script, table_script: String::new() };
+    let mut out = Vec::new();
+    for sp in lua_spellings() {
+        out.push(p(format!("lua block {sp:?}"), Kind::Lua, format!("[ENABLE]\n{sp}\n{}\nreturn ''\n{{$asm}}\n[DISABLE]\n", mark("lua"))));
+    }
+    for sp in spellings("luacall") {
+        out.push(p(format!("luacall {sp:?}"), Kind::LuaCall, format!("[ENABLE]\n{sp}({})\n[DISABLE]\n", mark("luacall"))));
+    }
+    for sp in spellings("loadbinary") {
+        out.push(p(format!("loadbinary {sp:?}"), Kind::File, format!("[ENABLE]\n{sp}({at},{file})\n[DISABLE]\n")));
+    }
+    out.push(p("loadbinary via define".into(), Kind::File, format!("[ENABLE]\ndefine(lb,loadbinary)\nlb({at},{file})\n[DISABLE]\n")));
+    for x in &out {
+        spelling_is_directive(pid, &x.script);
+    }
+    out.push(p("custom command of a trusted table".into(), Kind::Command, "[ENABLE]\nMYCMD(attacker args)\n[DISABLE]\n".into()));
+    out.push(p("prologue of a trusted table".into(), Kind::Prologue, plain.clone()));
+    out.push(p("symbol lookup of a trusted table".into(), Kind::Symbol, "[ENABLE]\nalloc(hhm,8)\nhhm:\ndq magicsym\n[DISABLE]\ndealloc(hhm)\n".into()));
+    out.push(Payload { name: "table Lua script".into(), kind: Kind::TableScript, script: plain.clone(), table_script: mark("script") });
+    out.push(p("record callback of a trusted table".into(), Kind::Callback, plain));
+    out
+}
+
+/// What the trusted side (the user's own console, standing in for a trusted table) has
+/// registered when the payload arrives; each callback leaves a trace when it is called.
+fn trusted_registrations(kind: Kind, marker: &std::path::Path, slot: &str, id: Option<i64>) -> String {
+    let m = format!("{:?}", marker.to_str().unwrap());
+    let mark = format!("local function mark(s) local f = io.open({m}, 'a') f:write(s .. '\\n') f:close() end\n");
+    mark + &match kind {
+        Kind::Command => "registerAutoAssemblerCommand('MYCMD', function(p) mark('cmd:' .. p) return '' end)".to_string(),
+        Kind::Prologue => "registerAutoAssemblerPrologue(function(s) mark('prologue') end)".to_string(),
+        Kind::Symbol => format!("registerSymbolLookupCallback(function(n) if n:lower() == 'magicsym' then mark('sym') return {slot} end end, slFailure)"),
+        Kind::Callback => format!("getAddressList().getMemoryRecordByID({}).OnActivate = function() mark('onactivate') end", id.unwrap()),
+        _ => String::new(),
+    }
+}
+
+fn is_aa_window(r: Route) -> bool {
+    matches!(r, Route::AaFileLf | Route::AaFileCrlf)
+}
+
+/// The routes whose data brings a table script along.
+fn brings_table_script(r: Route) -> bool {
+    matches!(r, Route::OpenCt | Route::OpenJson | Route::Dropped | Route::LoadTable | Route::MergeUi | Route::LoadTableMerge)
+}
+
+/// Routes that apply to a (route, payload) cell. Empty: the cell does not exist (listed in
+/// the report of `consent_matrix`).
+fn execs(r: Route, k: Kind) -> Vec<Exec> {
+    match (is_aa_window(r), k) {
+        (true, Kind::TableScript | Kind::Callback) => vec![],
+        (true, _) => vec![Exec::AaWindow, Exec::Check],
+        (false, Kind::TableScript) if brings_table_script(r) => vec![Exec::TableScript],
+        (false, Kind::TableScript) => vec![],
+        // A record callback is not part of the script: assembling or checking its text
+        // involves no callback.
+        (false, Kind::Callback) => ENTRY_EXECS.iter().copied().filter(|e| !matches!(e, Exec::LuaAutoAssemble | Exec::Check)).collect(),
+        (false, _) => ENTRY_EXECS.to_vec(),
+    }
+}
+
+/// A server that reports every module of a process under a hostile name.
+struct HostileBackend;
+struct Renamed(std::sync::Arc<dyn hh_core::Process>);
+const HOSTILE_MODULE: &str = "a\"\n{$lua}\nos.exit(1)\n--";
+impl hh_core::Memory for Renamed {
+    fn read(&self, a: u64, b: &mut [u8]) -> hh_core::Result<usize> {
+        self.0.read(a, b)
+    }
+    fn write(&self, a: u64, d: &[u8]) -> hh_core::Result<()> {
+        self.0.write(a, d)
+    }
+    fn pointer_size(&self) -> usize {
+        self.0.pointer_size()
+    }
+}
+impl hh_core::Process for Renamed {
+    fn pid(&self) -> u32 {
+        self.0.pid()
+    }
+    fn is_alive(&self) -> bool {
+        self.0.is_alive()
+    }
+    fn regions(&self) -> hh_core::Result<Vec<hh_core::Region>> {
+        self.0.regions()
+    }
+    fn modules(&self) -> hh_core::Result<Vec<hh_core::Module>> {
+        Ok(self.0.modules()?.into_iter().map(|m| hh_core::Module { name: HOSTILE_MODULE.into(), ..m }).collect())
+    }
+    fn threads(&self) -> hh_core::Result<Vec<u32>> {
+        self.0.threads()
+    }
+    fn alloc(&self, s: u64, p: hh_core::Prot, n: Option<u64>) -> hh_core::Result<u64> {
+        self.0.alloc(s, p, n)
+    }
+    fn free(&self, a: u64, s: u64) -> hh_core::Result<()> {
+        self.0.free(a, s)
+    }
+    fn protect(&self, a: u64, s: u64, p: hh_core::Prot) -> hh_core::Result<hh_core::Prot> {
+        self.0.protect(a, s, p)
+    }
+}
+impl hh_net::Backend for HostileBackend {
+    fn list_processes(&self) -> hh_core::Result<Vec<hh_core::ProcessInfo>> {
+        hh_core::list_processes()
+    }
+    fn open(&self, pid: u32) -> hh_core::Result<std::sync::Arc<dyn hh_core::Process>> {
+        Ok(std::sync::Arc::new(Renamed(hh_core::open(pid)?)))
+    }
+}
+
+/// One (route, payload) cell set up in a fresh app.
+struct Cell {
+    app: App,
+    route: Route,
+    payload_name: String,
+    kind: Kind,
+    script: String,
+    id: Option<i64>,
+    group: Option<i64>,
+    session: Option<u64>,
+    marker: PathBuf,
+    slot: String,
+    base: String,
+    log_at: u64,
+}
+
+const SECRET: [u8; 4] = [0x11, 0x22, 0x33, 0x44];
+const TOKEN: &str = "matrix-token-0123456789";
+
+fn find_desc(app: &App, d: &str) -> i64 {
+    fn go(l: &[Entry], d: &str) -> Option<i64> {
+        l.iter().find_map(|e| if e.description == d { Some(e.id) } else { go(&e.children, d) })
+    }
+    go(&app.table_get().unwrap().table.entries, d).unwrap_or_else(|| panic!("no entry {d:?}"))
+}
+
+fn take_entry(l: &mut Vec<Entry>, id: i64) -> Option<Entry> {
+    if let Some(i) = l.iter().position(|e| e.id == id) {
+        return Some(l.remove(i));
+    }
+    l.iter_mut().find_map(|e| take_entry(&mut e.children, id))
+}
+
+fn max_id(l: &[Entry]) -> i64 {
+    l.iter().map(|e| e.id.max(max_id(&e.children))).max().unwrap_or(0)
+}
+
+impl Cell {
+    #[allow(clippy::too_many_arguments)]
+    fn new(route: Route, p: &Payload, never: bool, pid: u32, slot: &str, dir: &std::path::Path, server: &str, n: usize) -> Cell {
+        let app = App::default();
+        if route == Route::RemoteTemplate {
+            app.remote_connect(server, TOKEN, false).unwrap();
+            app.remote_open(pid).unwrap();
+        } else {
+            app.open_process(pid).unwrap();
+        }
+        let base = app.read_memory(slot, 4).unwrap();
+        let cdir = dir.join(format!("cell{n}"));
+        std::fs::create_dir_all(&cdir).unwrap();
+        let marker = cdir.join("marker");
+        if never {
+            let mut st = app.settings_get().unwrap();
+            st.table_script = "never".into();
+            app.settings_set(st).unwrap();
+        }
+        // The data the route brings: a table with the payload entry (and its table script).
+        let entry = Entry { id: 1, description: "payload".into(), script: Some(p.script.clone()), ..Entry::default() };
+        let table = Table { entries: vec![entry.clone()], lua_script: p.table_script.clone(), ..Table::default() };
+        let json = cdir.join("evil.json");
+        heaphook::table::save(&json, &table).unwrap();
+        let mut cell = Cell { app, route, payload_name: p.name.clone(), kind: p.kind, script: p.script.clone(), id: None, group: None, session: None, marker, slot: slot.into(), base, log_at: 0 };
+        let app = &cell.app;
+        let paste = || app.table_paste(vec![entry.clone()], None, None).unwrap().ids[0];
+        match route {
+            Route::OpenCt => {
+                let ct = cdir.join("evil.CT");
+                heaphook::table::save(&ct, &table).unwrap();
+                app.table_open(ct.to_str().unwrap(), false).unwrap();
+            }
+            Route::OpenJson => {
+                app.table_open(json.to_str().unwrap(), false).unwrap();
+            }
+            Route::Dropped => {
+                app.table_open_data("evil.json", &std::fs::read_to_string(&json).unwrap(), false).unwrap();
+            }
+            Route::LoadTable => app.lua_exec(&format!("loadTable({:?})", json.to_str().unwrap())).unwrap(),
+            Route::MergeUi => {
+                app.table_merge(json.to_str().unwrap()).unwrap();
+            }
+            Route::LoadTableMerge => app.lua_exec(&format!("loadTable({:?}, true)", json.to_str().unwrap())).unwrap(),
+            Route::Paste => {
+                paste();
+            }
+            Route::UndoRedoRestore => {
+                let id = paste();
+                let cur = app.table_get().unwrap();
+                let mut t = cur.table.clone();
+                take_entry(&mut t.entries, id);
+                app.table_put(t, cur.version).unwrap();
+                app.table_history(false).unwrap();
+            }
+            Route::PutFromUi => {
+                let id = paste();
+                // The frontend edits it (text and description) and moves it: still untrusted.
+                let cur = app.table_get().unwrap();
+                let mut t = cur.table.clone();
+                let mut e = take_entry(&mut t.entries, id).unwrap();
+                e.script = Some(format!("// edited by the user\n{}", p.script));
+                t.entries.insert(0, e);
+                app.table_put(t, cur.version).unwrap();
+                cell.script = format!("// edited by the user\n{}", p.script);
+            }
+            Route::AaFileLf | Route::AaFileCrlf | Route::AaAssign => {
+                let f = cdir.join("evil.cea");
+                let text = if route == Route::AaFileCrlf { p.script.replace('\n', "\r\n") } else { p.script.clone() };
+                std::fs::write(&f, &text).unwrap();
+                let s = app.aa_session().unwrap();
+                let loaded = app.aa_load_file(f.to_str().unwrap(), s).unwrap();
+                // The window's textarea normalizes line endings: the backend must not care.
+                cell.script = loaded.replace("\r\n", "\n");
+                cell.session = Some(s);
+                if route == Route::AaAssign {
+                    app.aa_assign(s, &cell.script, "payload", None, None).unwrap();
+                }
+            }
+            Route::RemoteTemplate => {
+                let r = app.table_add_template(&cell_store(), "code", "payload", None, None).unwrap();
+                let tpl = entry_script(app, r.ids[0]);
+                assert!(!tpl.contains(HOSTILE_MODULE) && !tpl.to_ascii_lowercase().contains("{$lua}"), "the template embedded the server's module name:\n{tpl}");
+                assert_eq!(app.table_get().unwrap().untrusted, r.ids, "a remote template is untrusted");
+                // Its text edited into the payload: editing does not make it trusted.
+                let cur = app.table_get().unwrap();
+                let mut t = cur.table.clone();
+                t.entries.iter_mut().find(|e| e.id == r.ids[0]).unwrap().script = Some(p.script.clone());
+                app.table_put(t, cur.version).unwrap();
+            }
+        }
+        if !is_aa_window(route) {
+            // Into a group that activates its children, with two hotkeys: frontend edits,
+            // which keep the entry's origin.
+            let id = find_desc(app, "payload");
+            let cur = app.table_get().unwrap();
+            let mut t = cur.table.clone();
+            let mut e = take_entry(&mut t.entries, id).unwrap();
+            let hk = |keys: Vec<u32>| Hotkey { action: "Activate".into(), keys, value: None, description: None, id: None };
+            e.hotkeys = vec![hk(vec![17, 118]), hk(vec![17, 119])];
+            let gid = max_id(&t.entries).max(id) + 1000;
+            t.entries.push(Entry { id: gid, description: "grp".into(), options: vec!["moActivateChildrenAsWell".into(), "moDeactivateChildrenAsWell".into()], children: vec![e], ..Entry::default() });
+            app.table_put(t, cur.version).unwrap();
+            cell.id = Some(id);
+            cell.group = Some(gid);
+        }
+        let reg = trusted_registrations(p.kind, &cell.marker, slot, cell.id);
+        cell.app.lua_exec(&reg).unwrap();
+        cell.log_at = cell.app.lua_poll(0).unwrap().next;
+        cell
+    }
+
+    fn happened(&self) -> Option<String> {
+        let m = marks(&self.marker);
+        let v = self.app.read_memory(&self.slot, 4).unwrap();
+        (!m.is_empty() || v != self.base).then(|| format!("marker {m:?}, slot {v} (was {})", self.base))
+    }
+
+    fn reset(&mut self) {
+        if let (Some(g), Some(id)) = (self.group, self.id) {
+            let _ = self.app.table_set_active(&[id, g], false);
+        }
+        let _ = std::fs::remove_file(&self.marker);
+        let b = u32::from_str_radix(&self.base, 16).unwrap().swap_bytes();
+        self.app.write_value(&self.slot, de(json!("4bytes")), &b.to_string(), &Fmt::default(), None).unwrap();
+        self.log_at = self.app.lua_poll(0).unwrap().next;
+    }
+
+    fn new_log(&self) -> String {
+        self.app.lua_poll(self.log_at).unwrap().log.iter().map(|l| format!("{}: {}", l.kind, l.text)).collect::<Vec<_>>().join("\n")
+    }
+
+    /// Runs `e`; Ok(what it said) or Err(its error).
+    fn run(&self, e: Exec, second: bool) -> Result<String, String> {
+        let app = &self.app;
+        let (id, g) = (self.id.unwrap_or(0), self.group.unwrap_or(0));
+        match e {
+            Exec::Click => app.table_set_active(&[id], true).map(|_| String::new()),
+            Exec::HotkeyPress => app.hotkey_press(if second { &[17, 119] } else { &[17, 118] }).map(|n| n.to_string()),
+            Exec::TableHotkey => app.table_hotkey(id, 0).map(|_| String::new()),
+            Exec::Cascade => app.table_set_active(&[g], true).map(|_| String::new()),
+            Exec::LuaActive => app.lua_exec(&format!("getAddressList().getMemoryRecordByID({id}).Active = true")).map(|_| self.new_log()),
+            Exec::LuaAutoAssemble => app
+                .lua_exec(&format!("local ok, err = autoAssemble(getAddressList().getMemoryRecordByID({id}).Script) if not ok then print(err) end"))
+                .map(|_| self.new_log()),
+            Exec::Check => match app.aa_check(&self.script, self.session, self.id).unwrap() {
+                None => Ok(String::new()),
+                Some(e) => Err(e.message),
+            },
+            Exec::UndoRedo => {
+                let cur = app.table_get().unwrap();
+                let mut t = cur.table.clone();
+                take_entry(&mut t.entries, g).unwrap();
+                app.table_put(t, cur.version).unwrap();
+                app.table_history(false).unwrap();
+                app.table_history(true).unwrap();
+                app.table_history(false).unwrap();
+                app.table_set_active(&[id], true).map(|_| String::new())
+            }
+            Exec::TableScript => app.table_run_script().map(|_| String::new()),
+            Exec::AaWindow => {
+                let st = app.aa_execute(&self.script, true, None, self.session)?;
+                app.aa_execute(&self.script, false, Some(&st), self.session).map(|_| String::new())
+            }
+        }
+    }
+
+    fn grant(&self) -> Result<(), String> {
+        let app = &self.app;
+        match self.route {
+            Route::AaFileLf | Route::AaFileCrlf => app.aa_trust(self.session.unwrap()),
+            Route::OpenCt | Route::OpenJson | Route::Dropped | Route::LoadTable => app.table_trust(true),
+            _ if self.kind == Kind::TableScript => app.table_trust(true),
+            _ => app.table_trust_entries(&[self.id.unwrap()]),
+        }
+    }
+
+    fn what(&self, e: Exec) -> String {
+        format!("{:?} x {} x {e:?}", self.route, self.payload_name)
+    }
+}
+
+thread_local! {
+    static STORE: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+}
+fn cell_store() -> String {
+    STORE.with(|s| s.borrow().clone())
+}
+
+fn entry_script(app: &App, id: i64) -> String {
+    entry(app, id).script.unwrap_or_default()
+}
+
+/// Whether `r` (the outcome of a refused cell) tells the user consent is needed (`never`:
+/// that Settings refuse it).
+fn reports_refusal(e: Exec, r: &Result<String, String>, never: bool) -> bool {
+    let consent = |t: &str| if never { t.contains("never") || t.contains("needs your consent") } else { t.contains(heaphook::cheat::NEEDS_CONSENT) || t.contains("needs your consent") };
+    match (e, r) {
+        (Exec::LuaActive | Exec::LuaAutoAssemble, Ok(log)) => log.contains("needs your consent"),
+        (Exec::Check, Err(m)) => m.contains(hh_asm::NOT_AVAILABLE) || m.contains("needs your consent"),
+        (_, Err(m)) => consent(m),
+        _ => false,
+    }
+}
+
+/// Runs every cell of the matrix under Settings "ask" (refused, then consented and working)
+/// or "never" (refused, and consent refused too). Returns (cells run, cells that do not
+/// exist).
+fn run_matrix(never: bool) -> (usize, Vec<String>) {
+    let t = Target::spawn_exe(exe("hh-debug", "hh-debug-target"));
+    let pid = t.child.id();
+    STORE.with(|s| *s.borrow_mut() = t.addr("store"));
+    let slot = slot(&t);
+    let dir = tempfile::tempdir().unwrap();
+    let secret = dir.path().join("secret.bin");
+    std::fs::write(&secret, SECRET).unwrap();
+    let server = hh_net::Server::bind("127.0.0.1:0", hh_net::ServerConfig::new(TOKEN), std::sync::Arc::new(HostileBackend)).unwrap().spawn().unwrap();
+    let addr = server.addr().to_string();
+    let payloads = payloads(pid, &dir.path().join("unused"), &secret, &slot);
+    let (mut cells, mut missing, mut n) = (0, Vec::new(), 0);
+    for route in ROUTES {
+        for p in &payloads {
+            let ex = execs(route, p.kind);
+            if ex.is_empty() {
+                missing.push(format!("{route:?} x {}", p.name));
+                continue;
+            }
+            n += 1;
+            // The payload's trace goes to this cell's own marker.
+            let cdir = dir.path().join(format!("cell{n}"));
+            std::fs::create_dir_all(&cdir).unwrap();
+            let p2 = Payload {
+                name: p.name.clone(),
+                kind: p.kind,
+                script: p.script.replace(dir.path().join("unused").to_str().unwrap(), cdir.join("marker").to_str().unwrap()),
+                table_script: p.table_script.replace(dir.path().join("unused").to_str().unwrap(), cdir.join("marker").to_str().unwrap()),
+            };
+            let mut c = Cell::new(route, &p2, never, pid, &slot, dir.path(), &addr, n);
+            for &e in &ex {
+                c.reset();
+                let r = c.run(e, false);
+                if let Some(h) = c.happened() {
+                    panic!("{}: ran without consent: {h}\n{r:?}\n{}", c.what(e), c.new_log());
+                }
+                assert!(reports_refusal(e, &r, never), "{}: refused without saying why: {r:?}\n{}", c.what(e), c.new_log());
+                cells += 1;
+            }
+            c.reset();
+            if never {
+                let g = c.grant().expect_err("consent under never");
+                assert!(g.contains("never"), "{}: {g}", c.what(ex[0]));
+                for &e in &ex {
+                    let r = c.run(e, true);
+                    assert!(c.happened().is_none(), "{}: ran after a refused grant: {r:?}", c.what(e));
+                    assert!(reports_refusal(e, &r, true), "{}: {r:?}", c.what(e));
+                    c.reset();
+                }
+                continue;
+            }
+            c.grant().unwrap_or_else(|g| panic!("{:?} x {}: grant: {g}", route, p.name));
+            for &e in &ex {
+                c.reset();
+                let r = c.run(e, true);
+                match e {
+                    Exec::Check => assert!(r.is_ok(), "{}: consented check: {r:?}", c.what(e)),
+                    _ => {
+                        assert!(r.is_ok() && !reports_refusal(e, &r, false), "{}: consented but refused: {r:?}\n{}", c.what(e), c.new_log());
+                        assert!(c.happened().is_some(), "{}: consented but nothing ran: {r:?}\n{}", c.what(e), c.new_log());
+                    }
+                }
+            }
+            c.reset();
+        }
+    }
+    drop(server);
+    (cells, missing)
+}
+
+/// The matrix under Settings "ask": every cell refuses and asks; consented, every cell runs.
 #[test]
-fn untrusted_table_lua_never_runs_on_any_route() {
+fn consent_matrix() {
+    let (cells, missing) = run_matrix(false);
+    eprintln!("consent matrix: {cells} refused cells (then consented); cells that do not exist: {missing:?}");
+    assert!(cells > 1000, "{cells}");
+}
+
+/// The matrix under Settings "never": every cell stays refused and consent cannot be given.
+#[test]
+fn consent_matrix_never() {
+    let (cells, _) = run_matrix(true);
+    eprintln!("consent matrix under never: {cells} cells");
+    assert!(cells > 1000, "{cells}");
+}
+
+/// "Never" (and a withdrawn yes) stops what the table's Lua already started: a timer that
+/// runs every 20 ms is gone by the next driver tick.
+#[test]
+fn never_and_withdrawn_consent_stop_running_lua() {
+    for how in ["never", "decline"] {
+        let t = Target::spawn();
+        let app = App::default();
+        app.start_driver();
+        app.open_process(t.child.id()).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("marker");
+        let m = format!("{:?}", marker.to_str().unwrap());
+        let script = format!(
+            "tm = createTimer(nil) tm.Interval = 20 tm.OnTimer = function() local f = io.open({m}, 'a') f:write('t\\n') f:close() end\n\
+             createHotkey(function() local f = io.open({m}, 'a') f:write('hk\\n') f:close() end, VK_CONTROL, VK_F9)"
+        );
+        let file = dir.path().join("timer.json");
+        heaphook::table::save(&file, &Table { lua_script: script, ..Table::default() }).unwrap();
+        app.table_open(file.to_str().unwrap(), false).unwrap();
+        app.table_trust(true).unwrap();
+        app.table_run_script().unwrap();
+        wait("timer runs", || (marks(&marker).lines().count() >= 2).then_some(()));
+        if how == "never" {
+            let mut st = app.settings_get().unwrap();
+            st.table_script = "never".into();
+            app.settings_set(st).unwrap();
+        } else {
+            app.table_trust(false).unwrap();
+        }
+        let n = marks(&marker).lines().count();
+        std::thread::sleep(Duration::from_millis(150));
+        assert_eq!(marks(&marker).lines().count(), n, "{how}: the timer kept running");
+        assert_eq!(app.hotkey_press(&[17, 120]).unwrap(), 0, "{how}: the createHotkey hotkey survived");
+        assert!(!marks(&marker).contains("hk"));
+    }
+}
+
+/// A table's entry hotkeys go system-wide only with the entry's consent, and keys are
+/// watched for a table only once it is trusted.
+#[test]
+fn global_hotkeys_follow_consent() {
+    let t = Target::spawn();
+    let app = App::default();
+    app.open_process(t.child.id()).unwrap();
+    let hk = |keys: Vec<u32>| Hotkey { action: "Toggle Activation".into(), keys, value: None, description: None, id: None };
+    let e = Entry { id: 1, description: "hp".into(), addr: t.addr("i32"), hotkeys: vec![hk(vec![17, 113]), hk(vec![112])], ..Entry::default() };
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("t.json");
+    heaphook::table::save(&file, &Table { entries: vec![e.clone()], ..Table::default() }).unwrap();
+    app.table_open(file.to_str().unwrap(), false).unwrap();
+    assert!(app.global_combos().is_empty());
+    app.key_state(&[65]).unwrap();
+    app.lua_exec("assert(not isKeyPressed(VK_A))").unwrap();
+    app.table_trust(true).unwrap();
+    assert_eq!(app.global_combos(), vec![vec![17, 113]], "plain F1 is never system-wide");
+    let pasted = app.table_paste(vec![Entry { hotkeys: vec![hk(vec![17, 114])], ..e }], None, None).unwrap();
+    assert!(!app.global_combos().contains(&vec![17, 114]));
+    app.table_trust_entries(&pasted.ids).unwrap();
+    assert!(app.global_combos().contains(&vec![17, 114]));
+    app.key_state(&[65]).unwrap();
+    app.lua_exec("assert(isKeyPressed(VK_A))").unwrap();
+}
+
+/// Opening a table drops what the previous table's Lua left (timer, form, breakpoint).
+#[test]
+fn opening_a_table_drops_the_previous_tables_lua() {
     let mut t = Target::spawn_exe(exe("hh-debug", "hh-debug-target"));
     let app = App::default();
     app.start_driver();
     app.open_process(t.child.id()).unwrap();
     let dir = tempfile::tempdir().unwrap();
     let marker = dir.path().join("marker");
-    let file = dir.path().join("evil.json");
-    let evil = hostile_table(&marker, &t);
-    heaphook::table::save(&file, &evil).unwrap();
-    let evil_path = file.to_str().unwrap().to_string();
-
-    // Before the switch, under the user's own table: a timer, a form button, a record callback
-    // and a Lua breakpoint that would all activate entry 1 of whatever table is loaded next.
+    let m = format!("{:?}", marker.to_str().unwrap());
     let store = t.addr("store");
     app.lua_exec(&format!(
-        "tm = createTimer(nil) tm.Interval = 30 tm.OnTimer = function() local r = getAddressList().getMemoryRecordByID(1) if r then r.Active = true end end\n\
-         fm = createForm() bt = createButton(fm) bt.OnClick = function() getAddressList().getMemoryRecordByID(1).Active = true end\n\
-         debug_setBreakpoint({store}, function() local r = getAddressList().getMemoryRecordByID(1) if r then r.Active = true end return 1 end)"
+        "tm = createTimer(nil) tm.Interval = 30 tm.OnTimer = function() local f = io.open({m}, 'a') f:write('t\\n') f:close() end\n\
+         fm = createForm() bt = createButton(fm) bt.OnClick = function() local f = io.open({m}, 'a') f:write('b\\n') f:close() end\n\
+         debug_setBreakpoint({store}, function() local f = io.open({m}, 'a') f:write('bp\\n') f:close() return 1 end)"
     ))
     .unwrap();
     let old_button = find_control(&app.ui_poll(0).unwrap().snapshot.unwrap().roots, "TButton", None).unwrap();
-    assert_eq!(app.debug_breakpoints().unwrap().len(), 1);
-
-    let st = app.table_open(&evil_path, false).unwrap();
-    assert_eq!(st.trust, heaphook::cheat::Trust::Ask);
-    let off = || assert!(!entry(&app, 1).frozen && !entry(&app, 3).frozen, "{}", log_text(&app));
-    let none = |route: &str| assert_eq!(marks(&marker), "", "Lua ran via {route}\n{}", log_text(&app));
-
-    // 1. click
-    needs_consent(app.table_set_active(&[1], true));
-    none("table_set_active");
-    // 2. the hotkey of the audit's reproduction (plain F1, Toggle) and an Activate hotkey
-    needs_consent(app.hotkey_press(&[112]));
-    needs_consent(app.table_hotkey(1, 1));
-    none("hotkeys");
-    // 3. a group whose option activates a {$lua} child, from the UI and from Lua
-    needs_consent(app.table_set_active(&[2], true));
-    app.lua_exec("getAddressList().getMemoryRecordByID(2).Active = true").unwrap();
-    none("group cascade");
-    // 4. the engine itself: memrec.Active, a record hotkey, a createHotkey function, a form
-    app.lua_exec("getAddressList().getMemoryRecordByID(1).Active = true").unwrap();
-    app.lua_exec("getAddressList().getMemoryRecordByID(1).Hotkey[0].doHotkey()").unwrap();
-    app.lua_exec("h2 = createHotkey(function() getAddressList().getMemoryRecordByID(1).Active = true end, VK_CONTROL, VK_F8)").unwrap();
-    assert_eq!(app.hotkey_press(&[17, 119]).unwrap(), 1);
-    app.lua_exec("f2 = createForm() b2 = createButton(f2) b2.OnClick = function() getAddressList().getMemoryRecordByID(1).Active = true end").unwrap();
-    let b2 = find_control(&app.ui_poll(0).unwrap().snapshot.unwrap().roots, "TButton", None).unwrap();
-    app.ui_event(b2.id, "OnClick", vec![]).unwrap();
-    none("the engine's own activation");
-    off();
-    assert!(log_text(&app).contains("needs your consent"), "the engine's refusal is reported: {}", log_text(&app));
-    // 5. what the previous table's scripts left: timer, form, callbacks, breakpoint are gone
+    let file = dir.path().join("t.json");
+    heaphook::table::save(&file, &Table::default()).unwrap();
+    app.table_open(file.to_str().unwrap(), false).unwrap();
+    let _ = std::fs::remove_file(&marker);
     std::thread::sleep(Duration::from_millis(200));
     assert!(app.ui_event(old_button.id, "OnClick", vec![]).is_err() || marks(&marker).is_empty());
     assert!(app.debug_breakpoints().unwrap().is_empty(), "the Lua breakpoint survived the switch");
     assert!(t.cmd_line("store").starts_with("ok"));
-    none("leftovers of the previous table");
-    // 6. a put carrying an active entry, and undo / redo restoring one
-    let cur = app.table_get().unwrap();
-    let mut tb = cur.table.clone();
-    tb.entries[0].frozen = true;
-    app.table_put(tb, cur.version).unwrap();
-    off();
-    let cur = app.table_get().unwrap();
-    let mut tb = cur.table.clone();
-    tb.entries[0].script = None;
-    tb.entries[0].addr = slot(&t);
-    app.table_put(tb, cur.version).unwrap();
-    app.table_set_active(&[1], true).unwrap(); // a value entry now: no Lua, allowed
-    app.table_history(false).unwrap(); // entry 1 is the {$lua} script again, still marked active
-    assert!(entry(&app, 1).frozen && entry(&app, 1).script.is_some());
-    // Switched off without running its [DISABLE] {$lua}: only what an enable recorded is undone.
-    app.table_set_active(&[1], false).unwrap();
-    assert!(!entry(&app, 1).frozen);
-    app.table_history(true).unwrap();
-    app.table_history(false).unwrap();
-    none("put / undo / redo");
-    // 7. the table script, the Auto Assembler window, a trainer the table brought along
-    needs_consent(app.table_run_script());
-    needs_consent(app.aa_execute(&marker_script(&marker), true, None));
-    none("table script / aa_execute");
-    // 8. not system-wide while untrusted; keys are not watched for it
-    assert_eq!(app.global_combos(), vec![vec![17, 119]], "only the console's own createHotkey; none of the table's");
-    assert!(app.lua_poll(0).unwrap().hotkeys.contains(&vec![112]), "in-app it is still bound (and refused when pressed)");
-    app.key_state(&[65]).unwrap();
-    app.lua_exec("assert(not isKeyPressed(VK_A))").unwrap();
-    // 9. declining keeps all of it inert
-    app.table_trust(false).unwrap();
-    assert!(app.table_set_active(&[1], true).unwrap_err().contains("chose not to"));
-    assert!(app.hotkey_press(&[112]).unwrap_err().contains("chose not to"));
-    none("after declining");
-
-    // Agreed: every route runs the entry's Lua.
-    app.table_trust(true).unwrap();
-    assert_eq!(app.table_get().unwrap().trust, heaphook::cheat::Trust::Agreed);
-    let count = |s: &str| marks(&marker).lines().filter(|l| *l == s).count();
-    app.table_set_active(&[1], true).unwrap();
-    assert_eq!(count("on"), 1, "click");
-    std::thread::sleep(Duration::from_millis(200));
-    app.hotkey_press(&[112]).unwrap();
-    assert_eq!(count("off"), 1, "hotkey");
-    app.table_hotkey(1, 1).unwrap();
-    assert_eq!(count("on"), 2, "Activate hotkey");
-    app.lua_exec("getAddressList().getMemoryRecordByID(1).Active = false").unwrap();
-    app.lua_exec("getAddressList().getMemoryRecordByID(1).Hotkey[0].doHotkey()").unwrap();
-    assert_eq!((count("on"), count("off")), (3, 2), "memrec.Active and doHotkey");
-    app.table_set_active(&[2], false).unwrap(); // Lua switched the header on earlier (its child stayed off)
-    app.table_set_active(&[2], true).unwrap();
-    assert!(entry(&app, 3).frozen, "group cascade");
-    app.table_run_script().unwrap();
-    assert_eq!(count("script"), 1);
-    assert_eq!(app.global_combos(), vec![vec![17, 113], vec![17, 114], vec![17, 119]], "plain F1 never system-wide");
-    app.key_state(&[65]).unwrap();
-    app.lua_exec("assert(isKeyPressed(VK_A))").unwrap();
-
-    // A table loaded by a trusted script is a new, untrusted table (trust is not inherited).
-    app.lua_exec(&format!("loadTable({evil_path:?})")).unwrap();
-    assert_eq!(app.table_get().unwrap().trust, heaphook::cheat::Trust::Ask);
-    let before = marks(&marker);
-    needs_consent(app.table_set_active(&[1], true));
-    assert_eq!(marks(&marker), before);
-    // Merged by a script: the new entries need consent, the table's own keep working.
-    let own = dir.path().join("own.json");
-    heaphook::table::save(&own, &Table { entries: vec![Entry { id: 1, description: "mine".into(), script: Some(marker_script(&marker)), ..Entry::default() }], ..Table::default() }).unwrap();
-    app.table_open(own.to_str().unwrap(), false).unwrap();
-    app.table_trust(true).unwrap();
-    app.lua_exec(&format!("loadTable({evil_path:?}, true)")).unwrap();
-    assert_eq!(app.table_get().unwrap().trust, heaphook::cheat::Trust::Ask);
-    let before = marks(&marker).lines().count();
-    app.table_set_active(&[1], true).unwrap();
-    assert_eq!(marks(&marker).lines().count(), before + 1, "the current entry still runs");
-    needs_consent(app.table_set_active(&[2], true));
-    assert_eq!(marks(&marker).lines().count(), before + 1);
-
-    // Lua that reaches a trusted table from another one asks for itself, on every route:
-    // paste, a put carrying it, undo, the UI's merge, a dropped file, the Auto Assemble window.
-    let mine = dir.path().join("mine.json");
-    let my_script = format!("// mine\n{}", marker_script(&marker));
-    heaphook::table::save(&mine, &Table { entries: vec![Entry { id: 1, description: "mine".into(), script: Some(my_script), ..Entry::default() }], ..Table::default() }).unwrap();
-    app.table_open(mine.to_str().unwrap(), false).unwrap();
-    app.table_trust(true).unwrap();
-    let lines = || marks(&marker).lines().count();
-    let n = lines();
-    let entry_consent = |r: Result<(), String>| {
-        let e = r.expect_err("must be refused");
-        assert!(e.starts_with(heaphook::cheat::NEEDS_ENTRY_CONSENT), "{e}");
-    };
-    // 1. paste (from the untrusted table's file: what the UI's clipboard carries)
-    let pasted = app.table_paste(vec![evil.entries[0].clone()], Some(1), None).unwrap();
-    let pid_ = pasted.ids[0];
-    assert_eq!(app.table_get().unwrap().untrusted, vec![pid_]);
-    entry_consent(app.table_set_active(&[pid_], true));
-    app.lua_exec(&format!("getAddressList().getMemoryRecordByID({pid_}).Active = true")).unwrap();
-    entry_consent(app.hotkey_press(&[17, 113]).map(|_| ()));
-    assert!(!app.global_combos().contains(&vec![17, 113]), "a pasted entry's hotkey is not system-wide before its consent");
-    assert_eq!(lines(), n, "paste\n{}", log_text(&app));
-    // ... while the table's own entry still runs.
-    app.table_set_active(&[1], true).unwrap();
-    app.table_set_active(&[1], false).unwrap();
-    assert_eq!(lines(), n + 2);
-    // 2. a put that brings the same script under a new id, 3. undo bringing a deleted one back
-    let cur = app.table_get().unwrap();
-    let mut tb = cur.table.clone();
-    tb.entries.push(Entry { id: 99, description: "typed?".into(), script: evil.entries[0].script.clone(), ..Entry::default() });
-    app.table_put(tb, cur.version).unwrap();
-    entry_consent(app.table_set_active(&[99], true));
-    let cur = app.table_get().unwrap();
-    let mut tb = cur.table.clone();
-    tb.entries.retain(|e| e.id != pid_);
-    app.table_put(tb, cur.version).unwrap();
-    app.table_history(false).unwrap();
-    entry_consent(app.table_set_active(&[pid_], true));
-    assert_eq!(lines(), n + 2, "put / undo");
-    // 4. the UI's merge: its entries ask; the table script it brings asks for the table
-    let st = app.table_merge(&evil_path).unwrap();
-    assert_eq!(st.trust, heaphook::cheat::Trust::Ask);
-    let merged = st.table.entries.iter().find(|e| e.description == "Infinite HP" && !st.untrusted.is_empty() && st.untrusted.contains(&e.id) && e.id != pid_).map(|e| e.id).unwrap();
-    entry_consent(app.table_set_active(&[merged], true));
-    app.table_set_active(&[1], true).unwrap();
-    app.table_set_active(&[1], false).unwrap();
-    assert_eq!(lines(), n + 4, "merge keeps the own entry running");
-    // 5. a file dropped on the window: opened like any table
-    let st = app.table_open_data("evil.json", &std::fs::read_to_string(&file).unwrap(), false).unwrap();
-    assert_eq!(st.trust, heaphook::cheat::Trust::Ask);
-    needs_consent(app.table_set_active(&[1], true));
-    assert_eq!(lines(), n + 4, "drop");
-    // 6. the Auto Assemble window: a script file asks, a typed one does not
-    let aa = dir.path().join("evil.cea");
-    std::fs::write(&aa, marker_script(&marker)).unwrap();
-    let text = app.aa_load_file(aa.to_str().unwrap()).unwrap();
-    needs_consent(app.aa_execute(&text, true, None));
-    assert_eq!(lines(), n + 4, "aa window");
-    app.aa_trust(&text).unwrap();
-    let st = app.aa_execute(&text, true, None).unwrap();
-    app.aa_execute(&text, false, Some(&st)).unwrap();
-    assert_eq!(lines(), n + 6, "agreed aa script");
-    let typed = format!("// typed here\n{}", marker_script(&marker));
-    let st = app.aa_execute(&typed, true, None).unwrap();
-    app.aa_execute(&typed, false, Some(&st)).unwrap();
-    assert_eq!(lines(), n + 8, "typed aa script");
-    // 7. consent for the entry: it runs, and its hotkey goes system-wide
-    app.table_open(mine.to_str().unwrap(), false).unwrap();
-    app.table_trust(true).unwrap();
-    let pasted = app.table_paste(vec![evil.entries[0].clone()], None, None).unwrap();
-    entry_consent(app.table_set_active(&pasted.ids, true));
-    app.table_trust_entries(&pasted.ids).unwrap();
-    assert!(app.table_get().unwrap().untrusted.is_empty());
-    app.table_set_active(&pasted.ids, true).unwrap();
-    assert_eq!(lines(), n + 9, "agreed entry");
-    assert!(app.global_combos().contains(&vec![17, 113]));
-}
-
-/// Settings "never": nothing of a loaded table's Lua runs, consent cannot be given, and turning
-/// it on withdraws consent already given.
-#[test]
-fn never_setting_holds_on_every_route() {
-    let t = Target::spawn();
-    let app = App::default();
-    app.start_driver();
-    app.open_process(t.child.id()).unwrap();
-    let dir = tempfile::tempdir().unwrap();
-    let marker = dir.path().join("marker");
-    let file = dir.path().join("evil.json");
-    heaphook::table::save(&file, &hostile_table(&marker, &t)).unwrap();
-    let mut st = app.settings_get().unwrap();
-    st.table_script = "never".into();
-    app.settings_set(st.clone()).unwrap();
-    app.table_open(file.to_str().unwrap(), false).unwrap();
-    let never = |r: Result<(), String>| assert!(r.unwrap_err().contains("never"));
-    never(app.table_set_active(&[1], true));
-    never(app.hotkey_press(&[112]).map(|_| ()));
-    never(app.table_run_script());
-    assert!(app.table_trust(true).unwrap_err().contains("never"));
-    app.lua_exec("getAddressList().getMemoryRecordByID(1).Active = true\ngetAddressList().getMemoryRecordByID(2).Active = true").unwrap();
-    assert_eq!(marks(&marker), "", "{}", log_text(&app));
-    // Agreed first, then "never": withdrawn.
-    st.table_script = "ask".into();
-    app.settings_set(st.clone()).unwrap();
-    app.table_trust(true).unwrap();
-    st.table_script = "never".into();
-    app.settings_set(st).unwrap();
-    never(app.table_set_active(&[1], true));
-    assert_eq!(app.table_get().unwrap().trust, heaphook::cheat::Trust::Declined);
-    assert!(app.global_combos().is_empty());
-    assert_eq!(marks(&marker), "");
-
-    // Lua from another table in the user's own table: no consent can be given for it.
-    let st = app.settings_get().unwrap();
-    let app = App::default();
-    app.open_process(t.child.id()).unwrap();
-    app.settings_set(st.clone()).unwrap();
-    let evil = hostile_table(&marker, &t);
-    let pasted = app.table_paste(vec![evil.entries[0].clone()], None, None).unwrap();
-    never(app.table_set_active(&pasted.ids, true));
-    assert!(app.table_trust_entries(&pasted.ids).unwrap_err().contains("never"));
-    let aa = dir.path().join("evil.cea");
-    std::fs::write(&aa, marker_script(&marker)).unwrap();
-    let text = app.aa_load_file(aa.to_str().unwrap()).unwrap();
-    assert!(app.aa_execute(&text, true, None).unwrap_err().contains("never"));
-    assert!(app.aa_trust(&text).unwrap_err().contains("never"));
-    // Agreed first, then "never": the entry's consent is withdrawn too.
-    let mut ask = st.clone();
-    ask.table_script = "ask".into();
-    app.settings_set(ask).unwrap();
-    app.table_trust_entries(&pasted.ids).unwrap();
-    app.settings_set(st).unwrap();
-    never(app.table_set_active(&pasted.ids, true));
-    assert_eq!(app.table_get().unwrap().untrusted, pasted.ids);
     assert_eq!(marks(&marker), "");
 }
 
@@ -2361,8 +2720,10 @@ fn code_filter_finds_the_function_that_ran() {
     app.debug_detach().unwrap();
 }
 
+/// `loadbinary` in a typed Auto Assemble script: reads the file as Settings allow, never a
+/// device or a pipe; a loaded table's entry reads it only with the table's consent.
 #[test]
-fn loadbinary_needs_consent_and_file_access() {
+fn loadbinary_follows_origin_and_file_access() {
     let mut t = Target::spawn();
     let app = App::default();
     app.open_process(t.child.id()).unwrap();
@@ -2375,30 +2736,31 @@ fn loadbinary_needs_consent_and_file_access() {
     let e = Entry { id: 1, description: "blob".into(), script: Some(script.clone()), ..Entry::default() };
     heaphook::table::save(&tbl, &Table { entries: vec![e], ..Table::default() }).unwrap();
     app.table_open(tbl.to_str().unwrap(), false).unwrap();
-    // Untrusted table: neither route reads the file.
-    assert!(app.table_set_active(&[1], true).unwrap_err().contains("not allowed"));
-    needs_consent(app.aa_execute(&script, true, None));
+    // The loaded table's entry: refused until the table is trusted.
+    needs_consent(app.table_set_active(&[1], true));
+    // No session: nothing proves the text was typed.
+    needs_consent(app.aa_execute(&script, true, None, None));
     assert_eq!(t.cmd("get")["i32"], 123456);
-    // Consent: both routes read it.
     app.table_trust(true).unwrap();
-    let st = app.aa_execute(&script, true, None).unwrap();
-    assert_eq!(t.cmd("get")["i32"], 0x44332211);
-    app.write_value(&t.addr("i32"), de(json!("4bytes")), "5", &Fmt::default(), None).unwrap();
     app.table_set_active(&[1], true).unwrap();
     assert_eq!(t.cmd("get")["i32"], 0x44332211);
     app.table_set_active(&[1], false).unwrap();
-    let _ = app.aa_execute(&script, false, Some(&st));
+    app.write_value(&t.addr("i32"), de(json!("4bytes")), "5", &Fmt::default(), None).unwrap();
+    // Typed into the Auto Assemble window: it runs.
+    let s = app.aa_session().unwrap();
+    let st = app.aa_execute(&script, true, None, Some(s)).unwrap();
+    assert_eq!(t.cmd("get")["i32"], 0x44332211);
+    let _ = app.aa_execute(&script, false, Some(&st), Some(s));
     // Never a device or a pipe.
     let dev = format!("[ENABLE]\nloadbinary({at},/dev/zero)\n[DISABLE]\n");
-    assert!(app.aa_execute(&dev, true, None).unwrap_err().contains("not a regular file"));
+    assert!(app.aa_execute(&dev, true, None, Some(s)).unwrap_err().contains("not a regular file"));
     // Settings without file access refuse it outright.
-    let s = app.settings_get().unwrap();
-    app.settings_set(heaphook::settings::Settings { lua_allow_os: false, ..s.clone() }).unwrap();
-    assert!(app.aa_execute(&script, true, None).unwrap_err().contains("do not allow"));
-    // "Never run a table's Lua" withdraws the consent for the table's scripts too.
-    app.settings_set(heaphook::settings::Settings { table_script: "never".into(), ..s }).unwrap();
-    needs_consent(app.aa_execute(&script, true, None).map_err(|e| format!("{} {e}", heaphook::cheat::NEEDS_CONSENT)));
-    assert!(app.table_set_active(&[1], true).is_err());
+    let st = app.settings_get().unwrap();
+    app.settings_set(heaphook::settings::Settings { lua_allow_os: false, ..st.clone() }).unwrap();
+    assert!(app.aa_execute(&script, true, None, Some(s)).unwrap_err().contains("do not allow"));
+    // "Never" withdraws the table's consent: its entry is refused again.
+    app.settings_set(heaphook::settings::Settings { table_script: "never".into(), ..st }).unwrap();
+    assert!(app.table_set_active(&[1], true).unwrap_err().contains("never"));
 }
 
 #[test]

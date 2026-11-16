@@ -265,14 +265,14 @@ fn lua_blocks_in_aa_scripts() {
     t.set(r).unwrap();
     let script = "[ENABLE]\n{$lua}\nruns = (runs or 0) + 1\nif syntaxcheck then return nil end\nlastmemrec = memrec and memrec.Description\nreturn 'game.exe+3020:\\ndb ' .. string.format('%02X', 0x63)\n{$asm}\n[DISABLE]\ngame.exe+3020:\ndb 2A\n";
     let mut syms = e.symbols().lock().unwrap().clone();
-    assert_eq!(hh_asm::aa_check(&*p, &syms, script, &mut e.aa_hooks(None, true)), None);
+    assert_eq!(hh_asm::aa_check(&*p, &syms, script, &mut e.aa_hooks_with(None, true, hh_lua::Caps::Full)), None);
     assert_eq!(read_u32(&*p, GAME + 0x3020), 0x2A, "check does not write");
     hh_asm::aa_execute(&*p, &mut syms, script, true, None, &mut e.aa_hooks(Some(id), false)).unwrap();
     assert_eq!(read_u32(&*p, GAME + 0x3020), 0x63);
     assert_eq!(run(&e, "return lastmemrec, runs, syntaxcheck, memrec"), ["Lua patch", "2", "nil", "nil"]);
     // A failing block reports its error through the AA error.
     let bad = "[ENABLE]\n{$lua}\nerror('boom')\n{$asm}\n[DISABLE]\n";
-    let err = hh_asm::aa_execute(&*p, &mut syms, bad, true, None, &mut e.aa_hooks(None, false)).unwrap_err();
+    let err = hh_asm::aa_execute(&*p, &mut syms, bad, true, None, &mut e.aa_hooks_with(None, false, hh_lua::Caps::Full)).unwrap_err();
     assert!(err.to_string().contains("boom"), "{err}");
 }
 
@@ -282,7 +282,7 @@ fn lua_block_without_return_is_nil() {
     let mut syms = e.symbols().lock().unwrap().clone();
     // No return value means nil: the block's side effect happens and nothing is inserted.
     let noret = "[ENABLE]\n{$lua}\nwriteInteger(0x%X, 7)\n{$asm}\n[DISABLE]\n".replace("%X", &format!("{:X}", GAME + 0x3020));
-    hh_asm::aa_execute(&*p, &mut syms, &noret, true, None, &mut e.aa_hooks(None, false)).unwrap();
+    hh_asm::aa_execute(&*p, &mut syms, &noret, true, None, &mut e.aa_hooks_with(None, false, hh_lua::Caps::Full)).unwrap();
     assert_eq!(read_u32(&*p, GAME + 0x3020), 7);
 }
 

@@ -78,7 +78,7 @@ export function initDissect({ showView }) {
   function showSummary() {
     const s = summary;
     $('#dc-summary').textContent = s
-      ? `${s.modules.join(', ')} · ${fmtSize(s.code_bytes)} code · ${nf.format(s.instructions)} instructions · ${nf.format(s.functions)} functions · ${nf.format(s.refs)} references · ${nf.format(s.strings)} strings · ${nf.format(s.caves)} caves`
+      ? `${s.modules.join(', ')} · ${fmtSize(s.code_bytes)} code · ${nf.format(s.instructions)} instructions · ${nf.format(s.functions)} functions · ${nf.format(s.refs)} references · ${nf.format(s.strings)} strings · ${nf.format(s.caves)} caves${s.validated === false ? ' · loaded from a file, not yet checked against this process' : ''}`
       : 'Not dissected yet. Pick modules and press Run, or load a saved dissection.';
     addBtn.disabled = !s;
     for (const [k, el] of Object.entries(counts)) el.textContent = s ? nf.format(k === 'functions' || k === 'called' ? s.functions : s[k]) : '';
@@ -218,7 +218,7 @@ export function initDissect({ showView }) {
       bReset.disabled = rec || !st || !(st.ran_sets || st.not_ran_sets);
       status.textContent = !st ? '' : rec
         ? `Recording · ${nf.format(st.armed)} breakpoints armed · ${nf.format(st.last_hits)} functions hit so far`
-        : `${nf.format(st.ran_sets)} "ran" set${st.ran_sets === 1 ? '' : 's'} · ${nf.format(st.not_ran_sets)} "did not run" set${st.not_ran_sets === 1 ? '' : 's'} · last recording hit ${nf.format(st.last_hits)} · ${nf.format(st.matches)} function${st.matches === 1 ? '' : 's'} left`;
+        : `${nf.format(st.ran_sets)} "ran" set${st.ran_sets === 1 ? '' : 's'} · ${nf.format(st.not_ran_sets)} "did not run" set${st.not_ran_sets === 1 ? '' : 's'} · last recording hit ${nf.format(st.last_hits)} · ${nf.format(st.matches)} function${st.matches === 1 ? '' : 's'} left${st.rejected ? ` · ${nf.format(st.rejected)} entr${st.rejected === 1 ? 'y' : 'ies'} the debugger refused to watch (not an instruction start)` : ''}`;
     }
     async function refresh() {
       st = await api.codeFilterState().catch(() => null);

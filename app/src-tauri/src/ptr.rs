@@ -28,6 +28,14 @@ pub struct Ptr {
 
 /// Most paths a column sort loads into memory (~100 bytes each).
 const MAX_SORT: u64 = 2_000_000;
+/// Largest pointer map file opened (hh-ptr caps it at 2^28 pointers = 4 GiB of entries).
+const MAX_MAP_FILE: u64 = 5 << 30;
+/// Largest pointer result file opened (paged from disk; only its index is held).
+const MAX_RESULT_FILE: u64 = 64 << 30;
+
+fn map_file(path: &str) -> R<PointerMap> {
+    PointerMap::load(crate::tools::user_file(path, MAX_MAP_FILE)?).map_err(|e| format!("{path}: {e}"))
+}
 
 impl Ptr {
     pub(crate) fn new() -> Self {
@@ -72,7 +80,10 @@ impl Ptr {
     }
 
     /// A fresh progress for the next phase; errors if the user cancelled in between.
+    /// The flags are read and the progress swapped under the progress lock, which pause and
+    /// cancel also hold, so a press between phases is never lost.
     fn phase(&self, name: &'static str) -> R<Arc<Progress>> {
+        let mut cur = lock(&self.progress);
         if self.cancel.load(Relaxed) {
             return Err("cancelled".into());
         }
@@ -81,7 +92,7 @@ impl Ptr {
         if self.paused.load(Relaxed) {
             p.pause();
         }
-        *lock(&self.progress) = p.clone();
+        *cur = p.clone();
         Ok(p)
     }
 
@@ -228,14 +239,13 @@ impl App {
         let compare = req
             .compare
             .iter()
-            .map(|c| Ok((PointerMap::load(regular_file(&c.path)?).map_err(|e| format!("{}: {e}", c.path))?, parse_addr(&c.target)?)))
+            .map(|c| Ok((map_file(&c.path)?, parse_addr(&c.target)?)))
             .collect::<R<Vec<_>>>()?;
         let prog = pt.phase("collect")?;
         let map = match &req.map_path {
-            Some(p) => PointerMap::load(regular_file(p)?),
-            None => PointerMap::collect_ex(&*sess.proc, &CollectOptions { alignment: req.alignment, writable_only: req.writable_only }, sess.info.remote.is_none(), &prog),
-        }
-        .map_err(s)?;
+            Some(p) => map_file(p)?,
+            None => PointerMap::collect_ex(&*sess.proc, &CollectOptions { alignment: req.alignment, writable_only: req.writable_only }, sess.info.remote.is_none(), &prog).map_err(s)?,
+        };
         let map = Arc::new(map);
         *lock(&pt.map) = Some(map.clone());
         let prog = pt.phase("scan")?;
@@ -263,7 +273,7 @@ impl App {
             ends_with: req.ends_with.clone(),
             max_level: req.max_level,
         };
-        let map = req.map_path.as_deref().map(|p| PointerMap::load(regular_file(p)?).map_err(s)).transpose()?;
+        let map = req.map_path.as_deref().map(map_file).transpose()?;
         let src = match &map {
             Some(m) => Source::Map(m),
             None if sess.info.remote.is_none() => Source::LocalProcess(&*sess.proc),
@@ -295,17 +305,17 @@ impl App {
         if !sess.ptr.running.load(Relaxed) {
             return Err("no pointer scan is running".into());
         }
+        let p = lock(&sess.ptr.progress);
         sess.ptr.paused.store(pause, Relaxed);
-        let p = lock(&sess.ptr.progress).clone();
         if pause { p.pause() } else { p.resume() }
         Ok(())
     }
 
     pub fn ptr_cancel(&self) -> R<()> {
         if let Ok(sess) = self.session() {
+            let p = lock(&sess.ptr.progress);
             sess.ptr.cancel.store(true, Relaxed);
             sess.ptr.paused.store(false, Relaxed);
-            let p = lock(&sess.ptr.progress).clone();
             p.cancel();
             p.resume();
         }
@@ -382,7 +392,7 @@ impl App {
         let pt = &sess.ptr;
         let _run = pt.start()?;
         if key == "base" {
-            let sorted = pt.file()?.sorted(&pt.temp("ptr")?).map_err(s)?;
+            let sorted = pt.file()?.sorted_ex(&pt.temp("ptr")?, &*pt.phase("sort")?).map_err(s)?;
             let info = pt.set_file(sorted);
             if !desc {
                 return Ok(info);
@@ -424,7 +434,7 @@ impl App {
     }
 
     pub fn ptr_open_results(&self, path: &str) -> R<PtrInfo> {
-        let f = ResultFile::open(regular_file(path)?).map_err(s)?;
+        let f = ResultFile::open(crate::tools::user_file(path, MAX_RESULT_FILE)?).map_err(s)?;
         Ok(self.session()?.ptr.set_file(f))
     }
 }

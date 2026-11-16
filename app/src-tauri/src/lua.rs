@@ -152,7 +152,7 @@ impl Console {
     }
 
     /// Answers whatever dialog is open with "cancelled" (interrupt).
-    fn cancel(&self) {
+    pub(crate) fn cancel(&self) {
         let mut g = lock(&self.dialog);
         if let Some(id) = g.pending.as_ref().map(|p| p.id) {
             g.answer = Some((id, Value::Null));
@@ -180,15 +180,11 @@ fn button_result(mb: i64) -> i64 {
 }
 
 impl Host for Console {
-    /// `loadbinary` of a table entry: Settings allow file access (and a table's Lua at all)
-    /// and the table, with every file-reading entry in it, is trusted. Default deny.
+    /// `loadbinary` of a table entry: Settings allow file access. Only an entry with
+    /// capabilities (`TableHost::caps`) has a `loadbinary` hook that gets here at all.
     fn allow_aa_file(&self, _path: &str) -> bool {
         let Some(app) = self.app.get().and_then(App::upgrade) else { return false };
-        let ok = {
-            let st = lock(&app.x.settings);
-            st.lua_allow_os && st.table_script != "never"
-        };
-        ok && app.x.live.aa_files_trusted()
+        lock(&app.x.settings).lua_allow_os
     }
     fn print(&self, text: &str) {
         self.push("out", text);
@@ -703,10 +699,7 @@ impl App {
         for t in &hits {
             let r = match t {
                 Target::Entry(id, i) => self.table_hotkey(*id, *i),
-                Target::Lua(id) => {
-                    let _g = self.x.lua.enter();
-                    self.x.lua.engine.fire_hotkey(*id).map_err(|e| e.to_string())
-                }
+                Target::Lua(id) => self.consented(|| self.x.lua.engine.fire_hotkey(*id).map_err(|e| e.to_string())).and_then(|r| r),
                 Target::App(i) => self.app_hotkey(*i),
             };
             if let Err(e) = r {
@@ -737,11 +730,10 @@ impl App {
     /// would be taken from every other program), and a table's entry hotkeys only once the
     /// table is trusted. The rest work while HeapHook has focus.
     pub fn global_combos(&self) -> Vec<Vec<u32>> {
-        let trusted = self.x.live.trust().allows();
-        // An entry pasted or merged from another table: not system-wide before its consent either.
+        // An entry of a loaded table, or one that came from another, only with its consent.
         let ok = |t: &Target| match t {
             Target::Lua(_) | Target::App(_) => true,
-            Target::Entry(id, _) => trusted && !self.x.live.is_foreign_ask(*id),
+            Target::Entry(id, _) => self.x.live.caps(*id) == hh_lua::Caps::Full,
         };
         let mut combos: Vec<Vec<u32>> = self.bindings().into_iter().filter(|(k, t)| has_modifier(k) && ok(t)).map(|b| b.0).collect();
         combos.sort();

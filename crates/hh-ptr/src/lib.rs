@@ -38,7 +38,7 @@ mod tests;
 pub use map::{CollectOptions, PointerMap};
 pub use path::{PointerPath, resolve, resolve_ex, thread_stacks, to_table_entry};
 pub use script::{PointerScanJob, scan_process};
-pub use results::{RescanOptions, ResultFile, ResultHeader, ResultRow, Source, merge};
+pub use results::{RescanOptions, ResultFile, ResultHeader, ResultRow, Source, merge, merge_ex};
 pub use scan::ScanOptions;
 
 /// Longest path any file or scan supports.

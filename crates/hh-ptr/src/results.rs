@@ -29,6 +29,10 @@ const MIN_REC: u64 = 3;
 const RUN: usize = 1 << 18;
 /// Most runs merged at once (open files).
 const FAN: usize = 64;
+/// Largest JSON header of a result file (base names).
+const MAX_HEADER: u64 = 64 << 20;
+/// Most v2 index entries loaded (32 MiB; ~17 billion paths).
+const MAX_INDEX: u64 = 1 << 22;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResultHeader {
@@ -316,7 +320,7 @@ impl ResultFile {
             _ => return Err(bad()),
         };
         let hlen = u32::from_le_bytes([head[8], head[9], head[10], head[11]]) as u64;
-        if 12 + hlen > len {
+        if 12 + hlen > len || hlen > MAX_HEADER {
             return Err(bad());
         }
         let mut json = vec![0u8; hlen as usize];
@@ -343,6 +347,9 @@ impl ResultFile {
         let entries = count.div_ceil(INDEX_STEP);
         if index_off > body || count > index_off / MIN_REC || Some(body - index_off) != entries.checked_mul(8) {
             return Err(truncated());
+        }
+        if entries > MAX_INDEX {
+            return Err(Error::Parse(format!("pointer result file holds {count} paths (too many)")));
         }
         let mut raw = vec![0u8; (entries * 8) as usize];
         f.seek(SeekFrom::Start(data_start + index_off))?;
@@ -511,6 +518,12 @@ impl ResultFile {
     pub fn sorted(&self, out: &Path) -> Result<ResultFile> {
         merge(&[self], out)
     }
+
+    /// [`ResultFile::sorted`] honouring `progress` (pause; cancel returns an error and
+    /// leaves no output).
+    pub fn sorted_ex(&self, out: &Path, progress: &Progress) -> Result<ResultFile> {
+        merge_ex(&[self], out, progress)
+    }
 }
 
 /// Sort key: level, base (index into sorted names), base offset, offsets (zero padded).
@@ -532,10 +545,15 @@ impl Drop for Runs {
 /// bounded (runs of 2^18 paths sorted in RAM, written next to `out`, then merged), so
 /// `out` may be one of the inputs.
 pub fn merge(inputs: &[&ResultFile], out: &Path) -> Result<ResultFile> {
-    merge_runs(inputs, out, RUN)
+    merge_runs(inputs, out, RUN, &Progress::new())
 }
 
-pub(crate) fn merge_runs(inputs: &[&ResultFile], out: &Path, run: usize) -> Result<ResultFile> {
+/// [`merge`] honouring `progress`: pause holds it, cancel returns an error.
+pub fn merge_ex(inputs: &[&ResultFile], out: &Path, progress: &Progress) -> Result<ResultFile> {
+    merge_runs(inputs, out, RUN, progress)
+}
+
+pub(crate) fn merge_runs(inputs: &[&ResultFile], out: &Path, run: usize, progress: &Progress) -> Result<ResultFile> {
     let first = inputs.first().ok_or_else(|| Error::Other("nothing to merge".into()))?;
     if inputs.iter().any(|f| f.header.pointer_size != first.header.pointer_size) {
         return Err(Error::Other("pointer sizes differ".into()));
@@ -565,9 +583,11 @@ pub(crate) fn merge_runs(inputs: &[&ResultFile], out: &Path, run: usize) -> Resu
     };
     // Phase 1: sorted runs; every input is fully read before `out` is created.
     let mut buf: Vec<Key> = Vec::new();
+    progress.start(inputs.iter().map(|f| f.count).sum());
+    let check = || if progress.is_cancelled() { Err(crate::cancelled()) } else { Ok(()) };
     for f in inputs {
         let map: Vec<u32> = f.header.bases.iter().map(|n| header.bases.binary_search(n).map(|i| i as u32).unwrap_or(ABS)).collect();
-        f.batches(&Progress::new(), |recs| {
+        f.batches(progress, |recs| {
             for r in recs {
                 let base = if r.base == ABS { ABS } else { map[r.base as usize] };
                 buf.push((r.n as u8, base, r.base_off, r.offs));
@@ -580,11 +600,14 @@ pub(crate) fn merge_runs(inputs: &[&ResultFile], out: &Path, run: usize) -> Resu
             }
             Ok(())
         })?;
+        check()?;
     }
     if runs.0.is_empty() {
         // Everything fit in memory: no run files.
         buf.par_sort_unstable();
+        let mut pending = Runs(vec![out.to_path_buf()]);
         write(out, &mut buf.drain(..))?;
+        pending.0.clear();
         return ResultFile::open(out);
     }
     if !buf.is_empty() {
@@ -596,8 +619,11 @@ pub(crate) fn merge_runs(inputs: &[&ResultFile], out: &Path, run: usize) -> Resu
     drop(buf);
     // Phase 2: k-way merges, at most FAN files at a time.
     while runs.0.len() > 1 {
+        check()?;
         let group = Runs(runs.0.drain(..runs.0.len().min(FAN)).collect());
         let dst = if runs.0.is_empty() { out.to_path_buf() } else { next_run() };
+        // Removed on any failure below, so a half-written file never leaks.
+        let mut pending = Runs(vec![dst.clone()]);
         let files = group.0.iter().map(|p| ResultFile::open(p)).collect::<Result<Vec<_>>>()?;
         let mut readers = files.iter().map(|f| f.reader_at(0)).collect::<Result<Vec<_>>>()?;
         let mut heap = BinaryHeap::new();
@@ -626,6 +652,7 @@ pub(crate) fn merge_runs(inputs: &[&ResultFile], out: &Path, run: usize) -> Resu
         written?;
         // Close the runs before deleting them (Windows cannot delete open files).
         drop((readers, files, group));
+        pending.0.clear();
         if dst != out {
             runs.0.push(dst);
         }

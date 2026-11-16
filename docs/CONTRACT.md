@@ -63,8 +63,8 @@ decreased decreased_by changed unchanged same_as_first`, plus `not: bool` to inv
 | `set_frozen` | `[{addr, vtype, value, mode}]` (replaces the whole set; mode `exact`/`allow_increase`/`allow_decrease`) | – |
 | `disassemble` | `addr, count` | `[{addr, bytes, text, comment}]` |
 | `assemble` | `addr, text` | hex bytes |
-| `aa_check` | `script` | `null` or `{line, message}` |
-| `aa_execute` | `script, enable, state?` | `state` (opaque, pass back to disable) |
+| `aa_check` | `script, session?, entry?` | `null` or `{line, message}`; checked with the capabilities of table entry `entry`, else of Auto Assemble session `session`, else none (see "Script consent") |
+| `aa_execute` | `script, enable, state?, session?` | `state` (opaque, pass back to disable); capabilities of session `session` (none without one) |
 | `table_load` | `path` | table JSON (below); reads HeapHook JSON and Cheat Engine `.CT` XML |
 | `table_save` | `path, table` | – |
 | `write_value` (flags) | also `len?, utf16?, signed?, hex?` (the entry's flags; `set_frozen` entries take the same) | – |
@@ -91,8 +91,8 @@ decreased decreased_by changed unchanged same_as_first`, plus `not: bool` to inv
 | `table_get` | – | `{version, table, trust}`; the backend owns the live table (Lua and hotkeys change it too); `trust`: `own` (built in this session), `agreed`, `ask` (opened from a file, or loaded / merged by a script), `declined` |
 | `table_put` | `table, base` (version the edit is based on) | new version; rejects `stale table version …` (refetch, replay the edit); never changes activation; keeps an entry's (or the table's) `ct_extra` only when it is exactly what the backend holds for it, drops option names that are not `[A-Za-z0-9_]+` and colours that are not `#RRGGBB` |
 | `table_open` / `table_export` | `path` (`.json` or `.CT`), `force?` | `{version, table}` (all inactive; the Lua script is NOT run; the current table's active scripts are disabled first, and if one cannot be the open is refused with `… could not be disabled …` unless `force`, which carries those entries over, still active, into a group) / – |
-| `table_trust` | `trust` | – (the only way a loaded table's Lua becomes runnable: its table script and the `{$lua}` of its entries, on every route — click, hotkeys, group options, Lua `memrec.Active`, forms, timers, `aa_execute`, undo/redo. Until then each refuses with `needs consent: <what>: …` (`… you chose not to …` once declined); Settings `table_script: never` refuses instead, and `table_trust(true)` errors then. Entry hotkeys of an untrusted table are not registered system-wide; a hotkey without Ctrl/Shift/Alt/Win never is) |
-| `aa_check` (no execution) | | never runs `{$lua}` blocks (they count as empty text while checking) |
+| `table_trust` | `trust` | – (consent for a loaded table: its table script and the capabilities of the entries that came with it, on every route. `false` declines; if consent had been given it is withdrawn and the table's running Lua is stopped (see "Script consent"). `true` errors while Settings say never. Entry hotkeys without capabilities are not registered system-wide; a hotkey without Ctrl/Shift/Alt/Win never is) |
+| `aa_check` (no execution) | | never runs Lua: with capabilities `{$lua}` blocks count as empty text and registered commands expand to nothing; without them each directive that needs one is an error containing `is not available to this script` |
 | table limits | | groups nest at most 64 deep, at most 200000 entries, table files at most 64 MiB; `table_open`/`table_put` refuse more |
 | `close_process` (scripts) | | while the process lives, active scripts are disabled first (failures go to the Lua log, the close goes on); the app does the same on exit |
 | `table_set_active` | `ids, active` | – (CE activation: OnActivate/OnDeactivate, Auto Assembler with `{$lua}`, freeze, group options) |
@@ -178,13 +178,17 @@ decreased decreased_by changed unchanged same_as_first`, plus `not: bool` to inv
 | `process_pause` | `pause` | – (suspends / resumes every thread; refused while the debugger is attached; `close_process` and `debug_attach` resume first; `lua_poll.process.paused`) |
 | `trace_save` / `trace_load` | `path, trace` (any JSON) / `path` | – / the saved `trace` (file `{"heaphook_trace": 1, "trace"}`, at most 256 MiB) |
 | `table_export_text` | `path` | – (tab-separated listing: description indented by depth, address expression, type, live value) |
-| `table_merge` | `path` | `TableState` (entries appended with new ids, inactive; entries that run Lua arrive untrusted; a table script it brings into a table without one makes the table `ask`) |
-| `table_paste` | `entries, after?, base?` | `{version, ids}` (new ids after entry `after` in its list, or at the end; every entry that runs Lua arrives untrusted) |
+| `table_merge` | `path` | `TableState` (entries appended with new ids, inactive, every one untrusted; a table script it brings into a table without one makes the table `ask`) |
+| `table_paste` | `entries, after?, base?` | `{version, ids}` (new ids after entry `after` in its list, or at the end; every entry arrives untrusted) |
 | `table_trust_entries` | `ids` | – (consent for the untrusted entries in those subtrees; refused while Settings say never; "never" withdraws it again) |
-| per-entry trust | | `TableState.untrusted: [id]`: entries whose Lua came from another table (paste, merge, `loadTable(f, true)`, a dropped file, or any put / undo that brings a script first seen in an untrusted source). Their Lua refuses on every route with `needs consent: entries: <what>: …` until `table_trust_entries`, whatever the table's own trust; their hotkeys are not registered system-wide before that |
+| `table_add_template` | `addr, kind, description, after?, base?` | `{version, ids}`: `aa_template` inserted as a new script entry by the backend; untrusted when the target is remote (its text embeds names the server reported) |
+| `table_resolve` | `ids` | `[addr or null]`: entries' addresses, each resolved with the lookups its origin allows (the table rows use this, not `resolve_many`) |
+| per-entry trust | | `TableState.untrusted: [id]`: entries that came from elsewhere (paste, merge, `loadTable(f, true)`, a remote template, a script assigned from an Auto Assemble window a file was loaded into) and wait for their own consent (`table_trust_entries`), whatever the table's own trust; their hotkeys are not registered system-wide before that |
 | `table_dirty` | – | bool (the table differs from what was last opened or saved; activation does not count) |
 | `table_open_data` | `name, data, force?` | like `table_open` for a file's text (a browser drop; `.CT` by name) |
-| `aa_load_file` / `aa_trust` | `path` / `script` | script text / – (`aa_execute` refuses `{$lua}` of a script loaded from a file or an untrusted table until `aa_trust` of that exact text; what the user types runs) |
+| `aa_session` | | `id`: a new Auto Assemble window session; what is typed into it is the user's own |
+| `aa_load_file` / `aa_trust` | `path, session` / `session` | script text / – (a file loaded into a session makes the session untrusted until `aa_trust(session)`, whatever is typed into it afterwards; refused while Settings say never) |
+| `aa_assign` | `session, script, description, after?, base?` | `{version, ids}`: "Assign to table" — the script as a new entry keeping the session's origin (a loaded file arrives untrusted, or agreed if the session was) |
 | `app_args` | – | `{table, pid, attach, launch: {program, args}}` or `null` (command line, handed out once) |
 | `app_quit` | `quit` | – (desktop app only: the answer to `lua_poll.window.close_seq`, a close with unsaved changes; closing again while asked closes) |
 | `lua_poll.window` | | `{close_seq, drop_seq, drops: [path]}` (window close requests and files dropped on the window) |
@@ -246,7 +250,7 @@ a path in a prompt like the mock) and no global hotkeys (in-app hotkeys still wo
 | `symbol_list` | `module?, filter, offset, limit` | `{total, rows: [{name, module, addr, size, user}]}` |
 | `disassemble` (1.0) | `opts?: {att, typed}` | AT&T text (display only), typed operand comments |
 | `aa_template` (1.0) | `kind: api` | API hook template |
-| `aa_execute` (1.0) | | returns `scans: [{name, addr, matches}]`; Settings `aob_unique: off/warn/fail`; `loadbinary` reads a file only when the script is trusted (typed, or consented with `aa_trust` / `table_trust`) and Settings allow Lua and scripts to access files (regular files, at most 64 MiB). Table entries run through hh-lua, which has no `loadbinary` host: refused |
+| `aa_execute` (1.0) | | returns `scans: [{name, addr, matches}]`; Settings `aob_unique: off/warn/fail`; `loadbinary` reads a file only when the script has capabilities (see "Script consent") and Settings allow Lua and scripts to access files (regular files, at most 64 MiB in all) |
 | `debug_launch` | `req: {program, args, cwd, stop: entry/first/run}` | `{pid, name, is_64bit}` (started under the debugger and opened, stopped with reason `started: …`; reaped by the app once it exits and is untraced) |
 | `debug_set_break_on` / `debug_break_on` | `on: {thread_created, thread_exited, module_loaded: [pattern], module_unloaded: [pattern]}` / – | – / same |
 | `debug_add_breakpoint` (1.0) | `req.pending` (expression; armed when it resolves), `thread`, `outside_module`, `log` + `message` (tracepoint: `{rax}`, `{old}`, `{new}`, `{address}` become hex), `value_condition` (write / access: `old`, `new`, `address`, registers), `trace: {skip_modules, stay_start, stay_end, until_return, max_ms, capture_memory}` | `debug_breakpoints` rows carry them plus `resolved`; the debugger log shows tracepoint lines, resolutions and debug-event stops |
@@ -257,3 +261,32 @@ a path in a prompt like the mock) and no global hotkeys (in-app hotkeys still wo
 | `debug_trace` (1.0) | | rows carry `accesses: [{addr, size, read, write, before, after}]` with `capture_memory` |
 | `debug_status.reason` (1.0) | | the debug event that stopped it (`thread 12 created`, `module loaded: libz.so.1`, `started: …`) |
 | settings (1.0 RC) | | `aob_unique: off/warn/fail` |
+
+## Script consent (1.0-rc.1)
+
+Trust is decided by origin, never by content, and the engine fails closed.
+
+- **Origin.** The backend records where each table entry came from: typed or generated in this
+  session (the user's own), the table file that was opened (dropped file, command line, Lua
+  `loadTable(f)`: under `table_trust`), or elsewhere (paste, merge, `loadTable(f, true)`, a
+  remote template, an Auto Assemble session a file was loaded into: under
+  `table_trust_entries`). It survives edits, `table_put`, moves, undo / redo and saves within
+  the session. Editing an untrusted entry never makes it trusted; consent does
+  (`table_trust`, `table_trust_entries`, `aa_trust`), and Settings `table_script: never`
+  refuses it and withdraws consent already given. Auto Assemble window text is the user's own
+  only through its session (`aa_session`), never because of what it says.
+- **Capabilities.** An entry or script without consent is run with Auto Assembler hooks that
+  contain nothing that runs Lua, reads a local file or hands its text to Lua a table
+  registered: no `{$lua}`, `luacall`, `loadbinary`, `include`, custom commands, prologues,
+  epilogues or symbol lookup callbacks; its record callbacks (`OnActivate`, ...) do not run and
+  its address is never given to a lookup callback. A plain Auto Assembler script still runs.
+  A script that needed a capability fails, and the route answers with `needs consent: <what>:
+  …` (`needs consent: entries: <what>: …` for entries from elsewhere; under "never" an error
+  saying so) — on every route: click, hotkeys, group options, Lua `memrec.Active`, timers,
+  forms, `autoAssemble` of text Lua read from such an entry (it reports `needs your consent`
+  in its error), `aa_check` (an error containing `is not available to this script`).
+- **Withdrawing.** `table_trust(false)` after a yes, or Settings turning to "never", interrupts
+  the running script and drops the table's timers, threads, forms, `createHotkey` hotkeys,
+  record callbacks, registered Auto Assembler commands / prologues / lookup callbacks, Lua
+  breakpoints and pointer scans without running any of them once more.
+

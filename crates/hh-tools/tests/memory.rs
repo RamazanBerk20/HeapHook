@@ -379,6 +379,31 @@ fn page_change_map() {
     assert_eq!(m.changed.len(), MAX_MAP_CELLS);
     assert_eq!(m.changed.iter().sum::<u32>(), 3);
     assert!(change_map(&a, &b, 5, 5, 4).is_err());
+    // One cell over the whole address space: its size does not fit, an error not a panic.
+    assert!(change_map(&a, &b, 0, u64::MAX, 1).is_err());
+}
+
+#[test]
+fn file_search_cancel_is_seen_within_a_piece() {
+    // Every position matches the anchor and fails only at the last of 4096 bytes: about
+    // 64 G byte compares for one 16 MiB piece. Cancel must stop it promptly.
+    let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let f = dir.path().join("slow.hhmem");
+    let snap = Snapshot { blocks: vec![Block { addr: 0x1000, data: vec![0u8; 16 << 20] }] };
+    save_snapshot(&snap, &f).unwrap();
+    drop(snap);
+    let mut pat = vec![Some(0u8); MAX_PATTERN];
+    pat[MAX_PATTERN - 1] = Some(1);
+    let prog = std::sync::Arc::new(Progress::new());
+    let p2 = prog.clone();
+    let t = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        p2.cancel();
+    });
+    let t0 = std::time::Instant::now();
+    assert!(search_file(&f, &pat, 10, &prog).is_err());
+    assert!(t0.elapsed() < std::time::Duration::from_secs(10), "{:?}", t0.elapsed());
+    t.join().unwrap();
 }
 
 /// A module whose memory holds a minimal ELF but whose path names a different local file

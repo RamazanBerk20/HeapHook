@@ -11,6 +11,9 @@
 .ed-wrap > textarea.ed-ta::selection { background: color-mix(in srgb, var(--blue) 26%, transparent); }
 .ed-wrap > textarea.ed-ta::placeholder { -webkit-text-fill-color: var(--muted); color: var(--muted); }
 .ed-hl { position: absolute; inset: 0; overflow: hidden; pointer-events: none; user-select: none; }
+/* Past the highlighting budget (editor.js HL_DOC) the textarea paints its own plain text. */
+.ed-wrap.ed-plain > textarea.ed-ta { color: var(--text-2); -webkit-text-fill-color: var(--text-2); }
+.ed-wrap.ed-plain > .ed-hl { display: none; }
 .ed-in { position: absolute; top: 0; left: 0; min-width: 100%; white-space: pre; color: var(--text-2); font-variant-ligatures: none; font-kerning: none; }
 .ed-ln { height: var(--ed-lh, 18px); }
 .ed-ln.ed-err { background: var(--red-bg); }

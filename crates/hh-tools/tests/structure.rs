@@ -599,3 +599,24 @@ fn c_and_csharp_definitions() {
         assert!(cs.contains(want), "{want:?} missing in\n{cs}");
     }
 }
+
+#[test]
+fn code_generators_survive_huge_nested_sizes() {
+    // Each level multiplies the size by 65536 items: the sizes saturate instead of
+    // overflowing (a debug build would panic).
+    let level = |name: &str, child: &str| Structure {
+        name: name.into(),
+        elements: vec![Element { child: Some(child.into()), count: 65536, ..el(0x10, ElemType::Struct, "items") }],
+    };
+    let s = vec![
+        level("A", "B"),
+        level("B", "C"),
+        level("C", "D"),
+        level("D", "E"),
+        level("E", "F"),
+        Structure { name: "F".into(), elements: vec![Element { size: 1 << 20, ..el(0, ElemType::Aob, "blob") }] },
+    ];
+    validate_structures(&s).unwrap();
+    assert!(to_csharp(&s, 8).contains("struct A"));
+    assert!(to_c(&s, 8).contains("struct A"));
+}

@@ -21,20 +21,30 @@
 //! flags     u32      0 (reserved)
 //! meta_len  u64      length of the JSON that follows (at most MAX_META_BYTES)
 //! meta      JSON     {modules, code_bytes, instructions, functions, strings, caves,
-//!                    code}: the shapes the query methods return; `code` lists the
-//!                    disassembled executable ranges as [start, end) number pairs
+//!                    code, module_info}: the shapes the query methods return; `code`
+//!                    lists the disassembled executable ranges as [start, end) number
+//!                    pairs; `module_info` (since 1.0, optional) is a [`ModuleIdent`] per
+//!                    module: where it was loaded and a fingerprint of its contents
 //! ref_count u64      at most MAX_SAVED_REFS
 //! ref_count times:   to u64, from u64, kind u8 (0 call, 1 jump, 2 cond_jump, 3 data),
 //!                    sorted by (to, from, kind)
 //! ```
-//! Loading checks every count against the file size and the caps, every kind byte, the
-//! reference order and that functions, strings and caves are sorted, so a hostile file fails
-//! with an error instead of allocating or producing an inconsistent index.
+//! Loading checks every count against the file size and the caps (also the memory the
+//! metadata decodes to), every kind byte, the reference order and that functions, strings
+//! and caves are sorted, so a hostile file fails with an error instead of allocating or
+//! producing an inconsistent index.
+//!
+//! A loaded dissection holds absolute addresses of some earlier run: it is *unvalidated*
+//! until [`Dissection::validate`] matched its modules against a live process (rebasing
+//! the ones that moved, dropping the ones that changed). Nothing may write into a process
+//! (e.g. arm breakpoints) from an unvalidated dissection; files without `module_info`
+//! cannot be validated.
+use std::cell::Cell;
 use std::collections::{BTreeSet, HashMap};
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::Path;
 
-use hh_core::{Addr, Error, Module, Process, Result};
+use hh_core::{Addr, Error, Module, Process, Region, Result};
 use iced_x86::{Decoder, DecoderOptions, FlowControl, Instruction, Mnemonic, OpKind, Register};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -130,6 +140,106 @@ pub struct DissectSummary {
     pub refs: usize,
     pub strings: usize,
     pub caves: usize,
+    /// Matched against the live process ([`Dissection::validate`]); a loaded file is not
+    /// until then.
+    #[serde(default)]
+    pub validated: bool,
+}
+
+/// Where a dissected module was loaded and what it contained.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModuleIdent {
+    pub name: String,
+    pub path: String,
+    #[serde(with = "hexaddr")]
+    pub base: Addr,
+    pub size: u64,
+    /// [`module_fingerprint`] when it was dissected.
+    pub fingerprint: u64,
+}
+
+impl ModuleIdent {
+    pub fn module(&self) -> Module {
+        Module { name: self.name.clone(), path: self.path.clone(), base: self.base, size: self.size }
+    }
+}
+
+/// What [`Dissection::validate`] did per module (names).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Validation {
+    /// Loaded where they were.
+    pub kept: Vec<String>,
+    /// Loaded elsewhere, same contents: addresses moved with them.
+    pub rebased: Vec<String>,
+    /// Not loaded, or loaded with other contents: their addresses were dropped.
+    pub dropped: Vec<String>,
+}
+
+impl Validation {
+    /// Nothing moved or went.
+    pub fn unchanged(&self) -> bool {
+        self.rebased.is_empty() && self.dropped.is_empty()
+    }
+}
+
+fn fnv(h: &mut u64, b: &[u8]) {
+    for &x in b {
+        *h = (*h ^ x as u64).wrapping_mul(0x100_0000_01b3);
+    }
+}
+
+/// A cheap content fingerprint of a loaded module, the same wherever it is loaded: its size,
+/// its header page (a PE's ImageBase field, which the loader rewrites, zeroed), and for
+/// non-PE images (no base relocations in code) the first and last page of its first
+/// executable mapping. `None` when the header cannot be read. Read through a view that
+/// hides breakpoint bytes when a debugger may have patched the code.
+pub fn module_fingerprint(p: &dyn Process, m: &Module, regions: &[Region]) -> Option<u64> {
+    const PG: usize = 4096;
+    let mut h = 0xcbf2_9ce4_8422_2325u64;
+    fnv(&mut h, &m.size.to_le_bytes());
+    let mut page = vec![0u8; PG];
+    let n = p.read(m.base, &mut page).ok()?;
+    let hdr = &mut page[..n];
+    let pe = hdr.starts_with(b"MZ");
+    if pe && let Some(e) = hdr.get(0x3c..0x40).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize) {
+        let opt = e + 24;
+        let field = match hdr.get(opt..opt + 2) {
+            Some([0x0b, 0x01]) => Some((opt + 28, 4)),
+            Some([0x0b, 0x02]) => Some((opt + 24, 8)),
+            _ => None,
+        };
+        if let Some((o, len)) = field
+            && hdr.get(e..e + 4) == Some(b"PE\0\0")
+            && let Some(b) = hdr.get_mut(o..o + len)
+        {
+            b.fill(0);
+        }
+    }
+    fnv(&mut h, hdr);
+    let end = m.base.saturating_add(m.size);
+    if !pe && let Some(r) = regions.iter().find(|r| r.prot.x && r.start >= m.base && r.start < end) {
+        let r_end = r.start.saturating_add(r.size).min(end);
+        let last = r_end.saturating_sub(PG as u64).max(r.start);
+        for a in [r.start, last] {
+            let n = p.read(a, &mut page).unwrap_or(0);
+            fnv(&mut h, &page[..n]);
+        }
+    }
+    Some(h)
+}
+
+/// Identities of `modules` as loaded in `p` now.
+fn idents(p: &dyn Process, modules: &[Module], regions: &[Region]) -> Vec<ModuleIdent> {
+    modules
+        .iter()
+        .map(|m| ModuleIdent {
+            name: m.name.clone(),
+            path: m.path.clone(),
+            base: m.base,
+            size: m.size,
+            fingerprint: module_fingerprint(p, m, regions).unwrap_or(0),
+        })
+        .collect()
 }
 
 /// Results of [`dissect`]; query in pages.
@@ -148,6 +258,10 @@ pub struct Dissection {
     caves: Vec<Cave>,
     /// Executable ranges disassembled, `[start, end)`, sorted.
     code: Vec<(Addr, Addr)>,
+    /// Identity of each dissected module (empty for files from before 1.0).
+    idents: Vec<ModuleIdent>,
+    /// The addresses are those of the live process (see [`Dissection::validate`]).
+    validated: bool,
 }
 
 fn page<T: Clone>(v: &[T], offset: usize, limit: usize) -> Vec<T> {
@@ -164,7 +278,125 @@ impl Dissection {
             refs: self.to.len(),
             strings: self.strings.len(),
             caves: self.caves.len(),
+            validated: self.validated,
         }
+    }
+
+    /// The addresses are those of the live process: dissected from it, or a loaded file
+    /// [`Dissection::validate`]d against it.
+    pub fn is_validated(&self) -> bool {
+        self.validated
+    }
+
+    /// Where each dissected module was (is, once validated) loaded.
+    pub fn module_idents(&self) -> &[ModuleIdent] {
+        &self.idents
+    }
+
+    /// Matches the dissected modules against `p` as it is now: a module loaded at the same
+    /// path with the same size and fingerprint is kept, rebased when it moved (all its
+    /// addresses move with it); any other module's addresses are dropped (functions,
+    /// references from it or into it, strings, caves, code ranges), as is everything
+    /// claiming to be code outside the kept modules. Then the dissection is validated.
+    /// Errors (and stays unvalidated) for a file without module identities.
+    pub fn validate(&mut self, p: &dyn Process) -> Result<Validation> {
+        if self.idents.is_empty() {
+            return Err(Error::Other("this dissection file has no module identities (saved before 1.0); dissect again".into()));
+        }
+        let live = p.modules()?;
+        let regions = p.regions()?;
+        let mut v = Validation::default();
+        // (old start, old end, delta) of kept modules; old ranges of dropped ones.
+        let mut keep: Vec<(Addr, Addr, u64)> = Vec::new();
+        let mut gone: Vec<(Addr, Addr)> = Vec::new();
+        let mut idents = Vec::new();
+        for id in std::mem::take(&mut self.idents) {
+            let old = (id.base, id.base.saturating_add(id.size));
+            let found = live.iter().find(|m| {
+                m.path == id.path && m.size == id.size && id.fingerprint != 0 && module_fingerprint(p, m, &regions) == Some(id.fingerprint)
+            });
+            match found {
+                Some(m) => {
+                    keep.push((old.0, old.1, m.base.wrapping_sub(id.base)));
+                    if m.base == id.base { v.kept.push(id.name.clone()) } else { v.rebased.push(id.name.clone()) }
+                    idents.push(ModuleIdent { base: m.base, ..id });
+                }
+                None => {
+                    gone.push(old);
+                    v.dropped.push(id.name);
+                }
+            }
+        }
+        self.idents = idents;
+        self.modules = self.idents.iter().map(|i| i.name.clone()).collect();
+        // Fast path: everything where it was.
+        if !v.unchanged() || !self.all_inside(&keep) {
+            self.remap(&keep, &gone);
+        }
+        self.validated = true;
+        Ok(v)
+    }
+
+    /// Every code-like item lies inside a kept module.
+    fn all_inside(&self, keep: &[(Addr, Addr, u64)]) -> bool {
+        let inside = |a: Addr| keep.iter().any(|k| a >= k.0 && a < k.1);
+        self.code.iter().all(|c| inside(c.0) && c.1 <= keep.iter().find(|k| c.0 >= k.0 && c.0 < k.1).map_or(0, |k| k.1))
+            && self.functions.iter().all(|f| !f.internal || inside(f.addr))
+            && self.caves.iter().all(|c| inside(c.addr))
+            && self.from.iter().all(|&a| inside(a))
+            && self.strings.iter().all(|s| inside(s.addr))
+    }
+
+    /// Moves addresses of kept modules by their delta and drops what is not in one.
+    fn remap(&mut self, keep: &[(Addr, Addr, u64)], gone: &[(Addr, Addr)]) {
+        // New address of `a` when it lies in a kept module.
+        let moved = |a: Addr| keep.iter().find(|k| a >= k.0 && a < k.1).map(|k| a.wrapping_add(k.2));
+        let in_gone = |a: Addr| gone.iter().any(|g| a >= g.0 && a < g.1);
+        // Outside every dissected module (heap, other libraries): unchanged.
+        let target = |a: Addr| match moved(a) {
+            Some(n) => Some(n),
+            None if in_gone(a) => None,
+            None => Some(a),
+        };
+        let mut refs: Vec<Ref> = (0..self.to.len())
+            .filter_map(|i| Some((target(self.to[i])?, moved(self.from[i])?, self.kind[i])))
+            .collect();
+        refs.par_sort_unstable();
+        refs.dedup();
+        (self.to, self.from, self.kind) = (Vec::with_capacity(refs.len()), Vec::with_capacity(refs.len()), Vec::with_capacity(refs.len()));
+        for (t, f, k) in refs {
+            self.to.push(t);
+            self.from.push(f);
+            self.kind.push(k);
+        }
+        let funcs = std::mem::take(&mut self.functions);
+        self.functions = funcs
+            .into_iter()
+            .filter_map(|mut f| {
+                f.addr = if f.internal { moved(f.addr)? } else { target(f.addr)? };
+                Some(f)
+            })
+            .collect();
+        self.functions.sort_by_key(|f| f.addr);
+        self.functions.dedup_by_key(|f| f.addr);
+        self.by_callers = rank(&self.functions);
+        let strings = std::mem::take(&mut self.strings);
+        self.strings = strings.into_iter().filter_map(|mut x| { x.addr = moved(x.addr)?; Some(x) }).collect();
+        self.strings.sort_by_key(|x| x.addr);
+        self.strings.dedup_by_key(|x| x.addr);
+        let caves = std::mem::take(&mut self.caves);
+        self.caves = caves.into_iter().filter_map(|mut x| { x.addr = moved(x.addr)?; Some(x) }).collect();
+        self.caves.sort_by_key(|x| x.addr);
+        let code = std::mem::take(&mut self.code);
+        self.code = code
+            .into_iter()
+            .filter_map(|(s, e)| {
+                let k = keep.iter().find(|k| s >= k.0 && s < k.1)?;
+                (e > s && e <= k.1).then(|| (s.wrapping_add(k.2), e.wrapping_add(k.2)))
+            })
+            .collect();
+        self.code.sort_unstable();
+        self.code_bytes = self.code.iter().map(|c| c.1 - c.0).sum();
     }
     /// Functions sorted by address.
     pub fn functions(&self, offset: usize, limit: usize) -> Vec<Function> {
@@ -248,6 +480,8 @@ impl Dissection {
 
     /// Merges a dissection of other modules into this one.
     pub fn merge(&mut self, o: Dissection) {
+        self.validated = (self.validated || self.modules.is_empty()) && o.validated;
+        self.idents.extend(o.idents);
         self.modules.extend(o.modules);
         self.code_bytes += o.code_bytes;
         self.instructions += o.instructions;
@@ -325,6 +559,8 @@ impl Dissection {
             strings: &'a [StringRef],
             caves: &'a [Cave],
             code: &'a [(Addr, Addr)],
+            #[serde(skip_serializing_if = "<[_]>::is_empty")]
+            module_info: &'a [ModuleIdent],
         }
         let meta = serde_json::to_vec(&MetaRef {
             modules: &self.modules,
@@ -334,6 +570,7 @@ impl Dissection {
             strings: &self.strings,
             caves: &self.caves,
             code: &self.code,
+            module_info: &self.idents,
         })
         .map_err(|e| Error::Other(format!("dissection JSON: {e}")))?;
         progress.start(self.to.len() as u64);
@@ -382,16 +619,25 @@ impl Dissection {
         r.read_exact(&mut meta).map_err(|_| bad("truncated"))?;
         #[derive(Deserialize)]
         struct Meta {
+            #[serde(deserialize_with = "capped")]
             modules: Vec<String>,
             code_bytes: u64,
             instructions: u64,
+            #[serde(deserialize_with = "capped")]
             functions: Vec<Function>,
+            #[serde(deserialize_with = "capped")]
             strings: Vec<StringRef>,
+            #[serde(deserialize_with = "capped")]
             caves: Vec<Cave>,
-            #[serde(default)]
+            #[serde(default, deserialize_with = "capped")]
             code: Vec<(Addr, Addr)>,
+            #[serde(default, deserialize_with = "capped")]
+            module_info: Vec<ModuleIdent>,
         }
-        let mut m: Meta = serde_json::from_slice(&meta).map_err(|e| bad(&format!("metadata: {e}")))?;
+        META_BUDGET.with(|b| b.set(MAX_META_DECODED));
+        let m: std::result::Result<Meta, _> = serde_json::from_slice(&meta);
+        META_BUDGET.with(|b| b.set(0));
+        let mut m = m.map_err(|e| bad(&format!("metadata: {e}")))?;
         drop(meta);
         let sorted = |v: Vec<Addr>| v.windows(2).all(|w| w[0] < w[1]);
         if !sorted(m.functions.iter().map(|f| f.addr).collect())
@@ -448,8 +694,49 @@ impl Dissection {
             strings: m.strings,
             caves: m.caves,
             code: m.code,
+            idents: m.module_info,
+            validated: false,
         })
     }
+}
+
+thread_local! {
+    /// Bytes of elements the metadata being decoded may still produce (see [`capped`]).
+    static META_BUDGET: Cell<u64> = const { Cell::new(0) };
+}
+
+/// Most memory the metadata's element structs may take once decoded (their strings take at
+/// most the metadata's own size on top): many tiny JSON elements must not expand ~8×.
+pub const MAX_META_DECODED: u64 = 192 << 20;
+
+/// A `Vec` deserializer charging each element's size to [`META_BUDGET`].
+fn capped<'de, D: serde::Deserializer<'de>, T: Deserialize<'de>>(d: D) -> std::result::Result<Vec<T>, D::Error> {
+    struct V<T>(std::marker::PhantomData<T>);
+    impl<'de, T: Deserialize<'de>> serde::de::Visitor<'de> for V<T> {
+        type Value = Vec<T>;
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("a list")
+        }
+        fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut a: A) -> std::result::Result<Vec<T>, A::Error> {
+            let mut v = Vec::new();
+            let each = std::mem::size_of::<T>().max(1) as u64;
+            while let Some(x) = a.next_element()? {
+                let ok = META_BUDGET.with(|b| match b.get().checked_sub(each) {
+                    Some(left) => {
+                        b.set(left);
+                        true
+                    }
+                    None => false,
+                });
+                if !ok {
+                    return Err(serde::de::Error::custom("dissection metadata too large"));
+                }
+                v.push(x);
+            }
+            Ok(v)
+        }
+    }
+    d.deserialize_seq(V(std::marker::PhantomData))
 }
 
 const DMAGIC: &[u8; 8] = b"HHDISS\0\0";
@@ -806,6 +1093,8 @@ pub fn dissect(
     }
     progress.add_found(functions.len() as u64);
     Ok(Dissection {
+        idents: idents(p, modules, &regions),
+        validated: true,
         modules: modules.iter().map(|m| m.name.clone()).collect(),
         code_bytes,
         instructions,

@@ -11,7 +11,7 @@ mod symbols;
 pub use aa::{
     AaAlloc, AaError, AaHooks, AaScan, AaState, AobUnique, MAX_ALIGN, MAX_AOB_COUNT,
     MAX_ASSEMBLED_BYTES, MAX_CUSTOM_COMMANDS, MAX_DEFINES, MAX_IF_DEPTH, MAX_INCLUDES,
-    MAX_LUA_BLOCKS, MAX_PATTERN_LEN, MAX_READMEM_BYTES, MAX_SCRIPT_BYTES, Patch, Template,
+    MAX_LUA_BLOCKS, MAX_PATTERN_LEN, MAX_READMEM_BYTES, MAX_SCRIPT_BYTES, NOT_AVAILABLE, Patch, Template,
     aa_check, aa_execute, aob_scan, aob_scan_cancellable, injection_template, nop_instruction,
     restore_patch, write_code,
 };

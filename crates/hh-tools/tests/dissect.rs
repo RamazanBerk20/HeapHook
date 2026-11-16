@@ -264,7 +264,10 @@ fn dissection_file_round_trip() {
     let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
     let f = dir.path().join("d.hhdis");
     d.save(&f, &Progress::new()).unwrap();
-    let back = Dissection::load(&f, &Progress::new()).unwrap();
+    let mut back = Dissection::load(&f, &Progress::new()).unwrap();
+    // Loaded addresses are of some earlier run until matched against the live process.
+    assert!(!back.is_validated() && !back.summary().validated);
+    assert!(back.validate(&p).unwrap().unchanged());
     assert_eq!(back, d);
     assert_eq!(back.strings(None, 0, 10), d.strings(None, 0, 10));
     let c = Progress::new();
@@ -324,4 +327,107 @@ fn hostile_dissection_files_fail_cleanly() {
     let mut v = craft(1, meta, None, &[]);
     v[16..24].copy_from_slice(&(1u64 << 40).to_le_bytes());
     assert!(load(&v).is_err());
+}
+
+/// `p` loaded `by` bytes higher (same bytes; the PE header's ImageBase is not rewritten
+/// here, which the fingerprint ignores anyway).
+fn shifted(p: &FakeProc, by: u64) -> FakeProc {
+    let mut q = FakeProc::new();
+    for (r, d) in p.regions.read().unwrap().iter() {
+        q.add(r.start + by, d.clone(), r.prot, r.kind, r.path.as_deref());
+    }
+    for m in &p.modules {
+        q.modules.push(hh_core::Module { base: m.base + by, ..m.clone() });
+    }
+    q
+}
+
+#[test]
+fn loaded_dissection_is_rebased_or_dropped() {
+    let (p, main, _) = module();
+    let d = dissect(&p, &p.modules.clone(), &DissectOptions::default(), &Progress::new()).unwrap();
+    let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let f = dir.path().join("d.hhdis");
+    d.save(&f, &Progress::new()).unwrap();
+    let internal = |d: &Dissection| d.functions(0, 100).iter().filter(|f| f.internal).map(|f| f.addr).collect::<Vec<_>>();
+    let before = internal(&d);
+
+    // The next run loaded it elsewhere: every address moves with it.
+    let by = 0x10_0000;
+    let q = shifted(&p, by);
+    let mut back = Dissection::load(&f, &Progress::new()).unwrap();
+    let v = back.validate(&q).unwrap();
+    assert_eq!((v.rebased.as_slice(), v.dropped.len()), (&["test.dll".to_string()][..], 0));
+    assert!(back.is_validated());
+    assert_eq!(internal(&back), before.iter().map(|a| a + by).collect::<Vec<_>>());
+    assert_eq!(back.module_idents()[0].base, 0x400000 + by);
+    let x = back.xrefs_to(0x401200 + by, 0x401201 + by, &[RefKind::Call], 0, 10);
+    assert_eq!(x[0].from, main[2] + by);
+    assert_eq!(back.summary().code_bytes, 0x1000);
+    assert_eq!(back.code_filter(&[vec![main[1] + by]], &[]).len(), 1);
+    // Validating again against the same layout changes nothing.
+    assert!(back.validate(&q).unwrap().unchanged());
+
+    // A different build at the same path (header differs): nothing of it is kept.
+    let r = shifted(&p, 0);
+    r.put(0x400088, &[0x55; 4]); // PE TimeDateStamp
+    let mut back = Dissection::load(&f, &Progress::new()).unwrap();
+    let v = back.validate(&r).unwrap();
+    assert_eq!(v.dropped, ["test.dll"]);
+    assert!(internal(&back).is_empty() && back.summary().code_bytes == 0);
+    assert!(back.xrefs_to(0, u64::MAX, &[], 0, 10).is_empty());
+
+    // Not loaded at all.
+    let mut empty = FakeProc::new();
+    empty.add(0x10000, vec![0; 0x1000], RW, RegionKind::Private, None);
+    let mut back = Dissection::load(&f, &Progress::new()).unwrap();
+    assert_eq!(back.validate(&empty).unwrap().dropped, ["test.dll"]);
+    assert!(internal(&back).is_empty());
+}
+
+#[test]
+fn hostile_or_old_dissection_files_arm_nothing_outside_their_modules() {
+    let (p, _, _) = module();
+    let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let f = dir.path().join("h.hhdis");
+    // Old format (no module identities): loads, cannot be validated.
+    let old = r#"{"modules":["test.dll"],"code_bytes":1,"instructions":1,"functions":[{"addr":"0x401000","callers":1,"internal":true,"name":null}],"strings":[],"caves":[]}"#;
+    std::fs::write(&f, craft(1, old, None, &[])).unwrap();
+    let mut d = Dissection::load(&f, &Progress::new()).unwrap();
+    assert!(d.validate(&p).is_err());
+    assert!(!d.is_validated());
+    // Identity matches, but it claims code outside the module: that part is dropped.
+    let fp = module_fingerprint(&p, &p.modules[0], &hh_core::Process::regions(&p).unwrap()).unwrap();
+    let meta = format!(
+        r#"{{"modules":["test.dll"],"code_bytes":2,"instructions":1,"functions":[{{"addr":"0x401001","callers":1,"internal":true,"name":null}},{{"addr":"0x900000","callers":1,"internal":true,"name":null}}],"strings":[],"caves":[{{"addr":"0x900010","len":40,"byte":204}}],"code":[[4198400,4202496],[9437184,9441280]],"module_info":[{{"name":"test.dll","path":"{}","base":"0x400000","size":12288,"fingerprint":{fp}}}]}}"#,
+        p.modules[0].path
+    );
+    std::fs::write(&f, craft(1, &meta, None, &[(0x401001, 0x900000, 0), (0x900000, 0x401000, 0)])).unwrap();
+    let mut d = Dissection::load(&f, &Progress::new()).unwrap();
+    assert!(d.validate(&p).unwrap().dropped.is_empty());
+    let fs: Vec<u64> = d.functions(0, 10).iter().map(|f| f.addr).collect();
+    assert_eq!(fs, [0x401001]);
+    assert!(d.caves(0, 10).is_empty());
+    assert_eq!(d.summary().code_bytes, 0x1000);
+    // Only the reference made from inside the module is kept.
+    assert_eq!(d.xrefs_to(0, u64::MAX, &[], 0, 10).len(), 1);
+}
+
+#[test]
+fn tiny_metadata_elements_cannot_expand_memory() {
+    // ~8.4 M empty module names: 25 MB of JSON, ~200 MiB once decoded. Refused once the
+    // decoded elements pass the cap.
+    let n = (MAX_META_DECODED / 24) as usize + 1;
+    let mut meta = String::with_capacity(n * 3 + 128);
+    meta.push_str(r#"{"modules":["#);
+    for i in 0..n {
+        meta.push_str(if i == 0 { "\"\"" } else { ",\"\"" });
+    }
+    meta.push_str(r#"],"code_bytes":0,"instructions":0,"functions":[],"strings":[],"caves":[]}"#);
+    let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let f = dir.path().join("big.hhdis");
+    std::fs::write(&f, craft(1, &meta, None, &[])).unwrap();
+    drop(meta);
+    let e = Dissection::load(&f, &Progress::new()).unwrap_err();
+    assert!(e.to_string().contains("too large"), "{e}");
 }

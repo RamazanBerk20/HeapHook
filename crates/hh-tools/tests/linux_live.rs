@@ -82,7 +82,10 @@ fn live_hh_target() {
     let dir = tempfile::tempdir().unwrap();
     let dfile = dir.path().join("target.hhdis");
     d.save(&dfile, &Progress::new()).unwrap();
-    let back = hh_tools::dissect::Dissection::load(&dfile, &Progress::new()).unwrap();
+    let mut back = hh_tools::dissect::Dissection::load(&dfile, &Progress::new()).unwrap();
+    assert!(!back.is_validated());
+    // The live module's fingerprint matches what was saved: kept in place.
+    assert!(back.validate(p).unwrap().unchanged());
     assert_eq!(back, d);
     assert_eq!(back.summary(), s);
     // Remote mode: headers from memory only.

@@ -664,7 +664,7 @@ const C = {
     for (let i = 1; i < len; i++) b[i] = (h >>> (i * 5)) & 255;
     return out(b);
   },
-  aa_check: ({ script }) => aaCheck(script),
+  aa_check: ({ script }) => aaCheck(script), // session / entry: the mock has no capabilities to withhold
   aa_execute({ script, enable, state }) {
     need();
     const e = aaCheck(script);
@@ -1918,7 +1918,9 @@ C_lua_poll = C.lua_poll;
 Object.assign(C, NEW);
 
 // ---------- 1.0: search, memory, pause, per-entry trust, files ----------
-const TAINT = new Set(); // Lua script texts from untrusted sources (files, other tables)
+// Auto Assemble window sessions: id -> 'typed' | 'file' | 'agreed' (trust follows origin, never text).
+const SESS = new Map();
+let SESS_NEXT = 0;
 let PAUSED = false, SAVED = null;
 const plainJson = (t) => JSON.stringify(t, (k, v) => (k === 'frozen' ? undefined : v));
 const untrusted = () => (T.untrusted ||= []);
@@ -1933,8 +1935,8 @@ function parsePattern(p) {
   if (!out.some((b) => b != null)) err('the pattern needs at least one byte that is not ??');
   return out;
 }
-/** New ids for pasted / merged entries; the ones that run Lua wait for their own consent. */
-function insertForeign(entries, after) {
+/** New ids for pasted / merged entries; every one waits for its own consent (foreign false: the user's own). */
+function insertForeign(entries, after, foreign = true) {
   let max = 0;
   liveWalk(T.table.entries, (e) => { max = Math.max(max, e.id); });
   const reid = (e) => ({ ...clone(e), id: ++max, frozen: false, ct_extra: [], children: (e.children || []).map(reid) });
@@ -1942,7 +1944,7 @@ function insertForeign(entries, after) {
   pushUndo(clone(T.table));
   const list = (() => { let r = null; liveWalk(T.table.entries, (e, p) => { if (e.id === after) r = p ? p.children : T.table.entries; }); return r; })();
   if (list) list.splice(list.findIndex((e) => e.id === after) + 1, 0, ...items); else T.table.entries.push(...items);
-  liveWalk(items, (e) => { if (/\{\$lua\}/i.test(e.script || '')) { untrusted().push(e.id); TAINT.add(e.script); } });
+  if (foreign) liveWalk(items, (e) => { untrusted().push(e.id); });
   T.version++;
   return items.map((e) => e.id);
 }
@@ -2016,22 +2018,55 @@ const RC = {
     C.table_save({ path: '\u0000drop', table: t });
     return RC.table_open({ path: '\u0000drop' });
   },
-  table_open(a) { const r = LIVE_open(a); T.untrusted = []; liveWalk(T.table.entries, (e) => { if (e.script) TAINT.add(e.script); }); SAVED = plainJson(T.table); return r; },
+  table_open(a) { const r = LIVE_open(a); T.untrusted = []; SAVED = plainJson(T.table); return r; },
   table_export(a) { const r = C_export(a); SAVED = plainJson(T.table); return r; },
   table_set_active(a) {
     if (a.active) for (const id of a.ids) {
       const e = liveFind(id);
       if (!e) continue;
       let bad = null;
-      liveWalk([e], (x) => { if (!bad && untrusted().includes(x.id)) bad = x; });
+      // The mock runs no Lua: an untrusted script entry always asks (the real backend runs plain Auto Assembler).
+      liveWalk([e], (x) => { if (!bad && x.script && untrusted().includes(x.id)) bad = x; });
       if (bad) err(loadSettings().table_script === 'never' ? `${bad.description}: not run: it runs Lua from another table and Settings say never to run a table's Lua`
         : `needs consent: entries: ${bad.description}: this entry came from another table (pasted, merged or dropped in) and runs Lua code, which can use your files and the process`);
     }
     return LIVE_active(a);
   },
-  aa_load_file({ path }) { fs ??= loadFs(); const t = fs[path] ?? err(`file not found: ${path}`); const s = typeof t === 'string' ? t : t.script ?? err(`${path}: not a script`); if (/\{\$lua\}/i.test(s)) TAINT.add(s); return s; },
-  aa_trust({ script }) { if (loadSettings().table_script === 'never') err('Settings say never to run a table\'s Lua: change "Lua script in a loaded table" first'); TAINT.delete(script); return null; },
-  aa_execute(a) { if (/\{\$lua\}/i.test(a.script) && TAINT.has(a.script)) err('needs consent: this script: this table runs Lua code, which can use your files and the process'); return C_aa(a); },
+  aa_session() { SESS.set(++SESS_NEXT, 'typed'); return SESS_NEXT; },
+  aa_load_file({ path, session }) {
+    if (!SESS.has(session)) err(`no Auto Assemble session ${session}`);
+    fs ??= loadFs(); const t = fs[path] ?? err(`file not found: ${path}`); const s = typeof t === 'string' ? t : t.script ?? err(`${path}: not a script`);
+    SESS.set(session, 'file');
+    return s;
+  },
+  aa_trust({ session }) {
+    if (loadSettings().table_script === 'never') err('Settings say never to run a table\'s Lua: change "Lua script in a loaded table" first');
+    if (SESS.get(session) === 'file') SESS.set(session, 'agreed');
+    return null;
+  },
+  aa_execute(a) {
+    const s = SESS.get(a.session);
+    if (s !== 'typed' && !(s === 'agreed' && loadSettings().table_script !== 'never')) {
+      err(loadSettings().table_script === 'never' ? 'this script: not run: it needs Lua or file access from a loaded table and Settings say never to run a table\'s Lua'
+        : 'needs consent: this script: this table runs Lua code or reads files, which can use your files and the process');
+    }
+    return C_aa(a);
+  },
+  aa_assign({ session, script, description, after, base }) {
+    if (base != null && base !== T.version) err(`stale table version ${base} (current ${T.version})`);
+    const s = SESS.get(session) ?? err(`no Auto Assemble session ${session}`);
+    const ids = insertForeign([{ description, script, addr: '', offsets: [], children: [], hotkeys: [], options: [] }], after ?? null, s !== 'typed');
+    if (s === 'agreed') T.untrusted = untrusted().filter((id) => !ids.includes(id));
+    return { ids, version: T.version };
+  },
+  table_add_template({ addr, kind, description, after, base }) {
+    if (base != null && base !== T.version) err(`stale table version ${base} (current ${T.version})`);
+    const script = C.aa_template({ addr, kind });
+    return { ids: insertForeign([{ description, script, addr: '', offsets: [], children: [], hotkeys: [], options: [] }], after ?? null, false), version: T.version };
+  },
+  table_resolve({ ids }) {
+    return ids.map((id) => { const e = liveFind(id); if (!e) return null; const x = (e.offsets || []).reduce((a, o) => `[${a}]+${o}`, e.addr); return C.resolve_many({ exprs: [x] })[0]; });
+  },
   app_args: () => null,
   app_quit: () => null,
   debug_set_register(a) {

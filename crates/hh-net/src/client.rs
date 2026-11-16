@@ -280,6 +280,28 @@ impl RemoteHost {
     }
 }
 
+/// The server's region list made safe for code that assumes a local process's: sorted by
+/// address, without empty or wrapping regions, overlaps clipped off the later region.
+pub fn normalize_regions(mut v: Vec<Region>) -> Vec<Region> {
+    v.retain(|r| r.size > 0 && r.start.checked_add(r.size).is_some());
+    v.sort_by_key(|r| r.start);
+    let mut end = 0u64;
+    let mut out = Vec::with_capacity(v.len());
+    for mut r in v {
+        let e = r.start + r.size;
+        if e <= end {
+            continue;
+        }
+        if r.start < end {
+            r.size = e - end;
+            r.start = end;
+        }
+        end = e;
+        out.push(r);
+    }
+    out
+}
+
 /// A process on the server. Implements `Process`, so scanners and tools work on it unchanged.
 pub struct RemoteProcess {
     c: Arc<Client>,
@@ -447,10 +469,12 @@ impl Process for RemoteProcess {
         self.call(op::IS_ALIVE, |_| {}).is_ok_and(|b| b == [1])
     }
     fn regions(&self) -> Result<Vec<Region>> {
-        proto::dec_list(&self.call(op::REGIONS, |_| {})?, 20, proto::dec_region)
+        Ok(normalize_regions(proto::dec_list(&self.call(op::REGIONS, |_| {})?, 20, proto::dec_region)?))
     }
     fn modules(&self) -> Result<Vec<Module>> {
-        proto::dec_list(&self.call(op::MODULES, |_| {})?, 24, proto::dec_module)
+        let mut v = proto::dec_list(&self.call(op::MODULES, |_| {})?, 24, proto::dec_module)?;
+        v.retain(|m| m.base.checked_add(m.size).is_some());
+        Ok(v)
     }
     fn threads(&self) -> Result<Vec<u32>> {
         proto::dec_list(&self.call(op::THREADS, |_| {})?, 4, |d| d.u32())

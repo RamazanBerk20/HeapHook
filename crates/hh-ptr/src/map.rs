@@ -14,6 +14,12 @@ use crate::{Progress, cancelled};
 const MAGIC: &[u8; 8] = b"HHPMAP01";
 const CHUNK: u64 = 1 << 20;
 const PAGE: u64 = 4096;
+/// Most entries a pointer map file may hold (4 GiB of entries).
+pub(crate) const MAX_ENTRIES: u64 = 1 << 28;
+/// Largest pointer map JSON header (regions, modules, stacks).
+const MAX_HEADER: u64 = 64 << 20;
+/// Entries read per chunk while loading.
+const LOAD_CHUNK: usize = 1 << 16;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Entry {
@@ -76,12 +82,12 @@ fn in_ranges(ranges: &[(u64, u64)], v: u64) -> bool {
 /// Linux maps a module's .bss as an anonymous region right after its image: count it in.
 fn extend_bss(modules: &mut [Module], regions: &[Region]) {
     for m in modules {
-        let end = m.base + m.size;
+        let Some(end) = m.base.checked_add(m.size) else { continue };
         if let Some(r) = regions
             .iter()
             .find(|r| r.start == end && r.kind == RegionKind::Private && r.path.is_none())
         {
-            m.size += r.size;
+            m.size = m.size.saturating_add(r.size);
         }
     }
 }
@@ -103,7 +109,8 @@ fn scan_chunk(
         match p.read(addr, &mut buf[pos as usize..]) {
             Ok(n) if n > 0 => {
                 let seg = &buf[pos as usize..pos as usize + n];
-                let first = addr.next_multiple_of(align) - addr;
+                // A region at the very top of the address space has no aligned slot left.
+                let Some(first) = addr.checked_next_multiple_of(align).map(|a| a - addr) else { break };
                 let mut o = first;
                 while o + ps as u64 <= n as u64 && addr + o < start + len {
                     let b = &seg[o as usize..o as usize + ps];
@@ -123,7 +130,10 @@ fn scan_chunk(
                 pos += n as u64;
             }
             // Unreadable page in the middle of a region: skip to the next page.
-            _ => pos = (addr / PAGE + 1) * PAGE - start,
+            _ => match (addr / PAGE + 1).checked_mul(PAGE) {
+                Some(next) => pos = next - start,
+                None => break,
+            },
         }
     }
     out
@@ -151,7 +161,8 @@ impl PointerMap {
         let mut regions: Vec<Region> = p
             .regions()?
             .into_iter()
-            .filter(|r| r.prot.r && r.size > 0)
+            // A remote peer may report wrapping regions; overlaps only duplicate entries.
+            .filter(|r| r.prot.r && r.size > 0 && r.start.checked_add(r.size).is_some())
             .collect();
         regions.sort_by_key(|r| r.start);
         let mut modules = p.modules()?;
@@ -204,6 +215,8 @@ impl PointerMap {
         mut entries: Vec<Entry>,
     ) -> Self {
         entries.par_sort_unstable_by_key(|e| (e.value, e.addr));
+        // Overlapping regions (remote peer, odd file) would yield the same slot twice.
+        entries.dedup();
         PointerMap {
             pointer_size,
             regions,
@@ -287,7 +300,7 @@ impl PointerMap {
         let mut n4 = [0u8; 4];
         r.read_exact(&mut n4)?;
         let hlen = u32::from_le_bytes(n4) as u64;
-        if hlen > file_len {
+        if hlen > file_len || hlen > MAX_HEADER {
             return Err(bad());
         }
         let mut hbuf = vec![0u8; hlen as usize];
@@ -302,15 +315,21 @@ impl PointerMap {
         if count.checked_mul(16) != file_len.checked_sub(20 + hlen) {
             return Err(bad());
         }
-        let mut entries = Vec::with_capacity(count as usize);
-        let mut b = [0u8; 16];
-        for _ in 0..count {
-            r.read_exact(&mut b)?;
-            let (v, a) = b.split_at(8);
-            entries.push(Entry {
-                value: u64::from_le_bytes(v.try_into().unwrap_or_default()),
-                addr: u64::from_le_bytes(a.try_into().unwrap_or_default()),
-            });
+        if count > MAX_ENTRIES {
+            return Err(Error::Parse(format!("pointer map holds {count} pointers (limit {MAX_ENTRIES})")));
+        }
+        // Grows with what is actually read: a sparse file's header cannot reserve memory.
+        let mut entries = Vec::new();
+        let mut buf = vec![0u8; LOAD_CHUNK * 16];
+        let mut left = count as usize;
+        while left > 0 {
+            let n = left.min(LOAD_CHUNK);
+            r.read_exact(&mut buf[..n * 16])?;
+            entries.extend(buf[..n * 16].chunks_exact(16).map(|b| Entry {
+                value: u64::from_le_bytes(b[..8].try_into().unwrap_or_default()),
+                addr: u64::from_le_bytes(b[8..].try_into().unwrap_or_default()),
+            }));
+            left -= n;
         }
         let mut regions = h.regions;
         regions.sort_by_key(|r| r.start);
