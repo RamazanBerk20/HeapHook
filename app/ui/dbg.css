@@ -22,3 +22,36 @@
 .mi-ins.cur { background: var(--blue-bg); color: var(--text); font-weight: 600; box-shadow: inset 2px 0 0 var(--blue); }
 .regs-snap.mi-regs { border: var(--line); border-radius: var(--r); max-height: none; }
 .mi-dlg .regs-snap { grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); }
+
+/* 1.0 RC debugger: stop reason, threads, YMM, trace memory, tracepoint log, trace options */
+.dbg-reason { flex: none; margin: 0; padding: var(--s1) var(--s3); border-bottom: var(--line); background: var(--yellow-bg); color: var(--text); font-size: var(--fs-xs); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.dbg-reason .mono { color: var(--text-2); }
+.thr-name { color: var(--text); }
+.thr-cpu { font-size: var(--fs-xs); }
+.thr-row > .badge { justify-self: start; max-width: 100%; overflow: hidden; text-overflow: ellipsis; }
+/* Narrow side panel: two lines per thread (TID, name / state, CPU; buttons on the right). Wide: one line with a header. */
+#thr-list { container-type: inline-size; }
+.thr-head { display: none; }
+.thr-row { grid-template-columns: 56px auto minmax(0, 1fr) 62px 72px !important; grid-template-areas: "tid name name sw su" "tid st cpu sw su"; height: auto !important; min-height: 38px; row-gap: 0 !important; padding-block: 2px !important; }
+.thr-row > :nth-child(1) { grid-area: tid; }
+.thr-row > :nth-child(2) { grid-area: name; }
+.thr-row > :nth-child(3) { grid-area: st; }
+.thr-row > :nth-child(4) { grid-area: cpu; }
+.thr-row > :nth-child(5) { grid-area: sw; }
+.thr-row > :nth-child(6) { grid-area: su; }
+@container (min-width: 480px) {
+  .thr-head, .thr-row { grid-template-columns: 56px minmax(0, 1fr) 76px 104px 62px 72px !important; grid-template-areas: "tid name st cpu sw su"; }
+  .thr-row { min-height: 24px; padding-block: 0 !important; }
+  .thr-head { display: grid; gap: var(--s2); padding: 2px var(--s2); font-size: var(--fs-xs); color: var(--muted); }
+  .thr-head > span:last-child { grid-column: 4 / -1; }
+}
+.reg.ymm { cursor: default; height: auto; min-height: 22px; align-items: flex-start; padding-block: 2px; }
+.reg.ymm .rv { white-space: normal; color: var(--muted); }
+.regs-snap .acc-sec { grid-column: 1 / -1; padding: var(--s2) 0 2px; }
+.rg.acc { grid-column: 1 / -1; align-items: center; }
+.rg.acc .badge { padding: 0 5px; line-height: 15px; min-width: 3ch; text-align: center; }
+.rg.acc .rn { min-width: 17ch; }
+.rg.acc .rv { overflow: hidden; text-overflow: ellipsis; }
+.dlog-line .badge { padding: 0 5px; line-height: 15px; font-family: var(--font-ui); }
+.dlog-tp { color: var(--text); }
+.tr-more .field { margin-bottom: var(--s2); }

@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use hh_asm::{AaHooks, AaState, Ctx, SymbolTable};
+use hh_asm::{AaState, Ctx, SymbolTable};
 use hh_core::{Addr, Error, Process, Prot, Region, RegionKind, Result};
 use hh_scan::{CustomType, FirstScan, NextScan, NextScanEx, Rounding, ScanOptions, ScanType, Scanner, Tri, VType};
 use mlua::{AnyUserData, FromLuaMulti, Function, IntoLuaMulti, Lua, MultiValue, Table, Value, Variadic};
@@ -128,10 +128,13 @@ pub(crate) fn arg(a: &[Value], i: usize) -> Value {
 
 pub(crate) fn resolve(st: &State, expr: &str, local: bool) -> Result<Addr> {
     let syms = if local { SymbolTable::default() } else { st.syms.lock().unwrap().clone() };
+    // registerSymbolLookupCallback functions are asked last (not for HeapHook's own memory).
+    let lua = if local { None } else { crate::hooks::symbol_lua(st) };
+    let extra = |n: &str| lua.as_ref().and_then(|l| crate::hooks::symbol_now(l, st, n));
     match st.target(local) {
-        Some(p) => hh_asm::resolve_address(&*p, &syms, expr),
+        Some(p) => hh_asm::resolve_address_with(&*p, &syms, expr, &extra),
         None => {
-            let lookup = |n: &str| syms.get(n);
+            let lookup = |n: &str| syms.get(n).or_else(|| extra(n));
             hh_asm::eval(expr, &Ctx { lookup: &lookup, mem: None })
         }
     }
@@ -227,8 +230,11 @@ fn install_process(b: &B) -> LR<()> {
     b.f("getAddressSafe", |_, st, (v, local): (Value, Option<bool>)| {
         Ok(addr(st, &v, local.unwrap_or(false)).ok().map(|a| a as i64))
     })?;
-    b.f("getNameFromAddress", |_, st, (v, mods, syms): (Value, Option<bool>, Option<bool>)| {
+    b.f("getNameFromAddress", |lua, st, (v, mods, syms): (Value, Option<bool>, Option<bool>)| {
         let a = addr(st, &v, false).map_err(rt)?;
+        if let Some(n) = crate::hooks::address_name(lua, st).and_then(|f| f(a)) {
+            return Ok(n);
+        }
         if syms.unwrap_or(true)
             && let Some((n, _)) = st.syms.lock().unwrap().iter().find(|(_, x)| *x == a)
         {
@@ -556,6 +562,31 @@ pub(crate) fn ce_vtype(n: i64) -> Option<(VType, bool)> {
     })
 }
 
+/// HeapHook's `memscan.RegionFilter` table: `image` / `mapped` / `private` (false leaves
+/// that kind of region out), `modules`, `excludeModules`, `minRegionSize`, `maxRegionSize`,
+/// `simpleValues`; returns `pointsTo` (modules a vtPointer scan's values must point into).
+fn region_filter(v: &Value, o: &mut ScanOptions) -> LR<Vec<String>> {
+    let Value::Table(t) = v else { return Ok(Vec::new()) };
+    let g = |k: &str| t.get::<Value>(k).unwrap_or(Value::Nil);
+    let names = |k: &str| -> LR<Vec<String>> {
+        match g(k) {
+            Value::Table(l) => l.sequence_values::<String>().collect(),
+            Value::Nil => Ok(Vec::new()),
+            v => Ok(vec![str_of(&v).unwrap_or_default()]),
+        }
+    };
+    let kinds = [("image", RegionKind::Image), ("mapped", RegionKind::Mapped), ("private", RegionKind::Private)];
+    if kinds.iter().any(|(k, _)| matches!(g(k), Value::Boolean(false))) {
+        o.kinds = kinds.iter().filter(|(k, _)| !matches!(g(k), Value::Boolean(false))).map(|x| x.1).collect();
+    }
+    o.modules = names("modules")?;
+    o.exclude_modules = names("excludeModules")?;
+    o.min_region_size = int_of(&g("minRegionSize")).map(|n| n.max(0) as u64);
+    o.max_region_size = int_of(&g("maxRegionSize")).map(|n| n.max(0) as u64);
+    o.simple_values = truthy(&g("simpleValues"));
+    names("pointsTo")
+}
+
 fn ce_scan_type(n: i64) -> LR<ScanType> {
     Ok(match n {
         0 => ScanType::Unknown,
@@ -665,7 +696,7 @@ fn install_scan(b: &B, h: &B) -> LR<()> {
         let s = scanner(st, int_of(&arg(&a, 0)).unwrap_or(0))?;
         let vt = int_of(&arg(&a, 2)).unwrap_or(2);
         let custom = if vt == 13 { Some(custom_type(&arg(&a, 15))?) } else { None };
-        let (vtype, utf16) = if custom.is_some() {
+        let (vtype, utf16) = if custom.is_some() || vt == 12 {
             (VType::Bytes4, false)
         } else {
             ce_vtype(vt).ok_or_else(|| mlua::Error::runtime("unsupported variable type"))?
@@ -698,6 +729,16 @@ fn install_scan(b: &B, h: &B) -> LR<()> {
             custom,
             ..ScanOptions::default()
         };
+        let mut opts = opts;
+        let points_to = region_filter(&arg(&a, 17), &mut opts)?;
+        if vt == 12 {
+            // vtPointer: pointer-sized values pointing into readable memory (or `pointsTo`).
+            if !opts.alignment.is_some_and(|n| n > 1) {
+                opts.alignment = None;
+            }
+            let req = hh_scan::PointerScan { opts, modules: points_to, ranges: Vec::new() };
+            return Ok(s.pointer_scan(&req).map_err(rt)?.count as i64);
+        }
         let req = FirstScan {
             vtype,
             scan_type: ce_scan_type(int_of(&arg(&a, 1)).unwrap_or(1))?,
@@ -727,6 +768,27 @@ fn install_scan(b: &B, h: &B) -> LR<()> {
     h.f("ms_save", |_, st, (id, name): (i64, String)| scanner(st, id)?.save_scan(&name).map_err(rt))?;
     h.f("ms_saved", |_, st, id: i64| Ok(scanner(st, id)?.saved_scans()))?;
     h.f("ms_delsaved", |_, st, (id, name): (i64, String)| scanner(st, id)?.delete_saved_scan(&name).map_err(rt))?;
+    // HeapHook: order the results by value (or address), descending or not.
+    h.f("ms_sort", |_, st, (id, by_value, desc): (i64, Option<bool>, Option<bool>)| {
+        let key = if by_value.unwrap_or(true) { hh_scan::SortKey::Value } else { hh_scan::SortKey::Address };
+        scanner(st, id)?.sort(key, desc.unwrap_or(false)).map_err(rt)
+    })?;
+    // HeapHook: drop these addresses from the results; returns how many went.
+    h.f("ms_remove", |_, st, (id, addrs): (i64, Table)| {
+        if addrs.raw_len() > MAX_AOB_RESULTS {
+            return Err(mlua::Error::runtime(format!("removeResults: more than {MAX_AOB_RESULTS} addresses")));
+        }
+        let mut list = Vec::new();
+        for v in addrs.sequence_values::<Value>() {
+            list.push(addr(st, &v?, false).map_err(rt)?);
+        }
+        Ok(scanner(st, id)?.remove(&list).map_err(rt)? as i64)
+    })?;
+    // HeapHook: the value a saved scan (or "first") holds at an address, or nil.
+    h.f("ms_savedval", |_, st, (id, name, a): (i64, String, Value)| {
+        let a = addr(st, &a, false).map_err(rt)?;
+        Ok(scanner(st, id)?.saved_values(&name, &[a]).map_err(rt)?.pop().flatten())
+    })?;
     h.f("ms_row", |_, st, (id, i): (i64, i64)| {
         let rows = scanner(st, id)?.results(i.max(0) as u64, 1).map_err(rt)?;
         Ok(match rows.into_iter().next() {
@@ -752,10 +814,7 @@ fn aa_run(
 ) -> Result<AaState> {
     let before = st.syms.lock().unwrap().clone();
     let mut work = before.clone();
-    let mut hooks = AaHooks {
-        lua: Some(lua_block_hook(lua.clone(), st.clone(), memrec, false)),
-        ..Default::default()
-    };
+    let mut hooks = crate::hooks::full(lua, st, memrec, false);
     let r = hh_asm::aa_execute(p, &mut work, script, enable, prev, &mut hooks);
     let mut cur = st.syms.lock().unwrap();
     for (n, a) in work.iter() {
@@ -841,10 +900,7 @@ fn install_asm(b: &B) -> LR<()> {
             return (false, "no process opened").into_lua_multi(lua);
         };
         let syms = st.syms.lock().unwrap().clone();
-        let mut hooks = AaHooks {
-            lua: Some(lua_block_hook(lua.clone(), st.clone(), None, true)),
-            ..Default::default()
-        };
+        let mut hooks = crate::hooks::full(lua, st, None, true);
         match hh_asm::aa_check(&*p, &syms, &text, &mut hooks) {
             None => true.into_lua_multi(lua),
             Some(e) => (false, format!("line {}: {}", e.line, e.message)).into_lua_multi(lua),
@@ -862,11 +918,12 @@ fn install_asm(b: &B) -> LR<()> {
             Err(e) => (Value::Nil, e.to_string()).into_lua_multi(lua),
         }
     })?;
-    b.f("disassemble", |_, st, v: Value| {
+    b.f("disassemble", |lua, st, v: Value| {
         let p = need_proc(st, false)?;
         let a = addr(st, &v, false).map_err(rt)?;
         let syms = st.syms.lock().unwrap().clone();
-        let l = hh_asm::disassemble(&*p, &syms, a, 1).map_err(rt)?.remove(0);
+        let opts = hh_asm::DisasmOptions { address_name: crate::hooks::address_name(lua, st), ..Default::default() };
+        let l = hh_asm::disassemble_with(&*p, &syms, a, 1, &opts).map_err(rt)?.remove(0);
         let bytes: Vec<String> = l.bytes.iter().map(|b| format!("{b:02X}")).collect();
         let mut s = format!("{:X} - {} - {}", l.addr, bytes.join(" "), l.text);
         if !l.comment.is_empty() {
@@ -909,6 +966,12 @@ pub(crate) fn rec_value(st: &State, r: &Record) -> Result<String> {
     }
     let p = st.proc().ok_or(Error::Other("no process opened".into()))?;
     let a = rec_addr(st, r)?;
+    if let Some(ct) = &r.custom {
+        ct.validate()?;
+        let mut buf = vec![0u8; ct.size()];
+        p.read_exact(a, &mut buf)?;
+        return Ok(ct.format(&buf, &r.fmt));
+    }
     let n = hh_scan::value_size(r.vtype, &r.fmt)?;
     let mut buf = vec![0u8; n];
     let got = p.read(a, &mut buf)?;
@@ -918,9 +981,20 @@ pub(crate) fn rec_value(st: &State, r: &Record) -> Result<String> {
     Ok(hh_scan::format_value(r.vtype, &buf[..got], &r.fmt))
 }
 
+/// Writes a value entry's value (custom types in their converted units).
+fn rec_write(p: &dyn Process, a: Addr, r: &Record, v: &str) -> Result<()> {
+    match &r.custom {
+        Some(ct) => hh_scan::write_custom(p, a, ct, v, &r.fmt),
+        None => hh_scan::write_value(p, a, r.vtype, v, &r.fmt),
+    }
+}
+
 fn rec_type(r: &Record) -> i64 {
     if r.script.is_some() && !r.group_header {
         return 11;
+    }
+    if r.custom.is_some() {
+        return 13;
     }
     match r.vtype {
         VType::Byte => 0,
@@ -959,7 +1033,7 @@ fn set_value_rec(st: &State, t: &dyn crate::TableHost, id: RecId, v: &str, depth
             continue;
         }
         let p = st.proc().ok_or(Error::Other("no process opened".into()))?;
-        hh_scan::write_value(&*p, rec_addr(st, &r)?, r.vtype, v, &r.fmt)?;
+        rec_write(&*p, rec_addr(st, &r)?, &r, v)?;
         if r.active {
             r.frozen_value = Some(v.to_string());
             t.set(r)?;
@@ -1062,7 +1136,12 @@ fn install_records(h: &B) -> LR<()> {
                 let n = int_of(&v).ok_or_else(bad)?;
                 if n == 11 {
                     r.script.get_or_insert_with(String::new);
+                } else if n == 13 {
+                    // vtCustom: the definition comes with CustomTypeName.
+                    r.custom = Some(r.custom.unwrap_or(CustomType::int(4, false)));
+                    r.script = None;
                 } else {
+                    r.custom = None;
                     let (vt, utf16) = ce_vtype(n).ok_or_else(bad)?;
                     r.vtype = vt;
                     r.fmt.utf16 = utf16;
@@ -1079,12 +1158,17 @@ fn install_records(h: &B) -> LR<()> {
                 }
                 let p = need_proc(st, false)?;
                 let a = rec_addr(st, &r).map_err(rt)?;
-                hh_scan::write_value(&*p, a, r.vtype, &s, &r.fmt).map_err(rt)?;
+                rec_write(&*p, a, &r, &s).map_err(rt)?;
                 if r.active {
                     r.frozen_value = Some(s);
                 }
             }
             "Script" => r.script = str_of(&v),
+            // A preset name ('4 byte big endian') or a table of hh_scan::CustomType fields.
+            "CustomTypeName" => {
+                r.custom = Some(custom_type(&v)?);
+                r.script = None;
+            }
             "Color" => r.color = int_of(&v).ok_or_else(bad)? as u32,
             "Parent" => r.parent = int_of(&v).map(|p| p as RecId),
             "Offsets" => {
@@ -1125,6 +1209,26 @@ fn install_records(h: &B) -> LR<()> {
             _ => return Err(mlua::Error::runtime(format!("unknown memory record property {key}"))),
         }
         t.set(r).map_err(rt)
+    })?;
+    // Hotkey increase / decrease of a custom-typed record, in converted units: (id, delta)
+    // -> the new value text.
+    h.f("mr_add", |_, st, (id, delta): (RecId, f64)| {
+        let t = st.table();
+        let mut r = t.get(id).ok_or_else(|| mlua::Error::runtime("memory record was deleted"))?;
+        let ct = r.custom.ok_or_else(|| mlua::Error::runtime("not a custom type record"))?;
+        let p = need_proc(st, false)?;
+        let a = rec_addr(st, &r).map_err(rt)?;
+        let n = hh_scan::add_custom(&*p, a, &ct, delta).map_err(rt)?;
+        let mut buf = vec![0u8; ct.size()];
+        let text = match p.read_exact(a, &mut buf) {
+            Ok(()) => ct.format(&buf, &r.fmt),
+            Err(_) => n.to_string(),
+        };
+        if r.active {
+            r.frozen_value = Some(text.clone());
+            t.set(r).map_err(rt)?;
+        }
+        Ok(text)
     })?;
     // (id, active, execute) -> ok, err. Callbacks are handled by the prelude around this.
     h.f("mr_apply", |lua, st, (id, active, execute): (RecId, bool, bool)| {
@@ -1266,6 +1370,8 @@ pub(crate) fn install(lua: &Lua, st: &Arc<State>, allow_os: bool) -> LR<Internal
     install_misc(&b, &h)?;
     crate::ext::install(&b, &h)?;
     crate::debug::install(&h)?;
+    crate::hooks::install(&h)?;
+    crate::ptrscan::install(&h)?;
     crate::ui::install(&h)?;
     h.f("aborted", |_, st, ()| Ok(st.aborted()))?;
 
@@ -1277,6 +1383,7 @@ pub(crate) fn install(lua: &Lua, st: &Arc<State>, allow_os: bool) -> LR<Internal
     }
     let out: Table = lua.load(PRELUDE).set_name("=hh-prelude").call((h.t.clone(), stubs, allow_os, b.names.take()))?;
     lua.set_named_registry_value("hh_mr", out.get::<Function>("mr")?)?;
+    lua.set_named_registry_value("hh_hooks", out.get::<Table>("hooks")?)?;
     Ok(Internals {
         xcall: out.get("xcall")?,
         tick: out.get("tick")?,

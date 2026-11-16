@@ -180,6 +180,16 @@ fn button_result(mb: i64) -> i64 {
 }
 
 impl Host for Console {
+    /// `loadbinary` of a table entry: Settings allow file access (and a table's Lua at all)
+    /// and the table, with every file-reading entry in it, is trusted. Default deny.
+    fn allow_aa_file(&self, _path: &str) -> bool {
+        let Some(app) = self.app.get().and_then(App::upgrade) else { return false };
+        let ok = {
+            let st = lock(&app.x.settings);
+            st.lua_allow_os && st.table_script != "never"
+        };
+        ok && app.x.live.aa_files_trusted()
+    }
     fn print(&self, text: &str) {
         self.push("out", text);
     }
@@ -453,6 +463,8 @@ pub struct LuaPoll {
     pub ui_seq: u64,
     /// Close requests and dropped files of the window.
     pub window: crate::commands::WinEvents,
+    /// Frozen entries the freezer cannot write right now (it keeps retrying).
+    pub freeze_failures: Vec<crate::cheat::FreezeFail>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -578,6 +590,7 @@ impl App {
             selection: self.x.live.selection(),
             ui_seq: lock(&c.ui).0.seq(),
             window: lock(&self.x.win).clone(),
+            freeze_failures: self.freeze_failures(),
         })
     }
 

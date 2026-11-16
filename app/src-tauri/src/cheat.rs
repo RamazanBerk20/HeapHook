@@ -119,7 +119,7 @@ impl Inner {
     fn mark_foreign(&mut self, old: &Table) {
         let before: HashMap<i64, Option<&String>> = all(&old.entries).into_iter().map(|(e, _)| (e.id, e.script.as_ref())).collect();
         let mut now = HashMap::new();
-        for (e, _) in all(&self.table.entries).into_iter().filter(|(e, _)| runs_lua(e)) {
+        for (e, _) in all(&self.table.entries).into_iter().filter(|(e, _)| needs_trust(e)) {
             let script = e.script.as_deref().unwrap_or_default();
             let h = script_hash(script);
             let elsewhere = before.get(&e.id) != Some(&e.script.as_ref()) && self.tainted.contains(&h) && !self.own.contains(&h);
@@ -142,7 +142,7 @@ impl Inner {
     }
 
     fn taint(&mut self, entries: &[Entry]) {
-        let h: Vec<u64> = all(entries).into_iter().filter(|(e, _)| runs_lua(e)).filter_map(|(e, _)| e.script.as_deref().map(script_hash)).collect();
+        let h: Vec<u64> = all(entries).into_iter().filter(|(e, _)| needs_trust(e)).filter_map(|(e, _)| e.script.as_deref().map(script_hash)).collect();
         self.tainted.extend(h);
     }
 }
@@ -221,6 +221,16 @@ pub const NEEDS_ENTRY_CONSENT: &str = "needs consent: entries:";
 /// A script with a `{$lua}` block (hh-asm matches the directive case-insensitively).
 pub(crate) fn script_runs_lua(s: &str) -> bool {
     s.to_ascii_lowercase().contains("{$lua}")
+}
+
+/// A script with `loadbinary` (reads a file from this machine into the target).
+pub(crate) fn script_reads_files(s: &str) -> bool {
+    s.to_ascii_lowercase().contains("loadbinary")
+}
+
+/// What an untrusted source must not bring in unasked: `{$lua}` or `loadbinary`.
+fn needs_trust(e: &Entry) -> bool {
+    runs_lua(e) || e.script.as_deref().is_some_and(script_reads_files)
 }
 
 fn runs_lua(e: &Entry) -> bool {
@@ -334,9 +344,9 @@ fn record(e: &Entry, parent: Option<i64>, rt: Option<&Rt>, blocked: bool) -> Rec
     r.description = e.description.clone();
     r.address = e.addr.clone();
     r.offsets = e.offsets.iter().map(|o| parse_off(o)).collect();
-    // hh-lua has no custom types: it sees a custom entry's first 8 bytes as a plain integer,
-    // which `sync_freeze` turns back into bytes (see `custom_frozen_value`).
-    (r.vtype, r.fmt) = if e.custom.is_some() { (hh_scan::VType::Bytes8, Fmt::default()) } else { (e.vtype, fmt_of(e)) };
+    // A custom type overrides `vtype`: `memrec.Value`, set value and hotkey increase /
+    // decrease work in its converted units, and the frozen value is that converted text.
+    (r.vtype, r.fmt, r.custom) = (e.vtype, fmt_of(e), e.custom);
     r.group_header = is_group(e);
     r.script = if blocked { Some(BLOCKED_SCRIPT.into()) } else { e.script.clone() };
     r.color = color_in(e.color.as_deref());
@@ -377,7 +387,7 @@ impl Live {
     pub(crate) fn set_trust(&self, t: Trust) {
         let mut g = lock(&self.0);
         if t == Trust::Agreed {
-            let own: Vec<u64> = all(&g.table.entries).into_iter().filter(|(e, _)| runs_lua(e) && !g.foreign.contains_key(&e.id)).filter_map(|(e, _)| e.script.as_deref().map(script_hash)).collect();
+            let own: Vec<u64> = all(&g.table.entries).into_iter().filter(|(e, _)| needs_trust(e) && !g.foreign.contains_key(&e.id)).filter_map(|(e, _)| e.script.as_deref().map(script_hash)).collect();
             for h in own {
                 g.tainted.remove(&h);
             }
@@ -399,6 +409,11 @@ impl Live {
             g.foreign.values_mut().for_each(|a| *a = false);
             g.bump();
         }
+        // The Auto Assemble window (`aa_execute`) asks again for any table script too.
+        let again: Vec<u64> = all(&g.table.entries).into_iter().filter(|(e, _)| needs_trust(e)).filter_map(|(e, _)| e.script.as_deref().map(script_hash)).filter(|h| g.own.contains(h) || g.tainted.contains(h)).collect();
+        let foreign: Vec<u64> = all(&g.table.entries).into_iter().filter(|(e, _)| g.foreign.contains_key(&e.id)).filter_map(|(e, _)| e.script.as_deref().map(script_hash)).collect();
+        g.tainted.extend(again);
+        g.tainted.extend(foreign);
     }
 
     /// A script loaded more entries into this table: the table is untrusted again, but what
@@ -529,7 +544,7 @@ impl Live {
         g.foreign.clear();
         let entries = g.table.entries.clone();
         g.taint(&entries);
-        g.own = all(&entries).into_iter().filter(|(e, _)| runs_lua(e)).filter_map(|(e, _)| e.script.as_deref().map(script_hash)).collect();
+        g.own = all(&entries).into_iter().filter(|(e, _)| needs_trust(e)).filter_map(|(e, _)| e.script.as_deref().map(script_hash)).collect();
         g.saved = content_hash(&g.table);
         g.bump();
         g.st()
@@ -577,8 +592,9 @@ impl Live {
         let added: Vec<Entry> = ids.iter().filter_map(|id| all(&t.entries).into_iter().find(|(e, _)| e.id == *id).map(|(e, _)| e.clone())).collect();
         g.taint(&added);
         g.install(t, true);
-        // Whatever runs Lua among them is foreign, even when the same text is this table's own.
-        for (e, _) in all(&added).into_iter().filter(|(e, _)| runs_lua(e)) {
+        // Whatever runs Lua or reads files among them is foreign, even when the same text is
+        // this table's own.
+        for (e, _) in all(&added).into_iter().filter(|(e, _)| needs_trust(e)) {
             g.foreign.insert(e.id, false);
         }
         g.bump();
@@ -609,6 +625,18 @@ impl Live {
             g.bump();
         }
         n
+    }
+
+    /// Whether a table entry's `loadbinary` may read files (hh-lua asks per file, without
+    /// saying which entry): the table is trusted and no entry that reads files is still
+    /// waiting for consent. shortcut: one untrusted `loadbinary` entry blocks them all; ask
+    /// per entry once hh-lua tells the host which record runs.
+    pub(crate) fn aa_files_trusted(&self) -> bool {
+        let g = lock(&self.0);
+        g.trust.allows()
+            && !all(&g.table.entries).into_iter().any(|(e, _)| {
+                e.script.as_deref().is_some_and(script_reads_files) && (g.foreign.get(&e.id) == Some(&false) || e.script.as_deref().is_some_and(|x| g.tainted.contains(&script_hash(x))))
+            })
     }
 
     /// Scripts from an untrusted source (an Auto Assembler file): `aa_execute` asks first.
@@ -739,6 +767,7 @@ impl TableHost for Live {
             if rec.script.as_deref() != Some(BLOCKED_SCRIPT) {
                 e.script = rec.script.clone();
             }
+            e.custom = rec.custom;
             if e.custom.is_none() {
                 e.vtype = rec.vtype;
             }
@@ -1151,9 +1180,6 @@ the table was not opened: these active scripts could not be disabled (open anywa
         }
         .map_err(|x| x.to_string())?;
         self.x.live.set_frozen_value(e.id, value);
-        if e.custom.is_some() {
-            lock(&self.x.custom_frozen).insert(e.id, value.to_string());
-        }
         Ok(())
     }
 
@@ -1188,35 +1214,50 @@ the table was not opened: these active scripts could not be disabled (open anywa
         let active = self.x.live.frozen();
         // hh-lua formats record values by `vtype` only, so a custom entry's frozen value is
         // read here, with its type, when it turns active.
-        let mut cf = lock(&self.x.custom_frozen);
-        cf.retain(|id, _| active.iter().any(|(e, _)| e.id == *id && e.custom.is_some()));
-        let list: Vec<FrozenEntryEx> = active
+        let list = active
             .into_iter()
-            .filter_map(|(e, value)| match &e.custom {
-                None => Some((e, value)),
-                Some(ct) => {
-                    let v = match cf.entry(e.id) {
-                        std::collections::hash_map::Entry::Occupied(o) => o.get().clone(),
-                        // The engine's value at activation: 8 bytes as an unsigned integer.
-                        std::collections::hash_map::Entry::Vacant(v) => {
-                            let b = hh_scan::parse_value(hh_scan::VType::Bytes8, &value, &Fmt::default()).ok()?;
-                            v.insert(ct.format(&b, &fmt_of(&e))).clone()
-                        }
-                    };
-                    Some((e, v))
-                }
-            })
             // An unsupported custom type has nothing to write.
             .filter(|(e, _)| e.custom.is_some() || e.custom_name.is_none())
             .filter_map(|(e, value)| {
                 let addr = self.entry_addr(&e).ok()?;
-                Some(FrozenEntryEx { entry: FrozenEntry { addr, vtype: e.vtype, value, mode: e.freeze_mode, fmt: fmt_of(&e) }, custom: e.custom })
+                Some((e.id, e.freeze_interval_ms, FrozenEntryEx { entry: FrozenEntry { addr, vtype: e.vtype, value, mode: e.freeze_mode, fmt: fmt_of(&e) }, custom: e.custom }))
             })
-            .collect();
-        if let Err(e) = sess.freezer.set_ex(&list) {
+            .collect::<Vec<_>>();
+        *lock(&self.x.freeze_ids) = list.iter().map(|(id, _, f)| (f.entry.addr, *id)).collect();
+        let set: Vec<FrozenEntryEx> = list.iter().map(|x| x.2.clone()).collect();
+        if let Err(e) = sess.freezer.set_ex(&set) {
             self.x.lua.console.push("err", &format!("freeze: {e}"));
         }
+        // Entries with their own interval: updated in place (their state is kept).
+        for (_, ms, f) in list.iter().filter(|x| x.1.is_some()) {
+            if let Err(e) = sess.freezer.put(f, ms.map(std::time::Duration::from_millis)) {
+                self.x.lua.console.push("err", &format!("freeze: {e}"));
+            }
+        }
     }
+
+    /// Frozen table entries whose last write failed (freed or protected memory): id, address
+    /// and why. The freezer keeps retrying them.
+    pub(crate) fn freeze_failures(&self) -> Vec<FreezeFail> {
+        let Ok(sess) = self.session() else { return Vec::new() };
+        let fails = sess.freezer.failures();
+        if fails.is_empty() {
+            return Vec::new();
+        }
+        let ids = lock(&self.x.freeze_ids);
+        fails
+            .into_iter()
+            .flat_map(|f| ids.iter().filter(move |(a, _)| *a == f.addr).map(move |(_, id)| FreezeFail { id: *id, addr: crate::commands::hex_addr(f.addr), error: f.error.clone() }))
+            .collect()
+    }
+}
+
+/// A frozen entry the freezer cannot write (`lua_poll.freeze_failures`).
+#[derive(Debug, Clone, Serialize)]
+pub struct FreezeFail {
+    pub id: i64,
+    pub addr: String,
+    pub error: String,
 }
 
 /// `table_paste` answer.

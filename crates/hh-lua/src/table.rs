@@ -4,7 +4,7 @@ use std::sync::Mutex;
 
 use hh_asm::AaState;
 use hh_core::{Error, Result};
-use hh_scan::{Fmt, VType};
+use hh_scan::{CustomType, Fmt, VType};
 use hh_tools::structure::Structure;
 
 pub type RecId = u32;
@@ -50,6 +50,11 @@ pub struct Record {
     /// Hotkeys of this record. The host owns triggering them: when one is pressed it calls
     /// [`crate::Engine::fire_record_hotkey`].
     pub hotkeys: Vec<RecordHotkey>,
+    /// Custom type (CE `vtCustom`): when set it overrides `vtype` for reading and writing, and
+    /// `memrec.Value`, set value and hotkey increase / decrease work in its converted units
+    /// (`raw * scale + offset`); `frozen_value` then holds that converted text. `fmt.hex`
+    /// still applies.
+    pub custom: Option<CustomType>,
 }
 
 /// A memory record hotkey (CE `MemoryRecordHotkey`).
@@ -89,6 +94,7 @@ impl Record {
             dropdown_description_only: false,
             dropdown_display_as_item: false,
             hotkeys: Vec::new(),
+            custom: None,
         }
     }
 }

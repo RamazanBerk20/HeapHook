@@ -1290,6 +1290,7 @@ dependencies = [
  "hh-scan",
  "hh-tools",
  "iced-x86",
+ "libc",
  "mlua",
  "roxmltree",
  "serde",
@@ -1372,6 +1373,7 @@ version = "1.0.0-rc.1"
 dependencies = [
  "hh-asm",
  "hh-core",
+ "hh-ptr",
  "hh-scan",
  "hh-tools",
  "mlua",

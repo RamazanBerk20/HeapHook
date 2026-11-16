@@ -412,12 +412,12 @@ fn breakpoints_stepping_registers_trace() {
     assert_eq!(parse_addr(app.debug_context(tid).unwrap()["rflags"].as_str().unwrap()).unwrap() & 0x80, (fl ^ 0x80) & 0x80);
     app.debug_set_register(tid, "rflags", &hex(fl)).unwrap();
     assert!(app.debug_set_register(tid, "xyz", "0x1").is_err());
-    app.debug_step(tid, "into").unwrap();
+    app.debug_step(tid, "into", false).unwrap();
     let st = wait("the step", || Some(app.debug_status().unwrap()).filter(|s| s.state == "broken" && s.rip.as_deref() == Some(hex(store_a + 3).as_str())));
     assert_eq!(st.reason.as_deref(), Some("step"));
     assert_eq!(app.read_values(de(json!([{"addr": value, "vtype": "8bytes"}]))).unwrap(), [Some("4660".into())]);
     // Step out of store lands back in the caller.
-    app.debug_step(tid, "out").unwrap();
+    app.debug_step(tid, "out", false).unwrap();
     let st = wait("step out", || Some(app.debug_status().unwrap()).filter(|s| s.state == "broken" && s.reason.as_deref() == Some("step")));
     let rip = parse_addr(st.rip.as_deref().unwrap()).unwrap();
     assert!(rip < store_a || rip > store_a + 4, "still in store: {rip:#x}");
@@ -442,7 +442,7 @@ fn breakpoints_stepping_registers_trace() {
     t.send("outer");
     assert_eq!(broken(&app).rip.as_deref(), Some(outer.as_str()));
     app.debug_remove_breakpoint(id).unwrap();
-    app.debug_run_to(&hex(outer_a + 6), None).unwrap();
+    app.debug_run_to(&hex(outer_a + 6), None, 1).unwrap();
     wait("run to", || Some(app.debug_status().unwrap()).filter(|s| s.state == "broken" && s.rip.as_deref() == Some(hex(outer_a + 6).as_str())));
     app.debug_continue(false).unwrap();
     assert_eq!(t.line(), "ok 4663 200");
@@ -806,7 +806,13 @@ fn memory_tools_save_load_snapshot_pointers() {
     assert_eq!(sum.bytes, 64);
     app.write_value(&i32a, de(json!("4bytes")), "999", &Fmt::default(), None).unwrap();
     assert_eq!(t.cmd("get")["i32"], 999);
-    let r = app.mem_load(file.to_str().unwrap(), None).unwrap();
+    // Nothing is written before the plan's blocks are approved.
+    let plan = app.mem_load_plan(file.to_str().unwrap(), None).unwrap();
+    assert_eq!((plan.blocks.len(), plan.blocks[0].mapped, plan.blocks[0].writable), (1, true, true));
+    let none = app.mem_load_approved(file.to_str().unwrap(), None, &[]).unwrap();
+    assert_eq!(none.blocks, 0);
+    assert_eq!(t.cmd("get")["i32"], 999);
+    let r = app.mem_load_approved(file.to_str().unwrap(), None, &plan.blocks).unwrap();
     assert!(r.failed.is_empty());
     assert_eq!(t.cmd("get")["i32"], 123456);
 
@@ -1194,7 +1200,7 @@ fn breakpoints_change_in_place_options_signals_backtrace() {
     assert_eq!(frames[0].addr, store);
     assert_eq!(frames[0].module.as_deref(), Some("hh-debug-target"), "{frames:?}");
     app.debug_remove_breakpoint(id).unwrap();
-    app.debug_run_to(&hex(store_a + 3), Some(tid)).unwrap();
+    app.debug_run_to(&hex(store_a + 3), Some(tid), 1).unwrap();
     let st = wait("run to (thread)", || Some(app.debug_status().unwrap()).filter(|s| s.state == "broken" && s.rip.as_deref() == Some(hex(store_a + 3).as_str())));
     assert_eq!((st.tid, st.reason.as_deref()), (Some(tid), Some("step")));
     app.debug_continue(false).unwrap();
@@ -1667,7 +1673,9 @@ fn remote_session_end_to_end_and_connection_drop() {
     assert_eq!(parse_addr(&app.resolve_address(&expr).unwrap()).unwrap(), parse_addr(&t.addr("chain_value")).unwrap());
     let e = app.debug_attach().unwrap_err();
     assert!(e.contains("local processes only"), "{e}");
-    assert!(app.module_header("hh-target").unwrap_err().contains("local processes only"));
+    // A remote target's header comes from its memory, never from a same-named local file.
+    let hdr = app.module_header("hh-target").unwrap();
+    assert!(hdr.format == "elf" && hdr.source == "memory", "{hdr:?}");
     let p = serde_json::to_value(app.lua_poll(0).unwrap()).unwrap();
     assert_eq!((p["process"]["remote"].as_str(), p["process"]["alive"].as_bool()), (Some(addr.as_str()), Some(true)));
 
@@ -2259,4 +2267,284 @@ fn form_changes_coalesce_and_snapshot() {
     assert_eq!(caps.len(), 1, "5000 caption updates arrive as one");
     assert!(serde_json::to_value(caps[0]).unwrap().to_string().contains("n5000"));
     assert!(app.ui_poll(r.next + 100).unwrap().snapshot.is_some(), "a UI ahead of the backend (restarted) gets the tree");
+}
+
+// ------------------------------------------------- 1.0 RC: last wave's engine features
+
+fn ticker() -> PathBuf {
+    let ok = Command::new(env!("CARGO"))
+        .args(["build", "-q", "-p", "heaphook", "--example", "ticker"])
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .status()
+        .unwrap()
+        .success();
+    assert!(ok);
+    std::env::current_exe().unwrap().parent().unwrap().parent().unwrap().join("examples/ticker")
+}
+
+fn broken(app: &App) -> heaphook::debug::DebugStatus {
+    wait("a break", || app.debug_status().ok().filter(|s| s.state == "broken"))
+}
+
+#[test]
+fn launch_under_debugger_pending_breakpoint_tracepoint_and_reaping() {
+    let dir = tempfile::tempdir().unwrap();
+    let info_file = dir.path().join("info.json");
+    let app = App::default();
+    app.start_driver();
+    let info = app.debug_launch(&de(json!({"program": ticker().to_str().unwrap(), "args": info_file.to_str().unwrap(), "stop": "first"}))).unwrap();
+    // A failed assertion must not leave the program running.
+    struct Kill(u32);
+    impl Drop for Kill {
+        fn drop(&mut self) {
+            let _ = Command::new("kill").args(["-9", &self.0.to_string()]).status();
+        }
+    }
+    let _kill = Kill(info.pid);
+    // Stopped before its first instruction: nothing of the program ran, libc is not loaded.
+    let st = broken(&app);
+    assert!(st.reason.as_deref().unwrap_or("").contains("before the first instruction"), "{st:?}");
+    assert!(!info_file.exists());
+    // Traced by the debugger thread of this process.
+    let tracer = tracer_pid(info.pid);
+    assert!(std::path::Path::new(&format!("/proc/self/task/{tracer}")).exists(), "tracer {tracer}");
+    // A breakpoint set now, by expression, resolves once libc is loaded.
+    let id = app.debug_add_breakpoint(&bp(json!({"pending": "clock_nanosleep"}))).unwrap();
+    let row = bp_row(&app, id);
+    assert!(row.pending.as_deref() == Some("clock_nanosleep") && !row.resolved, "{row:?}");
+    app.debug_continue(false).unwrap();
+    let st = broken(&app);
+    assert_eq!(st.reason.as_deref(), Some(format!("breakpoint {id}").as_str()), "{st:?}");
+    assert!(bp_row(&app, id).resolved);
+    assert!(app.debug_log(0).unwrap().lines.iter().any(|l| l.text.contains(&format!("breakpoint {id} resolved"))));
+    // The same place as a tracepoint: it logs instead of breaking.
+    app.debug_remove_breakpoint(id).unwrap();
+    let tp = app.debug_add_breakpoint(&bp(json!({"pending": "clock_nanosleep", "log": true, "message": "sleep clock={rdi}"}))).unwrap();
+    app.debug_continue(false).unwrap();
+    wait("a tracepoint line", || app.debug_log(0).unwrap().lines.iter().any(|l| l.text.contains(&format!("tracepoint {tp}")) && l.text.contains("sleep clock=0x")).then_some(()));
+    assert_ne!(app.debug_status().unwrap().state, "broken");
+    // Released, killed and reaped by the app (it has no `Child` for it).
+    app.close_process().unwrap();
+    assert_eq!(tracer_pid(info.pid), 0);
+    let _ = Command::new("kill").arg(info.pid.to_string()).status();
+    wait("reaped", || {
+        app.reap_children();
+        std::fs::read_to_string(format!("/proc/{}/stat", info.pid)).is_err().then_some(())
+    });
+}
+
+#[test]
+fn code_filter_finds_the_function_that_ran() {
+    let mut t = Target::spawn_exe(exe("hh-debug", "hh-debug-target"));
+    let app = App::default();
+    app.open_process(t.child.id()).unwrap();
+    assert!(app.code_filter_start().is_err(), "needs a dissection");
+    app.dissect_run(&["hh-debug-target".into()], &Default::default()).unwrap();
+    assert!(app.code_filter_start().is_err(), "needs the debugger");
+    app.debug_attach().unwrap();
+    let mut rec = |cmd: &str, ran: bool| {
+        let s = app.code_filter_start().unwrap();
+        assert!(s.recording && s.armed > 10, "{s:?}");
+        t.send(cmd);
+        assert!(t.line().starts_with("ok"));
+        app.code_filter_stop(ran).unwrap()
+    };
+    rec("store", true);
+    let s = rec("load", false);
+    assert_eq!((s.ran_sets, s.not_ran_sets), (1, 1));
+    let list = app.code_filter_list(0, 10_000).unwrap();
+    let addrs: Vec<String> = list.rows.iter().map(|f| hex(f.addr)).collect();
+    assert!(addrs.contains(&t.addr("store")), "store ran: {addrs:?}");
+    assert!(!addrs.contains(&t.addr("load")), "load is in the did-not-run set");
+    app.code_filter_reset().unwrap();
+    assert_eq!(app.code_filter_state().unwrap().ran_sets, 0);
+    app.debug_detach().unwrap();
+}
+
+#[test]
+fn loadbinary_needs_consent_and_file_access() {
+    let mut t = Target::spawn();
+    let app = App::default();
+    app.open_process(t.child.id()).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let bin = dir.path().join("four.bin");
+    std::fs::write(&bin, [0x11u8, 0x22, 0x33, 0x44]).unwrap();
+    let at = t.addr("i32").trim_start_matches("0x").to_string();
+    let script = format!("[ENABLE]\nloadbinary({at},{})\n[DISABLE]\n", bin.display());
+    let tbl = dir.path().join("t.json");
+    let e = Entry { id: 1, description: "blob".into(), script: Some(script.clone()), ..Entry::default() };
+    heaphook::table::save(&tbl, &Table { entries: vec![e], ..Table::default() }).unwrap();
+    app.table_open(tbl.to_str().unwrap(), false).unwrap();
+    // Untrusted table: neither route reads the file.
+    assert!(app.table_set_active(&[1], true).unwrap_err().contains("not allowed"));
+    needs_consent(app.aa_execute(&script, true, None));
+    assert_eq!(t.cmd("get")["i32"], 123456);
+    // Consent: both routes read it.
+    app.table_trust(true).unwrap();
+    let st = app.aa_execute(&script, true, None).unwrap();
+    assert_eq!(t.cmd("get")["i32"], 0x44332211);
+    app.write_value(&t.addr("i32"), de(json!("4bytes")), "5", &Fmt::default(), None).unwrap();
+    app.table_set_active(&[1], true).unwrap();
+    assert_eq!(t.cmd("get")["i32"], 0x44332211);
+    app.table_set_active(&[1], false).unwrap();
+    let _ = app.aa_execute(&script, false, Some(&st));
+    // Never a device or a pipe.
+    let dev = format!("[ENABLE]\nloadbinary({at},/dev/zero)\n[DISABLE]\n");
+    assert!(app.aa_execute(&dev, true, None).unwrap_err().contains("not a regular file"));
+    // Settings without file access refuse it outright.
+    let s = app.settings_get().unwrap();
+    app.settings_set(heaphook::settings::Settings { lua_allow_os: false, ..s.clone() }).unwrap();
+    assert!(app.aa_execute(&script, true, None).unwrap_err().contains("do not allow"));
+    // "Never run a table's Lua" withdraws the consent for the table's scripts too.
+    app.settings_set(heaphook::settings::Settings { table_script: "never".into(), ..s }).unwrap();
+    needs_consent(app.aa_execute(&script, true, None).map_err(|e| format!("{} {e}", heaphook::cheat::NEEDS_CONSENT)));
+    assert!(app.table_set_active(&[1], true).is_err());
+}
+
+#[test]
+fn region_filters_sort_remove_export_and_stats() {
+    let t = Target::spawn();
+    let app = App::default();
+    app.open_process(t.child.id()).unwrap();
+    let i32a = t.addr("i32");
+    let a = parse_addr(&i32a).unwrap();
+    let scan = |opts: Value| first_scan(&app, json!({"vtype": "4bytes", "scan_type": "exact", "value": "123456", "not": false, "opts": opts}));
+    // The values live on the heap: private memory, not in a module image.
+    assert!(scan(json!({"writable": "any", "kinds": ["Private"]})) >= 1 && has_addr(&app, &i32a));
+    scan(json!({"writable": "any", "kinds": ["Image"]}));
+    assert!(!has_addr(&app, &i32a));
+    scan(json!({"writable": "any", "modules": ["hh-target"]}));
+    assert!(!has_addr(&app, &i32a));
+    assert!(app.scan_first(&de(json!({"vtype": "4bytes", "scan_type": "exact", "value": "1", "not": false, "opts": {"modules": ["no-such-module"]}}))).is_err());
+    assert_eq!(scan(json!({"writable": "any", "ranges": [{"start": i32a, "end": hex(a + 4)}]})), 1);
+    assert_eq!(scan(json!({"writable": "any", "min_region_size": 1u64 << 40})), 0);
+    // A wider scan to sort, remove, export.
+    let n = first_scan(&app, json!({"vtype": "byte", "scan_type": "unknown", "not": false, "opts": {"writable": "yes", "alignment": 4, "ranges": [{"start": i32a, "end": hex(a + 0x40)}]}}));
+    assert_eq!(n, 16);
+    app.scan_sort(de(json!("value")), true).unwrap();
+    let rows = app.scan_results(0, 100, None).unwrap();
+    let v: Vec<i64> = rows.iter().map(|r| r.value.clone().unwrap().parse().unwrap()).collect();
+    assert!(v.windows(2).all(|w| w[0] >= w[1]), "{v:?}");
+    assert_eq!(app.scan_remove(std::slice::from_ref(&i32a)).unwrap(), 1);
+    assert!(!has_addr(&app, &i32a));
+    app.scan_undo().unwrap();
+    assert!(has_addr(&app, &i32a));
+    let text = app.scan_copy_addresses().unwrap();
+    assert_eq!(text.lines().count(), 16);
+    assert!(text.contains(&format!("{a:X}")));
+    let f = tempfile::NamedTempFile::new().unwrap();
+    assert_eq!(app.scan_export_addresses(f.path().to_str().unwrap()).unwrap(), 16);
+    let stats = app.scan_stats().unwrap();
+    assert_eq!(stats.iter().map(|s| s.count).sum::<u64>(), 16);
+    // Pointer-value scan: the chain's base pointer points into the heap.
+    let c = app.scan_pointer(&de(json!({"opts": {"writable": "any"}}))).unwrap().count;
+    assert!(c >= 1 && has_addr(&app, &t.addr("chain")));
+}
+
+#[test]
+fn custom_typed_hotkey_increase_and_freeze_in_converted_units() {
+    let mut t = Target::spawn();
+    let app = App::default();
+    app.start_driver();
+    app.open_process(t.child.id()).unwrap();
+    let ct: hh_scan::CustomType = de(json!({"size": 4, "signed": true, "scale": 0.5, "offset": 0.0}));
+    let hk = |action: &str, value: &str| Hotkey { action: action.into(), keys: vec![17, 112], value: Some(value.into()), description: None, id: None };
+    let mut e = i32_entry(1, &t);
+    e.custom = Some(ct);
+    e.hotkeys = vec![hk("Increase Value", "1"), hk("Set Value", "100"), hk("Toggle Activation", "")];
+    put(&app, vec![e]);
+    // 123456 raw = 61728 converted; +1 converted = +2 raw.
+    app.table_hotkey(1, 0).unwrap();
+    assert_eq!(t.cmd("get")["i32"], 123458);
+    app.table_hotkey(1, 1).unwrap();
+    assert_eq!(t.cmd("get")["i32"], 200);
+    // Frozen to its converted value (100 = raw 200).
+    app.table_hotkey(1, 2).unwrap();
+    t.cmd("inc");
+    wait("frozen to 100 converted", || (t.cmd("get")["i32"] == 200).then_some(()));
+    let lua = "local r = getAddressList().getMemoryRecordByID(1) r.Value = 7 print(r.Value)";
+    app.lua_exec(lua).unwrap();
+    assert!(log_text(&app).contains('7'));
+    wait("frozen to 7 converted", || (t.cmd("get")["i32"] == 14).then_some(()));
+}
+
+#[test]
+fn pointer_scan_pauses_and_resumes() {
+    let t = Target::spawn();
+    let app = App::default();
+    app.open_process(t.child.id()).unwrap();
+    assert!(app.ptr_pause(true).is_err(), "nothing runs");
+    let a2 = app.clone();
+    let target = t.addr("chain_value");
+    let h = std::thread::spawn(move || {
+        a2.ptr_scan(&de(json!({"target": target, "opts": {"max_level": 4, "max_offset": 0x400, "static_only": true, "threads": 1, "starts_with": [], "stop_at_static": true, "time_limit_secs": 60}})))
+    });
+    let mut paused = false;
+    for _ in 0..5000 {
+        if app.ptr_progress().unwrap().running && app.ptr_pause(true).is_ok() {
+            paused = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_micros(200));
+    }
+    if paused {
+        std::thread::sleep(Duration::from_millis(100));
+        let p1 = app.ptr_progress().unwrap();
+        std::thread::sleep(Duration::from_millis(300));
+        let p2 = app.ptr_progress().unwrap();
+        assert!(p2.paused && p2.running && p1.done == p2.done && p1.phase == p2.phase, "{p1:?} {p2:?}");
+        app.ptr_pause(false).unwrap();
+    } else {
+        eprintln!("pointer scan finished before it could be paused");
+    }
+    let info = h.join().unwrap().unwrap();
+    assert!(info.count >= 1 && info.compact, "{info:?}");
+    assert!(!app.ptr_progress().unwrap().paused);
+}
+
+#[test]
+fn memory_file_search_stats_change_map_and_structure_view() {
+    let mut t = Target::spawn();
+    let app = App::default();
+    app.open_process(t.child.id()).unwrap();
+    let i32a = t.addr("i32");
+    let range: Vec<hh_tools::memory::Range> = de(json!([{"start": i32a, "size": 4096}]));
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("m.hhmem");
+    app.mem_save(&range, file.to_str().unwrap()).unwrap();
+    let hits = app.mem_file_search(&de(json!({"path": file.to_str().unwrap(), "pattern": "40 E2 01 00"}))).unwrap();
+    assert!(hits.contains(&i32a), "{hits:?}");
+    let hits = app.mem_file_search(&de(json!({"path": file.to_str().unwrap(), "vtype": "4bytes", "value": "123456"}))).unwrap();
+    assert!(hits.contains(&i32a));
+    assert!(app.mem_file_search(&de(json!({"path": "/dev/zero", "pattern": "00"}))).is_err());
+    let st = app.region_stats().unwrap();
+    assert!(st.regions > 0 && !st.by_prot.is_empty());
+    let s1 = app.snapshot_take(&range, "a").unwrap();
+    t.cmd("inc");
+    let s2 = app.snapshot_take(&range, "b").unwrap();
+    let m = app.snapshot_change_map(s1.id, s2.id, "", "", 16).unwrap();
+    // The range may straddle a page boundary: every compared page holds a changed value.
+    let (c, x) = (m.compared.iter().sum::<u32>(), m.changed.iter().sum::<u32>());
+    assert!(c >= 1 && x >= 1 && x <= c, "{m:?}");
+    // Structure view: changed fields between views, lock, write, C export, field entry.
+    let el = |o: u64, t: &str| json!({"offset": o, "description": format!("f{o}"), "vtype": t});
+    let st: Vec<hh_tools::structure::Structure> = de(json!([{"name": "V", "elements": [el(0, "4bytes"), el(8, "8bytes")]}]));
+    app.struct_set(st).unwrap();
+    let req: Vec<heaphook::tools::EvalReq> = de(json!([{"name": "V", "addr": i32a}]));
+    let v = app.struct_view(&req).unwrap().remove(0).unwrap();
+    assert!(v.changed.is_empty() && !v.locked);
+    t.cmd("inc");
+    let v = app.struct_view(&req).unwrap().remove(0).unwrap();
+    assert!(v.changed.contains(&0), "{v:?}");
+    app.struct_lock("V", &i32a, true).unwrap();
+    app.struct_write("V", &i32a, 0, "77").unwrap();
+    let v = app.struct_view(&req).unwrap().remove(0).unwrap();
+    assert!(v.locked && v.changed.contains(&0) && v.fields[0].value.as_deref() != Some("77"), "{v:?}");
+    app.struct_lock("V", &i32a, false).unwrap();
+    assert_eq!(t.cmd("get")["i32"], 77);
+    assert!(app.struct_code(&[], "c").unwrap().contains("struct V"));
+    let e = app.struct_field_entry("V", &i32a, &[1]).unwrap();
+    assert_eq!(e.vtype, de::<hh_scan::VType>(json!("8bytes")));
+    // Bad definitions are refused.
+    assert!(app.struct_set(de(json!([{"name": "B", "elements": [{"offset": 0, "description": "x", "vtype": "float", "bit_len": 3}]}]))).is_err());
 }

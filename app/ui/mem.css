@@ -55,3 +55,35 @@
 @media (max-width: 1180px) { #da-view .bl { display: none; } }
 /* Narrow: the cursor and selection size move to the status line under the dump. */
 @media (max-width: 1180px) { #hx-pos { display: none; } }
+
+/* ---------- 1.0 RC memory tools and structure dissector (memtools.js, structs.js) ---------- */
+/* Load plan states. */
+.ld-bad { color: var(--red); }
+.ld-ro { color: var(--yellow); }
+/* Region totals: plain tables. */
+.rs-wrap { flex: 1; min-height: 0; overflow: auto; display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: var(--s3); align-content: start; }
+.rs-table { border-collapse: collapse; font-size: var(--fs-sm); width: 100%; }
+.rs-table caption { text-align: left; font-weight: 600; padding-bottom: var(--s1); }
+.rs-table th, .rs-table td { padding: 2px var(--s2); border-bottom: 1px solid var(--hairline); text-align: right; white-space: nowrap; font-variant-numeric: tabular-nums; }
+.rs-table thead th { color: var(--muted); font-weight: 500; }
+.rs-table th:first-child { text-align: left; max-width: 220px; overflow: hidden; text-overflow: ellipsis; font-weight: 400; }
+/* Snapshot change map: focusable cells, intensity from the pastel tokens. */
+.cm-host { flex: 1; min-height: 0; display: flex; flex-direction: column; gap: var(--s2); }
+.cm-host[hidden] { display: none; }
+.cm-host > .btn { align-self: flex-start; }
+.cm-scroll { flex: 1; min-height: 0; overflow: auto; }
+.cm-grid { display: flex; flex-direction: column; gap: 2px; }
+.cm-row { display: grid; grid-template-columns: repeat(32, minmax(0, 1fr)); gap: 2px; }
+.cm-cell { display: block; height: 12px; min-width: 8px; border-radius: 2px; border: 1px solid var(--hairline); cursor: pointer; }
+.cm-cell:focus { outline: 2px solid var(--blue); outline-offset: 1px; }
+.cm-none { background: transparent; border-style: dashed; }
+.cm-l0 { background: var(--canvas-2); }
+.cm-l1 { background: var(--yellow-bg); border-color: var(--yellow); }
+.cm-l2 { background: var(--red-bg); border-color: var(--red); }
+.cm-l3 { background: var(--red); border-color: var(--red); }
+.cm-legend { display: flex; flex-wrap: wrap; gap: var(--s3); font-size: var(--fs-xs); color: var(--text-2); }
+.cm-key { display: inline-flex; align-items: center; gap: 6px; }
+.cm-key .cm-cell { width: 14px; cursor: default; }
+/* Structure dissector: column header with class name and lock state. */
+.st-colhead .st-class { color: var(--blue); }
+.st-colhead .st-locked { color: var(--yellow); }

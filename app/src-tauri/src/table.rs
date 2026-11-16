@@ -154,6 +154,9 @@ pub struct Entry {
     /// unsupported, written back unchanged).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub custom_name: Option<String>,
+    /// Own freezer rewrite interval (ms); `None` = Settings' freeze interval. JSON only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub freeze_interval_ms: Option<u64>,
 }
 
 impl Default for Entry {
@@ -180,6 +183,7 @@ impl Default for Entry {
             ct_extra: Vec::new(),
             custom: None,
             custom_name: None,
+            freeze_interval_ms: None,
         }
     }
 }
@@ -271,6 +275,7 @@ pub fn valid_color(c: &str) -> bool {
 /// (one entry; callers walk the tree).
 pub fn clean_entry(e: &mut Entry) {
     e.options.retain(|o| valid_option(o));
+    e.freeze_interval_ms = e.freeze_interval_ms.map(|ms| ms.clamp(1, 60_000));
     if e.color.as_deref().is_some_and(|c| !valid_color(c)) {
         e.color = None;
     }

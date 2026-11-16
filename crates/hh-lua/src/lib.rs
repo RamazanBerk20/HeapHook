@@ -21,6 +21,13 @@
 //! (forms built by scripts, kept as a retained control tree here) and [`DebugHost`]
 //! (breakpoints).
 //!
+//! Scripts can extend the Auto Assembler and the symbol handler (`registerAutoAssemblerCommand`,
+//! `registerAutoAssemblerPrologue`, `registerSymbolLookupCallback`,
+//! `registerAddressLookupCallback`, `registerStructureDissectOverride`,
+//! `registerStructureNameLookup`); [`Engine::aa_hooks`], [`Engine::address_name`],
+//! [`Engine::symbol_lookup`] and [`Engine::structure_override`] hand them to the host.
+//! HeapHook's own additions are prefixed `hh` (`hhCreatePointerScan`, `hhAssemblyScan`, ...).
+//!
 //! OS access: `io`, `os.execute`, `os.remove`, `os.rename`, `os.getenv`, `os.tmpname`,
 //! `dofile`, `loadfile`, file-based `require`, `shellExecute`, `readRegionFromFile` /
 //! `writeRegionToFile` and `md5file` are available like in Cheat Engine unless
@@ -32,7 +39,7 @@ use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock};
 use std::thread::ThreadId;
 use std::time::{Duration, Instant};
 
-use hh_asm::{AaHooks, SymbolTable};
+use hh_asm::{AaHooks, AddressName, SymbolLookup, SymbolTable};
 use hh_core::{Addr, Error, Process, Result};
 use hh_scan::Scanner;
 use mlua::chunk::ChunkMode;
@@ -41,6 +48,8 @@ use mlua::{Function, HookTriggers, IntoLua, IntoLuaMulti, Lua, MultiValue, Value
 mod api;
 mod debug;
 mod ext;
+mod hooks;
+mod ptrscan;
 mod table;
 mod ui;
 
@@ -96,13 +105,6 @@ pub const STUBS: &[(&str, &[&str])] = &[
             "dbvm_removechangeregonbp", "dbvm_speedhack_setSpeed",
         ],
     ),
-    (
-        "structures",
-        &[
-            "registerStructureDissectOverride", "unregisterStructureDissectOverride",
-            "registerStructureNameLookup", "unregisterStructureNameLookup",
-        ],
-    ),
     ("d3d", &["createD3DHook"]),
     (
         "injection",
@@ -114,8 +116,8 @@ pub const STUBS: &[(&str, &[&str])] = &[
     (
         "other",
         &[
-            "registerCustomTypeLua", "registerCustomTypeAutoAssembler", "registerAutoAssemblerCommand",
-            "registerAssembler", "connectToCEServer", "createMemoryStream", "createFileStream",
+            "registerCustomTypeLua", "registerCustomTypeAutoAssembler", "registerAssembler",
+            "unregisterAssembler", "connectToCEServer", "createMemoryStream", "createFileStream",
             "createStringStream",
         ],
     ),
@@ -193,6 +195,12 @@ pub trait Host: Send + Sync {
     fn is_key_pressed(&self, _vk: i64) -> bool {
         false
     }
+    /// Asked before Auto Assembler `loadbinary(address, file)` reads `path` (only when
+    /// [`EngineOptions::allow_os`] is on; the file must also be a regular file of at most
+    /// `hh_asm::MAX_ASSEMBLED_BYTES`). Default: denied.
+    fn allow_aa_file(&self, _path: &str) -> bool {
+        false
+    }
 }
 
 struct NullHost;
@@ -263,6 +271,13 @@ pub(crate) struct State {
     budget: Mutex<Option<Duration>>,
     speed: Mutex<f64>,
     allow_os: bool,
+    /// What scripts registered as AA / symbol / structure hooks (see `hooks`).
+    hooks: Mutex<hooks::Regs>,
+    /// Set while a symbol lookup callback runs (no recursion into the callbacks).
+    in_symlookup: AtomicBool,
+    /// The engine's Lua state, for address resolution deep inside Rust helpers (weak: the
+    /// state owns closures holding this struct).
+    weak: OnceLock<mlua::WeakLua>,
     pub(crate) ui: ui::UiState,
     pub(crate) dbg: debug::DebugState,
     pub(crate) ext: ext::ExtState,
@@ -397,10 +412,14 @@ impl Engine {
             budget: Mutex::new(opts.budget),
             speed: Mutex::new(1.0),
             allow_os: opts.allow_os,
+            hooks: Mutex::new(hooks::Regs::default()),
+            in_symlookup: AtomicBool::new(false),
+            weak: OnceLock::new(),
             ui: ui::UiState::default(),
             dbg: debug::DebugState::default(),
             ext: ext::ExtState::default(),
         });
+        let _ = st.weak.set(lua.weak());
         let hook_st = st.clone();
         lua.set_global_hook(HookTriggers::new().every_nth_instruction(1000), move |_, _| {
             hook_st.check().map(|_| VmState::Continue)
@@ -615,22 +634,52 @@ impl Engine {
         })
     }
 
-    /// Hooks for `hh_asm::aa_check` that do NOT run `{$lua}` blocks: each block yields an
-    /// empty string. For live syntax checks while the user types, which must not execute
-    /// table code.
+    /// Hooks for `hh_asm::aa_check` that run NO Lua at all, for live syntax checks while the
+    /// user types (the script may come from an untrusted table): `{$lua}` blocks yield an
+    /// empty string, custom commands registered with `registerAutoAssemblerCommand` expand
+    /// to nothing, prologues are skipped, and while a `registerSymbolLookupCallback` is
+    /// registered an otherwise unknown symbol resolves to a placeholder address.
+    /// `loadbinary` is accepted when OS access is on (checking never reads the file).
     pub fn aa_hooks_check_only(&self) -> AaHooks {
-        AaHooks {
-            lua: Some(Box::new(|_src: String| Ok(String::new()))),
-            ..Default::default()
-        }
+        hooks::check_only(&self.st)
     }
 
-    /// Hooks for `hh_asm::aa_execute` / `aa_check` so `{$lua}` blocks run in this engine,
-    /// with the `syntaxcheck` and `memrec` globals set like Cheat Engine does.
+    /// Hooks for `hh_asm::aa_execute` / `aa_check` so `{$lua}` blocks and `luacall` run in
+    /// this engine, with the `syntaxcheck` and `memrec` globals set like Cheat Engine does,
+    /// plus what scripts registered: `registerAutoAssemblerCommand` commands,
+    /// `registerAutoAssemblerPrologue` prologues and `registerSymbolLookupCallback` lookups
+    /// (all of them told `syntax_check`). `loadbinary` reads files only with
+    /// [`EngineOptions::allow_os`] and when [`Host::allow_aa_file`] agrees. `aob_unique` is
+    /// left at its default for the host to set.
     pub fn aa_hooks(&self, memrec: Option<RecId>, syntax_check: bool) -> AaHooks {
-        AaHooks {
-            lua: Some(api::lua_block_hook(self.lua.clone(), self.st.clone(), memrec, syntax_check)),
-            ..Default::default()
-        }
+        hooks::full(&self.lua, &self.st, memrec, syntax_check)
+    }
+
+    /// The `registerAddressLookupCallback` functions as a disassembler naming hook (put it in
+    /// `hh_asm::DisasmOptions::address_name`); `None` while none is registered. Each call
+    /// enters the engine (waits for a running script).
+    pub fn address_name(&self) -> Option<AddressName> {
+        hooks::address_name(&self.lua, &self.st)
+    }
+
+    /// The `registerSymbolLookupCallback` functions as a lookup for
+    /// `hh_asm::resolve_address_with`; `None` while none is registered. Each call enters the
+    /// engine.
+    pub fn symbol_lookup(&self) -> Option<SymbolLookup> {
+        hooks::symbol_lookup_opt(&self.lua, &self.st)
+    }
+
+    /// `registerStructureDissectOverride`: the structure the first override that took care
+    /// of `addr` filled (for `hh_tools::structure::StructOverride`, e.g.
+    /// `|a, s| engine.structure_override(a, s)`). An unnamed one is named by
+    /// [`Engine::structure_name`], else `Structure_<addr>`. `None`: guess as usual.
+    pub fn structure_override(&self, addr: Addr, size: usize) -> Option<hh_tools::structure::Structure> {
+        hooks::structure_override(&self.lua, &self.st, addr, size)
+    }
+
+    /// `registerStructureNameLookup`: the name the first callback gives for a structure at
+    /// `addr`, and the base address it suggests instead of `addr` (if any).
+    pub fn structure_name(&self, addr: Addr) -> Option<(String, Option<Addr>)> {
+        hooks::structure_name(&self.lua, &self.st, addr)
     }
 }

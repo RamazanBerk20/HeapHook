@@ -359,7 +359,7 @@ fn dissect_code_accessors() {
         dc.clear()
         assert(next(dc.getReferences(0x140003020)) == nil)
         local ok, err = pcall(dc.saveToFile, 'x')
-        assert(not ok and err:find('not implemented yet'))
+        assert(not ok and err:find('nothing dissected'), err)
     "#,
     );
 }

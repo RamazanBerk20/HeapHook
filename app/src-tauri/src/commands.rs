@@ -50,8 +50,8 @@ pub struct Session {
     pub(crate) dbg: Mutex<Option<crate::debug::Dbg>>,
     pub(crate) ptr: crate::ptr::Ptr,
     pub(crate) tools: crate::tools::Tools,
-    /// Saved scan name -> (address -> its value then), for the results' `saved` column.
-    pub(crate) saved: Mutex<HashMap<String, HashMap<Addr, String>>>,
+    /// Saved scan name -> its result count.
+    pub(crate) saved: Mutex<HashMap<String, u64>>,
     /// Suspended with `process_pause`.
     pub(crate) paused: std::sync::atomic::AtomicBool,
 }
@@ -145,8 +145,10 @@ pub struct Shared {
     pub(crate) remote: Mutex<Option<crate::remote::Conn>>,
     /// User-defined symbols registered from the table: (table version, session, names).
     pub(crate) user_syms: Mutex<(u64, usize, Vec<String>)>,
-    /// Frozen values of active custom-typed entries, by entry id.
-    pub(crate) custom_frozen: Mutex<HashMap<i64, String>>,
+    /// (address, entry id) of what the freezer holds, to name its failures.
+    pub(crate) freeze_ids: Mutex<Vec<(Addr, i64)>>,
+    /// Processes started under the debugger (`debug_launch`): reaped by pid once untraced.
+    pub(crate) launched: Mutex<Vec<u32>>,
     /// Command-line arguments, until the UI took them (`app_args`).
     pub(crate) args: Mutex<Option<crate::cli::StartArgs>>,
     /// Window events the UI picks up with `lua_poll`.
@@ -180,7 +182,8 @@ impl Default for Shared {
             remote_alive: Mutex::default(),
             remote: Mutex::default(),
             user_syms: Mutex::default(),
-            custom_frozen: Mutex::default(),
+            freeze_ids: Mutex::default(),
+            launched: Mutex::default(),
             args: Mutex::default(),
             win: Mutex::default(),
         }
@@ -204,8 +207,8 @@ pub struct Opened {
 pub struct SavedScan {
     pub name: String,
     pub count: u64,
-    /// Rows of it the results' `saved` column can show.
-    pub kept: usize,
+    /// Rows of it the results' `saved` column can show (all of them).
+    pub kept: u64,
 }
 
 /// A result row plus the value of a saved scan at its address.
@@ -240,10 +243,8 @@ impl std::ops::Deref for ProgressOut {
     }
 }
 
-/// Rows of a saved scan whose value is kept for the results' `saved` column.
-/// shortcut: hh-scan cannot read a saved scan's value by address, so the app copies up to
-/// this many rows when saving; upgrade when the scanner exposes saved values.
-const SAVED_KEEP: usize = 200_000;
+/// Most addresses `scan_copy_addresses` puts on the clipboard (export writes any number).
+const MAX_COPY: u64 = 1_000_000;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct RegionOut {
@@ -260,6 +261,16 @@ pub struct ModuleOut {
     pub path: String,
     pub base: String,
     pub size: u64,
+}
+
+/// Disassembler display options.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct DisasmOpts {
+    /// AT&T syntax (display only; the assembler reads Intel).
+    pub att: bool,
+    /// Comments show memory operands by guessed type (`(float)1.5`, `->name`, `'text'`).
+    pub typed: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -416,8 +427,16 @@ impl App {
             ptr: crate::ptr::Ptr::new(),
             tools: crate::tools::Tools::default(),
         };
+        // A remote target's module paths name files on the other machine: symbols come from
+        // its memory, never from a same-named local file.
+        if info.remote.is_some() {
+            hh_asm::set_module_files_local(pid, false);
+        }
         if let Some(old) = lock(&self.sess).replace(Arc::new(sess)) {
             old.scanner.cancel();
+            if old.info.remote.is_some() && (info.remote.is_none() || old.info.pid != pid) {
+                hh_asm::set_module_files_local(old.info.pid, true);
+            }
         }
         *lock(&self.x.lua.console.speedhack) = None;
         // The engine follows the Switch, so debugger attach/detach needs no rebind.
@@ -446,6 +465,9 @@ impl App {
         }
         sess.scanner.cancel();
         let _ = sess.freezer.set(&[]);
+        if sess.info.remote.is_some() {
+            hh_asm::set_module_files_local(sess.info.pid, true);
+        }
         *lock(&self.x.lua.console.speedhack) = None;
         self.x.lua.engine.set_process(None).map_err(s)?;
         self.x.live.scripts_off();
@@ -553,7 +575,12 @@ impl App {
         let sess = self.session()?;
         self.sync_user_symbols(&sess);
         let syms = lock(&sess.syms).clone();
-        match hh_asm::resolve_address(&*sess.proc, &syms, expr) {
+        let extra = if self.lua_hooks_ok() { self.x.lua.engine.symbol_lookup() } else { None };
+        let r = match &extra {
+            Some(f) => hh_asm::resolve_address_with(&*sess.proc, &syms, expr, &|n: &str| f(n)),
+            None => hh_asm::resolve_address(&*sess.proc, &syms, expr),
+        };
+        match r {
             Ok(a) => Ok(hex_addr(a)),
             // hh-asm does not know THREADSTACK<n> bases; pointer-scan paths do.
             // Only THREADSTACK paths report the pointer-path error; anything else keeps
@@ -565,6 +592,12 @@ impl App {
                 Err(_) => Err(s(e)),
             },
         }
+    }
+
+    /// Callbacks a table's Lua registered (address names, symbol lookups, structure
+    /// overrides) are only used while that table is trusted (`own` / `agreed`).
+    pub(crate) fn lua_hooks_ok(&self) -> bool {
+        self.x.live.trust().allows() && lock(&self.x.settings).table_script != "never"
     }
 
     /// Blocks until the scan ends; call it off the UI thread.
@@ -579,18 +612,7 @@ impl App {
     pub fn scan_save(&self, name: &str) -> R<()> {
         let sess = self.session()?;
         sess.scanner.save_scan(name).map_err(s)?;
-        let n = (sess.scanner.count() as usize).min(SAVED_KEEP);
-        let mut kept = HashMap::with_capacity(n);
-        let mut off = 0;
-        while off < n {
-            let rows = sess.scanner.results(off as u64, 4096.min(n - off)).map_err(s)?;
-            if rows.is_empty() {
-                break;
-            }
-            off += rows.len();
-            kept.extend(rows.into_iter().map(|r| (r.addr, r.value.unwrap_or(r.previous))));
-        }
-        lock(&sess.saved).insert(name.trim().to_string(), kept);
+        lock(&sess.saved).insert(name.trim().to_string(), sess.scanner.count());
         Ok(())
     }
 
@@ -600,7 +622,56 @@ impl App {
         let names = sess.scanner.saved_scans();
         // The scanner drops saved scans on a new or first scan; follow it.
         kept.retain(|k, _| names.contains(k));
-        Ok(names.into_iter().map(|n| SavedScan { count: kept.get(&n).map_or(0, |m| m.len() as u64), kept: kept.get(&n).map_or(0, HashMap::len), name: n }).collect())
+        Ok(names.into_iter().map(|n| SavedScan { count: kept.get(&n).copied().unwrap_or(0), kept: kept.get(&n).copied().unwrap_or(0), name: n }).collect())
+    }
+
+    /// Orders the results by address or value (at most `hh_scan::MAX_SORT`; more is an error
+    /// naming the cap).
+    pub fn scan_sort(&self, key: hh_scan::SortKey, desc: bool) -> R<()> {
+        let sess = self.session()?;
+        let n = sess.scanner.count();
+        if key == hh_scan::SortKey::Value && n > hh_scan::MAX_SORT {
+            return Err(format!("{n} results are too many to sort by value (at most {}): narrow them down with a next scan first", hh_scan::MAX_SORT));
+        }
+        sess.scanner.sort(key, desc).map_err(s)
+    }
+
+    /// Removes these results (undo brings them back); returns how many went.
+    pub fn scan_remove(&self, addrs: &[String]) -> R<u64> {
+        let a = addrs.iter().map(|x| parse_addr(x)).collect::<R<Vec<_>>>()?;
+        self.session()?.scanner.remove(&a).map_err(s)
+    }
+
+    /// Every result address, one per line (upper-case hex), into `path`; returns the count.
+    pub fn scan_export_addresses(&self, path: &str) -> R<u64> {
+        let sess = self.session()?;
+        let mut f = std::io::BufWriter::new(std::fs::File::create(path).map_err(|e| format!("{path}: {e}"))?);
+        let n = sess.scanner.export_addresses(&mut f).map_err(s)?;
+        std::io::Write::flush(&mut f).map_err(|e| format!("{path}: {e}"))?;
+        Ok(n)
+    }
+
+    /// Every result address as text for the clipboard (at most [`MAX_COPY`]).
+    pub fn scan_copy_addresses(&self) -> R<String> {
+        let sess = self.session()?;
+        let n = sess.scanner.count();
+        if n > MAX_COPY {
+            return Err(format!("{n} addresses are too many for the clipboard (at most {MAX_COPY}): export them to a file instead"));
+        }
+        let mut b = Vec::new();
+        sess.scanner.export_addresses(&mut b).map_err(s)?;
+        String::from_utf8(b).map_err(s)
+    }
+
+    /// Result counts per region (with its module).
+    pub fn scan_stats(&self) -> R<Vec<hh_scan::ResultStat>> {
+        self.session()?.scanner.result_stats().map_err(s)
+    }
+
+    /// Pointer-value scan: pointer-sized values that point into readable memory (or only
+    /// into the given modules / ranges). Starts a new scan.
+    pub fn scan_pointer(&self, req: &hh_scan::PointerScan) -> R<ScanCount> {
+        self.session()?.scanner.pointer_scan(req).map_err(s)
     }
 
     pub fn scan_delete_saved(&self, name: &str) -> R<()> {
@@ -636,16 +707,24 @@ impl App {
         Ok(ProgressOut {
             p: sess.as_ref().map(|s| s.scanner.progress()).unwrap_or_default(),
             spilled: sess.as_ref().map_or(0, |s| s.scanner.spilled_bytes()),
-            spill_dir: spill_dir_text(&lock(&self.x.settings)),
+            spill_dir: match &sess {
+                Some(s) => s.scanner.effective_spill_dir(),
+                None => hh_scan::spill_dir(spill_dir(&lock(&self.x.settings)).as_deref()),
+            }
+            .display()
+            .to_string(),
         })
     }
 
     pub fn scan_results(&self, offset: u64, limit: usize, saved: Option<&str>) -> R<Vec<ResultOut>> {
         let sess = self.session()?;
         let rows = sess.scanner.results(offset, limit).map_err(s)?;
-        let kept = lock(&sess.saved);
-        let m = saved.filter(|n| !n.is_empty()).map(|n| kept.get(n.trim()).ok_or_else(|| format!("no saved scan {n:?}"))).transpose()?;
-        Ok(rows.into_iter().map(|row| ResultOut { saved: m.map(|m| m.get(&row.addr).cloned()), row }).collect())
+        let vals = match saved.map(str::trim).filter(|n| !n.is_empty()) {
+            Some(n) => Some(sess.scanner.saved_values(n, &rows.iter().map(|r| r.addr).collect::<Vec<_>>()).map_err(s)?),
+            None => None,
+        };
+        let mut vals = vals.map(Vec::into_iter);
+        Ok(rows.into_iter().map(|row| ResultOut { saved: vals.as_mut().map(|v| v.next().flatten()), row }).collect())
     }
 
     pub fn set_frozen(&self, entries: &[FrozenEntryEx]) -> R<()> {
@@ -653,10 +732,21 @@ impl App {
     }
 
     pub fn disassemble(&self, addr: &str, count: usize) -> R<Vec<DisasmOut>> {
+        self.disassemble_ex(addr, count, &DisasmOpts::default())
+    }
+
+    /// [`App::disassemble`] in AT&T syntax and / or with typed operand comments.
+    pub fn disassemble_ex(&self, addr: &str, count: usize, o: &DisasmOpts) -> R<Vec<DisasmOut>> {
         let sess = self.session()?;
         self.sync_user_symbols(&sess);
         let syms = lock(&sess.syms).clone();
-        let lines = hh_asm::disassemble(&*sess.proc, &syms, parse_addr(addr)?, count.min(MAX_DISASM)).map_err(s)?;
+        let opts = hh_asm::DisasmOptions {
+            syntax: if o.att { hh_asm::Syntax::Att } else { hh_asm::Syntax::Intel },
+            guess_types: o.typed,
+            address_name: if self.lua_hooks_ok() { self.x.lua.engine.address_name() } else { None },
+            ..Default::default()
+        };
+        let lines = hh_asm::disassemble_with(&*sess.proc, &syms, parse_addr(addr)?, count.min(MAX_DISASM), &opts).map_err(s)?;
         let mut xr = self.xref_counts(&lines.iter().map(|l| l.addr).collect::<Vec<_>>()).map(Vec::into_iter);
         Ok(lines
             .into_iter()
@@ -689,17 +779,39 @@ impl App {
     /// Symbols the script registers stay registered for later expressions. `{$lua}` blocks
     /// run in the app's engine (so they cannot hold the symbol lock: work on a copy, merge).
     pub fn aa_execute(&self, script: &str, enable: bool, state: Option<&AaState>) -> R<AaState> {
-        // Same gate as table entries: `{$lua}` from an untrusted source (a loaded table not
-        // agreed to, a pasted entry, a script file) asks first; what the user typed runs.
-        if crate::cheat::script_runs_lua(script) && self.x.live.is_tainted(script) {
+        // Same gate as table entries: `{$lua}` and `loadbinary` from an untrusted source (a
+        // loaded table not agreed to, a pasted entry, a script file) ask first; what the user
+        // typed runs.
+        let reads = crate::cheat::script_reads_files(script);
+        if (crate::cheat::script_runs_lua(script) || reads) && self.x.live.is_tainted(script) {
             return Err(self.consent_error("this script"));
         }
         let sess = self.session()?;
+        let (unique, files) = {
+            let st = lock(&self.x.settings);
+            let u = match st.aob_unique.as_str() {
+                "warn" => hh_asm::AobUnique::Warn,
+                "fail" => hh_asm::AobUnique::Fail,
+                _ => hh_asm::AobUnique::Off,
+            };
+            (u, st.lua_allow_os && self.x.lua.engine.allow_os())
+        };
+        if reads && !files {
+            return Err("loadbinary reads a file, and Settings do not allow Lua and scripts to access files".into());
+        }
         let before = lock(&sess.syms).clone();
         let mut work = before.clone();
         let r = {
             let _g = self.x.lua.enter();
-            hh_asm::aa_execute(&*sess.proc, &mut work, script, enable, state, &mut self.x.lua.engine.aa_hooks(None, false))
+            let mut hooks = self.x.lua.engine.aa_hooks(None, false);
+            hooks.aob_unique = unique;
+            // Only for a trusted script (checked above) with file access allowed.
+            if reads && files {
+                hooks.read_file = Some(Box::new(|p: String| {
+                    crate::table::read_capped(Path::new(p.trim()), hh_asm::MAX_ASSEMBLED_BYTES as u64).map_err(hh_core::Error::Other)
+                }));
+            }
+            hh_asm::aa_execute(&*sess.proc, &mut work, script, enable, state, &mut hooks)
         };
         let mut cur = lock(&sess.syms);
         for (n, a) in work.iter() {
@@ -717,7 +829,7 @@ impl App {
     pub fn aa_load_file(&self, path: &str) -> R<String> {
         let b = table::read_capped(Path::new(path), table::MAX_FILE)?;
         let t = String::from_utf8(b).map_err(|e| format!("{path}: {e}"))?;
-        if crate::cheat::script_runs_lua(&t) {
+        if crate::cheat::script_runs_lua(&t) || crate::cheat::script_reads_files(&t) {
             self.x.live.taint_script(&t);
         }
         Ok(t)
@@ -780,14 +892,3 @@ fn spill_dir(s: &Settings) -> Option<PathBuf> {
     (!s.scan_spill_dir.is_empty()).then(|| PathBuf::from(&s.scan_spill_dir))
 }
 
-/// Where spill files go, as the UI shows it.
-/// shortcut: mirrors hh-scan's private `spill_dir` choice in words; upgrade when it is public.
-fn spill_dir_text(s: &Settings) -> String {
-    match spill_dir(s) {
-        Some(d) => d.display().to_string(),
-        None => match std::env::var_os("HEAPHOOK_TMPDIR").filter(|d| !d.is_empty()) {
-            Some(d) => PathBuf::from(d).display().to_string(),
-            None => format!("{} (or /var/tmp, ~/.cache/heaphook when that is in RAM)", std::env::temp_dir().display()),
-        },
-    }
-}

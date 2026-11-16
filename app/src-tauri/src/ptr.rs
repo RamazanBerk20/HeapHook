@@ -16,6 +16,8 @@ pub struct Ptr {
     seq: AtomicU64,
     running: AtomicBool,
     cancel: AtomicBool,
+    /// Paused by the user; carried over to the next phase's progress.
+    paused: AtomicBool,
     phase: Mutex<&'static str>,
     progress: Mutex<Arc<Progress>>,
     map: Mutex<Option<Arc<PointerMap>>>,
@@ -34,6 +36,7 @@ impl Ptr {
             seq: AtomicU64::new(0),
             running: AtomicBool::new(false),
             cancel: AtomicBool::new(false),
+            paused: AtomicBool::new(false),
             phase: Mutex::new(""),
             progress: Mutex::default(),
             map: Mutex::default(),
@@ -64,6 +67,7 @@ impl Ptr {
             return Err("a pointer scan is already running".into());
         }
         self.cancel.store(false, Relaxed);
+        self.paused.store(false, Relaxed);
         Ok(RunGuard(self))
     }
 
@@ -74,6 +78,9 @@ impl Ptr {
         }
         *lock(&self.phase) = name;
         let p = Arc::new(Progress::new());
+        if self.paused.load(Relaxed) {
+            p.pause();
+        }
         *lock(&self.progress) = p.clone();
         Ok(p)
     }
@@ -98,6 +105,7 @@ struct RunGuard<'a>(&'a Ptr);
 impl Drop for RunGuard<'_> {
     fn drop(&mut self) {
         *lock(&self.0.phase) = "";
+        self.0.paused.store(false, Relaxed);
         self.0.running.store(false, Relaxed);
     }
 }
@@ -148,12 +156,23 @@ pub struct PtrInfo {
     pub count: u64,
     pub max_level: usize,
     pub target: String,
+    /// The compact (1.0) file format; `false` for a result file from before 1.0.
+    pub compact: bool,
 }
 
 impl PtrInfo {
     fn of(f: &ResultFile) -> Self {
-        PtrInfo { count: f.len(), max_level: f.header.max_level, target: hex_addr(f.header.target) }
+        PtrInfo { count: f.len(), max_level: f.header.max_level, target: hex_addr(f.header.target), compact: f.is_compact() }
     }
+}
+
+/// A file the user picked must be a regular file (a FIFO or device would block the loader).
+pub(crate) fn regular_file(path: &str) -> R<&Path> {
+    let m = std::fs::metadata(path).map_err(|e| format!("{path}: {e}"))?;
+    if !m.is_file() {
+        return Err(format!("{path}: not a regular file"));
+    }
+    Ok(Path::new(path))
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -164,6 +183,8 @@ pub struct PtrProgress {
     pub done: u64,
     pub total: u64,
     pub found: u64,
+    /// Held by `ptr_pause` (cancel still ends it).
+    pub paused: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -190,6 +211,11 @@ fn range(a: &Option<String>, b: &Option<String>) -> R<Option<(u64, u64)>> {
 }
 
 impl App {
+    /// The target runs on this machine: every thread's stack counts (`THREADSTACK1`...).
+    fn ptr_local(&self) -> bool {
+        self.session().is_ok_and(|s| s.info.remote.is_none())
+    }
+
     /// Collects a pointer map (or loads `map_path`) and finds every path to `target`.
     /// Blocks until done; poll `ptr_progress`, stop with `ptr_cancel` (keeps what was found).
     pub fn ptr_scan(&self, req: &PtrScanReq) -> R<PtrInfo> {
@@ -202,12 +228,12 @@ impl App {
         let compare = req
             .compare
             .iter()
-            .map(|c| Ok((PointerMap::load(Path::new(&c.path)).map_err(|e| format!("{}: {e}", c.path))?, parse_addr(&c.target)?)))
+            .map(|c| Ok((PointerMap::load(regular_file(&c.path)?).map_err(|e| format!("{}: {e}", c.path))?, parse_addr(&c.target)?)))
             .collect::<R<Vec<_>>>()?;
         let prog = pt.phase("collect")?;
         let map = match &req.map_path {
-            Some(p) => PointerMap::load(Path::new(p)),
-            None => PointerMap::collect(&*sess.proc, &CollectOptions { alignment: req.alignment, writable_only: req.writable_only }, &prog),
+            Some(p) => PointerMap::load(regular_file(p)?),
+            None => PointerMap::collect_ex(&*sess.proc, &CollectOptions { alignment: req.alignment, writable_only: req.writable_only }, sess.info.remote.is_none(), &prog),
         }
         .map_err(s)?;
         let map = Arc::new(map);
@@ -237,9 +263,10 @@ impl App {
             ends_with: req.ends_with.clone(),
             max_level: req.max_level,
         };
-        let map = req.map_path.as_deref().map(|p| PointerMap::load(Path::new(p))).transpose().map_err(s)?;
+        let map = req.map_path.as_deref().map(|p| PointerMap::load(regular_file(p)?).map_err(s)).transpose()?;
         let src = match &map {
             Some(m) => Source::Map(m),
+            None if sess.info.remote.is_none() => Source::LocalProcess(&*sess.proc),
             None => Source::Process(&*sess.proc),
         };
         let prog = pt.phase("rescan")?;
@@ -249,7 +276,7 @@ impl App {
 
     pub fn ptr_progress(&self) -> R<PtrProgress> {
         let Ok(sess) = self.session() else {
-            return Ok(PtrProgress { running: false, phase: "", done: 0, total: 0, found: 0 });
+            return Ok(PtrProgress { running: false, phase: "", done: 0, total: 0, found: 0, paused: false });
         };
         let p = lock(&sess.ptr.progress).snapshot();
         Ok(PtrProgress {
@@ -258,13 +285,29 @@ impl App {
             done: p.done,
             total: p.total,
             found: p.found,
+            paused: sess.ptr.paused.load(Relaxed),
         })
+    }
+
+    /// Holds (`true`) or resumes the running pointer scan, rescan or map collection.
+    pub fn ptr_pause(&self, pause: bool) -> R<()> {
+        let sess = self.session()?;
+        if !sess.ptr.running.load(Relaxed) {
+            return Err("no pointer scan is running".into());
+        }
+        sess.ptr.paused.store(pause, Relaxed);
+        let p = lock(&sess.ptr.progress).clone();
+        if pause { p.pause() } else { p.resume() }
+        Ok(())
     }
 
     pub fn ptr_cancel(&self) -> R<()> {
         if let Ok(sess) = self.session() {
             sess.ptr.cancel.store(true, Relaxed);
-            lock(&sess.ptr.progress).cancel();
+            sess.ptr.paused.store(false, Relaxed);
+            let p = lock(&sess.ptr.progress).clone();
+            p.cancel();
+            p.resume();
         }
         Ok(())
     }
@@ -273,6 +316,7 @@ impl App {
     /// formatted as `vtype`.
     pub fn ptr_results(&self, offset: u64, limit: usize, vtype: VType, fmt: &Fmt) -> R<Vec<PtrRow>> {
         let sess = self.session()?;
+        let local = self.ptr_local();
         let order = lock(&sess.ptr.order).clone();
         let rows = match order {
             Some(o) => o
@@ -280,11 +324,11 @@ impl App {
                 .skip(offset as usize)
                 .take(limit.min(10_000))
                 .map(|p| {
-                    let address = hh_ptr::resolve(&*sess.proc, p).ok();
+                    let address = hh_ptr::resolve_ex(&*sess.proc, p, local).ok();
                     hh_ptr::ResultRow { text: p.to_string(), path: p.clone(), address, value: None }
                 })
                 .collect(),
-            None => sess.ptr.file()?.results(offset, limit.min(10_000), Some(&*sess.proc)).map_err(s)?,
+            None => sess.ptr.file()?.results_ex(offset, limit.min(10_000), Some(&*sess.proc), local).map_err(s)?,
         };
         let reqs: Vec<ValueRef> = rows.iter().map(|r| ValueRef { addr: r.address.unwrap_or(0), vtype, fmt: *fmt }).collect();
         let vals = hh_scan::read_values(&*sess.proc, &reqs);
@@ -322,7 +366,7 @@ impl App {
             Some(m) => m,
             None => {
                 let _run = pt.start()?;
-                let m = Arc::new(PointerMap::collect(&*sess.proc, &CollectOptions::default(), &*pt.phase("collect")?).map_err(s)?);
+                let m = Arc::new(PointerMap::collect_ex(&*sess.proc, &CollectOptions::default(), sess.info.remote.is_none(), &*pt.phase("collect")?).map_err(s)?);
                 *lock(&pt.map) = Some(m.clone());
                 m
             }
@@ -353,7 +397,8 @@ impl App {
             "base" => {}
             "offset" => paths.sort_by_key(|p| p.offsets.get(column).copied()),
             "value" => {
-                let reqs: Vec<ValueRef> = paths.iter().map(|p| ValueRef { addr: hh_ptr::resolve(&*sess.proc, p).unwrap_or(0), vtype, fmt: *fmt }).collect();
+                let local = sess.info.remote.is_none();
+                let reqs: Vec<ValueRef> = paths.iter().map(|p| ValueRef { addr: hh_ptr::resolve_ex(&*sess.proc, p, local).unwrap_or(0), vtype, fmt: *fmt }).collect();
                 let vals = hh_scan::read_values(&*sess.proc, &reqs);
                 let key = |v: &Option<String>| (v.is_some(), v.as_deref().and_then(|x| x.trim().parse::<f64>().ok()).unwrap_or(f64::NAN), v.clone().unwrap_or_default());
                 let mut kv: Vec<_> = paths.into_iter().zip(vals.iter().map(key)).collect();
@@ -379,7 +424,7 @@ impl App {
     }
 
     pub fn ptr_open_results(&self, path: &str) -> R<PtrInfo> {
-        let f = ResultFile::open(Path::new(path)).map_err(s)?;
+        let f = ResultFile::open(regular_file(path)?).map_err(s)?;
         Ok(self.session()?.ptr.set_file(f))
     }
 }

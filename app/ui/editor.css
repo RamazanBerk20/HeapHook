@@ -65,3 +65,22 @@
 .ed-aawin .dlg-head .btn { flex: none; }
 @media (max-width: 960px) { .ed-find kbd, .ed-aawin .dlg-actions kbd { display: none; } }
 @media (prefers-reduced-motion: reduce) { .ed-pop li, .ed-find .btn { transition: none; } }
+
+/* ---------- 1.0 RC: code analysis, disassembler tools, AOB scan feedback (dissect.js, memview.js, editor.js) ---------- */
+.dc-more { display: grid; grid-template-columns: 1fr 1fr; gap: var(--s1); }
+/* With a key hint a button takes the whole row (the side panel is 240 px at the narrowest). */
+.dc-more .wide { grid-column: span 2; }
+.dc-more .btn { justify-content: center; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.cf-steps { margin: 0; padding-left: 1.4em; display: flex; flex-direction: column; gap: 2px; color: var(--text-2); font-size: var(--fs-sm); }
+.cf-note { margin: 0; padding: 6px 8px; border-radius: var(--r); background: var(--yellow-bg); color: var(--yellow); font-size: var(--fs-sm); }
+.cf-status { margin: 0; min-height: 1.4em; font-size: var(--fs-sm); color: var(--text-2); }
+.sym-bar { align-items: center; }
+.sym-bar input { flex: 1 1 220px; min-width: 0; }
+.sym-bar select { flex: 0 1 260px; min-width: 0; }
+.sym-user { color: var(--blue); }
+.da-row .c-text .da-intel { margin-left: 6px; padding: 0 4px; border-radius: var(--r-sm); background: var(--yellow-bg); color: var(--yellow); font: var(--fs-xs) var(--font-ui); white-space: nowrap; }
+.da-row .c-text:has(.da-intel) { display: flex; align-items: center; }
+.aa-status.warn { background: var(--yellow-bg); color: var(--yellow); }
+.ed-scans { display: flex; flex-wrap: wrap; gap: 4px 12px; padding: 2px 8px; font-size: var(--fs-sm); }
+.ed-scan { white-space: nowrap; }
+.ed-scan.multi { padding: 0 4px; border-radius: var(--r-sm); background: var(--yellow-bg); color: var(--yellow); }

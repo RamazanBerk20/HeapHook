@@ -1,7 +1,9 @@
 //! The rest of the CE memory/process API, string and file helpers, structures (on
 //! `hh_tools::structure`) and dissect code (on `hh_tools::dissect`).
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use hh_core::{Addr, Module, Prot, RegionKind};
 use hh_scan::{Fmt, VType};
@@ -20,6 +22,8 @@ pub(crate) struct ExtState {
     dissect: Mutex<Option<Dissection>>,
     /// Buffers `copyMemory` allocated in HeapHook's memory, by address.
     local_bufs: Mutex<LocalBufs>,
+    /// `hhCreatePointerScan` jobs.
+    pub(crate) ptr_jobs: crate::ptrscan::Jobs,
 }
 
 #[derive(Default)]
@@ -37,7 +41,7 @@ pub(crate) const MAX_LOCAL_BUFS: usize = 256 << 20;
 
 /// Opens a regular file for reading (not a device, FIFO or directory: those can block or
 /// never end). Returns it with its size.
-fn open_regular(path: &str) -> LR<(std::fs::File, u64)> {
+pub(crate) fn open_regular(path: &str) -> LR<(std::fs::File, u64)> {
     let not_regular = || err(format!("{path}: not a regular file"));
     // stat first: opening a FIFO would block.
     if !std::fs::metadata(path).map_err(|e| err(format!("{path}: {e}")))?.is_file() {
@@ -353,6 +357,7 @@ fn install_host(b: &B, h: &B) -> LR<()> {
     })?;
     h.f("ext_clear", |_, st, ()| {
         free_local_bufs(st);
+        crate::ptrscan::clear(st);
         Ok(())
     })?;
     b.f("isKeyPressed", |_, st, k: Value| Ok(int_of(&k).is_some_and(|k| st.host().is_key_pressed(k))))?;
@@ -704,7 +709,7 @@ fn ptr_size(st: &State) -> u64 {
     st.proc().map_or(8, |p| p.pointer_size()) as u64
 }
 
-fn install_structures(h: &B) -> LR<()> {
+fn install_structures(b: &B, h: &B) -> LR<()> {
     h.f("st_new", |_, st, name: String| Ok(st.ext.structs.lock().unwrap().add(Structure { name, elements: Vec::new() }, false)))?;
     h.f("st_count", |_, st, ()| Ok(st.ext.structs.lock().unwrap().globals(st).len() as i64))?;
     // Handle of the i-th global structure (0-based), refreshed from the global list.
@@ -809,6 +814,10 @@ fn install_structures(h: &B) -> LR<()> {
             "Vartype" => Value::Integer(ce_elem_type(&e)),
             "Bytesize" => Value::Integer(elem_len(&e, ptr_size(st)) as i64),
             "ChildStruct" => e.child.as_deref().map(|c| lua.create_string(c).map(Value::String)).transpose()?.unwrap_or(Value::Nil),
+            "ChildStructStart" => Value::Integer(e.child_start as i64),
+            "BitOffset" => Value::Integer(e.bit_offset as i64),
+            "BitLength" => Value::Integer(e.bit_len as i64),
+            "ArrayCount" => Value::Integer(e.count.max(1) as i64),
             "DisplayMethod" => Value::String(lua.create_string(if e.hex {
                 "dtHexadecimal"
             } else if e.signed {
@@ -822,8 +831,9 @@ fn install_structures(h: &B) -> LR<()> {
     h.f("st_elem_set", |_, st, (id, uid, key, v): (i64, i64, String, Value)| {
         st.ext.structs.lock().unwrap().modify(st, id, |s, uids, _| {
             let i = uids.iter().position(|&u| u == uid).ok_or_else(|| err("structure element was destroyed"))?;
-            let e = &mut s.elements[i];
+            let mut e = s.elements[i].clone();
             let bad = || err(format!("invalid value for {key}"));
+            let small = |v: &Value| int_of(v).and_then(|n| u8::try_from(n).ok()).ok_or_else(bad);
             match key.as_str() {
                 "Offset" => e.offset = int_of(&v).filter(|&o| o >= 0).ok_or_else(bad)? as u64,
                 "Name" => e.description = str_of(&v).unwrap_or_default(),
@@ -839,6 +849,10 @@ fn install_structures(h: &B) -> LR<()> {
                         e.vtype = ElemType::Pointer;
                     }
                 }
+                "ChildStructStart" => e.child_start = int_of(&v).filter(|&o| o >= 0).ok_or_else(bad)? as u64,
+                "BitOffset" => e.bit_offset = small(&v)?,
+                "BitLength" => e.bit_len = small(&v)?,
+                "ArrayCount" => e.count = int_of(&v).filter(|&n| n >= 0).ok_or_else(bad)? as usize,
                 "DisplayMethod" => {
                     let m = str_of(&v).unwrap_or_default();
                     e.hex = m == "dtHexadecimal";
@@ -846,6 +860,8 @@ fn install_structures(h: &B) -> LR<()> {
                 }
                 _ => return Err(err(format!("unknown structure element property {key}"))),
             }
+            e.check().map_err(rt)?;
+            s.elements[i] = e;
             Ok(())
         })
     })?;
@@ -858,36 +874,43 @@ fn install_structures(h: &B) -> LR<()> {
             Ok(())
         })
     })?;
-    // (id, uid, base address) -> formatted value or nil
-    h.f("st_elem_value", |_, st, (id, uid, base): (i64, i64, Value)| {
+    // (id, uid, base address, array index) -> formatted value or nil
+    h.f("st_elem_value", |_, st, (id, uid, base, i): (i64, i64, Value, Option<i64>)| {
         let p = need_proc(st, false)?;
-        let base = addr(st, &base, false).map_err(rt)?;
         let e = st.ext.structs.lock().unwrap().elem(id, uid)?;
-        let a = base.wrapping_add(e.offset);
+        let a = elem_addr(st, &e, &base, i)?;
         let (vt, fmt) = elem_fmt(&e);
-        Ok(match vt {
-            None => p.read_ptr(a).ok().map(|v| format!("{v:X}")),
-            Some(vt) => {
+        Ok(match (e.bits(), vt) {
+            (Some(ct), _) => {
+                let mut buf = vec![0u8; ct.size()];
+                p.read_exact(a, &mut buf).ok().map(|_| ct.format(&buf, &fmt))
+            }
+            (None, None) => p.read_ptr(a).ok().map(|v| format!("{v:X}")),
+            (None, Some(vt)) => {
                 let mut buf = vec![0u8; hh_scan::value_size(vt, &fmt).map_err(rt)?];
                 p.read_exact(a, &mut buf).ok().map(|_| hh_scan::format_value(vt, &buf, &fmt))
             }
         })
     })?;
-    h.f("st_elem_setvalue", |_, st, (id, uid, base, v): (i64, i64, Value, Value)| {
+    h.f("st_elem_setvalue", |_, st, (id, uid, base, v, i): (i64, i64, Value, Value, Option<i64>)| {
         let p = need_proc(st, false)?;
-        let base = addr(st, &base, false).map_err(rt)?;
         let e = st.ext.structs.lock().unwrap().elem(id, uid)?;
-        let a = base.wrapping_add(e.offset);
+        let a = elem_addr(st, &e, &base, i)?;
         let v = str_of(&v).ok_or_else(|| err("setValue: value must be a string or number"))?;
         let (vt, fmt) = elem_fmt(&e);
-        let r = match vt {
-            None => {
+        let r = match (e.bits(), vt) {
+            (Some(ct), _) => hh_scan::write_custom(&*p, a, &ct, &v, &fmt),
+            (None, None) => {
                 let n = hh_asm::parse_num(&v).ok_or_else(|| err("setValue: bad pointer value"))?;
                 p.write(a, &n.to_le_bytes()[..p.pointer_size()])
             }
-            Some(vt) => hh_scan::write_value(&*p, a, vt, &v, &fmt),
+            (None, Some(vt)) => hh_scan::write_value(&*p, a, vt, &v, &fmt),
         };
         Ok(r.is_ok())
+    })?;
+    b.f("getRTTIClassName", |_, st, a: Value| {
+        let p = need_proc(st, false)?;
+        Ok(hh_tools::structure::rtti_class_name(&*p, addr(st, &a, false).map_err(rt)?))
     })?;
     h.f("st_autoguess", |_, st, (id, base, offset, size): (i64, Value, Option<i64>, Option<i64>)| {
         let p = need_proc(st, false)?;
@@ -913,6 +936,21 @@ fn install_structures(h: &B) -> LR<()> {
         })
     })?;
     Ok(())
+}
+
+/// Address of element `e` (array item `i`, 0-based) of a structure at `base`.
+fn elem_addr(st: &State, e: &Element, base: &Value, i: Option<i64>) -> LR<Addr> {
+    let base = addr(st, base, false).map_err(rt)?;
+    let i = i.unwrap_or(0);
+    if i < 0 || (i as usize) >= e.count.max(1) {
+        return Err(err(format!("array index {i} outside 0..{}", e.count.max(1))));
+    }
+    Ok(base.wrapping_add(e.offset).wrapping_add(i as u64 * elem_len(e, ptr_size(st))))
+}
+
+/// Takes structure `id` out of the handle store (for `Engine::structure_override`).
+pub(crate) fn take_structure(st: &State, id: i64) -> Option<Structure> {
+    st.ext.structs.lock().unwrap().items.remove(&id).map(|it| it.s)
 }
 
 fn elem_len(e: &Element, ptr: u64) -> u64 {
@@ -986,6 +1024,36 @@ fn install_dissect(h: &B) -> LR<()> {
         }
         Ok(t)
     })?;
+    h.f("dc_save", |_, st, path: String| {
+        if !st.allow_os {
+            return Err(err("DissectCode.saveToFile: file access is disabled"));
+        }
+        let g = st.ext.dissect.lock().unwrap();
+        let d = g.as_ref().ok_or_else(|| err("DissectCode.saveToFile: nothing dissected"))?;
+        d.save(std::path::Path::new(&path), &hh_tools::Progress::new()).map_err(rt)?;
+        Ok(true)
+    })?;
+    h.f("dc_load", |_, st, path: String| {
+        if !st.allow_os {
+            return Err(err("DissectCode.loadFromFile: file access is disabled"));
+        }
+        open_regular(&path)?;
+        let d = Dissection::load(std::path::Path::new(&path), &hh_tools::Progress::new()).map_err(rt)?;
+        *st.ext.dissect.lock().unwrap() = Some(d);
+        Ok(true)
+    })?;
+    // codeFilter({ran sets}, {not-ran sets}) -> function addresses (HeapHook)
+    h.f("dc_filter", |lua, st, (ran, not_ran): (Vec<Vec<i64>>, Option<Vec<Vec<i64>>>)| {
+        let not_ran = not_ran.unwrap_or_default();
+        let n: usize = ran.iter().chain(&not_ran).map(Vec::len).sum();
+        if n > MAX_FILTER_ADDRS {
+            return Err(err(format!("codeFilter: more than {MAX_FILTER_ADDRS} addresses")));
+        }
+        let conv = |v: Vec<Vec<i64>>| v.into_iter().map(|s| s.into_iter().map(|a| a as Addr).collect()).collect::<Vec<Vec<Addr>>>();
+        let g = st.ext.dissect.lock().unwrap();
+        let d = g.as_ref().ok_or_else(|| err("codeFilter: nothing dissected"))?;
+        lua.create_sequence_from(d.code_filter(&conv(ran), &conv(not_ran)).into_iter().map(|f| f.addr as i64))
+    })?;
     h.f("dc_funcs", |lua, st, ()| {
         let g = st.ext.dissect.lock().unwrap();
         let t = lua.create_table()?;
@@ -999,12 +1067,91 @@ fn install_dissect(h: &B) -> LR<()> {
     Ok(())
 }
 
+/// Most addresses one `codeFilter` call takes.
+const MAX_FILTER_ADDRS: usize = 1 << 20;
+/// Most hits one assembly scan returns.
+const MAX_ASM_HITS: usize = 100_000;
+
+/// Runs `f` with a cancel flag that turns on when the script's budget runs out or it is
+/// interrupted (for hh-asm searches that take an `AtomicBool`), then reports the abort.
+fn cancellable<T>(st: &State, f: impl FnOnce(&AtomicBool) -> hh_core::Result<T>) -> LR<T> {
+    let (cancel, done) = (AtomicBool::new(false), AtomicBool::new(false));
+    let deadline = *st.deadline.lock().unwrap();
+    let r = std::thread::scope(|s| {
+        s.spawn(|| {
+            while !done.load(Ordering::SeqCst) {
+                if st.interrupt.load(Ordering::SeqCst) || deadline.is_some_and(|d| Instant::now() >= d) {
+                    cancel.store(true, Ordering::SeqCst);
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        });
+        let r = f(&cancel);
+        done.store(true, Ordering::SeqCst);
+        r
+    });
+    st.check()?;
+    r.map_err(rt)
+}
+
+/// HeapHook's disassembler helpers: assembly scan, reference search, symbol list.
+fn install_disasm(b: &B) -> LR<()> {
+    // hhAssemblyScan(pattern, start OPTIONAL, stop OPTIONAL, max OPTIONAL) -> {{Address, Text}}:
+    // instructions whose text matches `pattern` (`mov [r?x+*],e?x`, `a;b` for a sequence).
+    b.f("hhAssemblyScan", |lua, st, (pat, start, stop, max): (String, Option<Value>, Option<Value>, Option<i64>)| {
+        let p = need_proc(st, false)?;
+        let start = start.filter(|v| !v.is_nil()).map(|v| addr(st, &v, false)).transpose().map_err(rt)?.unwrap_or(0);
+        let stop = stop.filter(|v| !v.is_nil()).map(|v| addr(st, &v, false)).transpose().map_err(rt)?.unwrap_or(u64::MAX);
+        let max = max.unwrap_or(1000).clamp(1, MAX_ASM_HITS as i64) as usize;
+        let page = cancellable(st, |c| hh_asm::asm_scan(&*p, start, stop, &pat, max, c))?;
+        let t = lua.create_table()?;
+        for h in page.hits {
+            let e = lua.create_table()?;
+            e.set("Address", h.addr as i64)?;
+            e.set("Text", h.text)?;
+            t.push(e)?;
+        }
+        Ok((t, page.next.map(|a| a as i64)))
+    })?;
+    // hhFindReference(from, target, forward OPTIONAL = true, maxBytes OPTIONAL) -> address
+    // of the nearest instruction referencing `target` (branch, memory operand, immediate).
+    b.f("hhFindReference", |_, st, (from, target, fwd, max): (Value, Value, Option<bool>, Option<i64>)| {
+        let p = need_proc(st, false)?;
+        let (from, target) = (addr(st, &from, false).map_err(rt)?, addr(st, &target, false).map_err(rt)?);
+        let max = max.map_or(16 << 20, |m| m.max(0) as u64);
+        Ok(cancellable(st, |c| hh_asm::find_reference(&*p, from, target, fwd.unwrap_or(true), max, c))?.map(|a| a as i64))
+    })?;
+    // hhSymbolList(module OPTIONAL, filter OPTIONAL, offset OPTIONAL, limit OPTIONAL) ->
+    // {{Name, Module, Address, Size, User}}, total: registered symbols, then each module's.
+    b.f("hhSymbolList", |lua, st, (module, filter, offset, limit): (Option<String>, Option<String>, Option<i64>, Option<i64>)| {
+        let p = need_proc(st, false)?;
+        let syms = st.syms.lock().unwrap().clone();
+        let module = module.filter(|m| !m.is_empty());
+        let limit = limit.unwrap_or(1000).clamp(0, hh_asm::MAX_SYMBOL_PAGE as i64) as usize;
+        let page = hh_asm::symbol_list(&*p, &syms, module.as_deref(), &filter.unwrap_or_default(), offset.unwrap_or(0).max(0) as usize, limit);
+        let t = lua.create_table()?;
+        for r in page.rows {
+            let e = lua.create_table()?;
+            e.set("Name", r.name)?;
+            e.set("Module", r.module)?;
+            e.set("Address", r.addr as i64)?;
+            e.set("Size", r.size as i64)?;
+            e.set("User", r.user)?;
+            t.push(e)?;
+        }
+        Ok((t, page.total as i64))
+    })?;
+    Ok(())
+}
+
 pub(crate) fn install(b: &B, h: &B) -> LR<()> {
+    install_disasm(b)?;
     install_memory(b)?;
     install_symbols(b, h)?;
     install_host(b, h)?;
     install_strings(b)?;
-    install_structures(h)?;
+    install_structures(b, h)?;
     install_dissect(h)?;
     Ok(())
 }

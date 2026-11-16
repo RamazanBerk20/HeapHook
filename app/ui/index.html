@@ -527,8 +527,15 @@
       <div class="inline"><input id="cr-prog" name="program" class="mono" autocomplete="off" spellcheck="false" required placeholder="/path/to/game"><button id="cr-browse" class="btn" type="button">Browse</button></div></div>
     <div class="field"><label for="cr-args">Arguments</label><input id="cr-args" name="args" class="mono" autocomplete="off" spellcheck="false" placeholder='--windowed "My Save"'></div>
     <div class="field"><label for="cr-cwd">Working directory</label><input id="cr-cwd" name="cwd" class="mono" autocomplete="off" spellcheck="false" placeholder="the program's directory"></div>
+    <div class="field"><label for="cr-debug">Debugger</label>
+      <select id="cr-debug" name="debug">
+        <option value="">Do not debug</option>
+        <option value="entry">Debug it, stop at the entry point</option>
+        <option value="first">Debug it, stop before the first instruction</option>
+        <option value="run">Debug it, do not stop</option>
+      </select></div>
     <label class="check"><input name="speedhack" type="checkbox"> Load the speedhack (Linux: preloaded library; changes the game's clock)</label>
-    <p class="hint">The process starts and HeapHook opens it. The speedhack only affects dynamically linked programs that use libc's time functions.</p>
+    <p class="hint">The process starts and HeapHook opens it. Debugging starts it under the debugger, so breakpoints can be set before its code runs (not together with the speedhack). The speedhack only affects dynamically linked programs that use libc's time functions.</p>
     <div class="dlg-actions">
       <button class="btn primary" value="ok">Start <kbd>Enter</kbd></button>
       <button class="btn" value="cancel" formnovalidate>Cancel <kbd>Esc</kbd></button>
@@ -802,7 +809,9 @@
           <select id="st-ts" name="table_script"><option value="ask">Always ask before running</option><option value="never">Never run</option></select></div>
       </div>
       <label class="check"><input name="lua_allow_os" type="checkbox"> Allow Lua scripts to access files and run programs</label>
-      <p class="hint">Cheat Engine allows it, and many tables need it. Off, scripts can still read and change the attached process. Applies after restarting HeapHook.</p>
+      <p class="hint">Cheat Engine allows it, and many tables need it. Off, scripts can still read and change the attached process. Applies after restarting HeapHook. Auto Assembler <code>loadbinary</code> also needs it, and a script you agreed to run.</p>
+      <div class="field"><label for="st-aob">Auto Assembler <code>aobscan</code> that matches more than once</label>
+        <select id="st-aob" name="aob_unique"><option value="off">Use the first match (like Cheat Engine)</option><option value="warn">Use the first match, report the count</option><option value="fail">Refuse to enable the script</option></select></div>
     </fieldset>
     <fieldset class="group">
       <legend>Debugger and hotkeys</legend>

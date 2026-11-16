@@ -43,7 +43,8 @@ export const api = {
   scanResults: (offset, limit) => call('scan_results', { offset, limit }),
   /** entries: [{addr, vtype, value, mode, len?, utf16?, signed?, hex?}] — replaces the whole frozen set */
   setFrozen: (entries) => call('set_frozen', { entries }),
-  disassemble: (addr, count) => call('disassemble', { addr, count }),
+  /** opts: {att?: AT&T syntax, typed?: typed operand comments} */
+  disassemble: (addr, count, opts = null) => call('disassemble', { addr, count, opts }),
   assemble: (addr, text) => call('assemble', { addr, text }),
   aaCheck: (script) => call('aa_check', { script }),
   aaExecute: (script, enable, state) => call('aa_execute', { script, enable, state: state ?? null }),
@@ -100,10 +101,10 @@ export const api = {
   debugStack: (tid, count) => call('debug_stack', { tid, count }),
   debugContinue: (passSignal = false) => call('debug_continue', { passSignal }),
   debugPause: () => call('debug_pause', {}),
-  /** kind: into|over|out */
-  debugStep: (tid, kind) => call('debug_step', { tid, kind }),
-  /** tid: only that thread stops at addr (others pass it); null = any thread */
-  debugRunTo: (addr, tid = null) => call('debug_run_to', { addr, tid }),
+  /** kind: into|over|out; skipBreakpoints: breakpoints are ignored until the step completes */
+  debugStep: (tid, kind, skipBreakpoints = false) => call('debug_step', { tid, kind, skipBreakpoints }),
+  /** tid: only that thread stops at addr (others pass it); null = any thread; count: break at the count-th arrival */
+  debugRunTo: (addr, tid = null, count = 1) => call('debug_run_to', { addr, tid, count }),
   /** options: {skip_hits, one_shot, max_hits} — changed in place, hits so far count */
   debugSetOptions: (id, options) => call('debug_set_options', { id, options }),
   /** req: {addr, len, kind: write|access, max_hits?} -> id (page-protection watch that records; refuses stack memory) */
@@ -169,7 +170,10 @@ export const api = {
   regionsInfo: () => call('regions_info', {}),
   memProtect: (addr, size, prot) => call('mem_protect', { addr, size, prot }),
   memSave: (ranges, path) => call('mem_save', { ranges, path }),
-  memLoad: (path, relocate) => call('mem_load', { path, relocate: relocate || null }),
+  /** -> {blocks: [{index, addr, len, mapped, writable}], bytes, unmapped, read_only}; writes nothing */
+  memLoadPlan: (path, relocate) => call('mem_load_plan', { path, relocate: relocate || null }),
+  /** blocks: the plan blocks the user approved -> {blocks, bytes, failed: [addr]} */
+  memLoadApproved: (path, relocate, blocks) => call('mem_load_approved', { path, relocate: relocate || null, blocks }),
   memFill: (addr, len, pattern) => call('mem_fill', { addr, len, pattern }),
   memCopy: (src, dst, len) => call('mem_copy', { src, dst, len }),
   snapshotTake: (ranges, label) => call('snapshot_take', { ranges, label }),
@@ -284,6 +288,67 @@ export const api = {
   appArgs: () => call('app_args', {}),
   /** Quits (after the unsaved-changes question) */
   appQuit: () => call('app_quit', {}),
+
+  // ---------- 1.0 RC: scanner ----------
+  /** key: address|value; value sorts refuse more than 5,000,000 results */
+  scanSort: (key, desc = false) => call('scan_sort', { key, desc }),
+  /** addrs: [hex] -> how many results were removed (scan_undo brings them back) */
+  scanRemove: (addrs) => call('scan_remove', { addrs }),
+  /** Every result address, one per line, into a file -> count */
+  scanExportAddresses: (path) => call('scan_export_addresses', { path }),
+  /** Every result address as text (refused above 1,000,000) */
+  scanCopyAddresses: () => call('scan_copy_addresses', {}),
+  /** -> [{start, size, kind, path, module, count}] results per region */
+  scanStats: () => call('scan_stats', {}),
+  /** req: {opts: scan options, modules: [name], ranges: [{start, end}]} -> {count}; pointer-sized values pointing into readable memory (or those modules / ranges) */
+  scanPointer: (req) => call('scan_pointer', { req }),
+  // ---------- 1.0 RC: pointer scanner ----------
+  ptrPause: () => call('ptr_pause', {}),
+  ptrResume: () => call('ptr_resume', {}),
+  // ---------- 1.0 RC: memory tools ----------
+  /** req: {path, pattern: "48 ?? 05" | "", vtype?, value?, fmt?, max?} -> [addr] (a saved .hhmem file, no process needed) */
+  memFileSearch: (req) => call('mem_file_search', { req }),
+  /** -> {regions, bytes, by_prot, by_tag, by_kind, by_module: [{key, regions, bytes}]} */
+  regionStats: () => call('region_stats', {}),
+  /** -> {start, cell_size, compared: [n], changed: [n]} pages per cell; start/end null = the old snapshot's span */
+  snapshotChangeMap: (old, nw, start = null, end = null, cells = 1024) => call('snapshot_change_map', { old, new: nw, start, end, cells }),
+  // ---------- 1.0 RC: structures ----------
+  /** reqs: [{name, addr}] -> [{Ok: {fields, changed: [leaf index], locked, class}} | {Err}] */
+  structView: (reqs) => call('struct_view', { reqs }),
+  structLock: (name, addr, on) => call('struct_lock', { name, addr, on }),
+  /** leaf: index in the flattened leaf order of struct_view's fields */
+  structWrite: (name, addr, leaf, value) => call('struct_write', { name, addr, leaf, value }),
+  /** lang: c|csharp; names: [] = all -> source text (also written to `path` when given) */
+  structCode: (names, lang, path = null) => call('struct_code', { names, lang, path }),
+  /** path: element indexes (array element then item index; pointer / nested element then the path inside its child) -> table entry */
+  structFieldEntry: (name, root, path) => call('struct_field_entry', { name, root, path }),
+  // ---------- 1.0 RC: code analysis ----------
+  dissectAdd: (modules, opts = {}) => call('dissect_add', { modules, opts }),
+  dissectSave: (path) => call('dissect_save', { path }),
+  dissectLoad: (path) => call('dissect_load', { path }),
+  /** -> {recording, armed, ran_sets, not_ran_sets, last_hits, matches} (needs the debugger attached) */
+  codeFilterStart: () => call('code_filter_start', {}),
+  /** ran: the recording becomes a "ran" set (true) or a "did not run" set (false) */
+  codeFilterStop: (ran) => call('code_filter_stop', { ran }),
+  codeFilterState: () => call('code_filter_state', {}),
+  codeFilterReset: () => call('code_filter_reset', {}),
+  /** -> {total, rows: [{addr, callers, internal, name}]} */
+  codeFilterList: (offset, limit) => call('code_filter_list', { offset, limit }),
+  /** req: {start, end, pattern: "mov [r?x+*],e?x; ret", max} -> {hits: [{addr, text}], next: addr|null} */
+  asmScan: (req) => call('asm_scan', { req }),
+  /** -> addr of the next (forward) / previous instruction referencing target, or null */
+  findReference: (from, target, forward = true, maxBytes = null) => call('find_reference', { from, target, forward, maxBytes }),
+  /** module: null = user symbols and every module -> {total, rows: [{name, module, addr, size, user}]} */
+  symbolList: (module, filter, offset, limit) => call('symbol_list', { module, filter, offset, limit }),
+  // ---------- 1.0 RC: debugger ----------
+  /** req: {program, args, cwd, stop: entry|first|run} -> {pid, name, is_64bit}; opened with the debugger attached */
+  debugLaunch: (req) => call('debug_launch', { req }),
+  /** on: {thread_created, thread_exited, module_loaded: [pattern], module_unloaded: [pattern]} */
+  debugSetBreakOn: (on) => call('debug_set_break_on', { on }),
+  debugBreakOn: () => call('debug_break_on', {}),
+  debugSetIp: (tid, addr) => call('debug_set_ip', { tid, addr }),
+  /** frame: backtrace frame index (0 = the current function) */
+  debugRunUntilReturn: (tid, frame = 0) => call('debug_run_until_return', { tid, frame }),
 };
 
 /** Ask for a file path: native dialog in the app, a text prompt in a browser (mock or bridge). */

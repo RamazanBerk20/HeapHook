@@ -3,7 +3,7 @@
 import { api, askPath } from './backend.js';
 import { $, $$, h, icon, fmtAddr, fmtSize, wire, attempt, toast, prompt, rafThrottle, contextMenu, store, busy, modal, excerpt, helpAdd } from './util.js';
 import { state, addTicker, on, emit } from './core.js';
-import { vlist } from './vlist.js';
+import { vlist, pager } from './vlist.js';
 import * as tools from './memtools.js';
 import { editTableMeta } from './table.js';
 import * as F from './memfmt.js';
@@ -43,13 +43,18 @@ export function initMemview() {
   /** Shift selection: the anchor line's address; the selection runs from it to the cursor line. */
   let daAnchor = null;
   let modRel = store.get('da.modrel', false), showBytes = store.get('da.bytes', true);
+  // AT&T is display only (assembling still takes Intel); typed adds operand type comments.
+  let att = store.get('da.att', false), typed = store.get('da.typed', false);
+  const dopts = () => (att || typed ? { att, typed } : null);
+  /** Branch target of a line; AT&T indirect forms (*, parentheses) carry no direct target. */
+  const branchTarget = (t) => (att && /[*(]/.test(t) ? null : F.branchTarget(t));
   const daFwd = h('button.btn.ghost.icon#da-fwd', { type: 'button', disabled: true, 'aria-label': 'Forward (Alt →)', title: 'Forward (Alt →)', html: IC.fwd });
   $('#da-back').after(daFwd);
   const daHist = navHistory($('#da-back'), daFwd);
   async function daLoad() {
     if (daTop == null || editing) return;
     const top = daTop;
-    const rows = await api.disassemble(wire(top), visOf(da) + 4).catch((e) => { toast(e); return null; });
+    const rows = await api.disassemble(wire(top), visOf(da) + 4, dopts()).catch((e) => { toast(e); return null; });
     if (rows && top === daTop) { daRows = rows; daRender(); probeFunctions(); }
   }
   const daPool = [];
@@ -75,7 +80,7 @@ export function initMemview() {
     for (const [a, r] of at) {
       const d = daRows[+r.dataset.i];
       if (/^call\b/i.test(d.text)) continue;
-      const t = F.branchTarget(d.text);
+      const t = branchTarget(d.text);
       if (t == null || !at.has(t)) continue;
       arrows.push({ y1: r.offsetTop + ROW / 2, y2: at.get(t).offsetTop + ROW / 2, cond: !F.isUncond(d.text), hot: +r.dataset.i === daSel || +at.get(t).dataset.i === daSel });
     }
@@ -188,7 +193,7 @@ export function initMemview() {
   async function backN(n) {
     if (daTop == null) return daTop;
     const from = daTop > BigInt(n * 8) ? daTop - BigInt(n * 8) : 0n;
-    const rows = await api.disassemble(wire(from), n * 3).catch(() => []);
+    const rows = await api.disassemble(wire(from), n * 3, dopts()).catch(() => []);
     const before = rows.filter((r) => big(r.addr) < daTop);
     return before.length ? big(before[Math.max(0, before.length - n)].addr) : daTop;
   }
@@ -204,7 +209,7 @@ export function initMemview() {
     await daLoad();
   }
   function follow() {
-    const d = daRows[daSel], t = d && F.branchTarget(d.text);
+    const d = daRows[daSel], t = d && branchTarget(d.text);
     if (t != null) daGoto(t);
   }
   function back() {
@@ -215,20 +220,24 @@ export function initMemview() {
     const p = daHist.fwd([daTop, daSel]);
     if (p) { [daTop, daSel] = p; daAnchor = null; daLoad(); }
   }
-  function assembleLine() {
-    const d = daRows[daSel], row = rowEl(daSel);
-    if (!d || !row) return;
+  async function assembleLine() {
+    const d = daRows[daSel];
+    if (!d || !rowEl(daSel) || editing) return;
     editing = true;
+    // The assembler takes Intel syntax only: with AT&T on, edit the Intel form of the line.
+    const orig = att ? ((await api.disassemble(d.addr, 1).catch(() => []))[0]?.text ?? d.text) : d.text;
+    const row = rowEl(daSel);
+    if (!row) { editing = false; return; }
     const cell = row.children[2];
-    const input = h('input.cell-input.mono', { value: d.text, spellcheck: 'false', 'aria-label': `Assemble at ${fmtAddr(d.addr)}` });
-    cell.replaceChildren(input);
+    const input = h('input.cell-input.mono', { value: orig, spellcheck: 'false', 'aria-label': `Assemble at ${fmtAddr(d.addr)}${att ? ' (Intel syntax)' : ''}` });
+    cell.replaceChildren(input, att ? h('span.da-intel', { title: 'AT&T is display only: the assembler takes Intel syntax' }, 'Intel syntax') : '');
     delete cell.dataset.v;
     input.focus(); input.select();
     let done = false;
     const finish = async (ok) => {
       if (done) return;
       done = true;
-      if (ok && input.value.trim() && input.value.trim() !== d.text) {
+      if (ok && input.value.trim() && input.value.trim() !== orig) {
         await attempt(async () => {
           let hex = (await api.assemble(d.addr, input.value)).replace(/\s+/g, '');
           const old = d.bytes.split(' ').length;
@@ -374,16 +383,16 @@ export function initMemview() {
   }
   // ---------- disassembler: copy, info tip, search, view ----------
   /** The selected lines (disassembled again when the selection reaches past the screen). */
-  async function selLines() {
+  async function selLines(intel = false) {
     const r = daRange();
     if (!r) return [];
     const [lo, hi] = r, shown = daRows.filter((d) => big(d.addr) >= lo && big(d.addr) <= hi);
-    if (shown.length && big(shown[0].addr) === lo && big(shown.at(-1).addr) === hi) return shown;
-    const rows = await api.disassemble(wire(lo), Math.min(2000, Number(hi - lo) + 1)).catch((e) => { toast(e); return []; });
+    if (!(intel && att) && shown.length && big(shown[0].addr) === lo && big(shown.at(-1).addr) === hi) return shown;
+    const rows = await api.disassemble(wire(lo), Math.min(2000, Number(hi - lo) + 1), intel ? null : dopts()).catch((e) => { toast(e); return []; });
     return rows.filter((d) => big(d.addr) <= hi);
   }
   async function daCopy(kind) {
-    const rows = await selLines();
+    const rows = await selLines(kind === 'aob');
     if (!rows.length) return;
     const is64 = state.proc?.is_64bit !== false;
     const s = kind === 'text' ? rows.map((d) => `${(modRel ? relName(d.addr) : fmtAddr(d.addr)).padEnd(16)} ${d.bytes.padEnd(24)} ${d.text}${d.comment ? '  ; ' + d.comment : ''}`).join('\n')
@@ -398,9 +407,9 @@ export function initMemview() {
   let tipFor = null, hoverI = -1, tipTimer = 0;
   function hideTip() { clearTimeout(tipTimer); tipFor = null; hoverI = -1; tip.hidden = true; da.removeAttribute('aria-describedby'); }
   async function tipLines(d) {
-    const t = F.branchTarget(d.text);
+    const t = branchTarget(d.text);
     if (t != null) {
-      const [x] = await api.disassemble(wire(t), 1).catch(() => []);
+      const [x] = await api.disassemble(wire(t), 1, dopts()).catch(() => []);
       const name = labelsAt(t)[0] || (x && fnCache.get(x.addr)) || relName(t);
       return [[h('span.muted', null, /^call/i.test(d.text) ? 'Calls ' : 'Jumps to '), fmtAddr(t), name !== fmtAddr(t) ? h('span.muted', null, ' · ' + excerpt(name, 60)) : ''],
         [x && x.text !== '??' ? h('span', null, ...highlight(x.text)) : 'unreadable']];
@@ -503,6 +512,110 @@ export function initMemview() {
     toast(`Match ${f.i + 1} of ${f.rows.length}`, 'info');
   }
 
+  // ---------- references by scanning (no dissection needed), assembly scan, symbols ----------
+  let refTarget = null; // address (hex string) R / Shift R step through
+  /** Next (dir 1) / previous (-1) instruction whose operand references refTarget; ask = choose a new target. */
+  async function findRef(dir, ask = false) {
+    const a = cur();
+    if (a == null) return;
+    if (ask || !refTarget) {
+      const s = await prompt('Find instructions referencing an address', refTarget ? fmtAddr(refTarget) : fmtAddr(a), {
+        label: 'Address or expression',
+        hint: 'Scans the code from the cursor, up to 64 MiB each way: works without a code dissection. X lists every reference, but only inside a dissected module.',
+      });
+      da.focus();
+      if (!s) return;
+      const t = await attempt(() => api.resolveAddress(s));
+      if (!t) return;
+      refTarget = t;
+    }
+    const what = excerpt(relName(refTarget), 48);
+    const r = await attempt(() => busy(`Looking for ${dir > 0 ? 'the next' : 'the previous'} reference to ${what}`, api.findReference(a, refTarget, dir > 0), { cancel: () => api.toolsCancel() }));
+    if (r === undefined) return;
+    if (r == null) { toast(`No instruction ${dir > 0 ? 'after' : 'before'} the cursor references ${what} (searched 64 MiB)`, 'info'); return; }
+    await daGoto(r);
+    da.focus();
+    toast(`References ${what} · R next, Shift R previous`, 'info');
+  }
+
+  async function apiHook(a) {
+    const script = await attempt(() => api.aaTemplate(a, 'api'));
+    if (script) emit('table:script', { description: `API hook at ${relName(a)}`, script });
+  }
+
+  /** Instruction patterns (? one character, * any run, ; chains) over a module, a region or all code. */
+  async function asmScan() {
+    if (!state.proc) return;
+    const a = cur() ?? daTop, n = a == null ? null : big(a);
+    const m = n == null ? null : mods.find((x) => n >= big(x.base) && n < big(x.base) + BigInt(x.size)), r = regionAt(n);
+    const scopes = [m && ['module', `Module ${excerpt(m.name, 40)} (${fmtSize(m.size)})`], r && ['region', `This region ${fmtAddr(r.start)} (${fmtSize(r.size)})`], ['all', 'All executable memory (slow)']].filter(Boolean);
+    const last = store.get('da.asm', { pattern: '', scope: 'module' });
+    const v = await tools.formDialog('Assembly scan', [
+      { name: 'pattern', label: 'Instructions', value: last.pattern, placeholder: 'mov [r?x+*],e?x; ret', hint: '? matches one character, * any run of characters, ; chains instructions that follow each other. Intel syntax, any case.' },
+      { name: 'scope', label: 'Where', type: 'select', value: scopes.some((o) => o[0] === last.scope) ? last.scope : scopes[0][0], options: scopes },
+    ], { ok: 'Scan', text: 'Matches the disassembled text of every instruction, so it finds code a byte pattern cannot (any register, any offset). It is slower than an AOB search.' });
+    da.focus();
+    if (!v || !v.pattern) return;
+    store.set('da.asm', v);
+    const start = v.scope === 'module' ? big(m.base) : v.scope === 'region' ? big(r.start) : 0n;
+    const end = v.scope === 'module' ? wire(start + BigInt(m.size)) : v.scope === 'region' ? wire(start + BigInt(r.size)) : '';
+    const where = v.scope === 'module' ? excerpt(m.name, 40) : v.scope === 'region' ? 'region ' + fmtAddr(r.start) : 'all executable memory';
+    const rows = [], what = `"${excerpt(v.pattern, 40)}" in ${where}`;
+    let next = null, running = false;
+    const { dialog, body } = tools.listDialog(`Assembly scan: ${excerpt(v.pattern, 50)}`);
+    const strip = tools.progressStrip('Assembly scan progress');
+    const host = h('div.tool-list'), info = h('p.hint', { role: 'status' });
+    const more = h('button.btn', { type: 'button', hidden: true, onclick: () => scan(next) }, 'Find more ', h('kbd', null, 'Ctrl Enter'));
+    const list = vlist(host, {
+      cols: '128px minmax(0, 1fr) minmax(0, 1.6fr)', head: ['Address', 'Where', 'Instructions'], label: 'Assembly scan results',
+      empty: () => (running ? 'Scanning…' : 'No match.'), count: () => rows.length, item: (i) => rows[i],
+      cells: (x) => [fmtAddr(x.addr), relName(x.addr), h('span', { role: 'gridcell', class: 'c-text' }, ...highlight(x.text))],
+      onActivate: (i, x) => { if (!x) return; daFound = { rows: rows.slice(), i, what }; dialog.close(); daGoto(x.addr); da.focus(); },
+    });
+    body.append(info, h('div.tool-bar', null, more), strip.wrap, host);
+    // Esc cancels a running scan first; a second Esc closes the window.
+    dialog.addEventListener('cancel', (e) => { if (running) { e.preventDefault(); tools.jobs.cancel(); } });
+    dialog.addEventListener('close', () => { if (running) tools.jobs.cancel(); });
+    dialog.addEventListener('keydown', (e) => { if ((e.ctrlKey || e.metaKey) && e.key === 'Enter' && next && !running) { e.preventDefault(); scan(next); } });
+    async function scan(from) {
+      running = true; more.disabled = true; list.refresh();
+      const got = await tools.runJob(() => api.asmScan({ start: typeof from === 'string' ? from : wire(from), end, pattern: v.pattern, max: 1000 }), strip, 'Scanning');
+      running = false; more.disabled = false;
+      if (got) { rows.push(...got.hits); next = got.next; }
+      more.hidden = !next;
+      info.replaceChildren(`${rows.length.toLocaleString('en-US')} match${rows.length === 1 ? '' : 'es'} for ${what}${next ? ' so far (stopped at 1,000 per pass)' : ''} · `,
+        h('kbd', null, 'Enter'), ' go to it · then ', h('kbd', null, 'F3'), ' / ', h('kbd', null, 'Shift F3'), ' step through them');
+      list.refresh();
+      if (dialog.open) { list.focus(); if (list.sel < 0 && rows.length) list.select(0); }
+    }
+    await scan(start);
+  }
+
+  /** Every known symbol (your labels and script symbols first, then the modules'), paged. */
+  function symbolList() {
+    if (!state.proc) return;
+    const { dialog, body } = tools.listDialog('Symbols');
+    const filt = h('input.mono', { type: 'text', placeholder: 'Filter by name (Ctrl F)', spellcheck: 'false', autocomplete: 'off', 'aria-label': 'Filter symbols' });
+    const modSel = h('select', { 'aria-label': 'Module' }, h('option', { value: '' }, 'Your symbols and every module'), ...mods.map((x) => h('option', { value: x.name }, x.name)));
+    const count = h('span.hint.mono', { role: 'status' });
+    const src = pager((off, lim) => api.symbolList(modSel.value || null, filt.value, off, lim), (e) => { if (e) toast(e); count.textContent = `${src.count().toLocaleString('en-US')} symbol${src.count() === 1 ? '' : 's'}`; list.refresh(); });
+    const host = h('div.tool-list');
+    const list = vlist(host, {
+      cols: '128px minmax(0, 1.6fr) minmax(0, 1fr) 80px', head: ['Address', 'Name', 'Module', 'Size'], label: 'Symbols',
+      empty: 'No symbols match.', count: src.count, item: src.item,
+      cells: (x) => [fmtAddr(x.addr), h('span', { role: 'gridcell', class: x.user ? 'sym-user' : '', title: x.user ? 'Your label or a script symbol' : '' }, x.name), x.module || '', x.size ? fmtSize(x.size) : ''],
+      onActivate: (i, x) => { if (!x) return; dialog.close(); daGoto(x.addr); da.focus(); },
+    });
+    const reload = () => { src.reset(); list.refresh({ reset: true }); };
+    filt.addEventListener('input', rafThrottle(reload));
+    filt.addEventListener('keydown', (e) => { if (e.key === 'ArrowDown' || e.key === 'Enter') { e.preventDefault(); list.focus(); list.select(Math.max(0, list.sel)); } });
+    modSel.addEventListener('change', reload);
+    dialog.addEventListener('keydown', (e) => { if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'f') { e.preventDefault(); filt.focus(); filt.select(); } });
+    body.append(h('div.tool-bar.sym-bar', null, filt, modSel, count), h('p.hint', null, h('kbd', null, 'Enter'), ' disassembles at the symbol · ', h('kbd', null, '↓'), ' from the filter goes to the list'), host);
+    reload();
+    filt.focus();
+  }
+
   function applyDaView() {
     da.classList.toggle('modrel', modRel);
     da.classList.toggle('nobytes', !showBytes);
@@ -510,6 +623,8 @@ export function initMemview() {
   }
   function toggleModRel() { modRel = !modRel; store.set('da.modrel', modRel); applyDaView(); toast(modRel ? 'Addresses as module + offset' : 'Absolute addresses', 'info'); }
   function toggleBytes() { showBytes = !showBytes; store.set('da.bytes', showBytes); applyDaView(); }
+  function toggleAtt() { att = !att; store.set('da.att', att); daLoad(); toast(att ? 'AT&T syntax (display only: assembling a line still takes Intel syntax)' : 'Intel syntax', 'info'); }
+  function toggleTyped() { typed = !typed; store.set('da.typed', typed); daLoad(); }
   const daView = h('button.btn.ghost#da-view', { type: 'button', 'aria-haspopup': 'menu', title: 'View options: addresses, bytes, sync, text size, second viewer', html: icon('gear') }, h('span.bl', null, 'View'));
   daView.addEventListener('click', () => { const r = daView.getBoundingClientRect(); viewMenu(r.left, r.bottom + 4, da); });
   $('#da-goto').after(daView);
@@ -520,15 +635,21 @@ export function initMemview() {
       { label: 'Toggle breakpoint', kbd: 'F5', disabled: !a, run: () => emit('debug:toggle-bp', a) },
       { label: 'Run to cursor', kbd: 'F4', disabled: !a || state.dbg?.state !== 'broken', run: () => emit('debug:run-to', a) },
       { label: 'Run to cursor, this thread only', kbd: 'Shift F4', disabled: !a || state.dbg?.state !== 'broken', run: () => emit('debug:run-to-thread', a) },
+      { label: 'Run until this is reached N times…', disabled: !a || state.dbg?.state !== 'broken', run: () => emit('debug:run-to-count', { addr: a }) },
+      { label: 'Set instruction pointer here…', disabled: !a || state.dbg?.state !== 'broken', run: () => emit('debug:set-ip', { addr: a }) },
       { label: 'Find out what addresses this instruction accesses', disabled: !a || !/\[/.test(d?.text || ''), run: () => emit('debug:ea', { addr: a, text: d.text }) },
       { label: 'Break and trace…', disabled: !a, run: () => emit('debug:trace', { addr: a, text: d.text }) },
       { label: 'Set breakpoint…', disabled: !a, run: () => emit('debug:bp-dialog', a) },
       '-',
-      { label: 'What references this address', kbd: 'X', disabled: !a, run: () => emit('code:xrefs', a) },
+      { label: 'What references this address (from the code dissection)', kbd: 'X', disabled: !a, run: () => emit('code:xrefs', a) },
+      { label: refTarget ? `Next instruction referencing ${excerpt(relName(refTarget), 32)} (scan)` : 'Next instruction referencing an address (scan)…', kbd: 'R', disabled: !a, run: () => findRef(1) },
+      { label: 'Previous instruction referencing it (scan)', kbd: 'Shift R', disabled: !a || !refTarget, run: () => findRef(-1) },
+      { label: 'Find references to another address (scan)…', kbd: 'Alt R', disabled: !a, run: () => findRef(1, true) },
       { label: 'Generate AOB signature', disabled: !a, run: () => tools.signatureDialog(a) },
       { label: 'Create AOB injection script', disabled: !a, run: () => tools.aobScript(a) },
       { label: 'Create code injection script', disabled: !a, run: () => tools.injectScript(a, 'code') },
       { label: 'Create full injection script', disabled: !a, run: () => tools.injectScript(a, 'full') },
+      { label: 'Create API hook script', disabled: !a, run: () => apiHook(a) },
       '-',
       { label: 'Go to function start', kbd: 'Ctrl Home', disabled: !a, run: gotoFunctionStart },
       { label: 'Find call / jump targets…', kbd: 'T', disabled: !a, run: branchTargets },
@@ -539,7 +660,7 @@ export function initMemview() {
       { label: 'Add to code list', disabled: !a, run: () => emit('debug:codelist', { addr: a, text: d.text, bytes: d.bytes }) },
       '-',
       { label: 'Assemble', kbd: 'Enter', disabled: !a, run: assembleLine },
-      { label: 'Follow', kbd: 'Space', disabled: F.branchTarget(d?.text || '') == null, run: follow },
+      { label: 'Follow', kbd: 'Space', disabled: branchTarget(d?.text || '') == null, run: follow },
       { label: 'Show target / operand info', kbd: 'I', disabled: !a, run: () => showTip(daSel, 'key') },
       { label: 'Go to address…', kbd: 'Ctrl G', run: () => gotoPrompt('da') },
       '-',
@@ -548,6 +669,8 @@ export function initMemview() {
       { label: 'Copy as AOB pattern (wildcards)', kbd: 'Ctrl Shift C', disabled: !a, run: () => daCopy('aob') },
       { label: 'Search the module…', kbd: 'Ctrl F', disabled: !a, run: daSearch },
       { label: daFound?.rows.length ? `Search results (${daFound.rows.length})…` : 'Search results…', kbd: 'F3', disabled: !daFound?.rows.length, run: daResults },
+      { label: 'Assembly scan (instruction patterns)…', kbd: 'Ctrl Shift F', disabled: !state.proc, run: asmScan },
+      { label: 'Symbol list…', kbd: 'N', disabled: !state.proc, run: symbolList },
       { label: 'Bookmark this line…', kbd: 'Ctrl B', disabled: !a, run: () => bmAdd(a, da) },
       { label: 'View…', run: () => { const r = (rowEl(daSel) || da).getBoundingClientRect(); viewMenu(r.left + 120, r.bottom, da); } },
       ...(att ? [] : ['-', { label: 'Attach debugger', kbd: 'Ctrl Shift D', run: () => emit('debug:attach') }]),
@@ -572,7 +695,11 @@ export function initMemview() {
     else if (e.key === ' ') follow();
     else if (e.key === 'Backspace' || (e.altKey && e.key === 'ArrowLeft')) back();
     else if (e.altKey && e.key === 'ArrowRight') forward();
+    else if (ctrl && e.shiftKey && k === 'f') asmScan();
     else if (ctrl && k === 'f') daSearch();
+    else if (e.altKey && !ctrl && k === 'r') findRef(1, true);
+    else if (!ctrl && !e.altKey && k === 'r') findRef(e.shiftKey ? -1 : 1);
+    else if (plain && !e.shiftKey && k === 'n') symbolList();
     else if (e.key === 'F3' && !ctrl) daStep(e.shiftKey ? -1 : 1);
     else if (ctrl && k === 'c') daCopy(e.shiftKey ? 'aob' : 'text');
     else if (plain && k === 'm') toggleModRel();
@@ -859,6 +986,8 @@ export function initMemview() {
       { label: 'Save this region to a file…', disabled: !r, run: () => tools.saveRegions([{ start: r.start, size: r.size }], 'region ' + fmtAddr(r.start)) },
       { label: 'Load memory file…', disabled: !state.proc, run: () => canEdit() && after(tools.loadMemoryFile()) },
       { label: 'Compare with saved file…', disabled: !state.proc, run: compareFile },
+      { label: 'Search in a memory file…', run: () => tools.searchFileDialog() },
+      { label: 'Region statistics…', disabled: !state.proc, run: () => tools.regionStatsDialog() },
       '-',
       { label: 'Allocate memory…', disabled: !state.proc, run: () => tools.allocDialog().then((p) => { if (p) hxGoto(p); hx.focus(); }) },
       { label: 'Free memory…', disabled: !state.proc, run: () => tools.freeDialog(a).then(() => { lastTop = null; hxLoad(); hx.focus(); }) },
@@ -1183,6 +1312,8 @@ export function initMemview() {
     contextMenu(x, y, [
       { label: 'Module + offset addresses', kbd: 'M', checked: modRel, run: toggleModRel },
       { label: 'Bytes column', kbd: 'B', checked: showBytes, run: toggleBytes },
+      { label: 'AT&T syntax (display only)', checked: att, run: toggleAtt },
+      { label: 'Typed operand comments', checked: typed, run: toggleTyped },
       { label: 'Sync disassembler and hex view', kbd: 'S', checked: syncOn, run: () => toggleSync(back === hx ? 'hx' : 'da') },
       { label: 'Data inspector (hex view)', kbd: 'Ctrl I', checked: inspOn, run: toggleInsp },
       { label: 'Lock hex editing', kbd: 'Ctrl L', checked: locked, run: toggleLock },
@@ -1230,6 +1361,10 @@ export function initMemview() {
     ['Ctrl Shift M', 'Second memory viewer (Esc closes it)'],
     ['S', 'Sync disassembler and hex view'],
     ['M / B / I', 'Module + offset addresses / bytes column / target info (disassembler)'],
+    ['Ctrl Shift F', 'Assembly scan: instruction patterns with ? and * (disassembler)'],
+    ['R / Shift R', 'Next / previous instruction referencing an address (Alt R: another address)'],
+    ['X', 'What references this address, from the code dissection'],
+    ['N', 'Symbol list (disassembler)'],
   ]);
 
   // ---------- regions / modules ----------
@@ -1326,7 +1461,7 @@ export function initMemview() {
     daTop = null; daRows = []; daAnchor = null; daHist.clear(); hxHist.clear(); fnCache.clear(); hxTop = hxCur = hxAnchor = null; bytes = []; lastTop = null; regs = []; shownRegs = []; mods = [];
     builtFor = ''; hxPool.length = 0; hx.replaceChildren();
     regList.refresh({ reset: true }); $('#mod-list').replaceChildren(); $('#reg-count').textContent = ''; $('#mod-count').textContent = '';
-    daFound = null; hideTip(); bmAt = [];
+    daFound = null; refTarget = null; hideTip(); bmAt = [];
     daRender(); renderStatus();
   });
   applyDaView(); renderStatus();

@@ -2,8 +2,8 @@
 // this address", save / load memory files, region protection, module headers, AOB
 // signatures and AOB injection scripts. Dialogs are built here; memview.js wires the menus.
 import { api, askPath } from './backend.js';
-import { h, fmtAddr, fmtSize, nf, attempt, toast, modal } from './util.js';
-import { emit } from './core.js';
+import { h, fmtAddr, fmtSize, nf, attempt, toast, modal, busy, wire, helpAdd } from './util.js';
+import { emit, state } from './core.js';
 import { vlist } from './vlist.js';
 
 /** The session runs one long tool operation at a time; Esc cancels it (app.js). */
@@ -157,17 +157,140 @@ export async function saveRegions(ranges, what) {
   if (r) toast(`Saved ${nf.format(r.blocks)} block(s), ${fmtSize(r.bytes)} to ${p}`, 'info');
 }
 
+const HHMEM = [['HeapHook memory', ['hhmem']], ['All files', ['*']]];
+
+/** Plan, approve, then write: resolves true when at least one block was written. */
 export async function loadMemoryFile() {
-  const p = await askPath({ save: false, title: 'Load memory file', filters: [['HeapHook memory', ['hhmem']], ['All files', ['*']]], dflt: 'memory.hhmem' });
+  const p = await askPath({ save: false, title: 'Load memory file', filters: HHMEM, dflt: 'memory.hhmem' });
   if (!p) return false;
   const v = await formDialog('Load memory file', [
     { name: 'relocate', label: 'Relocate to address (empty = where it was saved)', value: '', placeholder: 'original addresses' },
-  ], { ok: 'Load', text: p });
+  ], { ok: 'Review blocks', text: `${p}\nNothing is written until you approve the blocks.` });
   if (!v) return false;
-  const r = await attempt(() => api.memLoad(p, v.relocate || null));
+  const reloc = v.relocate || null;
+  const plan = await attempt(() => api.memLoadPlan(p, reloc));
+  if (!plan) return false;
+  const chosen = await chooseBlocks(p, plan);
+  if (!chosen?.length) return false;
+  const r = await attempt(() => busy('Writing memory', api.memLoadApproved(p, reloc, chosen)));
   if (!r) return false;
-  toast(`Wrote ${nf.format(r.blocks)} block(s), ${fmtSize(r.bytes)}` + (r.failed.length ? `; ${r.failed.length} failed at ${r.failed.slice(0, 3).map(fmtAddr).join(', ')}` : ''), r.failed.length ? 'error' : 'info');
-  return true;
+  const msg = `Wrote ${nf.format(r.blocks)} of ${nf.format(chosen.length)} block(s), ${fmtSize(r.bytes)}.`;
+  if (r.failed.length) await modal({ title: 'Memory file loaded with failures', text: `${msg} ${nf.format(r.failed.length)} block(s) could not be written at:`, pre: r.failed.map(fmtAddr).join('\n'), buttons: [{ label: 'Close', value: 'cancel', primary: true, kbd: 'Esc' }] });
+  else toast(msg, 'info');
+  return r.blocks > 0;
+}
+
+/** The load plan as a checklist; resolves to the approved plan blocks (as returned) or null. */
+function chooseBlocks(path, plan) {
+  return new Promise((done) => {
+    const blocks = plan.blocks;
+    const on = blocks.map((b) => b.mapped); // unmapped blocks cannot be written: off by default
+    let result = null;
+    const { dialog, body } = listDialog('Load memory file: choose blocks');
+    const host = h('div.tool-list'), sum = h('p.hint', { 'aria-live': 'polite' });
+    const writeBtn = h('button.btn.primary', { type: 'button', onclick: () => finish() }, 'Write chosen blocks ', h('kbd', null, 'Ctrl Enter'));
+    const blockState = (b) => (!b.mapped ? ['ld-bad', 'Not mapped: cannot be written'] : !b.writable ? ['ld-ro', 'Read-only: protection is lifted for the write'] : ['', 'Writable']);
+    const set = (f) => { blocks.forEach((b, i) => { on[i] = f(b, i); }); update(); };
+    const toggle = (i) => { if (i >= 0) { on[i] = !on[i]; update(); } };
+    function update() {
+      const n = on.filter(Boolean).length, bytes = blocks.reduce((s, b, i) => s + (on[i] ? b.len : 0), 0);
+      sum.textContent = `${nf.format(n)} of ${nf.format(blocks.length)} block(s) chosen, ${fmtSize(bytes)}` + (on.some((x, i) => x && !blocks[i].mapped) ? ' · some chosen blocks are not mapped and will fail' : '');
+      writeBtn.disabled = !n;
+      list.refresh({ force: true });
+    }
+    function finish() { result = blocks.filter((_, i) => on[i]); dialog.close(); }
+    const list = vlist(host, {
+      cols: '32px 128px 96px minmax(0, 1fr)', head: ['', 'Address', 'Size', 'State'], label: 'Blocks in the file',
+      empty: 'The file has no blocks.', count: () => blocks.length, item: (i) => blocks[i],
+      cells: (b, i) => {
+        const [cls, text] = blockState(b);
+        return [
+          h('span', { role: 'gridcell' }, h('input', { type: 'checkbox', tabindex: '-1', checked: on[i], 'aria-label': `Write the block at ${fmtAddr(b.addr)}`, onclick: (e) => { e.stopPropagation(); on[i] = e.target.checked; update(); } })),
+          fmtAddr(b.addr), fmtSize(b.len), h('span', { role: 'gridcell', class: cls }, text),
+        ];
+      },
+      onActivate: (i) => toggle(i),
+      onKey: (e, i) => {
+        const k = e.key.toLowerCase();
+        if ((e.ctrlKey || e.metaKey) && k === 'enter') { if (on.some(Boolean)) finish(); }
+        else if (e.ctrlKey || e.metaKey || e.altKey) return false;
+        else if (k === ' ') toggle(i);
+        else if (k === 'a') set(() => true);
+        else if (k === 'n') set(() => false);
+        else return false;
+        return true;
+      },
+    });
+    const notes = [
+      plan.unmapped ? `${nf.format(plan.unmapped)} block(s) are not mapped in the process and cannot be written.` : '',
+      plan.read_only ? `${nf.format(plan.read_only)} block(s) are read-only: their protection is lifted for the write, then restored.` : '',
+    ].filter(Boolean).join(' ');
+    body.append(
+      h('p.hint', null, `${path} · ${nf.format(blocks.length)} block(s), ${fmtSize(plan.bytes)}. ${notes}`),
+      h('div.tool-bar', null,
+        h('button.btn', { type: 'button', onclick: () => set(() => true) }, 'Select all ', h('kbd', null, 'A')),
+        h('button.btn', { type: 'button', onclick: () => set(() => false) }, 'Select none ', h('kbd', null, 'N'))),
+      h('p.hint', null, 'Space or Enter toggles the block under the cursor.'),
+      host, sum,
+      h('div.dlg-actions', null, writeBtn, h('button.btn', { type: 'button', onclick: () => dialog.close() }, 'Cancel ', h('kbd', null, 'Esc'))));
+    dialog.addEventListener('close', () => done(result));
+    update();
+    list.focus();
+  });
+}
+
+// ---------- search inside a saved memory file ----------
+const FILE_TYPES = [['pattern', 'Byte pattern'], ['byte', 'Byte'], ['2bytes', '2 Bytes'], ['4bytes', '4 Bytes'], ['8bytes', '8 Bytes'], ['float', 'Float'], ['double', 'Double'], ['string', 'String']];
+export async function searchFileDialog() {
+  const p = await askPath({ save: false, title: 'Search a memory file', filters: HHMEM, dflt: 'memory.hhmem' });
+  if (!p) return;
+  const v = await formDialog('Search a memory file', [
+    { name: 'kind', label: 'Search for', type: 'select', value: 'pattern', options: FILE_TYPES },
+    { name: 'value', label: 'Pattern or value', value: '', hint: 'Pattern: hex bytes, ?? for any byte, e.g. 48 8B ?? 05' },
+    { name: 'hex', label: 'Integer value is hexadecimal', type: 'checkbox', value: false },
+    { name: 'max', label: 'Most results', value: '1000' },
+  ], { ok: 'Search', text: `${p}\nSearches the saved file; no process needed.` });
+  if (!v) return;
+  if (!v.value) { toast('Give a byte pattern or a value'); return; }
+  const pat = v.kind === 'pattern';
+  const req = { path: p, pattern: pat ? v.value : '', vtype: pat ? null : v.kind, value: pat ? '' : v.value, fmt: { hex: v.hex }, max: Math.max(1, Math.min(100000, parseInt(v.max, 10) || 1000)) };
+  const { dialog, body } = listDialog('Memory file search');
+  const strip = progressStrip('File search progress'), host = h('div.tool-list'), head = h('p.hint');
+  let hits = [];
+  const list = vlist(host, {
+    cols: 'minmax(0, 1fr)', head: ['Address'], label: 'Addresses found in the file',
+    empty: () => 'No match in the file.', count: () => hits.length, item: (i) => hits[i], cells: (a) => [fmtAddr(a)],
+    onActivate: (i) => {
+      if (!state.proc) { toast('Open a process to view this address in the hex view'); return; }
+      dialog.close(); emit('mem:goto', { addr: hits[i], pane: 'hex' });
+    },
+  });
+  body.append(head, strip.wrap, host);
+  head.textContent = `Searching ${p}`;
+  const r = await runJob(() => api.memFileSearch(req), strip, 'Searching the file');
+  if (!r) { head.textContent = `The search did not finish: ${p}`; return; }
+  hits = r;
+  head.textContent = `${nf.format(r.length)} match(es)${r.length >= req.max ? ` (stopped at ${nf.format(req.max)})` : ''} in ${p}` + (state.proc ? ' · Enter shows the address in the hex view' : '');
+  list.refresh({ reset: true });
+  list.focus();
+}
+
+// ---------- region totals ----------
+export async function regionStatsDialog() {
+  const s = await attempt(() => api.regionStats());
+  if (!s) return;
+  const { body } = listDialog('Memory region totals');
+  const pct = (b) => (s.bytes ? ((b / s.bytes) * 100).toFixed(1) + ' %' : '');
+  const table = (title, rows) => h('table.rs-table', null,
+    h('caption', null, title),
+    h('thead', null, h('tr', null, h('th', { scope: 'col' }, title.replace(/^By /, '')), h('th', { scope: 'col' }, 'Regions'), h('th', { scope: 'col' }, 'Size'), h('th', { scope: 'col' }, 'Share'))),
+    h('tbody', null, rows.length ? [...rows].sort((a, b) => b.bytes - a.bytes).map((r) => h('tr', null, h('th.mono', { scope: 'row' }, r.key || '(none)'), h('td', null, nf.format(r.regions)), h('td', null, fmtSize(r.bytes)), h('td', null, pct(r.bytes))))
+      : h('tr', null, h('td', { colspan: '4' }, 'None'))));
+  body.append(
+    h('p.hint', null, `${nf.format(s.regions)} region(s), ${fmtSize(s.bytes)} in all. Module totals leave out memory outside modules.`),
+    h('div.rs-wrap', { tabindex: '0', role: 'region', 'aria-label': 'Region totals' },
+      table('By protection', s.by_prot), table('By tag', s.by_tag), table('By kind', s.by_kind), table('By module', s.by_module)));
+  body.querySelector('.rs-wrap').focus();
 }
 
 // ---------- protection ----------
@@ -203,16 +326,88 @@ export async function snapshotsDialog({ at, region } = {}) {
       if (!v) return;
       const a = await resolve(v.addr), n = hexNum(v.size);
       if (a && n > 0) take([{ start: a, size: n }], `${fmtAddr(a)} +${n.toString(16).toUpperCase()}`);
-    } }, 'Snapshot a range…'));
+    } }, 'Snapshot a range…'),
+    h('button.btn', { type: 'button', onclick: () => compareTwo() }, 'Compare two snapshots… ', h('kbd', null, 'C')));
   const snapList = vlist(listHost, {
     cols: '48px minmax(0, 1fr) 90px 70px', head: ['#', 'Snapshot', 'Size', 'Blocks'], label: 'Snapshots',
     empty: 'No snapshots yet. Take one, change something in the game, then compare.',
     count: () => snaps.length, item: (i) => snaps[i],
     cells: (s) => [String(s.id), s.label, fmtSize(s.bytes), nf.format(s.blocks)],
     onActivate: (i) => compare(snaps[i]),
-    onKey: (e, i) => { if (e.key === 'Delete' && snaps[i]) { attempt(() => api.snapshotDelete(snaps[i].id)).then(reload); return true; } return false; },
+    onKey: (e, i) => {
+      if (e.ctrlKey || e.metaKey || e.altKey) return false;
+      if (e.key === 'Delete' && snaps[i]) { attempt(() => api.snapshotDelete(snaps[i].id)).then(reload); return true; }
+      if (e.key.toLowerCase() === 'c') { compareTwo(snaps[i]); return true; }
+      return false;
+    },
   });
-  const head = h('p.hint', null, 'Enter compares the selected snapshot with live memory · Del removes it');
+  const head = h('p.hint', null, 'Enter compares the selected snapshot with live memory · C compares two snapshots page by page · Del removes it');
+  const mapHost = h('div.cm-host', { hidden: true });
+  const showMap = (on) => { mapHost.hidden = !on; diffHead.hidden = on; diffHost.hidden = on; };
+  async function compareTwo(sel) {
+    if (snaps.length < 2) { toast('Take two snapshots first (before and after a change in the game)'); return; }
+    const opts = snaps.map((s) => [String(s.id), `#${s.id} ${s.label}`]);
+    const v = await formDialog('Compare two snapshots', [
+      { name: 'old', label: 'Old snapshot', type: 'select', value: String((sel && sel !== snaps.at(-1) ? sel : snaps.at(-2)).id), options: opts },
+      { name: 'new', label: 'New snapshot', type: 'select', value: String(snaps.at(-1).id), options: opts },
+      { name: 'cells', label: 'Cells', type: 'select', value: '512', options: [['256', '256 (coarse)'], ['512', '512'], ['1024', '1024 (fine)']] },
+    ], { ok: 'Compare', text: 'Counts the 4 KiB pages that changed between the two snapshots, over the old snapshot\'s address span.' });
+    if (!v) { snapList.focus(); return; }
+    if (v.old === v.new) { toast('Choose two different snapshots'); return; }
+    const m = await runJob(() => api.snapshotChangeMap(+v.old, +v.new, null, null, +v.cells), strip, 'Comparing pages');
+    if (m) renderMap(m, v.old, v.new);
+  }
+  function renderMap(m, a, b) {
+    const COLS = 32, n = m.changed.length, start = BigInt(m.start), cs = BigInt(m.cell_size);
+    const pages = Math.max(1, Math.round(m.cell_size / 4096));
+    const sum = (x) => x.reduce((s, y) => s + y, 0);
+    const level = (c, ch) => (!c ? 'none' : !ch ? 'l0' : ch / c <= 0.25 ? 'l1' : ch / c <= 0.75 ? 'l2' : 'l3');
+    const lo = (i) => start + BigInt(i) * cs;
+    const label = (i) => `${fmtAddr(lo(i))} to ${fmtAddr(lo(i + 1) - 1n)}: ` + (m.compared[i] ? `${m.changed[i]} of ${m.compared[i]} page(s) changed` : 'not in both snapshots');
+    const readout = h('p.hint.mono', { 'aria-live': 'polite' }, label(0));
+    const cells = [];
+    const grid = h('div.cm-grid', { role: 'grid', 'aria-label': `Pages changed between snapshot ${a} and ${b}`, 'aria-rowcount': Math.ceil(n / COLS), 'aria-colcount': COLS });
+    for (let r = 0; r * COLS < n; r++) {
+      const row = h('div.cm-row', { role: 'row' });
+      for (let i = r * COLS; i < Math.min(n, (r + 1) * COLS); i++) {
+        const t = label(i);
+        const c = h('span.cm-cell.cm-' + level(m.compared[i], m.changed[i]), { role: 'gridcell', tabindex: i ? '-1' : '0', 'aria-label': t, title: t, 'data-i': i });
+        cells.push(c); row.append(c);
+      }
+      grid.append(row);
+    }
+    let cur = 0;
+    const move = (i) => {
+      i = Math.max(0, Math.min(n - 1, i));
+      cells[cur].tabIndex = -1; cur = i; cells[cur].tabIndex = 0; cells[cur].focus();
+      readout.textContent = label(cur);
+    };
+    const go = (i) => { dialog.close(); emit('mem:goto', { addr: wire(lo(i)), pane: 'hex' }); };
+    grid.addEventListener('keydown', (e) => {
+      const k = e.key, ctrl = e.ctrlKey || e.metaKey, col = cur % COLS;
+      if (k === 'ArrowRight') move(cur + 1);
+      else if (k === 'ArrowLeft') move(cur - 1);
+      else if (k === 'ArrowDown') move(cur + COLS);
+      else if (k === 'ArrowUp') move(cur - COLS);
+      else if (k === 'Home') move(ctrl ? 0 : cur - col);
+      else if (k === 'End') move(ctrl ? n - 1 : cur - col + COLS - 1);
+      else if (k === 'PageDown') move(cur + COLS * 8);
+      else if (k === 'PageUp') move(cur - COLS * 8);
+      else if (k === 'Enter') go(cur);
+      else return;
+      e.preventDefault(); e.stopPropagation();
+    });
+    grid.addEventListener('click', (e) => { const c = e.target.closest('.cm-cell'); if (c) move(+c.dataset.i); });
+    grid.addEventListener('dblclick', (e) => { const c = e.target.closest('.cm-cell'); if (c) go(+c.dataset.i); });
+    const key = (cls, text) => h('span.cm-key', null, h('span.cm-cell.cm-' + cls, { 'aria-hidden': 'true' }), text);
+    mapHost.replaceChildren(
+      h('p.hint', null, `Snapshot ${a} to ${b} · ${nf.format(sum(m.changed))} of ${nf.format(sum(m.compared))} page(s) changed · one cell covers ${fmtSize(m.cell_size)} (${nf.format(pages)} page${pages > 1 ? 's' : ''}) from ${fmtAddr(m.start)} · arrows move, Enter shows the cell in the hex view`),
+      h('div.cm-legend', { 'aria-label': 'Legend' }, key('none', 'Not in both'), key('l0', 'No change'), key('l1', 'Up to 25 % of pages'), key('l2', 'Up to 75 %'), key('l3', 'More')),
+      h('div.cm-scroll', null, grid), readout,
+      h('button.btn', { type: 'button', onclick: () => { showMap(false); snapList.focus(); } }, 'Back to the differences list'));
+    showMap(true);
+    if (n) cells[0].focus();
+  }
   const diffHead = h('p.hint.mono');
   const diffList = vlist(diffHost, {
     cols: '128px 64px minmax(0, 1fr) minmax(0, 1fr)', head: ['Address', 'Bytes', 'Snapshot', 'Now'], label: 'Differences',
@@ -226,12 +421,13 @@ export async function snapshotsDialog({ at, region } = {}) {
     const r = await runJob(() => api.snapshotDiff(s.id), strip, 'Comparing');
     if (!r) return;
     diffs = r; diffOf = s;
+    showMap(false);
     diffHead.textContent = `${nf.format(r.length)} changed range(s) since snapshot ${s.id} · Enter jumps to the hex view`;
     diffList.refresh({ reset: true });
     diffList.focus();
   }
   async function reload() { snaps = (await attempt(() => api.snapshotList())) || []; snapList.refresh(); }
-  body.append(btns, strip.wrap, head, listHost, diffHead, diffHost);
+  body.append(btns, strip.wrap, head, listHost, diffHead, diffHost, mapHost);
   await reload();
   snapList.focus();
 }
@@ -316,3 +512,10 @@ export async function signatureDialog(addr) {
 }
 
 export { hexNum };
+
+if (document.getElementById('dlg-help')) helpAdd('Memory tools', [
+  ['Space / A / N', 'Load memory file: toggle a block / all / none'],
+  ['Ctrl Enter', 'Load memory file: write the chosen blocks'],
+  ['C', 'Snapshots: compare two snapshots (page change map)'],
+  ['Enter', 'Change map: show the cell in the hex view (arrows move)'],
+]);

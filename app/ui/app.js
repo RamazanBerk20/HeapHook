@@ -257,6 +257,13 @@ async function createProcess() {
   d.onclose = async () => {
     if (d.returnValue !== 'ok') return;
     const req = { program: f.elements.program.value.trim(), args: f.elements.args.value, cwd: f.elements.cwd.value.trim(), speedhack: f.elements.speedhack.checked };
+    const stop = f.elements.debug.value;
+    if (stop && req.speedhack) { toast('The speedhack cannot be loaded into a program started under the debugger: start it without one of them'); return; }
+    if (stop) {
+      const info = await attempt(() => busy('Starting the program under the debugger', api.debugLaunch({ program: req.program, args: req.args, cwd: req.cwd, stop })));
+      if (info) { opened(info); toast(stop === 'run' ? 'Started under the debugger' : 'Started under the debugger and stopped: set breakpoints, then continue (F9)', 'info'); }
+      return;
+    }
     const info = await attempt(() => busy('Starting the program', api.processCreate(req)));
     if (info) { opened(info); if (req.speedhack) toast('Started with the speedhack: the speed control is in the top bar', 'info'); }
   };

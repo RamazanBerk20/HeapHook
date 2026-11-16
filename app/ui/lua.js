@@ -137,6 +137,7 @@ export function initLua({ openTableScript }) {
       emit('table:selection', p.selection);
       emit('ui:seq', p.ui_seq);
       if (p.window) emit('backend:window', p.window);
+      emit('freeze:failures', p.freeze_failures || []);
       bound = new Set(p.hotkeys.map((k) => k.join(',')));
       if (busy !== p.busy) { busy = p.busy; sync(); }
       if (sound != null && p.sound > sound) beep();

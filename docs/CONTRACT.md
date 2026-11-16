@@ -131,12 +131,13 @@ decreased decreased_by changed unchanged same_as_first`, plus `not: bool` to inv
 | `disassemble` (xrefs) | | rows also carry `xrefs: {calls, jumps, data}` when a dissection knows the address |
 | `regions_info` | – | `[{start, size, prot, prot_text, kind, shared, path, module, tag: image/heap/stack/mapped/private/special}]` |
 | `mem_protect` | `addr, size, prot: {r, w, x}` | old prot |
-| `mem_save` / `mem_load` | `ranges: [{start, size}], path` / `path, relocate?` | `{blocks, bytes}` / `{blocks, bytes, failed: [addr]}` (`.hhmem`) |
+| `mem_save` | `ranges: [{start, size}], path` | `{blocks, bytes}` (`.hhmem`) |
+| `mem_load_plan` / `mem_load_approved` | `path, relocate?` / `path, relocate?, blocks: [plan block]` | `{blocks: [{index, addr, len, mapped, writable}], bytes, unmapped, read_only}` (nothing written) / `{blocks, bytes, failed: [addr]}` (writes only the approved blocks; refuses when the file changed since the plan). There is no unplanned load |
 | `mem_fill` / `mem_copy` | `addr, len, pattern` (hex) / `src, dst, len` | – |
 | `snapshot_take` / `snapshot_list` / `snapshot_delete` | `ranges` (empty = writable memory), `label` / – / `id` | `{id, label, blocks, bytes}` / list / – |
 | `snapshot_diff` | `id, max` | `[{addr, len, old, new}]` (hex bytes; `new` empty = unreadable now) |
 | `find_pointers` | `query: {target, max_offset, static_only, writable_only, max_results}` | `[{addr, value, offset, module}]` |
-| `module_header` | `name` | `{format: elf/pe, is_64, machine, kind, entry, image_base, sections: [{name, addr, size, prot}], imports, import_libs, exports, source}` |
+| `module_header` | `name` | `{format: elf/pe, is_64, machine, kind, entry, image_base, sections: [{name, addr, size, prot}], imports, import_libs, exports, source}` (a remote target's from its memory only) |
 | `aob_signature` | `addr` | `{pattern, addr, module, module_offset, unique, matches, found: [addr]}` |
 | `aa_template` | `addr, kind: aob/code/full` | Auto Assembler script |
 | `code_list` | – | `[{description, address, bytes, before, after, addr, state: original/nopped/changed/unreadable, current}]` (hh-tools CodeList over `table.codes`) |
@@ -162,7 +163,7 @@ decreased decreased_by changed unchanged same_as_first`, plus `not: bool` to inv
 | `remote_saved` / `remote_forget` | – | `{addr, has_token}` / – (remembered server; the token only when the user asked; `remote.json` in the config dir, mode 0600) |
 | `remote_connect` | `addr, token, remember` (`token` empty = the remembered one) | `{addr}` (hh-net challenge-response; traffic is not encrypted after it) |
 | `remote_status` / `remote_processes` | – | `{addr, connected}` or `null` / `[{pid, name, exe}]` |
-| `remote_open` | `pid` | `{pid, name, is_64bit, remote}` (scanner, table, memory view, pointer scan, structures and tools work through it; debugger, `module_header` and speedhack are local only and refuse with a message) |
+| `remote_open` | `pid` | `{pid, name, is_64bit, remote}` (scanner, table, memory view, pointer scan, structures and tools work through it; debugger and speedhack are local only and refuse with a message; symbols, headers, dissections and structure guesses never read a same-named local file: hh-asm `set_module_files_local(pid, false)` until it is closed) |
 | `remote_disconnect` | – | – (closes the remote target first) |
 | `open_process` / `lua_poll.process` (remote) | | `remote: addr` on a remote target; `lua_poll.process.lost`: why the connection dropped (`alive` is false then) |
 | `code_function` | `addr` | `{start, name, source: dissection/heuristic}` |
@@ -217,3 +218,42 @@ with header `x-hh-token` and the Tauri-style args object as the body answers `{"
 `{"err": "text"}`. `main.rs` builds the Tauri commands and the bridge dispatch from one table, so
 names and argument decoding are the same. No native dialogs (`pick_path` errors; the UI asks for
 a path in a prompt like the mock) and no global hotkeys (in-app hotkeys still work).
+| `scan_first.opts` (1.0) | `kinds: [Image/Mapped/Private]`, `modules: [name]`, `exclude_modules: [name]`, `ranges: [{start, end}]` (at most 4096), `min_region_size`, `max_region_size`, `simple_values` | – (hh-scan `ScanOptions`; an unknown module name is an error) |
+| `scan_sort` | `key: address/value, desc` | – (`scan_results` follow the order until the results change; value sorts refuse more than 5,000,000 results) |
+| `scan_remove` | `addrs: [addr]` | removed count (`scan_undo` brings them back) |
+| `scan_export_addresses` / `scan_copy_addresses` | `path` / – | count / text (upper-case hex, one per line; copy refuses more than 1,000,000) |
+| `scan_stats` | – | `[{start, size, kind, path, module, count}]` (results per region; `size` 0 = no longer mapped) |
+| `scan_pointer` | `req: {opts, modules, ranges}` | `{count}` (new scan of pointer-sized values pointing into readable memory, or into those modules / ranges) |
+| `scan_results` (saved, 1.0) | | `saved` comes from hh-scan's `saved_values` (every row; `scan_saved.kept` = `count`); `scan_progress.spill_dir` is the directory in use |
+| `lua_poll.freeze_failures` | | `[{id, addr, error}]`: frozen entries whose write fails now (the freezer keeps retrying) |
+| entry `freeze_interval_ms` | | the entry's own freezer interval (JSON only; 1..60000) |
+| custom types (1.0) | | records carry `custom`: Lua `memrec.Value`, hotkey `Set Value` / `Increase Value` / `Decrease Value` and freezing work in converted units (`raw * scale + offset`) |
+| `ptr_pause` / `ptr_resume` | – | – (`ptr_progress.paused`; cancel still ends a paused scan) |
+| `ptr_scan.opts` (1.0) | `starts_with: [i64]`, `allowed_offsets: [i64]`, `stop_at_static`, `time_limit_secs` | – (local targets: every thread's stack is a `THREADSTACK<n>` base; `PtrInfo.compact` false = a pre-1.0 result file, still read) |
+| `mem_file_search` | `req: {path, pattern?, vtype?, value?, fmt?, max?}` | `[addr]` (in a saved `.hhmem`; no process needed; at most `max`, default 1000) |
+| `region_stats` | – | `{regions, bytes, by_prot, by_tag, by_kind, by_module: [{key, regions, bytes}]}` |
+| `snapshot_change_map` | `old, new` (snapshot ids), `start?, end?` (default the old snapshot's span), `cells` | `{start, cell_size, compared: [pages], changed: [pages]}` |
+| `struct_view` | `reqs: [{name, addr}]` | `[{Ok: {fields, changed: [leaf index], locked, class}} or {Err}]` (`changed`: since this column's previous view, or while locked between the locked copy shown and live memory; `class`: C++ class from RTTI) |
+| `struct_lock` / `struct_write` | `name, addr, on` / `name, addr, leaf, value` | – (`leaf`: index in the flattened leaf order) |
+| `struct_code` | `names, lang: c/csharp, path?` | source text (also written to `path`) |
+| `struct_field_entry` | `name, root, path: [element index]` | cheat-table entry (pointer hops become offsets; bit fields carry `custom`) |
+| element (1.0) | | `bit_offset`, `bit_len`, `count` (array), `child_start`; `struct_set` validates every definition; `struct_guess` names a structure after its RTTI class when `name` is empty |
+| `dissect_add` / `dissect_save` / `dissect_load` | `modules, opts` / `path` / `path` | summary / – / summary (`.hhdis`, validated; a remote target never reads local module files) |
+| `code_filter_start` / `code_filter_stop` / `code_filter_state` / `code_filter_reset` | – / `ran` / – / – | `{recording, armed, ran_sets, not_ran_sets, last_hits, matches}` (one-shot int3 on every function entry of the current dissection, nothing else; needs the debugger) |
+| `code_filter_list` | `offset, limit` | `{total, rows: [function]}` (in every ran set, in no did-not-run set) |
+| `asm_scan` | `req: {start, end?, pattern, max?}` | `{hits: [{addr, text}], next}` (instruction text with `?` / `*`; `;` chains instructions; `tools_cancel` stops it) |
+| `find_reference` | `from, target, forward, maxBytes?` | addr or `null` |
+| `symbol_list` | `module?, filter, offset, limit` | `{total, rows: [{name, module, addr, size, user}]}` |
+| `disassemble` (1.0) | `opts?: {att, typed}` | AT&T text (display only), typed operand comments |
+| `aa_template` (1.0) | `kind: api` | API hook template |
+| `aa_execute` (1.0) | | returns `scans: [{name, addr, matches}]`; Settings `aob_unique: off/warn/fail`; `loadbinary` reads a file only when the script is trusted (typed, or consented with `aa_trust` / `table_trust`) and Settings allow Lua and scripts to access files (regular files, at most 64 MiB). Table entries run through hh-lua, which has no `loadbinary` host: refused |
+| `debug_launch` | `req: {program, args, cwd, stop: entry/first/run}` | `{pid, name, is_64bit}` (started under the debugger and opened, stopped with reason `started: …`; reaped by the app once it exits and is untraced) |
+| `debug_set_break_on` / `debug_break_on` | `on: {thread_created, thread_exited, module_loaded: [pattern], module_unloaded: [pattern]}` / – | – / same |
+| `debug_add_breakpoint` (1.0) | `req.pending` (expression; armed when it resolves), `thread`, `outside_module`, `log` + `message` (tracepoint: `{rax}`, `{old}`, `{new}`, `{address}` become hex), `value_condition` (write / access: `old`, `new`, `address`, registers), `trace: {skip_modules, stay_start, stay_end, until_return, max_ms, capture_memory}` | `debug_breakpoints` rows carry them plus `resolved`; the debugger log shows tracepoint lines, resolutions and debug-event stops |
+| `debug_step` / `debug_run_to` (1.0) | `skipBreakpoints?` / `count?` | – |
+| `debug_run_until_return` / `debug_set_ip` | `tid, frame` / `tid, addr` | – |
+| `debug_threads` (1.0) | | rows carry `name`, `state`, `user_ms`, `kernel_ms` |
+| `debug_context` (1.0) | | `fpu.has_ymm`, `fpu.ymm_hi: [hex]` (upper halves of YMM0..15) |
+| `debug_trace` (1.0) | | rows carry `accesses: [{addr, size, read, write, before, after}]` with `capture_memory` |
+| `debug_status.reason` (1.0) | | the debug event that stopped it (`thread 12 created`, `module loaded: libz.so.1`, `started: …`) |
+| settings (1.0 RC) | | `aob_unique: off/warn/fail` |

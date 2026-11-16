@@ -3,6 +3,7 @@ import { api } from './backend.js';
 import { $, $$, h, nf, toast, busy, fmtSize, icon, prompt, attempt } from './util.js';
 import { state, on } from './core.js';
 import { listCustomTypes, editCustomType } from './custom.js';
+import { listDialog } from './memtools.js';
 
 const FIRST = [['exact', 'Exact value'], ['bigger', 'Bigger than'], ['smaller', 'Smaller than'], ['between', 'Value between'], ['unknown', 'Unknown initial value']];
 const NEXT = [...FIRST.slice(0, 4), ['increased', 'Increased'], ['increased_by', 'Increased by'], ['decreased', 'Decreased'],
@@ -11,6 +12,68 @@ const NO_VALUE = new Set(['unknown', 'increased', 'decreased', 'changed', 'uncha
 const ALIGN = { byte: 1, binary: 1, '2bytes': 2, '4bytes': 4, '8bytes': 4, float: 4, double: 4, string: 1, aob: 1, all: 1, grouped: 1 };
 const TRI_NEXT = { yes: 'no', no: 'any', any: 'yes' };
 const TRI_ARIA = { yes: 'true', no: 'false', any: 'mixed' };
+const FLOATY = ['float', 'double', 'all'];
+const SUF = { k: 1024, m: 1 << 20, g: 1 << 30 };
+
+/** "4096", "0x1000", "64K", "16M" -> bytes; "" -> null. */
+function sizeOf(s, name) {
+  const t = s.trim();
+  if (!t) return null;
+  const m = /^(0x[0-9a-f]+|\d+)\s*([kmg])?(?:i?b)?$/i.exec(t);
+  if (!m) throw `${name}: '${t}' is not a size (4096, 0x1000, 64K, 16M)`;
+  return Number(m[1]) * (SUF[m[2]?.toLowerCase()] || 1);
+}
+/** "400000-500000" per line (or comma separated), hex -> [{start, end}] ([start, end)). */
+function rangesOf(text) {
+  const out = [];
+  for (const part of text.split(/[\n,;]+/).map((x) => x.trim()).filter(Boolean)) {
+    const m = /^(?:0x)?([0-9a-f]+)\s*-\s*(?:0x)?([0-9a-f]+)$/i.exec(part);
+    if (!m) throw `Range '${part}': write it as start-end in hex, e.g. 400000-500000`;
+    if (BigInt('0x' + m[1]) >= BigInt('0x' + m[2])) throw `Range '${part}': the end must be above the start`;
+    out.push({ start: '0x' + m[1], end: '0x' + m[2] });
+  }
+  if (out.length > 4096) throw 'At most 4096 address ranges';
+  return out;
+}
+
+/** Checklist of the process's module names; resolves to the chosen names, or null on cancel. */
+async function chooseModules(title, current) {
+  if (!state.proc) { toast('Open a process first (Ctrl P)'); return null; }
+  const mods = await attempt(() => api.modules());
+  if (!mods) return null;
+  const names = [...new Set(mods.map((m) => m.name))].sort((a, b) => a.localeCompare(b));
+  const want = new Set(current.map((n) => n.toLowerCase()));
+  return new Promise((resolve) => {
+    const { dialog, body } = listDialog(title, { wide: false });
+    const boxes = names.map((n) => h('label.check', { title: n }, h('input', { type: 'checkbox', checked: want.has(n.toLowerCase()) }), ' ' + n));
+    const filter = h('input', { type: 'text', placeholder: 'Filter', 'aria-label': 'Filter modules', spellcheck: 'false', autocomplete: 'off',
+      oninput: () => { const q = filter.value.toLowerCase(); boxes.forEach((b, i) => { b.hidden = !names[i].toLowerCase().includes(q); }); } });
+    let done = false;
+    const finish = (ok) => { done = true; resolve(ok ? names.filter((_, i) => boxes[i].firstChild.checked) : null); dialog.close(); };
+    body.append(
+      h('div.tool-bar', null, filter, h('button.btn', { type: 'button', onclick: () => boxes.forEach((b) => { b.firstChild.checked = false; }) }, 'Clear all')),
+      names.length ? h('div.mod-pick', { role: 'group', 'aria-label': 'Modules' }, ...boxes) : h('p.hint', null, 'The process lists no modules.'),
+      h('div.dlg-actions', null,
+        h('button.btn.primary', { type: 'button', onclick: () => finish(true) }, 'OK ', h('kbd', null, 'Enter')),
+        h('button.btn', { type: 'button', onclick: () => finish(false) }, 'Cancel ', h('kbd', null, 'Esc'))));
+    dialog.addEventListener('keydown', (e) => { if (e.key === 'Enter' && e.target.tagName !== 'BUTTON') { e.preventDefault(); finish(true); } });
+    dialog.addEventListener('close', () => { if (!done) resolve(null); });
+    filter.focus();
+  });
+}
+/** A "modules: any [Choose…]" field backed by chooseModules. */
+function modulePick(label, onChange) {
+  let list = [];
+  const shown = h('span.mono.mod-sum');
+  const show = () => { shown.textContent = list.length ? list.slice(0, 3).join(', ') + (list.length > 3 ? ` +${list.length - 3}` : '') : 'any'; shown.title = list.join(', '); };
+  const btn = h('button.btn.ghost', { type: 'button', 'aria-label': `${label}: choose modules`, onclick: async () => {
+    const r = await chooseModules(label, list);
+    if (r) { list = r; show(); onChange?.(); }
+    btn.focus();
+  } }, 'Choose…');
+  show();
+  return { el: h('div.field', null, h('span', null, label), h('div.mod-row', null, shown, btn)), get list() { return list; } };
+}
 
 export function initScan(results) {
   const el = (id) => document.getElementById(id);
@@ -23,6 +86,40 @@ export function initScan(results) {
   el('o-fast').closest('.align-row').after(h('div.align-row', null, h('label.check', null, ldOn, ' Last digits (hex)'), ld));
   const gHint = h('p.hint.mono', { hidden: true }, "Grouped: 4:100 2:7 f:12.5 d:2.25 s:'text' su:'wide' w:8 2:*  (1 2 4 8 f d numbers, s / su text, w:n skips n bytes, * = any; BA:n OOO BS:n)");
   v1.after(gHint);
+  // Region filters (1.0), collapsed under "More filters" in the memory options.
+  const kindBoxes = ['Image', 'Mapped', 'Private'].map((k) => h('input', { type: 'checkbox', value: k }));
+  const moreSum = h('span.muted');
+  const incMods = modulePick('Only in modules', () => countFilters()), excMods = modulePick('Skip modules', () => countFilters());
+  const rangesEl = h('textarea.mono#o-ranges', { rows: '2', spellcheck: 'false', autocomplete: 'off', placeholder: '400000-4FFFFF' });
+  const minSz = h('input.mono#o-minsz', { type: 'text', spellcheck: 'false', autocomplete: 'off', placeholder: 'any' });
+  const maxSz = h('input.mono#o-maxsz', { type: 'text', spellcheck: 'false', autocomplete: 'off', placeholder: 'any' });
+  const more = h('details.scan-more', null, h('summary', null, 'More filters ', moreSum),
+    h('div.field', { role: 'group', 'aria-label': 'Region kinds' }, h('span', null, 'Region kinds (none = all)'),
+      h('div.checks', null, ...kindBoxes.map((b) => h('label.check', null, b, ' ' + b.value)))),
+    incMods.el, excMods.el,
+    h('div.field', null, h('label', { for: 'o-ranges' }, 'Only these ranges (hex start-end, one per line)'), rangesEl),
+    h('div.range', null,
+      h('div.field', null, h('label', { for: 'o-minsz' }, 'Min region size'), minSz),
+      h('div.field', null, h('label', { for: 'o-maxsz' }, 'Max region size'), maxSz)),
+    h('p.hint', null, 'Sizes in bytes: 4096, 0x1000, 64K, 16M. Every filter must hold.'));
+  el('o-pause').closest('fieldset').append(more);
+  function countFilters() {
+    const n = [kindBoxes.some((b) => b.checked), incMods.list.length, excMods.list.length, rangesEl.value.trim(), minSz.value.trim(), maxSz.value.trim()].filter(Boolean).length;
+    moreSum.textContent = n ? `(${n} on)` : '';
+  }
+  more.addEventListener('input', countFilters);
+  // Float noise filter: lives with the float options.
+  const simple = h('input', { type: 'checkbox' });
+  el('o-round').after(h('label.check', { title: 'Matches must be zero or have a magnitude from 0.00001 to 10^15 (no exponent). Also applies to next scans.' }, simple, ' Simple values only'));
+  // Pointer-value scan: "Pointer" in the Value type select, with its own target filters.
+  vt.querySelector('option[value="8bytes"]').after(h('option', { value: 'pointer' }, 'Pointer'));
+  const ptrMods = modulePick('Points into modules');
+  const ptrRanges = h('textarea.mono#o-ptr-ranges', { rows: '2', spellcheck: 'false', autocomplete: 'off', placeholder: 'any' });
+  const ptrBox = h('div.ptr-into', { hidden: true },
+    h('p.hint', null, 'Finds pointer-sized values (8 bytes, 4 on 32-bit targets) that point into readable memory, or only into the modules and ranges below. Next scans then treat them as 8-byte (4-byte) values in hex: changed, unchanged, exact address.'),
+    ptrMods.el,
+    h('div.field', null, h('label', { for: 'o-ptr-ranges' }, 'Points into ranges (hex start-end, one per line)'), ptrRanges));
+  vt.closest('.field').after(ptrBox);
   let hasScan = false, running = false, paused = false, canUndo = false, count = 0, prevCount = 0, scanMeta = {};
   let customs = [], lastVt = vt.value; // listCustomTypes() rows; option value "ct:<index>"
 
@@ -46,7 +143,7 @@ export function initScan(results) {
     cmpTo.replaceChildren(h('option', { value: '' }, 'Previous scan'), h('option', { value: 'first' }, 'First scan'), ...list.map((s) => h('option', { value: s.name }, 'Saved: ' + s.name)));
     cmpTo.value = cur === '' || cur === 'first' || list.some((s) => s.name === cur) ? cur : '';
     savedList.replaceChildren(...(list.length ? list.map((s) => h('li', null,
-      h('span.name', null, s.name), h('span.muted.mono', { title: s.kept < s.count ? `the Saved column can show ${nf.format(s.kept)} of them` : '' }, nf.format(s.count)),
+      h('span.name', null, s.name), h('span.muted.mono', null, nf.format(s.count)),
       h('button.btn.ghost.icon', { type: 'button', 'aria-label': `Delete saved scan ${s.name}`, title: 'Delete', html: icon('trash'),
         onclick: async () => { if (await attempt(() => api.scanDeleteSaved(s.name)) !== undefined) refreshSaved(); } })))
       : [h('li.muted', null, 'None yet. Save the current results to compare later scans against them.')]));
@@ -78,9 +175,12 @@ export function initScan(results) {
     sync();
   }
   function sync() {
-    const t = st.value, ty = vt.value;
-    el('v1-wrap').hidden = NO_VALUE.has(t);
-    el('v2-wrap').hidden = t !== 'between';
+    const t = st.value, ty = vt.value, ptrFirst = ty === 'pointer' && !hasScan;
+    el('v1-wrap').hidden = NO_VALUE.has(t) || ptrFirst;
+    el('v2-wrap').hidden = t !== 'between' || ptrFirst;
+    st.closest('.field').hidden = ptrFirst;
+    el('o-not').closest('.checks').hidden = ptrFirst;
+    ptrBox.hidden = !ptrFirst;
     el('v1-label').textContent = t === 'between' ? 'From' : t.endsWith('_by') ? 'By' : 'Value';
     vt.disabled = hasScan || running;
     el('opt-float').hidden = !['float', 'double', 'all'].includes(ty);
@@ -93,7 +193,7 @@ export function initScan(results) {
     bPause.title = paused ? 'Resume the scan' : 'Pause the scan';
     bPause.setAttribute('aria-label', bPause.title);
     gHint.hidden = ty !== 'grouped';
-    el('opt-percent').hidden = !['between', 'increased_by', 'decreased_by'].includes(t) || hasScan;
+    el('opt-percent').hidden = !['between', 'increased_by', 'decreased_by'].includes(t) || hasScan || ptrFirst;
     v1.placeholder = { string: 'text', aob: '8B 45 ?? 89', binary: '01001011' }[ty] || (el('o-hex').checked ? 'hex' : 'decimal');
     bFirst.innerHTML = hasScan ? 'New scan <kbd>Ctrl N</kbd>' : 'First scan <kbd>Enter</kbd>';
     bFirst.classList.toggle('primary', !hasScan);
@@ -119,7 +219,15 @@ export function initScan(results) {
       alignment: fast ? Math.max(1, +el('o-align').value || 1) : 1,
       hex: el('o-hex').checked, case_sensitive: el('o-case').checked, utf16: el('o-utf16').checked,
       rounding: el('o-round').value, percent: el('o-percent').checked, pause_while_scanning: el('o-pause').checked, threads: state.settings.scan_threads || null,
-      priority: state.settings.scan_priority || 'normal', ...typeOpts(),
+      priority: state.settings.scan_priority || 'normal', ...typeOpts(), ...regionOpts(),
+    };
+  }
+  function regionOpts() {
+    const min = sizeOf(minSz.value, 'Min region size'), max = sizeOf(maxSz.value, 'Max region size');
+    if (min != null && max != null && min > max) throw 'Min region size is above max region size';
+    return {
+      kinds: kindBoxes.filter((b) => b.checked).map((b) => b.value), modules: incMods.list, exclude_modules: excMods.list,
+      ranges: rangesOf(rangesEl.value), min_region_size: min, max_region_size: max, simple_values: simple.checked && FLOATY.includes(vt.value),
     };
   }
   // Options that depend on the value type.
@@ -137,8 +245,8 @@ export function initScan(results) {
   async function run(kind) {
     if (running) return;
     if (!state.proc) { toast('Open a process first (Ctrl P)'); return; }
-    const t = st.value;
-    if (!NO_VALUE.has(t) && !v1.value.trim()) { toast('Enter a value to scan for'); v1.focus(); return; }
+    const t = st.value, isPtr = kind === 'first' && vt.value === 'pointer';
+    if (!isPtr && !NO_VALUE.has(t) && !v1.value.trim()) { toast('Enter a value to scan for'); v1.focus(); return; }
     const req = { scan_type: t, value: v1.value, value2: t === 'between' ? v2.value : null, not: el('o-not').checked };
     if (kind === 'next' && cmpTo.value) req.compare_to = cmpTo.value;
     running = true; paused = false; sync(); results.setBusy(true);
@@ -156,7 +264,15 @@ export function initScan(results) {
     }, 100);
     try {
       let r;
-      if (kind === 'first') {
+      if (isPtr) {
+        const o = { ...opts(), hex: true }, ty = state.proc.is_64bit === false ? '4bytes' : '8bytes';
+        const want = { opts: o, modules: ptrMods.list, ranges: rangesOf(ptrRanges.value) };
+        r = await busy('Scanning for pointers', () => api.scanPointer(want), { cancel });
+        scanMeta = { vtype: ty, hex: true, utf16: false, custom: null, custom_name: null, len: 0, pointer: true };
+        vt.value = lastVt = ty; // next scans compare pointer-sized integers, in hex
+        el('o-hex').checked = true;
+        canUndo = false;
+      } else if (kind === 'first') {
         const o = opts(), c = customOf();
         const ty = c ? '4bytes' : vt.value; // a custom type rides on a numeric placeholder; opts.custom decides
         r = await busy('Scanning', () => api.scanFirst({ vtype: ty, ...req, opts: o }), { cancel });
@@ -186,6 +302,7 @@ export function initScan(results) {
     if (running) return;
     try { await api.scanNew(); } catch (e) { toast(e); }
     hasScan = false; canUndo = false; count = 0;
+    if (scanMeta.pointer) { vt.value = lastVt = 'pointer'; scanMeta = {}; }
     results.set({ count: 0 });
     fillTypes();
     refreshSaved();
@@ -201,6 +318,8 @@ export function initScan(results) {
       refreshSaved();
     } catch (e) { toast(e); }
   }
+  // Results removed from the list (results.js): one more undo step.
+  on('scan:removed', ({ count: n }) => { prevCount = count; count = n; canUndo = true; sync(); });
   const cancel = () => running && api.scanCancel().catch(toast);
   const togglePause = () => running && (paused ? api.scanResume() : api.scanPause()).then(() => { paused = !paused; sync(); }, toast);
 
@@ -220,7 +339,7 @@ export function initScan(results) {
     }
     lastVt = vt.value;
     const c = customOf();
-    el('o-align').value = c ? Math.min(4, c.ct.size) : ALIGN[vt.value] || 1;
+    el('o-align').value = c ? Math.min(4, c.ct.size) : vt.value === 'pointer' ? (state.proc?.is_64bit === false ? 4 : 8) : ALIGN[vt.value] || 1;
     sync();
   });
   let tver = null; // the table's custom types change with the table
@@ -239,6 +358,6 @@ export function initScan(results) {
     run: () => run(hasScan ? 'next' : 'first'), newScan, undo, cancel, togglePause,
     get running() { return running; },
     get hasScan() { return hasScan; },
-    focusValue: () => (el('v1-wrap').hidden ? st : v1).focus(),
+    focusValue: () => (!el('v1-wrap').hidden ? v1 : st.closest('.field').hidden ? vt : st).focus(),
   };
 }

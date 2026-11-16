@@ -576,12 +576,21 @@ fn stubs_raise_clear_errors() {
     }
     let err = e.exec("createListView()", "s").unwrap_err().to_string();
     assert!(err.contains("not implemented yet: createListView"), "{err}");
+    // hh-asm has no assembler hook: registerAssembler stays a stub.
+    let err = e.exec("registerAssembler(function() end)", "s").unwrap_err().to_string();
+    assert!(err.contains("not implemented yet: registerAssembler"), "{err}");
     for (f, why) in [("dbk_initialize", "kernel driver"), ("dbvm_initialize", "hypervisor"), ("injectDll", "injection"), ("mono_initialize", "mono"), ("createD3DHook", "injection")] {
         let err = e.exec(&format!("{f}()"), "s").unwrap_err().to_string();
         assert!(err.contains(&format!("not supported in HeapHook: {f}")) && err.contains(why), "{err}");
     }
     // Implemented now: no longer stubs.
-    for f in ["createForm", "createButton", "debug_setBreakpoint", "createStructure", "loadTable", "getCurrentMemscan", "createProcess", "getMainForm"] {
+    for f in [
+        "createForm", "createButton", "debug_setBreakpoint", "createStructure", "loadTable", "getCurrentMemscan", "createProcess", "getMainForm",
+        "registerAutoAssemblerCommand", "unregisterAutoAssemblerCommand", "registerAutoAssemblerPrologue", "unregisterAutoAssemblerPrologue",
+        "registerSymbolLookupCallback", "unregisterSymbolLookupCallback", "registerAddressLookupCallback", "unregisterAddressLookupCallback",
+        "registerStructureDissectOverride", "unregisterStructureDissectOverride", "registerStructureNameLookup", "unregisterStructureNameLookup",
+        "getRTTIClassName", "hhCreatePointerScan", "hhAssemblyScan", "hhFindReference", "hhSymbolList",
+    ] {
         assert!(!STUBS.iter().any(|(_, n)| n.contains(&f)), "{f} still listed");
         assert_eq!(run(&e, &format!("return type({f})")), ["function"]);
     }

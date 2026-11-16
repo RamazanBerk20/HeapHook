@@ -2,7 +2,7 @@
 // of paths; only the visible window is fetched, again on every tick for live values), rescan,
 // save / open results, save pointer map, compare against saved maps.
 import { api, askPath } from './backend.js';
-import { $, h, fmtAddr, nf, attempt, toast, rafThrottle, store, icon, busy } from './util.js';
+import { $, h, fmtAddr, nf, attempt, toast, rafThrottle, store, icon, busy, helpAdd } from './util.js';
 import { state, emit, on, addTicker } from './core.js';
 import { VTYPES } from './table.js';
 
@@ -174,6 +174,7 @@ export function initPtrscan({ showView }) {
     else if (k.toLowerCase() === 'n') scanDialog();
     else if (k.toLowerCase() === 'r' && info) rescanDialog();
     else if (k === 'Escape' && running) cancel();
+    else if (k.toLowerCase() === 'p' && running) togglePause();
     else return;
     e.preventDefault(); e.stopPropagation();
   });
@@ -185,7 +186,7 @@ export function initPtrscan({ showView }) {
   // ---------- running operations ----------
   async function op(f, quiet = false) {
     if (running) { toast('A pointer scan is already running'); return false; }
-    running = true;
+    running = true; paused = false; showPaused();
     $('#ptr-progress').hidden = false;
     render();
     const poll = setInterval(progress, 200);
@@ -207,10 +208,26 @@ export function initPtrscan({ showView }) {
     const pct = p.total ? Math.min(100, (p.done / p.total) * 100) : 0;
     $('#ptr-bar').style.transform = `scaleX(${pct / 100})`;
     $('#ptr-bar-wrap').setAttribute('aria-valuenow', Math.round(pct));
-    $('#ptr-phase').textContent = `${PHASE[p.phase] || 'Working'} · ${nf.format(p.found)} found`;
+    if (!!p.paused !== paused) { paused = !!p.paused; showPaused(); }
+    $('#ptr-phase').textContent = `${paused ? 'Paused · ' : ''}${PHASE[p.phase] || 'Working'} · ${nf.format(p.found)} found`;
   }
   const cancel = () => attempt(() => api.ptrCancel());
   $('#ptr-cancel').addEventListener('click', cancel);
+  // ---------- pause / resume (1.0); a time limit does not count paused time ----------
+  let paused = false;
+  const bPause = h('button.btn.icon#ptr-pause', { type: 'button', onclick: () => togglePause() });
+  $('#ptr-cancel').before(bPause);
+  function showPaused() {
+    bPause.innerHTML = icon(paused ? 'play' : 'pause');
+    bPause.title = paused ? 'Resume the pointer scan (P)' : 'Pause the pointer scan (P)';
+    bPause.setAttribute('aria-label', bPause.title);
+  }
+  async function togglePause() {
+    if (!running) return;
+    if (await attempt(async () => { await (paused ? api.ptrResume() : api.ptrPause()); return true; })) { paused = !paused; showPaused(); }
+  }
+  showPaused();
+  helpAdd('Pointer scanner', [['P', 'Pause / resume a running scan']]);
 
   // ---------- scan dialog ----------
   const dScan = $('#dlg-ptrscan'), fScan = dScan.querySelector('form'), cmp = $('#ps-cmp');
@@ -224,6 +241,15 @@ export function initPtrscan({ showView }) {
     return row;
   }
   $('#ps-cmp-add').addEventListener('click', () => cmpRow().firstChild.focus());
+  // 1.0 options, added next to the ones in the markup.
+  const fld = (id, name, label, attrs) => h('div.field', null, h('label', { for: id }, label), h('input.mono', { id, name, spellcheck: 'false', autocomplete: 'off', ...attrs }));
+  $('#ps-ends').closest('.field').after(h('div.grid3', null,
+    fld('ps-starts', 'starts_with', 'Path starts with offsets', { placeholder: 'e.g. 10, 8' }),
+    fld('ps-allowed', 'allowed_offsets', 'Every offset is one of', { placeholder: 'any, e.g. 0, 8, 10' }),
+    fld('ps-time', 'time_limit_secs', 'Time limit, seconds (0 = none)', { type: 'number', min: '0', value: '0', class: 'mono num' })));
+  fScan.elements.writable_only.closest('.check').after(h('label.check', { title: 'Do not search further back from a node that is already a static base: shorter paths through it only' },
+    h('input', { name: 'stop_at_static', type: 'checkbox' }), ' Stop at static bases'));
+  $('#ps-stack').closest('.grid3').after(h('p.hint', null, 'Local targets: THREADSTACK0 is the main thread\'s stack, THREADSTACK1 and up the other threads\'.'));
   $('#ps-mapbrowse').addEventListener('click', async () => { const p = await askPath({ save: false, title: 'Scan a saved pointer map', filters: MAP_FILTER }); if (p) fScan.elements.map_path.value = p; });
   function scanDialog(d = {}) {
     if (!state.proc) { toast('Open a process first'); return; }
@@ -249,6 +275,8 @@ export function initPtrscan({ showView }) {
             thread_stacks: el.thread_stacks.checked, stack_max: hexNum(el.stack_max.value, 'Stack size'), no_loops: el.no_loops.checked,
             max_children: +el.max_children.value || 0, last_offsets: hexList(el.last_offsets.value), ends_with: hexList(el.ends_with.value),
             heap_only: el.heap_only.checked, max_results: +el.max_results.value || 0, threads: +el.threads.value || 0,
+            starts_with: hexList(el.starts_with.value), allowed_offsets: hexList(el.allowed_offsets.value), stop_at_static: el.stop_at_static.checked,
+            time_limit_secs: Math.max(0, Math.round(+el.time_limit_secs.value || 0)),
           },
           base_start: addrOrNull(el.base_start.value), base_end: addrOrNull(el.base_end.value),
           alignment: +el.alignment.value || 0, writable_only: el.writable_only.checked,
@@ -303,7 +331,10 @@ export function initPtrscan({ showView }) {
     if (!state.proc) { toast('Open a process first'); return; }
     const p = await askPath({ save: false, title: 'Open pointer scan results', filters: RES_FILTER });
     const r = p && await attempt(() => api.ptrOpenResults(p));
-    if (r) { setInfo(r); vp.focus(); }
+    if (r) {
+      setInfo(r); vp.focus();
+      if (r.compact === false) toast('This result file is in the format from before HeapHook 1.0: it still opens and works as usual', 'info');
+    }
   });
   $('#ptr-map').addEventListener('click', async () => {
     if (!state.proc) { toast('Open a process first'); return; }

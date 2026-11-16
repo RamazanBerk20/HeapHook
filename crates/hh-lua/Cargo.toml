@@ -9,6 +9,7 @@ hh-core.workspace = true
 hh-scan.workspace = true
 hh-asm.workspace = true
 hh-tools.workspace = true
+hh-ptr.workspace = true
 serde.workspace = true
 mlua = { version = "0.12", features = ["lua53", "vendored", "send"] }
 

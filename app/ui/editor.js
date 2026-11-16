@@ -1,7 +1,7 @@
 // Script editor over a plain <textarea>: highlighted mirror, find / replace, own undo history,
 // auto-indent, completion, error line. Plus the standalone Auto Assemble window.
 // The textarea stays the real input; the mirror behind it only paints (aria-hidden, no events).
-import { h, icon, modal, codeView, helpAdd, excerpt } from './util.js';
+import { h, icon, modal, codeView, helpAdd, excerpt, fmtAddr } from './util.js';
 import { api, askPath } from './backend.js';
 import { state } from './core.js';
 
@@ -720,6 +720,7 @@ function buildAaWindow() {
   const gut = h('pre.aa-gutter.mono', { 'aria-hidden': 'true' });
   const status = h('button.aa-status', { type: 'button', id: id + '-status', 'aria-live': 'polite' });
   const src = h('span.hint.ed-src');
+  const scansEl = h('div.ed-scans', { role: 'status', 'aria-label': 'AOB scan matches', hidden: true });
   const btn = (label, kbd, onclick, cls = '') => h('button.btn' + cls, { type: 'button', onclick }, label, ' ', h('kbd', null, kbd));
   const bExec = btn('Execute', 'Ctrl Enter', () => run(true), '.primary');
   const bUndo = btn('Run [DISABLE]', 'Ctrl Shift Enter', () => run(false));
@@ -731,7 +732,7 @@ function buildAaWindow() {
         h('div.ed-aawin-title', null, h('h2', { id: id + '-title' }, 'Auto Assemble'), src),
         bOpen),
       h('div.aa-editor', null, gut, ta),
-      status,
+      status, scansEl,
       h('div.dlg-actions', null, bExec, bUndo, bCheck,
         h('button.btn', { value: 'cancel', formnovalidate: true }, 'Close ', h('kbd', null, 'Esc')))));
   document.body.append(dlg);
@@ -758,12 +759,16 @@ function buildAaWindow() {
   }
   async function askLua(script) {
     const info = await api.appInfo().catch(() => null);
+    const lua = /\{\$lua\}/i.test(script), bin = /loadbinary/i.test(script);
     const r = await modal({
-      title: 'Run this script\'s Lua?',
-      text: 'This Auto Assembler script came from a file and has {$lua} blocks. Lua runs with your user account\'s rights. '
-        + (info?.lua_allow_os === false
-          ? 'Settings turn off Lua\'s access to files and programs: it can still read and change the attached process and run Auto Assembler in it.'
-          : 'It can read, change and delete your files, start programs, use the network, and read and change the attached process.')
+      title: lua ? 'Run this script\'s Lua?' : 'Let this script read a file?',
+      text: (lua
+        ? 'This Auto Assembler script came from a file and has {$lua} blocks. Lua runs with your user account\'s rights. '
+          + (info?.lua_allow_os === false
+            ? 'Settings turn off Lua\'s access to files and programs: it can still read and change the attached process and run Auto Assembler in it.'
+            : 'It can read, change and delete your files, start programs, use the network, and read and change the attached process.')
+        : '')
+        + (bin ? (lua ? ' ' : 'This Auto Assembler script came from a file. ') + 'Its loadbinary reads a file from this computer (up to 64 MiB, any file your account can read) and writes it into the attached process.' : '')
         + ' Run it only if you trust where the file came from.',
       quote: path, quoteLabel: 'File',
       body: h('div', null, h('p.hint', null, 'Start of the script:'), codeView(script, 12)),
@@ -779,18 +784,35 @@ function buildAaWindow() {
     const script = ta.value;
     const go = () => api.aaExecute(script, enable, enable ? null : execState);
     let r;
+    showScans(null);
     try { r = await go(); } catch (e) {
       const msg = errText(e);
-      if (!msg.startsWith(NEEDS) || msg.includes('Settings say never')) return fail(msg);
-      if (!(await askLua(script))) { ta.focus(); return show('Not run: its Lua needs your consent', 'err'); }
-      try { await api.aaTrust(script); r = await go(); } catch (e2) { ta.focus(); return fail(errText(e2)); }
+      if (!msg.startsWith(NEEDS) || msg.includes('Settings say never')) return failRun(msg);
+      if (!(await askLua(script))) { ta.focus(); return show(/\{\$lua\}/i.test(script) ? 'Not run: its Lua needs your consent' : 'Not run: its loadbinary needs your consent', 'err'); }
+      try { await api.aaTrust(script); r = await go(); } catch (e2) { ta.focus(); return failRun(errText(e2)); }
       ta.focus();
     }
     execState = enable ? r : null;
     executed = enable;
     errLine = 0; ed.markError(0);
-    show(enable ? 'Executed [ENABLE]. Run [DISABLE] undoes it.' : 'Ran [DISABLE].', 'ok');
+    const multi = (r?.scans || []).filter((x) => x.matches > 1);
+    show(enable ? (multi.length ? `Executed [ENABLE], but ${multi.length} AOB pattern${multi.length > 1 ? 's match' : ' matches'} more than once: the first match was used. Run [DISABLE] undoes it.` : 'Executed [ENABLE]. Run [DISABLE] undoes it.') : 'Ran [DISABLE].', multi.length ? 'warn' : 'ok');
+    if (enable) showScans(r?.scans);
     syncBtns();
+  }
+  /** Errors the user fixes in Settings rather than in the script get a pointer there. */
+  function failRun(msg) {
+    fail(/do not allow Lua and scripts to access files/.test(msg) ? msg + '. To allow it, tick "Allow Lua scripts to access files and run programs" in Settings (Ctrl ,).' : msg);
+  }
+  /** Each aobscan's match count after Execute; more than one is flagged (the script used the first). */
+  function showScans(scans) {
+    scansEl.hidden = !scans?.length;
+    if (!scans?.length) { scansEl.replaceChildren(); return; }
+    const counted = scans.some((x) => x.matches != null);
+    scansEl.replaceChildren(
+      h('span.muted', null, counted ? 'AOB scans: ' : 'AOB scans (match counts are off in Settings, aobscan that matches more than once): '),
+      ...scans.map((x) => h('span' + (x.matches > 1 ? '.ed-scan.multi' : '.ed-scan'), { title: x.matches > 1 ? 'Matches more than once: the script used the first match, which may be the wrong place' : '' },
+        excerpt(x.name, 40), ' ', h('span.mono', null, fmtAddr(x.addr)), x.matches == null ? '' : ` · ${x.matches >= 1000 ? '1,000 or more' : x.matches} match${x.matches === 1 ? '' : 'es'}`)));
   }
   async function openFile() {
     const p = await askPath({ save: false, title: 'Open Auto Assembler script', filters: [['Auto Assembler script', ['cea', 'aa', 'txt']], ['All files', ['*']]] });

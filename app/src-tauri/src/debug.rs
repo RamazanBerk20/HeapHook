@@ -10,7 +10,10 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
 use hh_core::{Addr, Process};
-use hh_debug::{Action, AddressOf, BpId, BpKind, BpMethod, BpOptions, BreakReason, Breakpoint, Context, Debugger, Event, Hooks, SignalAction, State, ThreadInfo, Tid};
+use hh_debug::{
+    Action, AddressOf, BpExtra, BpId, BpKind, BpMethod, BpOptions, BreakOn, BreakReason, Breakpoint, Context, DataHit, Debugger, Event, Hooks, SignalAction,
+    State, ThreadInfo, Tid, TraceOptions, Trigger,
+};
 use iced_x86::{Decoder, DecoderOptions, OpKind, Register};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -34,6 +37,8 @@ pub struct Dbg {
     log_seq: u64,
     /// A break the Lua engine handles before the UI sees it: (tid, breakpoint, registers).
     lua_break: Option<(Tid, BpId, Box<Context>)>,
+    /// Why the next `Pause` break happens (a debug event that breaks, the launch stop).
+    stop_why: Option<String>,
 }
 
 /// What the app adds to an hh-debug breakpoint.
@@ -50,6 +55,10 @@ struct AppBp {
     note: Option<String>,
     /// Trace: break at the first traced step where this holds.
     stop: Option<String>,
+    /// Data breakpoints: only hits where this holds over `old` / `new` / `address`.
+    value_cond: Option<String>,
+    /// Tracepoint message template (`{rax}`, `{old}`...); `None` = the debugger's line.
+    message: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -91,6 +100,68 @@ pub struct BpReq {
     pub max_hits: Option<u64>,
     /// Trace only: break at the first traced instruction where this holds (condition syntax).
     pub stop_when: String,
+    /// Pending breakpoint: an address expression (`libc.so.6+1234`, a symbol) armed when it
+    /// resolves and again whenever modules change; `addr` is ignored then.
+    pub pending: String,
+    /// Only hits by this thread count.
+    pub thread: Option<Tid>,
+    /// Only hits whose instruction is outside this module.
+    pub outside_module: String,
+    /// Tracepoint: log a line per hit instead of breaking (`message`, see [`format_message`]).
+    pub log: bool,
+    pub message: String,
+    /// Write / access breakpoints: only hits where this holds, over `old`, `new` (the value
+    /// before / after, little endian) and `address` besides the registers.
+    pub value_condition: String,
+    /// Trace options.
+    pub trace: TraceReq,
+}
+
+/// Break-and-trace options as the UI sends them.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct TraceReq {
+    /// Module name patterns (`*`, `?`) not traced into (calls into them run at full speed).
+    pub skip_modules: Vec<String>,
+    /// Only trace inside `[stay_start, stay_end)` (hex; both empty = anywhere).
+    pub stay_start: String,
+    pub stay_end: String,
+    /// End once the function the trace started in returns.
+    pub until_return: bool,
+    /// End after this many milliseconds (0 = no limit).
+    pub max_ms: u64,
+    /// Record what each step reads and writes.
+    pub capture_memory: bool,
+}
+
+impl TraceReq {
+    fn options(&self) -> R<TraceOptions> {
+        let stay = match (self.stay_start.trim(), self.stay_end.trim()) {
+            ("", "") => None,
+            (a, b) => {
+                let (a, b) = (parse_addr(a)?, parse_addr(b)?);
+                if a >= b {
+                    return Err("the trace range is empty".into());
+                }
+                Some((a, b))
+            }
+        };
+        let skip = self.skip_modules.iter().map(|m| m.trim().to_string()).filter(|m| !m.is_empty()).take(64).collect();
+        Ok(TraceOptions { skip_modules: skip, stay_in: stay, until_return: self.until_return, max_ms: self.max_ms, capture_memory: self.capture_memory })
+    }
+}
+
+/// `debug_launch`: start a program under the debugger.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct LaunchReq {
+    pub program: String,
+    /// Shell-like: split on whitespace, `"..."` groups.
+    pub args: String,
+    pub cwd: String,
+    /// `entry` (default: libraries loaded, program code not run), `first` (before the first
+    /// instruction) or `run`.
+    pub stop: String,
 }
 
 /// `debug_watch_range`: a page-protection watch of any length.
@@ -141,6 +212,16 @@ pub struct BpOut {
     pub owner: &'static str,
     /// Why it is disabled, when the debugger disabled it.
     pub note: Option<String>,
+    /// Pending breakpoint: its expression, and whether it resolved (then `addr` is where).
+    pub pending: Option<String>,
+    pub resolved: bool,
+    pub thread: Option<Tid>,
+    pub outside_module: Option<String>,
+    /// Tracepoint: logs instead of breaking.
+    pub log: bool,
+    pub message: Option<String>,
+    pub value_condition: Option<String>,
+    pub trace: TraceReq,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -162,6 +243,20 @@ pub struct TraceOut {
     pub addr: String,
     pub text: String,
     pub context: Value,
+    /// Memory the step read and wrote (traces with `capture_memory`).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub accesses: Vec<AccessOut>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AccessOut {
+    pub addr: String,
+    pub size: u32,
+    pub read: bool,
+    pub write: bool,
+    /// Hex bytes before / after the step (`after` only for writes).
+    pub before: String,
+    pub after: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -306,6 +401,9 @@ pub fn ctx_json(c: &Context, fpu: bool) -> Value {
                 "st": f.st.iter().map(|b| json!({"hex": hex_bytes(&b.iter().rev().copied().collect::<Vec<_>>(), ""), "value": f80(b).to_string()})).collect::<Vec<_>>(),
                 // Little-endian byte order; the UI renders hex and lanes.
                 "xmm": f.xmm.iter().map(|b| hex_bytes(b, "").to_lowercase()).collect::<Vec<_>>(),
+                // Upper halves of YMM0..15 (same byte order), when the CPU has AVX.
+                "has_ymm": f.has_ymm,
+                "ymm_hi": if f.has_ymm { f.ymm_hi.iter().map(|b| hex_bytes(b, "").to_lowercase()).collect::<Vec<_>>() } else { Vec::new() },
             }),
         );
     }
@@ -376,6 +474,67 @@ fn reason_text(r: &BreakReason) -> String {
     }
 }
 
+fn trigger_text(t: &Trigger) -> String {
+    match t {
+        Trigger::ThreadCreated { tid } => format!("thread {tid} created"),
+        Trigger::ThreadExited { tid } => format!("thread {tid} exited"),
+        Trigger::ModuleLoaded(m) => format!("module loaded: {}", m.name),
+        Trigger::ModuleUnloaded(m) => format!("module unloaded: {}", m.name),
+        Trigger::Start => "started: stopped before the first instruction".into(),
+        Trigger::Entry => "started: stopped at the entry point".into(),
+    }
+}
+
+/// Names a value condition may use besides the registers.
+const VALUE_NAMES: [&str; 3] = ["old", "new", "address"];
+
+fn value_condition_hook(cond: &Option<String>) -> R<Option<hh_debug::ValuePredicate>> {
+    Ok(match cond {
+        Some(c) => {
+            let c = Arc::new(Cond::parse_with(c, &VALUE_NAMES)?);
+            Some(Arc::new(move |x: &Context, h: &DataHit| c.eval_with(x, &|n| hit_var(h, n)).is_some_and(|v| v != 0)) as hh_debug::ValuePredicate)
+        }
+        None => None,
+    })
+}
+
+fn hit_var(h: &DataHit, n: &str) -> Option<u64> {
+    match n {
+        "old" => h.old,
+        "new" => h.new,
+        "address" => Some(h.address),
+        _ => None,
+    }
+}
+
+/// Longest tracepoint template.
+const MAX_MESSAGE: usize = 1024;
+
+/// A tracepoint line: `{reg}` (any register name the conditions know), `{old}`, `{new}` and
+/// `{address}` become hex; anything else stays as written.
+pub fn format_message(t: &str, c: &Context, h: Option<&DataHit>) -> String {
+    let mut out = String::new();
+    let mut rest = t;
+    while let Some(i) = rest.find('{') {
+        out.push_str(&rest[..i]);
+        let after = &rest[i + 1..];
+        let Some(j) = after.find('}') else {
+            out.push_str(&rest[i..]);
+            return out;
+        };
+        let name = after[..j].trim().to_ascii_lowercase();
+        let v = reg_of(c, &name).or_else(|| h.and_then(|h| hit_var(h, &name)));
+        match v {
+            Some(v) => out.push_str(&format!("{v:#x}")),
+            None if VALUE_NAMES.contains(&name.as_str()) => out.push('?'),
+            None => out.push_str(&rest[i..i + j + 2]),
+        }
+        rest = &after[j + 1..];
+    }
+    out.push_str(rest);
+    out
+}
+
 fn condition_hook(cond: &Option<String>) -> R<Option<hh_debug::Predicate>> {
     Ok(match cond {
         Some(c) => {
@@ -407,7 +566,7 @@ fn merge_ctx(c: &mut Context, r: &hh_lua::RegContext) {
 
 impl Dbg {
     fn new(d: Debugger) -> Dbg {
-        Dbg { d, last: None, exit_code: None, bps: Vec::new(), insns: HashMap::new(), log: VecDeque::new(), log_seq: 0, lua_break: None }
+        Dbg { d, last: None, exit_code: None, bps: Vec::new(), insns: HashMap::new(), log: VecDeque::new(), log_seq: 0, lua_break: None, stop_why: None }
     }
 
     fn note(&mut self, text: String) {
@@ -427,7 +586,14 @@ impl Dbg {
     }
 
     fn hooks(&self, b: &AppBp, proc: &dyn Process) -> R<Hooks> {
-        Ok(Hooks { address_of: if b.ea { Some(ea_hook(proc, b.addr)?) } else { None }, condition: condition_hook(&b.cond)?, stop_when: condition_hook(&b.stop)?, ..Hooks::default() })
+        let message = b.message.clone().map(|t| Arc::new(move |c: &Context, h: Option<&DataHit>| format_message(&t, c, h)) as hh_debug::Formatter);
+        Ok(Hooks {
+            address_of: if b.ea { Some(ea_hook(proc, b.addr)?) } else { None },
+            condition: condition_hook(&b.cond)?,
+            stop_when: condition_hook(&b.stop)?,
+            value_condition: value_condition_hook(&b.value_cond)?,
+            message,
+        })
     }
 
     /// Drains debugger events into the session state and the log. `lua_onbp`: the script
@@ -453,7 +619,26 @@ impl Dbg {
                     {
                         self.lua_break = Some((tid, id, context));
                     }
-                    self.last = Some((tid, reason_text(&reason)));
+                    let why = match reason {
+                        BreakReason::Pause => self.stop_why.take(),
+                        _ => None,
+                    };
+                    self.last = Some((tid, why.unwrap_or_else(|| reason_text(&reason))));
+                }
+                Event::Stopped { tid, why } => {
+                    let t = trigger_text(&why);
+                    self.note(format!("stopped (thread {tid}): {t}"));
+                    self.stop_why = Some(t);
+                }
+                Event::Log { bp, tid, text, dropped } => {
+                    let more = if dropped > 0 { format!(" ({dropped} lines left out)") } else { String::new() };
+                    self.note(format!("tracepoint {bp} (thread {tid}): {text}{more}"));
+                }
+                Event::BreakpointResolved { bp, address } => {
+                    self.note(format!("breakpoint {bp} resolved at {address:#x}"));
+                    if let Ok(b) = self.bp_mut(bp) {
+                        b.addr = address;
+                    }
                 }
                 Event::ProcessExited { code } => {
                     self.exit_code = Some(code);
@@ -612,7 +797,14 @@ impl App {
     }
 
     fn add_bp(&self, req: &BpReq, script: bool) -> R<u32> {
-        let address = parse_addr(&req.addr)?;
+        let pending = Some(req.pending.trim().to_string()).filter(|p| !p.is_empty());
+        if pending.as_ref().is_some_and(|p| p.len() > 4096) {
+            return Err("the breakpoint expression is too long".into());
+        }
+        if pending.is_some() && req.ea {
+            return Err("a pending breakpoint cannot record accessed addresses (its instruction is not known yet)".into());
+        }
+        let address = if pending.is_some() { 0 } else { parse_addr(&req.addr)? };
         let kind = match req.kind.as_str() {
             "" | "execute" => BpKind::Execute,
             "write" => BpKind::Write,
@@ -639,14 +831,114 @@ impl App {
         }
         let cond = Some(req.condition.trim().to_string()).filter(|c| !c.is_empty());
         let stop = Some(req.stop_when.trim().to_string()).filter(|c| !c.is_empty() && matches!(action, Action::Trace { .. }));
+        let value_cond = Some(req.value_condition.trim().to_string()).filter(|c| !c.is_empty());
+        if value_cond.is_some() && kind == BpKind::Execute {
+            return Err("value conditions apply to write and access breakpoints".into());
+        }
+        let message = Some(req.message.trim().chars().take(MAX_MESSAGE).collect::<String>()).filter(|m| req.log && !m.is_empty());
+        let extra = BpExtra {
+            thread: req.thread,
+            outside_module: Some(req.outside_module.trim().to_string()).filter(|m| !m.is_empty()),
+            log_only: req.log,
+            trace: if matches!(action, Action::Trace { .. }) { req.trace.options()? } else { TraceOptions::default() },
+        };
         self.with_dbg(|d, sess| {
-            let mut b = AppBp { id: 0, addr: address, ea: req.ea, cond, script, note: None, stop };
+            let mut b = AppBp { id: 0, addr: address, ea: req.ea, cond, script, note: None, stop, value_cond, message };
             let hooks = d.hooks(&b, &*sess.proc)?;
-            b.id = d.d.add_breakpoint_with(Breakpoint { address, kind, size, method, action }, hooks, opts_of(req)).map_err(s)?;
+            let bp = Breakpoint { address, kind, size, method, action };
+            b.id = match &pending {
+                Some(expr) => d.d.add_pending_breakpoint(expr, bp, hooks, opts_of(req), extra),
+                None => d.d.add_breakpoint_ext(bp, hooks, opts_of(req), extra),
+            }
+            .map_err(s)?;
             let id = b.id;
             d.bps.push(b);
             Ok(id)
         })
+    }
+
+    /// Starts `program` under the debugger, stopped where `stop` says (`entry`, `first`,
+    /// `run`), and opens it with the debugger attached, so breakpoints can be set before its
+    /// code runs. The process is HeapHook's child; it is reaped once it exits and is no
+    /// longer traced (`reap_children`).
+    pub fn debug_launch(&self, req: &LaunchReq) -> R<crate::commands::Opened> {
+        let program = req.program.trim();
+        if program.is_empty() {
+            return Err("no program given".into());
+        }
+        let stop = match req.stop.as_str() {
+            "" | "entry" => hh_debug::LaunchStop::Entry,
+            "first" => hh_debug::LaunchStop::FirstInstruction,
+            "run" => hh_debug::LaunchStop::Run,
+            x => return Err(format!("unknown launch stop {x:?}")),
+        };
+        let o = hh_debug::LaunchOptions {
+            program: program.to_string(),
+            args: crate::inject::split_args(&req.args),
+            cwd: Some(req.cwd.trim().to_string()).filter(|c| !c.is_empty()),
+            stop,
+            ..hh_debug::LaunchOptions::default()
+        };
+        let d = Debugger::launch(&o).map_err(s)?;
+        let pid = d.pid();
+        lock(&self.x.launched).push(pid);
+        let name = std::path::Path::new(program).file_name().map_or_else(|| program.to_string(), |n| n.to_string_lossy().into_owned());
+        let opened = hh_core::open(pid).map_err(s).and_then(|raw| self.install_process(raw, pid, name, None));
+        let info = match opened {
+            Ok(i) => i,
+            Err(e) => {
+                // Nothing half-started stays behind.
+                drop(d);
+                kill_pid(pid);
+                return Err(e);
+            }
+        };
+        let sess = self.session()?;
+        sess.switch.set(d.process());
+        apply_signals(&d, &lock(&self.x.settings).signals);
+        *lock(&sess.dbg) = Some(Dbg::new(d));
+        Ok(info)
+    }
+
+    /// Which debug events break the process (thread create / exit, module load / unload).
+    pub fn debug_set_break_on(&self, b: BreakOn) -> R<()> {
+        let b = BreakOn {
+            module_loaded: b.module_loaded.into_iter().map(|p| p.trim().to_string()).filter(|p| !p.is_empty() && p.len() <= 256).take(64).collect(),
+            module_unloaded: b.module_unloaded.into_iter().map(|p| p.trim().to_string()).filter(|p| !p.is_empty() && p.len() <= 256).take(64).collect(),
+            ..b
+        };
+        self.with_dbg(|d, _| d.d.set_break_on(b).map_err(s))
+    }
+
+    pub fn debug_break_on(&self) -> R<BreakOn> {
+        self.with_dbg(|d, _| d.d.break_on().map_err(s))
+    }
+
+    /// Moves the instruction pointer of a stopped thread (checked: executable memory that
+    /// decodes).
+    pub fn debug_set_ip(&self, tid: Tid, addr: &str) -> R<()> {
+        let a = parse_addr(addr)?;
+        self.with_dbg(|d, _| d.d.set_ip(tid, a).map_err(s))
+    }
+
+    /// "Execute till return" of backtrace frame `frame` (0 = the current function).
+    pub fn debug_run_until_return(&self, tid: Tid, frame: usize) -> R<()> {
+        self.with_dbg(|d, _| {
+            d.d.run_until_return(tid, frame).map_err(s)?;
+            d.resumed();
+            Ok(())
+        })?;
+        self.x.lua.engine.debug_resumed();
+        Ok(())
+    }
+
+    /// Code filter: arms coverage on `entries` (function entries from a dissection only).
+    pub(crate) fn coverage_start(&self, entries: Vec<Addr>) -> R<usize> {
+        self.with_dbg(|d, _| d.d.coverage_start(entries).map_err(s))
+    }
+
+    pub(crate) fn coverage_stop(&self) -> R<Vec<Addr>> {
+        self.with_dbg(|d, _| d.d.coverage_stop().map_err(s))
     }
 
     /// "Find out what writes / accesses this range": a page-protection watch that records.
@@ -666,7 +958,7 @@ impl App {
         self.with_dbg(|d, _| {
             let opts = BpOptions { max_hits: req.max_hits.filter(|&m| m > 0), ..BpOptions::default() };
             let id = d.d.add_watch_range(start, req.len, kind, Action::Record, Hooks::default(), opts).map_err(s)?;
-            d.bps.push(AppBp { id, addr: start, ea: false, cond: None, script: false, note: None, stop: None });
+            d.bps.push(AppBp { id, addr: start, ea: false, cond: None, script: false, note: None, stop: None, value_cond: None, message: None });
             Ok(id)
         })
     }
@@ -782,6 +1074,21 @@ impl App {
                         records_dropped: i.records_dropped,
                         owner: if b.script { "script" } else { "user" },
                         note: if i.enabled { None } else { b.note.clone() },
+                        pending: i.pending.clone(),
+                        resolved: i.resolved,
+                        thread: i.extra.thread,
+                        outside_module: i.extra.outside_module.clone(),
+                        log: i.extra.log_only,
+                        message: b.message.clone(),
+                        value_condition: b.value_cond.clone(),
+                        trace: TraceReq {
+                            skip_modules: i.extra.trace.skip_modules.clone(),
+                            stay_start: i.extra.trace.stay_in.map(|r| hex_addr(r.0)).unwrap_or_default(),
+                            stay_end: i.extra.trace.stay_in.map(|r| hex_addr(r.1)).unwrap_or_default(),
+                            until_return: i.extra.trace.until_return,
+                            max_ms: i.extra.trace.max_ms,
+                            capture_memory: i.extra.trace.capture_memory,
+                        },
                     })
                 })
                 .collect())
@@ -823,13 +1130,19 @@ impl App {
     pub fn debug_trace(&self, id: u32) -> R<Vec<TraceOut>> {
         self.with_dbg(|d, sess| {
             d.bp(id)?;
-            let log = d.d.trace(id).map_err(s)?;
+            let log = d.d.trace_steps(id).map_err(s)?;
             Ok(log
                 .iter()
                 .take(MAX_TRACE)
-                .map(|c| {
+                .map(|st| {
+                    let c = &st.context;
                     let (_, text) = d.insn(sess, c.rip);
-                    TraceOut { addr: hex_addr(c.rip), text, context: ctx_json(c, false) }
+                    let accesses = st
+                        .accesses
+                        .iter()
+                        .map(|a| AccessOut { addr: hex_addr(a.addr), size: a.size, read: a.read, write: a.write, before: hex_bytes(&a.before, " "), after: a.after.as_ref().map(|b| hex_bytes(b, " ")) })
+                        .collect();
+                    TraceOut { addr: hex_addr(c.rip), text, context: ctx_json(c, false), accesses }
                 })
                 .collect())
         })
@@ -901,16 +1214,17 @@ impl App {
         self.with_dbg(|d, _| d.d.pause().map_err(s))
     }
 
-    /// `kind`: `into` / `over` / `out`.
-    pub fn debug_step(&self, tid: Tid, kind: &str) -> R<()> {
+    /// `kind`: `into` / `over` / `out`; `skip_breakpoints`: breakpoints are ignored until the
+    /// step completes.
+    pub fn debug_step(&self, tid: Tid, kind: &str, skip_breakpoints: bool) -> R<()> {
+        let k = match kind {
+            "into" => hh_debug::StepKind::Into,
+            "over" => hh_debug::StepKind::Over,
+            "out" => hh_debug::StepKind::Out,
+            k => return Err(format!("unknown step kind {k:?}")),
+        };
         self.with_dbg(|d, _| {
-            match kind {
-                "into" => d.d.step_into(tid),
-                "over" => d.d.step_over(tid),
-                "out" => d.d.step_out(tid),
-                k => return Err(format!("unknown step kind {k:?}")),
-            }
-            .map_err(s)?;
+            d.d.step_with(tid, k, hh_debug::StepOptions { skip_breakpoints, ..Default::default() }).map_err(s)?;
             d.resumed();
             Ok(())
         })?;
@@ -918,15 +1232,12 @@ impl App {
         Ok(())
     }
 
-    /// Continues until a thread reaches `addr`: any thread, or only `tid` (others pass it).
-    pub fn debug_run_to(&self, addr: &str, tid: Option<Tid>) -> R<()> {
+    /// Continues until a thread reaches `addr` (`count` times; default once): any thread,
+    /// or only `tid` (others pass it).
+    pub fn debug_run_to(&self, addr: &str, tid: Option<Tid>, count: u64) -> R<()> {
         let a = parse_addr(addr)?;
         self.with_dbg(|d, _| {
-            match tid {
-                Some(t) => d.d.run_to_thread(t, a),
-                None => d.d.run_to(a),
-            }
-            .map_err(s)?;
+            d.d.run_to_count(a, count.max(1), tid).map_err(s)?;
             d.resumed();
             Ok(())
         })?;
@@ -958,7 +1269,7 @@ impl App {
             return self.with_dbg(|d, _| {
                 let k = if kind == "write" { BpKind::Write } else { BpKind::Access };
                 let id = d.d.add_watch_range(start, spec.size.max(1) as u64, k, Action::Break, Hooks::default(), BpOptions::default()).map_err(s)?;
-                d.bps.push(AppBp { id, addr: start, ea: false, cond: None, script: true, note: None, stop: None });
+                d.bps.push(AppBp { id, addr: start, ea: false, cond: None, script: true, note: None, stop: None, value_cond: None, message: None });
                 Ok(id)
             });
         }
@@ -1045,6 +1356,18 @@ impl App {
     }
 }
 
+/// Kills a process HeapHook started and reaps it (a launch that could not be opened).
+fn kill_pid(pid: u32) {
+    #[cfg(unix)]
+    unsafe {
+        libc::kill(pid as i32, libc::SIGKILL);
+        let mut st = 0;
+        libc::waitpid(pid as i32, &mut st, 0);
+    }
+    #[cfg(not(unix))]
+    let _ = pid;
+}
+
 /// Stack pointers of threads blocked in a system call (`/proc/<pid>/task/*/syscall`).
 fn thread_stack_pointers(pid: u32) -> Vec<Addr> {
     let Ok(dir) = std::fs::read_dir(format!("/proc/{pid}/task")) else { return Vec::new() };
@@ -1102,6 +1425,8 @@ fn apply_signals(d: &Debugger, set: &std::collections::BTreeMap<String, String>)
 pub enum Cond {
     Num(u64),
     Reg(String),
+    /// A name the caller supplies (`old`, `new`, `address` of a value condition).
+    Var(String),
     Not(Box<Cond>),
     Bin(String, Box<Cond>, Box<Cond>),
 }
@@ -1120,9 +1445,17 @@ fn reg_of(c: &Context, n: &str) -> Option<u64> {
 
 impl Cond {
     pub fn parse(src: &str) -> R<Cond> {
+        Self::parse_with(src, &[])
+    }
+
+    /// [`Cond::parse`] that also accepts the names in `vars`.
+    pub fn parse_with(src: &str, vars: &[&str]) -> R<Cond> {
+        if src.len() > 4096 {
+            return Err("condition: too long".into());
+        }
         let toks = Self::lex(src)?;
         let mut i = 0;
-        let e = Self::level(&toks, &mut i, 0)?;
+        let e = Self::level(&toks, &mut i, 0, vars, 0)?;
         if i != toks.len() {
             return Err(format!("condition: unexpected {:?}", toks[i]));
         }
@@ -1160,28 +1493,32 @@ impl Cond {
     }
 
     /// Precedence climbing; level 0 = `||` (loosest).
-    fn level(t: &[String], i: &mut usize, lvl: usize) -> R<Cond> {
+    fn level(t: &[String], i: &mut usize, lvl: usize, vars: &[&str], depth: usize) -> R<Cond> {
         const OPS: [&[&str]; 8] = [&["||"], &["&&"], &["|"], &["^"], &["&"], &["==", "!=", "<", "<=", ">", ">="], &["+", "-"], &["*"]];
         if lvl == OPS.len() {
-            return Self::atom(t, i);
+            return Self::atom(t, i, vars, depth);
         }
-        let mut l = Self::level(t, i, lvl + 1)?;
+        let mut l = Self::level(t, i, lvl + 1, vars, depth)?;
         while let Some(op) = t.get(*i).filter(|o| OPS[lvl].contains(&o.as_str())) {
             let op = op.clone();
             *i += 1;
-            let r = Self::level(t, i, lvl + 1)?;
+            let r = Self::level(t, i, lvl + 1, vars, depth)?;
             l = Cond::Bin(op, Box::new(l), Box::new(r));
         }
         Ok(l)
     }
 
-    fn atom(t: &[String], i: &mut usize) -> R<Cond> {
+    fn atom(t: &[String], i: &mut usize, vars: &[&str], depth: usize) -> R<Cond> {
+        // Nesting depth (`!!!!…`, `((((…`) is bounded: the input may come from a table.
+        if depth > 64 {
+            return Err("condition: nested too deeply".into());
+        }
         let tok = t.get(*i).ok_or("condition: unexpected end")?.clone();
         *i += 1;
         match tok.as_str() {
-            "!" => Ok(Cond::Not(Box::new(Self::atom(t, i)?))),
+            "!" => Ok(Cond::Not(Box::new(Self::atom(t, i, vars, depth + 1)?))),
             "(" => {
-                let e = Self::level(t, i, 0)?;
+                let e = Self::level(t, i, 0, vars, depth + 1)?;
                 if t.get(*i).map(String::as_str) != Some(")") {
                     return Err("condition: missing )".into());
                 }
@@ -1191,17 +1528,25 @@ impl Cond {
             s if s.starts_with("0x") => u64::from_str_radix(&s[2..], 16).map(Cond::Num).map_err(|_| format!("condition: bad number {s}")),
             s if s.as_bytes()[0].is_ascii_digit() => s.parse().map(Cond::Num).map_err(|_| format!("condition: bad number {s}")),
             s if reg_of(&Context::default(), s).is_some() => Ok(Cond::Reg(s.into())),
+            s if vars.contains(&s) => Ok(Cond::Var(s.into())),
             s => Err(format!("condition: unknown name {s:?}")),
         }
     }
 
     pub fn eval(&self, c: &Context) -> u64 {
-        match self {
+        self.eval_with(c, &|_| None).unwrap_or(0)
+    }
+
+    /// Evaluates with `var` for [`Cond::Var`] names; `None` when one of them is unknown
+    /// (a value condition over an unknown old value does not hold).
+    pub fn eval_with(&self, c: &Context, var: &dyn Fn(&str) -> Option<u64>) -> Option<u64> {
+        Some(match self {
             Cond::Num(n) => *n,
             Cond::Reg(r) => reg_of(c, r).unwrap_or(0),
-            Cond::Not(e) => (e.eval(c) == 0) as u64,
+            Cond::Var(v) => var(v)?,
+            Cond::Not(e) => (e.eval_with(c, var)? == 0) as u64,
             Cond::Bin(op, a, b) => {
-                let (x, y) = (a.eval(c), b.eval(c));
+                let (x, y) = (a.eval_with(c, var)?, b.eval_with(c, var)?);
                 match op.as_str() {
                     "||" => (x != 0 || y != 0) as u64,
                     "&&" => (x != 0 && y != 0) as u64,
@@ -1219,7 +1564,7 @@ impl Cond {
                     _ => x.wrapping_mul(y),
                 }
             }
-        }
+        })
     }
 }
 

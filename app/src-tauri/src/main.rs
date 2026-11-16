@@ -20,7 +20,7 @@ use tauri::{Manager, State};
 use heaphook::tools::{CodeRow, EvalReq, JobProgress, Page, SigOut, SnapInfo, XRefOut};
 use hh_tools::dissect::{DissectOptions, DissectSummary};
 use hh_tools::headers::HeaderSummary;
-use hh_tools::memory::{DiffRange, FileSummary, PointerHit, PointerQuery, Range, RegionInfo, RestoreSummary};
+use hh_tools::memory::{ChangeMap, DiffRange, FileSummary, LoadPlan, PlanBlock, PointerHit, PointerQuery, Range, RegionInfo, RegionStats, RestoreSummary};
 use hh_tools::structure::{FieldValue, SpiderHit, SpiderOptions, Structure};
 
 #[cfg(feature = "dev-bridge")]
@@ -97,7 +97,7 @@ commands! {
     now scan_progress() -> ProgressOut = |a| a.scan_progress();
     run scan_results(offset: u64, limit: usize, saved: Option<String>) -> Vec<ResultOut> = |a| a.scan_results(offset, limit, saved.as_deref());
     run set_frozen(entries: Vec<FrozenEntryEx>) -> () = |a| a.set_frozen(&entries);
-    run disassemble(addr: String, count: usize) -> Vec<DisasmOut> = |a| a.disassemble(&addr, count);
+    run disassemble(addr: String, count: usize, opts: Option<heaphook::commands::DisasmOpts>) -> Vec<DisasmOut> = |a| a.disassemble_ex(&addr, count, &opts.unwrap_or_default());
     run assemble(addr: String, text: String) -> String = |a| a.assemble(&addr, &text);
     run aa_check(script: String) -> Option<AaError> = |a| a.aa_check(&script);
     run aa_execute(script: String, enable: bool, state: Option<AaState>) -> AaState = |a| a.aa_execute(&script, enable, state.as_ref());
@@ -136,8 +136,8 @@ commands! {
     run debug_stack(tid: u32, count: usize) -> Vec<StackOut> = |a| a.debug_stack(tid, count);
     run debug_continue(pass_signal: bool) -> () = |a| a.debug_continue(pass_signal);
     run debug_pause() -> () = |a| a.debug_pause();
-    run debug_step(tid: u32, kind: String) -> () = |a| a.debug_step(tid, &kind);
-    run debug_run_to(addr: String, tid: Option<u32>) -> () = |a| a.debug_run_to(&addr, tid);
+    run debug_step(tid: u32, kind: String, skip_breakpoints: Option<bool>) -> () = |a| a.debug_step(tid, &kind, skip_breakpoints.unwrap_or(false));
+    run debug_run_to(addr: String, tid: Option<u32>, count: Option<u64>) -> () = |a| a.debug_run_to(&addr, tid, count.unwrap_or(1));
     run nop_instruction(addr: String) -> String = |a| a.nop_instruction(&addr);
     run ptr_scan(req: PtrScanReq) -> PtrInfo = |a| a.ptr_scan(&req);
     run ptr_rescan(req: PtrRescanReq) -> PtrInfo = |a| a.ptr_rescan(&req);
@@ -167,7 +167,8 @@ commands! {
     run regions_info() -> Vec<RegionInfo> = |a| a.regions_info();
     run mem_protect(addr: String, size: u64, prot: hh_core::Prot) -> hh_core::Prot = |a| a.mem_protect(&addr, size, prot);
     run mem_save(ranges: Vec<Range>, path: String) -> FileSummary = |a| a.mem_save(&ranges, &path);
-    run mem_load(path: String, relocate: Option<String>) -> RestoreSummary = |a| a.mem_load(&path, relocate.as_deref());
+    run mem_load_plan(path: String, relocate: Option<String>) -> LoadPlan = |a| a.mem_load_plan(&path, relocate.as_deref());
+    run mem_load_approved(path: String, relocate: Option<String>, blocks: Vec<PlanBlock>) -> RestoreSummary = |a| a.mem_load_approved(&path, relocate.as_deref(), &blocks);
     run mem_fill(addr: String, len: u64, pattern: String) -> () = |a| a.mem_fill(&addr, len, &pattern);
     run mem_copy(src: String, dst: String, len: u64) -> () = |a| a.mem_copy(&src, &dst, len);
     run snapshot_take(ranges: Vec<Range>, label: String) -> SnapInfo = |a| a.snapshot_take(&ranges, &label);
@@ -237,6 +238,39 @@ commands! {
     run aa_load_file(path: String) -> String = |a| a.aa_load_file(&path);
     run aa_trust(script: String) -> () = |a| a.aa_trust(&script);
     now app_args() -> Option<heaphook::cli::StartArgs> = |a| a.app_args();
+    // 1.0 release candidate: engine features of the last wave.
+    run scan_sort(key: hh_scan::SortKey, desc: bool) -> () = |a| a.scan_sort(key, desc);
+    run scan_remove(addrs: Vec<String>) -> u64 = |a| a.scan_remove(&addrs);
+    run scan_export_addresses(path: String) -> u64 = |a| a.scan_export_addresses(&path);
+    run scan_copy_addresses() -> String = |a| a.scan_copy_addresses();
+    run scan_stats() -> Vec<hh_scan::ResultStat> = |a| a.scan_stats();
+    run scan_pointer(req: hh_scan::PointerScan) -> ScanCount = |a| a.scan_pointer(&req);
+    now ptr_pause() -> () = |a| a.ptr_pause(true);
+    now ptr_resume() -> () = |a| a.ptr_pause(false);
+    run mem_file_search(req: heaphook::tools::FileSearchReq) -> Vec<String> = |a| a.mem_file_search(&req);
+    run region_stats() -> RegionStats = |a| a.region_stats();
+    run snapshot_change_map(old: u64, new: u64, start: Option<String>, end: Option<String>, cells: usize) -> ChangeMap = |a| a.snapshot_change_map(old, new, start.as_deref().unwrap_or(""), end.as_deref().unwrap_or(""), cells);
+    run struct_view(reqs: Vec<EvalReq>) -> Vec<Result<heaphook::tools::StructView, String>> = |a| a.struct_view(&reqs);
+    run struct_lock(name: String, addr: String, on: bool) -> () = |a| a.struct_lock(&name, &addr, on);
+    run struct_write(name: String, addr: String, leaf: usize, value: String) -> () = |a| a.struct_write(&name, &addr, leaf, &value);
+    run struct_code(names: Vec<String>, lang: String, path: Option<String>) -> String = |a| { let t = a.struct_code(&names, &lang)?; if let Some(p) = path.as_deref().filter(|p| !p.trim().is_empty()) { std::fs::write(p, &t).map_err(|e| format!("{p}: {e}"))?; } Ok(t) };
+    run struct_field_entry(name: String, root: String, path: Vec<usize>) -> heaphook::table::Entry = |a| a.struct_field_entry(&name, &root, &path);
+    run dissect_add(modules: Vec<String>, opts: DissectOptions) -> DissectSummary = |a| a.dissect_add(&modules, &opts);
+    run dissect_save(path: String) -> () = |a| a.dissect_save(&path);
+    run dissect_load(path: String) -> DissectSummary = |a| a.dissect_load(&path);
+    run code_filter_start() -> heaphook::tools::FilterState = |a| a.code_filter_start();
+    run code_filter_stop(ran: bool) -> heaphook::tools::FilterState = |a| a.code_filter_stop(ran);
+    run code_filter_state() -> heaphook::tools::FilterState = |a| a.code_filter_state();
+    run code_filter_reset() -> () = |a| a.code_filter_reset();
+    run code_filter_list(offset: usize, limit: usize) -> Page<hh_tools::dissect::Function> = |a| a.code_filter_list(offset, limit);
+    run asm_scan(req: heaphook::tools::AsmScanReq) -> heaphook::tools::AsmPageOut = |a| a.asm_scan(&req);
+    run find_reference(from: String, target: String, forward: bool, max_bytes: Option<u64>) -> Option<String> = |a| a.find_reference(&from, &target, forward, max_bytes.unwrap_or(0));
+    run symbol_list(module: Option<String>, filter: String, offset: usize, limit: usize) -> Page<heaphook::tools::SymbolOut> = |a| a.symbol_list(module.as_deref(), &filter, offset, limit);
+    run debug_launch(req: heaphook::debug::LaunchReq) -> Opened = |a| a.debug_launch(&req);
+    run debug_set_break_on(on: hh_debug::BreakOn) -> () = |a| a.debug_set_break_on(on);
+    run debug_break_on() -> hh_debug::BreakOn = |a| a.debug_break_on();
+    run debug_set_ip(tid: u32, addr: String) -> () = |a| a.debug_set_ip(tid, &addr);
+    run debug_run_until_return(tid: u32, frame: usize) -> () = |a| a.debug_run_until_return(tid, frame);
 }
 
 /// The UI's answer to a close request with unsaved changes (`lua_poll.window.close_seq`):

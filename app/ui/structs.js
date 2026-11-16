@@ -3,7 +3,7 @@
 // type / description / size edits, in-place value edits, "add to cheat table" with the
 // pointer path, and the structure spider. Definitions live in the backend's table.
 import { api, askPath } from './backend.js';
-import { $, h, icon, fmtAddr, wire, attempt, toast, prompt, contextMenu, nf, busy, store } from './util.js';
+import { $, h, icon, fmtAddr, wire, attempt, toast, prompt, contextMenu, nf, busy, store, modal, helpAdd } from './util.js';
 import { state, emit, on, addTicker } from './core.js';
 import { vlist } from './vlist.js';
 import { formDialog, progressStrip, runJob, hexNum } from './memtools.js';
@@ -34,11 +34,12 @@ export function initStructs({ showView }) {
   const view = $('#view-struct'), sel = $('#st-sel'), colsBar = $('#st-cols'), host = $('#st-tree');
   let structs = [], cur = null, groups = [[]], rows = [], list = null, ncols = -1, editing = false, gen = 0;
   const expanded = new Set();
-  // CE's lock: one column's values frozen as the baseline; "highlight changes" marks values that
-  // moved since the last refresh, or differ from the locked column.
-  let locked = null; // {ci, vals: Map(row key -> value)}
+  // Lock and change highlighting come from the engine (struct_view): a locked column shows its
+  // frozen copy and flags the leaves live memory differs in; otherwise leaves that changed since
+  // the previous view. chgAt only holds a flag on screen briefly between refreshes.
+  let info = []; // per column: {locked, cls} of the root structure view
   let hilite = store.get('st.hilite', true);
-  const prevVals = new Map(), chgAt = new Map(); // `${key}|${ci}` -> value / time it changed
+  const chgAt = new Map(); // `${key}|${ci}` -> time the engine last reported a change
   const columns = () => groups.flatMap((g, gi) => g.map((c) => ({ ...c, gi })));
   const groupIdx = () => { let k = 0; return groups.map((g) => g.map(() => k++)); };
 
@@ -50,43 +51,63 @@ export function initStructs({ showView }) {
     sel.replaceChildren(...(structs.length ? structs.map((s) => h('option', { value: s.name, selected: s.name === cur }, s.name)) : [h('option', { value: '' }, 'No structures')]));
     sel.disabled = !structs.length;
   }
-  const save = async () => { if (await attempt(async () => { await api.structSet(structs); return true; })) { await loadStructs(); await evalTree(); } };
+  // struct_set validates every definition; on refusal its error is toasted and the local edit is
+  // dropped by reloading the backend's copy.
+  const save = async () => {
+    const ok = await attempt(async () => { await api.structSet(structs); return true; });
+    await loadStructs();
+    if (ok) await evalTree(); else render();
+    return !!ok;
+  };
   const elemOf = (r) => structs.find((s) => s.name === r.owner)?.elements[r.index];
-  sel.addEventListener('change', () => { cur = sel.value; expanded.clear(); evalTree(); });
+  sel.addEventListener('change', () => { cur = sel.value; expanded.clear(); chgAt.clear(); evalTree(); });
 
   // ---------- evaluation ----------
+  const isBox = (f) => f.vtype === 'struct' || f.children.length > 0; // flattened, not a leaf
+  const leafCount = (fs) => fs.reduce((n, f) => n + (isBox(f) ? leafCount(f.children) : 1), 0);
   async function evalTree() {
     const g = ++gen, cols = columns();
     if (!cur || !cols.length) { rows = []; render(); return; }
-    const out = [];
-    async function level(name, bases, depth, prefix, path) {
+    const out = [], now = performance.now(), inf = cols.map(() => ({ locked: false, cls: null }));
+    // name: the structure evaluated at `bases` (one per column); fp: element path from the root.
+    async function level(name, bases, depth, prefix, path, fp) {
       const live = bases.map((b, i) => (b ? i : -1)).filter((i) => i >= 0);
       if (!live.length) return;
-      const res = await api.structEval(live.map((i) => ({ name, addr: bases[i] })));
+      const res = await api.structView(live.map((i) => ({ name, addr: bases[i] })));
       const per = bases.map(() => null);
       live.forEach((ci, k) => { per[ci] = res[k]?.Ok || null; });
-      const proto = per.find(Boolean);
+      if (!depth) per.forEach((v, ci) => { if (v) inf[ci] = { locked: !!v.locked, cls: v.class || null }; });
+      const proto = per.find(Boolean)?.fields;
       if (!proto) { out.push({ key: prefix + 'err', depth, error: res[0]?.Err || 'unreadable' }); return; }
-      const walk = async (fields, at, d, pre, getter) => {
+      const chg = per.map((v) => new Set(v?.changed || []));
+      const lv = { name, bases };
+      let leaf = 0; // index in the engine's flattened leaf order (depth-first)
+      const walk = async (fields, d, pre, getter, fpre, items) => {
         for (let i = 0; i < fields.length; i++) {
           const f = fields[i], key = pre + i, vals = cols.map((_, ci) => getter(ci)?.[i] ?? null);
-          const kids = f.vtype === 'struct' ? f.children.length > 0 : f.vtype === 'pointer' && vals.some((v) => v?.target);
-          out.push({ key, depth: d, owner: f.owner, index: f.index, offset: f.offset, vtype: f.vtype, size: f.size, description: f.description, child: f.child, vals, kids, path: at });
-          if (!kids || !expanded.has(key)) continue;
-          if (f.vtype === 'struct') await walk(f.children, at, d + 1, key + '.', (ci) => getter(ci)?.[i]?.children);
-          else if (f.child) await level(f.child, vals.map((v) => v?.target || null), d + 1, key + '/', [...at, f.offset]);
+          const e = elemOf(f), box = isBox(f), fpath = [...fpre, items ? i : f.index];
+          const ln = box ? null : leaf++;
+          const ch = cols.map((_, ci) => ln != null && chg[ci].has(ln));
+          ch.forEach((c, ci) => { if (c) chgAt.set(key + '|' + ci, now); });
+          const kids = box ? f.children.length > 0 : f.vtype === 'pointer' && vals.some((v) => v?.target);
+          out.push({ key, depth: d, owner: f.owner, index: f.index, offset: f.offset, vtype: f.vtype, size: f.size, description: f.description, child: f.child,
+            vals, kids, path, lv, leaf: ln, chg: ch, fpath, item: items, arr: !items && e?.count > 1 });
+          if (box) {
+            if (kids && expanded.has(key)) await walk(f.children, d + 1, key + '.', (ci) => getter(ci)?.[i]?.children, fpath, !items && e?.count > 1);
+            else leaf += leafCount(f.children);
+          } else if (kids && expanded.has(key) && f.child) {
+            // The child starts child_start bytes before where the pointer points.
+            const cs = BigInt(e?.child_start || 0);
+            const tb = vals.map((v) => { const t = v?.target ? BigInt(v.target) : null; return t != null && t >= cs ? wire(t - cs) : null; });
+            await level(f.child, tb, d + 1, key + '/', [...path, f.offset], fpath);
+          }
         }
       };
-      await walk(proto, path, depth, prefix, (ci) => per[ci]);
+      await walk(proto, depth, prefix, (ci) => per[ci]?.fields, fp, false);
     }
-    try { await level(cur, cols.map((c) => c.addr), 0, '', []); } catch (e) { if (g === gen) toast(e); }
+    try { await level(cur, cols.map((c) => c.addr), 0, '', [], []); } catch (e) { if (g === gen) toast(e); }
     if (g !== gen) return;
-    const now = performance.now();
-    for (const r of out) (r.vals || []).forEach((v, ci) => {
-      const k = r.key + '|' + ci, val = v?.value ?? null;
-      if (prevVals.has(k) && prevVals.get(k) !== val) chgAt.set(k, now);
-      prevVals.set(k, val);
-    });
+    info = inf;
     rows = out;
     render();
   }
@@ -99,7 +120,7 @@ export function initStructs({ showView }) {
     const colW = cols.map(() => 'minmax(120px, 1fr)').join(' ');
     list = vlist(host, {
       cols: `minmax(130px, 0.6fr) 96px minmax(140px, 1fr) ${colW}`,
-      head: ['Offset', 'Type', 'Description', ...cols.map((c, ci) => h('span', { class: 'st-colhead', title: c.expr }, `${groups.length > 1 ? 'G' + (c.gi + 1) + ' · ' : ''}${fmtAddr(c.addr)}${locked?.ci === ci ? ' · locked' : ''}`))],
+      head: ['Offset', 'Type', 'Description', ...(heads = cols.map((c) => h('span', { class: 'st-colhead', title: c.expr })))],
       label: 'Structure fields', row: 22,
       empty: () => (!state.proc ? ['No process. Open one with ', h('kbd', null, 'Ctrl P'), ', then dissect a structure at an address.']
         : !structs.length ? ['No structure yet. Press ', h('kbd', null, 'G'), ' to dissect at an address, or use "Open in structure dissector" in the cheat table, scan results, memory view or registers. ', h('kbd', null, 'Ctrl I'), ' imports structures from a file.']
@@ -112,14 +133,13 @@ export function initStructs({ showView }) {
         const caret = r.kids ? h('span.st-caret', { html: icon(expanded.has(r.key) ? 'chevD' : 'chevR') }) : h('span.st-caret');
         return [
           h('span', { role: 'gridcell', class: 'st-off', style: `padding-left:${r.depth * 14}px` }, caret, hex(r.offset)),
-          h('span', { role: 'gridcell', class: 'st-type' }, (TNAME[r.vtype] || r.vtype) + (SIZED.has(r.vtype) ? `[${r.size}]` : '') + (r.child && r.vtype === 'pointer' ? ` → ${r.child}` : '')),
+          (() => { const t = typeText(r); return h('span', { role: 'gridcell', class: 'st-type', title: t }, t); })(),
           h('span', { role: 'gridcell', class: 'st-desc' }, r.description || ''),
           ...r.vals.map((v, ci) => {
-            const txt = v == null ? '??' : v.value ?? (r.vtype === 'struct' ? '' : '??');
-            const k = r.key + '|' + ci, base = locked?.vals.get(r.key);
-            // Locked: every column is compared with the locked column's values at lock time.
-            const changed = hilite && r.vtype !== 'struct' && (locked ? locked.vals.has(r.key) && (v?.value ?? null) !== base : performance.now() - (chgAt.get(k) || 0) < 1500);
-            return h('span', { role: 'gridcell', class: 'st-val ' + cls + (changed ? ' chg' : ''), title: changed && locked ? `Locked value: ${base ?? '??'}` : null }, txt);
+            const txt = v == null ? '??' : v.value ?? (r.leaf == null ? '' : '??');
+            const changed = hilite && r.leaf != null && (r.chg[ci] || performance.now() - (chgAt.get(r.key + '|' + ci) || 0) < 1500);
+            const lockedCol = info[ci]?.locked;
+            return h('span', { role: 'gridcell', class: 'st-val ' + cls + (changed ? ' chg' : ''), title: changed ? (lockedCol ? 'Live memory differs from this locked value' : 'Changed since the previous refresh') : null }, txt);
           }),
         ];
       },
@@ -128,8 +148,29 @@ export function initStructs({ showView }) {
       onKey: keys,
     });
   }
+  /** Type column: bit fields, arrays and the child structure (with its start offset). */
+  function typeText(r) {
+    const e = elemOf(r);
+    let t = (TNAME[r.vtype] || r.vtype) + (SIZED.has(r.vtype) ? `[${e?.size || r.size}]` : '');
+    if (r.arr) t += ` × ${e?.count}`;
+    if (e?.bit_len) t += e.bit_len === 1 ? ` bit ${e.bit_offset || 0}` : ` bits ${e.bit_offset || 0}-${(e.bit_offset || 0) + e.bit_len - 1}`;
+    if (r.child && r.vtype === 'pointer') t += ` → ${r.child}` + (e?.child_start ? ` -${hex(e.child_start)}` : '');
+    return t;
+  }
+  let heads = [];
+  /** Column headers: address, C++ class (RTTI, from the target: text only) and lock state. */
+  function renderHeads() {
+    columns().forEach((c, ci) => {
+      const el = heads[ci], inf = info[ci] || {};
+      if (!el) return;
+      el.replaceChildren(...[`${groups.length > 1 ? 'G' + (c.gi + 1) + ' · ' : ''}${fmtAddr(c.addr)}`,
+        inf.cls ? h('span.st-class', null, ' ' + inf.cls) : null, inf.locked ? h('span.st-locked', null, ' · locked') : null].filter(Boolean));
+      el.title = c.expr + (inf.cls ? ` · class ${inf.cls}` : '') + (inf.locked ? ' · locked' : '');
+    });
+  }
   function render() {
     if (columns().length !== ncols || !list) build();
+    renderHeads();
     renderCols();
     list.refresh({ force: true });
   }
@@ -137,25 +178,90 @@ export function initStructs({ showView }) {
     colsBar.replaceChildren(...groups.map((g, gi) => h('div.st-group', { role: 'group', 'aria-label': `Group ${gi + 1}` },
       h('span.st-glabel', null, groups.length > 1 ? `Group ${gi + 1}` : 'Addresses'),
       ...g.map((c, ci) => h('span.st-chip.mono', { title: c.expr }, c.expr === fmtAddr(c.addr) ? c.expr : `${c.expr} = ${fmtAddr(c.addr)}`,
-        h('button.st-lock', { type: 'button', 'aria-pressed': String(locked?.ci === flatIdx(gi, ci)), title: 'Lock: freeze these values as the baseline (L)', onclick: () => toggleLock(flatIdx(gi, ci)) }, locked?.ci === flatIdx(gi, ci) ? 'Locked' : 'Lock'),
-        h('button.st-x', { type: 'button', 'aria-label': `Remove ${c.expr}`, html: icon('x'), onclick: () => { g.splice(ci, 1); if (!g.length && groups.length > 1) groups.splice(gi, 1); locked = null; render(); evalTree(); } }))),
+        h('button.st-lock', { type: 'button', 'aria-pressed': String(!!info[flatIdx(gi, ci)]?.locked), title: 'Lock: show a frozen copy and highlight where live memory differs (L)', onclick: () => toggleLock(flatIdx(gi, ci)) }, info[flatIdx(gi, ci)]?.locked ? 'Locked' : 'Lock'),
+        h('button.st-x', { type: 'button', 'aria-label': `Remove ${c.expr}`, html: icon('x'), onclick: () => removeColumn(gi, ci) }))),
       h('button.btn.ghost.icon', { type: 'button', 'aria-label': `Add an address to group ${gi + 1}`, title: 'Add address (A)', html: icon('plus'), onclick: () => addColumn(gi) }))),
     h('button.btn.ghost', { type: 'button', onclick: () => { groups.push([]); addColumn(groups.length - 1); } }, h('span', { html: icon('group') }), 'Group'));
   }
 
   const flatIdx = (gi, ci) => groups.slice(0, gi).reduce((n, g) => n + g.length, 0) + ci;
-  function toggleLock(ci) {
-    if (locked?.ci === ci) locked = null;
-    else locked = { ci, vals: new Map(rows.filter((r) => r.vals).map((r) => [r.key, r.vals[ci]?.value ?? null])) };
-    list?.head && build(); // the column title says which one is locked
-    render();
-    toast(locked ? 'Column locked: values that differ from its current values are highlighted' : 'Column unlocked', 'info');
+  async function toggleLock(ci) {
+    const c = columns()[ci];
+    if (!c || !cur) return;
+    const on = !info[ci]?.locked;
+    if (!(await attempt(async () => { await api.structLock(cur, c.addr, on); return true; }))) return;
+    await evalTree();
+    toast(on ? 'Column locked: it shows the values at lock time; fields where live memory differs are highlighted' : 'Column unlocked', 'info');
+  }
+  function removeColumn(gi, ci) {
+    const fi = flatIdx(gi, ci), c = groups[gi][ci];
+    if (info[fi]?.locked && cur) api.structLock(cur, c.addr, false).catch(() => {});
+    groups[gi].splice(ci, 1);
+    info.splice(fi, 1);
+    if (!groups[gi].length && groups.length > 1) groups.splice(gi, 1);
+    render(); evalTree();
   }
   function toggleHilite() {
     hilite = !hilite; store.set('st.hilite', hilite);
     hlBtn.setAttribute('aria-pressed', String(hilite));
     render();
   }
+  // ---------- element editor ----------
+  /** Every element field: offset, type, size, array count, bit field, pointer child start. */
+  async function editElement(r) {
+    const e = elemOf(r);
+    if (!e) return;
+    const v = await formDialog(`Element at +${hex(e.offset)} of ${r.owner}`, [
+      { name: 'offset', label: 'Offset (hex)', value: hex(e.offset) },
+      { name: 'description', label: 'Description', value: e.description || '', mono: false },
+      { name: 'vtype', label: 'Type', type: 'select', value: e.vtype, options: TYPES.filter(([t]) => t !== 'struct' || e.vtype === 'struct') },
+      { name: 'size', label: 'Size in bytes (strings, byte arrays)', value: String(e.size || 0) },
+      { name: 'count', label: 'Array: number of items (0 or 1 = a single value)', value: String(e.count || 0) },
+      { name: 'bit_offset', label: 'Bit field: first bit (0 = least significant)', value: String(e.bit_offset || 0), hint: 'Bit fields need an integer type (Byte to 8 Bytes)' },
+      { name: 'bit_len', label: 'Bit field: number of bits (0 = the whole value)', value: String(e.bit_len || 0) },
+      { name: 'child_start', label: 'Pointer: child structure starts this far before the target (hex)', value: hex(e.child_start || 0) },
+      { name: 'hex', label: 'Show as hexadecimal', type: 'checkbox', value: !!e.hex },
+      { name: 'signed', label: 'Show as signed', type: 'checkbox', value: !!e.signed },
+      { name: 'utf16', label: 'String is UTF-16', type: 'checkbox', value: !!e.utf16 },
+    ], { ok: 'Apply' });
+    list.focus();
+    if (!v) return;
+    const dec = (x) => (/^\d+$/.test(x) ? +x : NaN);
+    const n = { offset: hexNum(v.offset), size: dec(v.size), count: dec(v.count), bit_offset: dec(v.bit_offset), bit_len: dec(v.bit_len), child_start: hexNum(v.child_start) };
+    const bad = Object.entries(n).find(([, x]) => !(x >= 0));
+    if (bad) { toast(`${bad[0].replace('_', ' ')}: not a valid number`); return; }
+    if ((n.bit_len || n.bit_offset) && !INT.has(v.vtype)) { toast('Bit fields need an integer type (Byte, 2, 4 or 8 Bytes)'); return; }
+    Object.assign(e, n, { description: v.description, vtype: v.vtype, hex: v.hex, signed: v.signed, utf16: v.utf16 });
+    if (v.vtype !== 'pointer' && v.vtype !== 'struct') { e.child = undefined; e.child_start = 0; }
+    if (SIZED.has(v.vtype) && !e.size) e.size = 16;
+    const st = structs.find((s) => s.name === r.owner);
+    st?.elements.sort((a, b) => a.offset - b.offset);
+    await save(); // struct_set validates; its error is shown and the edit dropped
+    list.focus();
+  }
+
+  // ---------- C / C# ----------
+  async function exportCode() {
+    if (!structs.length) { toast('No structures to export'); return; }
+    const v = await formDialog('Export as source code', [
+      { name: 'lang', label: 'Language', type: 'select', value: store.get('st.lang', 'c'), options: [['c', 'C'], ['csharp', 'C#']] },
+      { name: 'which', label: 'Structures', type: 'select', value: cur ? 'cur' : 'all', options: [...(cur ? [['cur', `${cur} and the structures it uses`]] : []), ['all', `All ${structs.length} structures`]] },
+    ], { ok: 'Generate' });
+    if (!v) { list?.focus(); return; }
+    store.set('st.lang', v.lang);
+    const text = await attempt(() => api.structCode(v.which === 'cur' ? [cur] : [], v.lang));
+    if (text == null) { list?.focus(); return; }
+    const ext = v.lang === 'c' ? 'h' : 'cs';
+    const r = await modal({ title: `${v.lang === 'c' ? 'C' : 'C#'} definitions`, pre: text, label: 'Source code',
+      buttons: [{ label: 'Copy', value: 'copy', primary: true, kbd: 'Enter' }, { label: 'Save…', value: 'save' }, { label: 'Close', value: 'cancel', kbd: 'Esc' }] });
+    if (r.value === 'copy') { if (await attempt(async () => { await navigator.clipboard.writeText(text); return true; })) toast('Copied', 'info'); }
+    else if (r.value === 'save') {
+      const p = await askPath({ save: true, title: 'Save source code', filters: [[v.lang === 'c' ? 'C header' : 'C# source', [ext]]], dflt: `${v.which === 'cur' ? cur : 'structures'}.${ext}` });
+      if (p && (await attempt(async () => { await api.structCode(v.which === 'cur' ? [cur] : [], v.lang, p); return true; }))) toast(`Saved ${p}`, 'info');
+    }
+    list?.focus();
+  }
+
   // ---------- export / import ----------
   const ST_FILTERS = [['Structures', ['json', 'xml']], ['HeapHook JSON', ['json']], ['Cheat Engine XML', ['xml']]];
   async function exportStructs() {
@@ -214,7 +320,7 @@ export function initStructs({ showView }) {
     if (v.mode === 'replace' || !columns().length) groups = [[c]];
     else if (v.mode === 'group') groups.push([c]);
     else groups[0].push(c);
-    expanded.clear(); locked = null;
+    expanded.clear(); chgAt.clear();
     await loadStructs();
     render();
     await busy('Reading the structure', evalTree());
@@ -310,15 +416,11 @@ export function initStructs({ showView }) {
     input.addEventListener('keydown', (e) => { e.stopPropagation(); if (e.key === 'Enter') { e.preventDefault(); finish(true); } else if (e.key === 'Escape') { e.preventDefault(); finish(false); } });
     input.addEventListener('blur', () => finish(false));
   }
+  /** Writes through the engine (struct_write): bit fields keep their other bits, array items work. */
   function editValue(i, col) {
-    const r = rows[i], v = r?.vals[col];
-    if (!r || !v || r.vtype === 'struct') return;
-    const e = elemOf(r);
-    const vtype = r.vtype === 'pointer' ? '8bytes' : r.vtype;
-    inlineEdit(i, col, r.vtype === 'pointer' ? '0x' + (v.value || '0') : v.value ?? '', (val) => attempt(() => api.writeValue(v.addr, vtype, val, {
-      len: SIZED.has(r.vtype) ? (r.vtype === 'string' && e?.utf16 ? r.size / 2 : r.size) : undefined, utf16: !!e?.utf16,
-      hex: r.vtype === 'pointer' || (!!e?.hex && INT.has(vtype)), signed: !!e?.signed,
-    })));
+    const r = rows[i], v = r?.vals[col], base = r?.lv?.bases[col];
+    if (!r || !v || r.leaf == null || !base) return;
+    inlineEdit(i, col, r.vtype === 'pointer' ? '0x' + (v.value || '0') : v.value ?? '', (val) => attempt(() => api.structWrite(r.lv.name, base, r.leaf, val)));
   }
   function editDesc(i) {
     const r = rows[i];
@@ -326,7 +428,15 @@ export function initStructs({ showView }) {
   }
   async function addToTable(r) {
     const c = columns()[0];
-    if (!r || !c) return;
+    if (!r || r.error || !c) return;
+    if (r.leaf != null) {
+      // One field, reached from the root structure through nested structures, array items and pointers.
+      const en = await attempt(() => api.structFieldEntry(cur, c.expr, r.fpath));
+      if (!en) return;
+      emit('table:add', [en]);
+      toast('Added the field to the table', 'info');
+      return;
+    }
     const es = await attempt(() => api.structEntries(r.owner, c.expr, r.path, [r.index]));
     if (!es?.length) return;
     emit('table:add', es);
@@ -357,6 +467,7 @@ export function initStructs({ showView }) {
       { label: 'Change value', kbd: 'Enter', disabled: !ok || !v0 || r.vtype === 'struct', run: () => editValue(list.sel, 0) },
       { label: 'Change description', kbd: 'F2', disabled: !ok, run: () => editDesc(list.sel) },
       { label: 'Change type…', kbd: 'T', disabled: !ok, run: () => changeType(r, x, y) },
+      { label: 'Edit element…', kbd: 'E', disabled: !ok, run: () => editElement(r) },
       { label: 'Change size…', kbd: 'S', disabled: !ok || !SIZED.has(r.vtype), run: () => changeSize(r) },
       { label: 'Show as hexadecimal', checked: !!(ok && elemOf(r)?.hex), disabled: !ok || !INT.has(r.vtype), run: () => editElem(r, (e) => { e.hex = !e.hex; }) },
       { label: 'Show as signed', checked: !!(ok && elemOf(r)?.signed), disabled: !ok || !INT.has(r.vtype), run: () => editElem(r, (e) => { e.signed = !e.signed; }) },
@@ -364,7 +475,8 @@ export function initStructs({ showView }) {
       { label: 'Add element…', kbd: 'Ins', run: () => addElement(ok ? r : null) },
       { label: 'Remove element', kbd: 'Del', disabled: !ok, run: () => removeElement(r) },
       '-',
-      { label: 'Add to cheat table', kbd: 'Ctrl Enter', disabled: !ok, run: () => addToTable(r) },
+      { label: r?.leaf != null ? 'Add this field to the cheat table' : 'Add its fields to the cheat table', kbd: 'Ctrl Enter', disabled: !ok, run: () => addToTable(r) },
+      { label: 'Export as C / C#…', kbd: 'C', disabled: !structs.length, run: () => exportCode() },
       { label: 'Browse this address', kbd: 'Ctrl M', disabled: !v0, run: () => emit('mem:goto', { addr: v0.addr, pane: 'hex' }) },
       { label: 'Find out what accesses this address', disabled: !v0, run: () => emit('debug:accesses', { addr: v0.addr, vtype: r.vtype === 'pointer' ? '8bytes' : r.vtype }) },
       { label: 'Find out what writes to this address', disabled: !v0, run: () => emit('debug:writes', { addr: v0.addr, vtype: r.vtype === 'pointer' ? '8bytes' : r.vtype }) },
@@ -391,7 +503,9 @@ export function initStructs({ showView }) {
     else if (k === 'Insert') addElement(r && !r.error ? r : null);
     else if (k === 'Delete' && r && !r.error) removeElement(r);
     else if (k.toLowerCase() === 'a') addColumn(0);
-    else if (k.toLowerCase() === 'l' && columns().length) toggleLock(Math.max(0, locked ? locked.ci : 0));
+    else if (k.toLowerCase() === 'l' && columns().length) toggleLock(Math.max(0, info.findIndex((x) => x?.locked)));
+    else if (k.toLowerCase() === 'e' && r && !r.error) editElement(r);
+    else if (k.toLowerCase() === 'c') exportCode();
     else if (k.toLowerCase() === 'h') toggleHilite();
     else if (k.toLowerCase() === 'g') newStructure();
     else if (/^[1-9]$/.test(k) && +k <= columns().length) editValue(i, +k - 1);
@@ -444,14 +558,14 @@ export function initStructs({ showView }) {
   $('#st-spider-btn').addEventListener('click', spider);
   $('#st-rename').addEventListener('click', renameStruct);
   $('#st-delete').addEventListener('click', deleteStruct);
-  const hlBtn = h('button.btn.ghost#st-hilite', { type: 'button', 'aria-pressed': String(hilite), title: 'Highlight values that changed, or differ from the locked column (H)', onclick: toggleHilite }, h('span.bl', null, 'Highlight changes'), ' ', h('kbd', null, 'H'));
+  const hlBtn = h('button.btn.ghost#st-hilite', { type: 'button', 'aria-pressed': String(hilite), title: 'Highlight values that changed, or differ from live memory in a locked column (H)', onclick: toggleHilite }, h('span.bl', null, 'Highlight changes'), ' ', h('kbd', null, 'H'));
   $('#st-rename').before(hlBtn,
     h('button.btn.ghost.icon#st-import', { type: 'button', 'aria-label': 'Import structures (Ctrl I)', title: 'Import structures (Ctrl I)', html: icon('folder'), onclick: importStructs }),
     h('button.btn.ghost.icon#st-export', { type: 'button', 'aria-label': 'Export structures (Ctrl Shift E)', title: 'Export structures (Ctrl Shift E)', html: icon('save'), onclick: exportStructs }));
   $('#st-spider-close').addEventListener('click', () => { spHost.hidden = true; list?.focus(); });
   on('struct:open', ({ addr, expr }) => openAt(addr, expr));
-  on('process:opened', () => { groups = [[]]; expanded.clear(); rows = []; hits = []; locked = null; prevVals.clear(); loadStructs().then(render); });
-  on('process:closed', () => { groups = [[]]; rows = []; locked = null; render(); });
+  on('process:opened', () => { groups = [[]]; expanded.clear(); rows = []; hits = []; info = []; chgAt.clear(); loadStructs().then(render); });
+  on('process:closed', () => { groups = [[]]; rows = []; info = []; render(); });
   let structVer = null;
   on('table:version', (v) => { if (!view.hidden && v !== structVer) { structVer = v; loadStructs(); } });
   addTicker(() => (!view.hidden && !editing && state.proc && columns().length ? evalTree() : null));
@@ -464,6 +578,11 @@ export function initStructs({ showView }) {
     else return;
     e.preventDefault();
   });
+  helpAdd('Structures', [
+    ['E', 'Edit element: bit field, array count, pointer child start'],
+    ['C', 'Export as C / C# (copy or save)'],
+    ['Ctrl Enter', 'Add the field under the cursor to the cheat table (with its pointer path)'],
+  ]);
   loadStructs().then(render);
   return { focus: () => list?.focus(), refresh: () => loadStructs().then(evalTree) };
 }

@@ -576,7 +576,7 @@ fieldset.group > .btn { align-self: flex-start; }
 /* Narrow windows: toolbar and tab labels collapse to icons (still named for screen readers). */
 @media (max-width: 1300px) {
   .panel .bl { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
-  .dbg-main .toolbar kbd, .ptr-pane .toolbar kbd { display: none; }
+  .dbg-main .toolbar kbd, .ptr-pane .toolbar kbd, #disasm-pane .toolbar kbd { display: none; }
   .ptr-pane .toolbar .btn:not(.icon) { padding: 0 8px; }
 }
 @media (max-width: 1000px) {
@@ -915,3 +915,18 @@ body.drop-file::after {
 .calc-copy { height: 20px; padding: 0 6px; font-size: var(--fs-xs); }
 @media (max-width: 1300px) { #table .toolbar kbd { display: none; } #table .toolbar .btn:not(.icon) { padding: 0 8px; } }
 @media (max-width: 1000px) { .tbl-search { flex-basis: 150px; } }
+
+/* ---------- 1.0 RC: scanner filters, result actions, freezer markers ---------- */
+.scan-more > summary { cursor: pointer; font-size: var(--fs-sm); color: var(--text-2); border-radius: var(--r-sm); width: fit-content; }
+.scan-more > summary:focus-visible { box-shadow: var(--focus); outline: none; }
+.scan-more[open] { display: flex; flex-direction: column; gap: var(--s2); }
+.scan-more[open] > summary { margin-bottom: 2px; }
+.scan-more textarea, .ptr-into textarea { resize: vertical; min-height: 44px; }
+.ptr-into { display: flex; flex-direction: column; gap: var(--s2); }
+.mod-row { display: flex; align-items: center; gap: var(--s2); min-width: 0; }
+.mod-sum { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: var(--fs-sm); color: var(--text-2); }
+.mod-pick { display: flex; flex-direction: column; gap: 2px; max-height: min(50vh, 420px); overflow-y: auto; border: var(--line); border-radius: var(--r); padding: 6px var(--s2); }
+.mod-pick .check { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.tool-bar .hint { align-self: center; }
+.mark.freeze-fail { color: var(--yellow); background: var(--yellow-bg); border-radius: var(--r-sm); padding: 1px; }
+.mark.freeze-fail .ic { width: 12px; height: 12px; }

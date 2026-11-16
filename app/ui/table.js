@@ -12,6 +12,7 @@ import { listCustomTypes, editCustomType, ctLabel } from './custom.js';
 import { state, addSource, addTicker, emit, on, TICK_MS } from './core.js';
 import { comboOf, comboText, MODS } from './keys.js';
 import { attachEditor } from './editor.js';
+import { formDialog } from './memtools.js';
 
 const ROW = 24;
 export const VTYPES = [['byte', 'Byte'], ['2bytes', '2 Bytes'], ['4bytes', '4 Bytes'], ['8bytes', '8 Bytes'], ['float', 'Float'],
@@ -61,6 +62,7 @@ export function initTable(root) {
   let sortCol = null, sortDir = 1, filter = '';
   const hiddenCols = new Set(store.get('tbl.hiddenCols', []));
   let untrusted = new Set(); // entries whose Lua came from another table and waits for consent
+  let failing = new Map(); // id -> why freezing it fails now (lua_poll.freeze_failures)
   const rt = new Map(); // id -> {addr: BigInt|null, value, chgAt}
   const R = (id) => { let r = rt.get(id); if (!r) rt.set(id, (r = { addr: null, value: null, chgAt: 0 })); return r; };
   let flat = [];
@@ -211,6 +213,8 @@ export function initTable(root) {
       ? h('span.mode', { title: MODES.find((m) => m[0] === e.freeze_mode)[1], html: icon(e.freeze_mode === 'allow_increase' ? 'up' : 'down') }) : null;
     const marks = [
       untrusted.has(e.id) ? h('span.mark.untrusted', { title: 'Came from another table: its Lua asks for your consent before it runs', 'aria-label': 'untrusted Lua', role: 'img', html: icon('shield') }) : null,
+      failing.has(e.id) ? h('span.mark.freeze-fail', { role: 'img', 'aria-label': 'Freezing fails: ' + failing.get(e.id), title: `Freezing fails: ${failing.get(e.id)} (HeapHook keeps retrying)`, html: icon('info') }) : null,
+      isValue(e) && e.freeze_interval_ms ? h('span.mark', { role: 'img', 'aria-label': `Own freeze interval ${e.freeze_interval_ms} ms`, title: `Freezes every ${e.freeze_interval_ms} ms (its own interval)`, html: icon('clock') }) : null,
       e.hotkeys.length ? h('span.mark', { title: e.hotkeys.map((k) => comboText(k.keys)).join(', '), html: icon('key') }) : null,
       e.children.length && !showsKids(e) ? h('span.mark.muted', { title: `${e.children.length} hidden`, html: icon('group') }) : null,
     ];
@@ -269,6 +273,13 @@ export function initTable(root) {
     resolveVisible();
   }
   const paintSoon = rafThrottle(paint);
+  // Sent on every poll; an entry no longer listed has its marker cleared.
+  on('freeze:failures', (list) => {
+    const next = new Map((list || []).map((f) => [f.id, String(f.error)]));
+    if (next.size === failing.size && [...next].every(([id, why]) => failing.get(id) === why)) return;
+    failing = next;
+    paintSoon();
+  });
   body.addEventListener('scroll', paintSoon, { passive: true });
   new ResizeObserver(paintSoon).observe(body);
   function render() {
@@ -472,6 +483,20 @@ export function initTable(root) {
   function setMode(mode) { edit(selIds(), (e) => { e.freeze_mode = mode; }); }
   function setFlag(flag) { const s = selectedAll(), v = !s[0]?.[flag]; edit(s.map((e) => e.id), (e) => { e[flag] = v; }); }
   function setColor(c) { edit(selIds(), (e) => { e.color = c; }); }
+  /** The selected value entries' own freezer interval (null = Settings' interval). */
+  async function intervalDialog() {
+    const list = selectedAll().filter(isValue);
+    if (!list.length) return;
+    const dflt = state.settings?.freeze_interval_ms;
+    const v = await formDialog('Freeze interval', [{
+      name: 'ms', label: 'Milliseconds, 1 to 60000 (empty = the Settings interval)', value: list[0].freeze_interval_ms ?? '',
+      placeholder: dflt ? `${dflt} (Settings)` : 'Settings',
+    }], { ok: 'Apply', text: `How often the freezer writes ${list.length > 1 ? `the ${list.length} selected entries` : 'this entry'} back while frozen. Short intervals cost CPU.` });
+    if (!v) return;
+    const ms = v.ms === '' ? null : /^\d+$/.test(v.ms) && +v.ms >= 1 && +v.ms <= 60000 ? +v.ms : NaN;
+    if (Number.isNaN(ms)) { toast('The interval must be a whole number from 1 to 60000 ms, or empty'); return; }
+    edit(list.map((e) => e.id), (e) => { e.freeze_interval_ms = ms; });
+  }
 
   /** Inserts after the cursor (or at the end); returns the new ids. */
   function add(items, { edit: editNow, then } = {}) {
@@ -736,6 +761,7 @@ export function initTable(root) {
       { label: 'Group options…', disabled: !cur || !(cur.children.length || isGroup(cur)), run: () => groupDialog(cur.id) },
       '-',
       ...MODES.map(([m, l]) => ({ label: l, checked: cur?.freeze_mode === m, disabled: !addrE, run: () => setMode(m) })),
+      { label: cur?.freeze_interval_ms ? `Freeze interval: ${cur.freeze_interval_ms} ms…` : 'Freeze interval…', disabled: !addrE, run: intervalDialog },
       '-',
       { label: 'Show as hexadecimal', checked: !!cur?.hex, disabled: !addrE, run: () => setFlag('hex') },
       { label: 'Show as signed', checked: !!cur?.signed, disabled: !addrE, run: () => setFlag('signed') },

@@ -334,11 +334,13 @@ local function memscan(id, owned)
   ms = object(
     { FoundCount = function() return H.ms_count(id) end, OnScanDone = function() return st.ondone end,
       CustomType = function() return st.ct end, Not = function() return st.isnot or false end,
-      OnlyOneResult = function() return st.onlyone or false end, Result = function() return st.result end },
+      OnlyOneResult = function() return st.onlyone or false end, Result = function() return st.result end,
+      RegionFilter = function() return st.filter end },
     { OnScanDone = function(f) st.ondone = f end, CustomType = function(v) st.ct = v end,
+      RegionFilter = function(v) st.filter = v end,
       Not = function(v) st.isnot = v and true or false end, OnlyOneResult = function(v) st.onlyone = v and true or false end },
     { firstScan = function(so, vt, rt, i1, i2, start, stop, prot, at, ap, hex, nb, uni, cs)
-        H.ms_first(id, so, vt, rt, i1, i2, start, stop, prot, at, ap, hex, nb, uni, cs, st.ct, st.isnot); done()
+        H.ms_first(id, so, vt, rt, i1, i2, start, stop, prot, at, ap, hex, nb, uni, cs, st.ct, st.isnot, st.filter); done()
       end,
       nextScan = function(so, rt, i1, i2, hex, nb, uni, cs, pct, saved)
         H.ms_next(id, so, rt, i1, i2, hex, nb, uni, cs, pct, saved, st.isnot); done()
@@ -351,6 +353,10 @@ local function memscan(id, owned)
       saveCurrentResults = function(name) H.ms_save(id, name) end,
       getSavedResultList = function() return stringlist(H.ms_saved(id)) end,
       deleteSavedResult = function(name) H.ms_delsaved(id, name) end,
+      -- HeapHook: results order, removal and saved-scan values
+      sortResults = function(byValue, descending) H.ms_sort(id, byValue ~= false, descending and true or false) end,
+      removeResults = function(addrs) return H.ms_remove(id, addrs) end,
+      getSavedResultValue = function(name, address) return H.ms_savedval(id, name, address) end,
       destroy = function() if owned then H.ms_free(id); myscans[id] = nil end end })
   rawset(ms, '__hh_id', id)
   rawset(ms, '__hh_st', st)
@@ -579,6 +585,9 @@ rechotkey = function(id, hid)
   elseif a == 3 then act(true)
   elseif a == 4 then act(false)
   elseif a == 5 then rec.Value = h.Value
+  elseif (a == 6 or a == 7) and H.mr_get(id, 'Type') == vtCustom then
+    local d = tonumber(h.Value) or 1
+    H.mr_add(id, a == 6 and d or -d)
   elseif a == 6 or a == 7 then
     local base = rec.ShowAsHex and 16 or 10
     local cur, d = tonumber(rec.Value, base) or tonumber(rec.Value) or 0, tonumber(h.Value) or 1
@@ -648,6 +657,7 @@ mr = function(id)
       String = function() return object({ Size = g 'StringSize', Unicode = g 'Unicode' }, { Size = s 'StringSize', Unicode = s 'Unicode' }) end,
       Aob = function() return object({ Size = g 'AobSize' }, { Size = s 'AobSize' }) end },
     { Description = s 'Description', Address = s 'Address', Type = s 'Type', Value = s 'Value',
+      CustomTypeName = s 'CustomTypeName',
       Script = s 'Script', Color = s 'Color', ShowAsHex = s 'ShowAsHex', ShowAsSigned = s 'ShowAsSigned',
       IsGroupHeader = s 'IsGroupHeader', Options = s 'Options', Collapsed = s 'Collapsed',
       DropDownReadOnly = s 'DropDownReadOnly', DropDownDescriptionOnly = s 'DropDownDescriptionOnly',
@@ -763,12 +773,106 @@ function getThreadlist(list)
 end
 function translate(s) return s end
 
+-------------------------------------------------------------------- AA / symbol / structure hooks
+-- Registered callbacks, in registration order: { id, f } lists (commands by lowercase name).
+-- Rust gets a mirror of what is registered (H.hooks_sync) and calls the dispatchers in
+-- `HOOKS` (registry `hh_hooks`).
+local aacmds, aapro, symlk, addrlk, stov, stnm = {}, {}, {}, {}, {}, {}
+local hookid = 0
+local function hooksync()
+  local names = {}
+  for n in pairs(aacmds) do names[#names + 1] = n end
+  H.hooks_sync(names, #aapro, #symlk, #addrlk, #stov, #stnm)
+end
+local function addhook(list, f)
+  if type(f) ~= 'function' then error('a function is required', 3) end
+  hookid = hookid + 1
+  list[#list + 1] = { hookid, f }
+  hooksync()
+  return hookid
+end
+local function delhook(list, id)
+  for i, e in ipairs(list) do
+    if e[1] == id or e[2] == id then table.remove(list, i); hooksync(); return true end
+  end
+  return false
+end
+
+-- registerAutoAssemblerCommand(name, function(parameters, syntaxcheckonly)): the function
+-- returns the replacement text, or nil and an error message.
+function registerAutoAssemblerCommand(name, f)
+  if type(f) ~= 'function' then error('registerAutoAssemblerCommand: a function is required', 2) end
+  aacmds[tostring(name):lower()] = f
+  hooksync()
+end
+function unregisterAutoAssemblerCommand(name)
+  aacmds[tostring(name):lower()] = nil
+  hooksync()
+end
+-- registerAutoAssemblerPrologue(function(script, syntaxcheck), postAOB): script is a
+-- TStrings the function may change. (postAOB is ignored: prologues run before the script.)
+function registerAutoAssemblerPrologue(f) return addhook(aapro, f) end
+function unregisterAutoAssemblerPrologue(id) return delhook(aapro, id) end
+-- registerSymbolLookupCallback(function(name): address, location): asked when nothing else
+-- knows a name (every location counts as slFailure in HeapHook).
+slStart, slNotInt, slNotModule, slNotUserdefinedSymbol, slNotSymbol, slFailure = 0, 1, 2, 3, 4, 5
+function registerSymbolLookupCallback(f) return addhook(symlk, f) end
+function unregisterSymbolLookupCallback(id) return delhook(symlk, id) end
+-- registerAddressLookupCallback(function(address): name)
+function registerAddressLookupCallback(f) return addhook(addrlk, f) end
+function unregisterAddressLookupCallback(id) return delhook(addrlk, id) end
+-- registerStructureDissectOverride(function(structure, baseaddress): handled)
+function registerStructureDissectOverride(f) return addhook(stov, f) end
+function unregisterStructureDissectOverride(id) return delhook(stov, id) end
+-- registerStructureNameLookup(function(address): name, newaddress)
+function registerStructureNameLookup(f) return addhook(stnm, f) end
+function unregisterStructureNameLookup(id) return delhook(stnm, id) end
+
+local HOOKS = {}
+function HOOKS.command(name, args, check)
+  local f = aacmds[name]
+  if not f then return nil end
+  local r, err = f(args, check)
+  if r == nil and err ~= nil then error(tostring(err), 0) end
+  return r ~= nil and tostring(r) or ''
+end
+function HOOKS.prologue(script, check)
+  for _, e in ipairs(aapro) do
+    local sl = stringlist(splitlines(script))
+    e[2](sl, check)
+    script = sl.Text
+  end
+  return script
+end
+function HOOKS.symbol(name)
+  for _, e in ipairs(symlk) do
+    local a = e[2](name)
+    if a ~= nil then return a end
+  end
+end
+function HOOKS.address(a)
+  for _, e in ipairs(addrlk) do
+    local n = e[2](a)
+    if n ~= nil then return tostring(n) end
+  end
+end
+local structoverride -- set with the structures
+function HOOKS.structoverride(a, size) return structoverride(a, size) end
+function HOOKS.structname(a)
+  for _, e in ipairs(stnm) do
+    local n, na = e[2](a)
+    if n ~= nil then return tostring(n), na end
+  end
+end
+
 -------------------------------------------------------------------- structures
 local structobj = {}
 local structure
 
+-- Bit fields and arrays are HeapHook element properties: BitOffset / BitLength (a field of an
+-- integer element, bits counted from the least significant; set BitLength first) and ArrayCount (the element
+-- repeats back to back; getValue(base, index) reads element `index`).
 local function element(sid, uid)
-  local css = 0
   local function g(k) return function() return H.st_elem_get(sid, uid, k) end end
   local function s(k) return function(v) H.st_elem_set(sid, uid, k, v) end end
   return object(
@@ -779,35 +883,59 @@ local function element(sid, uid)
         local gi = n and H.st_find(n)
         return gi and structure(H.st_global(gi)) or nil
       end,
-      ChildStructStart = function() return css end },
+      ChildStructStart = g 'ChildStructStart', BitOffset = g 'BitOffset', BitLength = g 'BitLength',
+      ArrayCount = g 'ArrayCount' },
     { Offset = s 'Offset', Name = s 'Name', Vartype = s 'Vartype', Bytesize = s 'Bytesize', DisplayMethod = s 'DisplayMethod',
       ChildStruct = function(v) H.st_elem_set(sid, uid, 'ChildStruct', v and v.Name) end,
-      ChildStructStart = function(v) css = toint(v) end },
-    { getValue = function(a) return H.st_elem_value(sid, uid, a) end,
-      setValue = function(a, v) return H.st_elem_setvalue(sid, uid, a, v) end,
-      getValueFromBase = function(a) return H.st_elem_value(sid, uid, a) end,
-      setValueFromBase = function(a, v) return H.st_elem_setvalue(sid, uid, a, v) end,
+      ChildStructStart = s 'ChildStructStart', BitOffset = s 'BitOffset', BitLength = s 'BitLength',
+      ArrayCount = s 'ArrayCount' },
+    { getValue = function(a, i) return H.st_elem_value(sid, uid, a, i) end,
+      setValue = function(a, v, i) return H.st_elem_setvalue(sid, uid, a, v, i) end,
+      getValueFromBase = function(a, i) return H.st_elem_value(sid, uid, a, i) end,
+      setValueFromBase = function(a, v, i) return H.st_elem_setvalue(sid, uid, a, v, i) end,
       destroy = function() H.st_elem_del(sid, uid) end })
 end
 
 structure = function(sid)
   if structobj[sid] then return structobj[sid] end
   local function el(i) local uid = H.st_uid_at(sid, toint(i)); return uid and element(sid, uid) or nil end
-  local s = object(
+  local s
+  s = object(
     { Name = function() return H.st_get(sid, 'Name') end, Size = function() return H.st_get(sid, 'Size') end,
       Count = function() return H.st_get(sid, 'Count') end, Element = function() return indexed(el) end },
     { Name = function(v) H.st_set_name(sid, tostring(v)) end },
     { getElement = el,
       addElement = function() return element(sid, H.st_add(sid)) end,
       getElementByOffset = function(o) local uid = H.st_uid_by_offset(sid, toint(o)); return uid and element(sid, uid) or nil end,
-      autoGuess = function(base, off, size) H.st_autoguess(sid, base, off, size) end,
+      -- registerStructureDissectOverride functions get the first try (with the guessed
+      -- address); one returning true took care of it.
+      autoGuess = function(base, off, size)
+        local a = getAddress(base) + toint(off or 0)
+        for _, e in ipairs(stov) do
+          if e[2](s, a) then return end
+        end
+        H.st_autoguess(sid, base, off, size)
+      end,
       fillFromDotNetAddress = function() error('not supported in HeapHook: fillFromDotNetAddress (mono/.NET inspection needs an injected data collector)', 2) end,
       addToGlobalStructureList = function() H.st_global_set(sid, true) end,
       removeFromGlobalStructureList = function() H.st_global_set(sid, false) end,
       beginUpdate = function() end, endUpdate = function() end,
       destroy = function() H.st_destroy(sid); structobj[sid] = nil end })
+  rawset(s, '__hh_sid', sid)
   structobj[sid] = s
   return s
+end
+
+-- For Engine::structure_override: a scratch structure the first override that returns true
+-- filled (its id; the engine takes it over), or nil.
+structoverride = function(a, size)
+  for _, e in ipairs(stov) do
+    local sid = H.st_new('')
+    local ok, r = pcall(e[2], structure(sid), a)
+    if ok and r then structobj[sid] = nil; return sid end
+    H.st_destroy(sid); structobj[sid] = nil
+    if not ok then error(r, 0) end
+  end
 end
 
 function createStructure(name) return structure(H.st_new(tostring(name or 'unnamed structure'))) end
@@ -818,15 +946,43 @@ function getStructure(i) local sid = H.st_global(toint(i)); return sid and struc
 local dc
 function getDissectCode()
   if dc then return dc end
-  local function nyi(n) return function() error('not implemented yet: DissectCode.' .. n, 2) end end
   dc = object({}, nil,
     { dissect = function(a, size) return H.dc_dissect(a, size) end,
       clear = function() H.dc_clear() end,
       getReferences = function(a) return H.dc_refs(a) end,
       getReferencedStrings = function() return H.dc_strings() end,
       getReferencedFunctions = function() return H.dc_funcs() end,
-      saveToFile = nyi 'saveToFile', loadFromFile = nyi 'loadFromFile', destroy = function() end })
+      saveToFile = function(f) return H.dc_save(f) end, loadFromFile = function(f) return H.dc_load(f) end,
+      -- HeapHook: functions that ran an instruction of every `ran` address set and none of
+      -- the `notRan` sets (code filter without tracing)
+      codeFilter = function(ran, notRan) return H.dc_filter(ran, notRan) end,
+      destroy = function() end })
   return dc
+end
+
+-------------------------------------------------------------------- pointer scan (HeapHook)
+-- hhCreatePointerScan(options): HeapHook's own background pointer scan (Cheat Engine has no
+-- stable Lua API for it). options: target (address, required), maxLevel, maxOffset,
+-- allowNegative, staticOnly, baseModules, threadStacks, stackMax, noLoops, maxChildren,
+-- lastOffsets, endsWith, startsWith, allowedOffsets, heapOnly, maxResults (default 100000),
+-- threads (0 = all cores), stopAtStatic, timeLimit (seconds), alignment, writableOnly.
+-- Object: getProgress() -> {Done, Total, Found, Paused, Cancelled, Finished}, isDone(),
+-- waitTillDone(ms) -> count or nil on timeout, getResults(offset, limit) -> {{Base,
+-- BaseOffset, Offsets, Text, Address, Value}}, Count, pause(), resume(), cancel(), destroy().
+function hhCreatePointerScan(opts)
+  if type(opts) ~= 'table' then error('hhCreatePointerScan: an options table is required', 2) end
+  local id = H.ps_start(opts)
+  local count
+  return object(
+    { Count = function() count = count or H.ps_wait(id); return count end, ID = function() return id end },
+    nil,
+    { getProgress = function() return H.ps_progress(id) end,
+      isDone = function() return H.ps_done(id) end,
+      waitTillDone = function(ms) local n = H.ps_wait(id, ms); if n then count = n end; return n end,
+      getResults = function(offset, limit) return H.ps_results(id, offset, limit) end,
+      pause = function() H.ps_pause(id) end, resume = function() H.ps_resume(id) end,
+      cancel = function() H.ps_cancel(id) end,
+      destroy = function() H.ps_free(id) end })
 end
 
 -------------------------------------------------------------------- debugger
@@ -1251,6 +1407,7 @@ end
 -------------------------------------------------------------------- host entry points
 local I = {}
 I.mr = mr
+I.hooks = HOOKS
 I.setactive = setactive
 I.rechotkey = rechotkey
 function I.xcall(f, ...) return xpcall(f, traceback, ...) end
@@ -1354,6 +1511,8 @@ function I.clear()
   bpfuncs = {}
   for id in pairs(myscans) do H.ms_free(id) end
   myscans = {}
+  aacmds, aapro, symlk, addrlk, stov, stnm = {}, {}, {}, {}, {}, {}
+  hooksync()
   H.ext_clear()
   if #errs > 0 then error(tconcat(errs, '\n'), 0) end
 end

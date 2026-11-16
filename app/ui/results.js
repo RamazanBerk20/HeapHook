@@ -1,17 +1,21 @@
 // Scan results: virtualized rows fetched in pages via scan_results, live values for the
 // visible rows only. Above ~180k rows the scrollbar is scaled so any count fits.
-import { api } from './backend.js';
-import { $, h, fmtAddr, rafThrottle, nf, attempt, contextMenu, toast } from './util.js';
+import { api, askPath } from './backend.js';
+import { $, h, fmtAddr, fmtSize, rafThrottle, nf, attempt, contextMenu, toast, busy, modal, icon, helpAdd } from './util.js';
 import { state, addSource, emit } from './core.js';
+import { listDialog } from './memtools.js';
+import { vlist } from './vlist.js';
 
 const ROW = 22, PAGE = 256, MAXPX = 4_000_000, MAX_ADD = 2000;
+// Backend caps (hh-scan): sorting other than address ascending, and copying to the clipboard.
+const SORT_MAX = 5_000_000, COPY_MAX = 1_000_000, REMOVE_MAX = 100_000;
 
 export function initResults(root) {
   const vp = $('.vl-viewport', root), spacer = $('.vl-spacer', root), layer = $('.vl-rows', root);
   const countEl = $('#res-count'), savedSel = $('#res-saved'), empty = $('#res-empty');
   const headBit = $('.vl-head .c-bit', root), headSaved = $('.vl-head .c-saved', root);
   let scan = { count: 0, vtype: '4bytes', hex: false, len: 0, utf16: false, custom: null, custom_name: null, has: false };
-  let busyScan = false, diff = '', isBinary = false;
+  let busyScan = false, diff = '', isBinary = false, sorted = null; // sorted: {key, desc} until the results change
   let gen = 0, first = 0, vis = 0, cursor = -1, anchor = -1, ignoreScroll = false;
   const pages = new Map(), pending = new Set(), live = new Map(), pool = [];
 
@@ -119,10 +123,10 @@ export function initResults(root) {
     schedule();
   }
 
-  async function selectedRows() {
+  async function selectedRows(max = MAX_ADD) {
     if (cursor < 0) return [];
-    const lo = Math.min(anchor, cursor), n = Math.min(MAX_ADD, Math.abs(anchor - cursor) + 1);
-    if (Math.abs(anchor - cursor) + 1 > MAX_ADD) toast(`Only the first ${MAX_ADD} selected rows are used`, 'info');
+    const lo = Math.min(anchor, cursor), n = Math.min(max, Math.abs(anchor - cursor) + 1);
+    if (Math.abs(anchor - cursor) + 1 > max) toast(`Only the first ${nf.format(max)} selected rows are used`, 'info');
     return api.scanResults(lo, n);
   }
   async function addSelected() {
@@ -146,6 +150,116 @@ export function initResults(root) {
     const d = cursor >= 0 && rowData(cursor);
     if (d) emit(event, { addr: d.addr, vtype: rowType(d), len: scan.len, utf16: scan.utf16, description: 'Pointer to ' + fmtAddr(d.addr) });
   }
+  // ---------- whole-list actions (1.0) ----------
+  function toTop() { first = 0; cursor = -1; anchor = -1; ignoreScroll = vp.scrollTop !== 0; vp.scrollTop = 0; }
+  async function sortBy(key, desc) {
+    if (!count() || busyScan) return;
+    if ((key !== 'address' || desc) && count() > SORT_MAX) {
+      toast(`Sorting ${nf.format(count())} results by ${key === 'value' ? 'value' : 'descending address'} is refused above ${nf.format(SORT_MAX)}: narrow them with a next scan first`, 'info');
+      return;
+    }
+    const ok = await busy('Sorting results', () => attempt(async () => { await api.scanSort(key, desc); return true; }));
+    if (!ok) return;
+    sorted = key === 'address' && !desc ? null : { key, desc };
+    resetRows(); toTop(); measure();
+  }
+  async function removeSelected() {
+    if (cursor < 0 || busyScan) return;
+    const rows = await attempt(() => selectedRows(REMOVE_MAX));
+    if (!rows?.length) return;
+    const removed = await attempt(() => api.scanRemove(rows.map((r) => r.addr)));
+    if (removed == null) return;
+    const at = Math.min(anchor, cursor);
+    scan.count = Math.max(0, scan.count - removed);
+    sorted = null; // a changed result set is back in address order
+    resetRows();
+    countEl.textContent = scan.count ? nf.format(scan.count) : '';
+    showEmpty(); measure();
+    cursor = anchor = -1;
+    if (count()) moveTo(Math.min(at, count() - 1));
+    emit('scan:removed', { count: scan.count });
+    toast(`Removed ${nf.format(removed)} result${removed === 1 ? '' : 's'} (Ctrl Z brings them back)`, 'info');
+  }
+  async function exportAll() {
+    if (!count()) return;
+    const p = await askPath({ save: true, title: 'Export every result address', filters: [['Text', ['txt']], ['All files', ['*']]], dflt: 'addresses.txt' });
+    if (!p) return;
+    const n = await busy('Exporting addresses', () => attempt(() => api.scanExportAddresses(p)));
+    if (n != null) toast(`Exported ${nf.format(n)} addresses to ${p}`, 'info');
+  }
+  async function copyAll() {
+    if (!count() || busyScan) return;
+    if (count() > COPY_MAX) {
+      const r = await modal({ title: 'Too many to copy', text: `${nf.format(count())} addresses are more than the clipboard copy takes (${nf.format(COPY_MAX)}). Export them to a text file instead (one address per line)?`,
+        buttons: [{ label: 'Export…', value: 'export', kbd: 'Enter', primary: true }, { label: 'Cancel', value: 'cancel', kbd: 'Esc' }] });
+      if (r.value === 'export') exportAll();
+      return;
+    }
+    const text = await busy('Copying addresses', () => attempt(() => api.scanCopyAddresses()));
+    if (text == null) return;
+    try { await navigator.clipboard.writeText(text); toast(`Copied ${nf.format(count())} addresses`, 'info'); } catch (e) { toast(e?.message || e); }
+  }
+  async function statsDialog() {
+    if (!count()) return;
+    const rows = await busy('Counting results per region', () => attempt(() => api.scanStats()));
+    if (!rows) return;
+    const { dialog, body } = listDialog('Results per region');
+    const host = h('div.tool-list');
+    const byRegion = [...rows].sort((a, b) => b.count - a.count);
+    const mods = new Map();
+    for (const r of rows) {
+      const k = r.module || `${r.kind || 'Other'} memory, no module`;
+      const m = mods.get(k) || mods.set(k, { name: k, regions: 0, count: 0 }).get(k);
+      m.regions++; m.count += r.count;
+    }
+    const byModule = [...mods.values()].sort((a, b) => b.count - a.count);
+    const total = rows.reduce((t, r) => t + r.count, 0);
+    let list = null;
+    function show(mode) {
+      host.replaceChildren();
+      list = mode === 'module'
+        ? vlist(host, { cols: 'minmax(0, 1fr) 90px 110px', head: ['Module', 'Regions', 'Results'], label: 'Results per module', empty: 'No results.',
+          count: () => byModule.length, item: (i) => byModule[i], cells: (m) => [m.name, nf.format(m.regions), nf.format(m.count)] })
+        : vlist(host, { cols: '128px 80px 72px minmax(0, 1fr) 100px', head: ['Region', 'Size', 'Kind', 'Module / file', 'Results'], label: 'Results per region', empty: 'No results.',
+          count: () => byRegion.length, item: (i) => byRegion[i],
+          cells: (r) => [fmtAddr(r.start), r.size ? fmtSize(r.size) : 'unmapped', r.kind || '', r.module || r.path || '', nf.format(r.count)],
+          onActivate: (i) => { dialog.close(); emit('mem:goto', { addr: byRegion[i].start, pane: 'hex' }); } });
+      list.refresh({ reset: true });
+      list.focus();
+    }
+    const mode = h('select.compact', { 'aria-label': 'Group the results by', onchange: () => show(mode.value) },
+      h('option', { value: 'region' }, 'Per region'), h('option', { value: 'module' }, 'Per module'));
+    body.append(h('div.tool-bar', null, mode,
+      h('p.hint', null, `${nf.format(total)} results in ${nf.format(rows.length)} regions, most first. Enter on a region shows it in the hex view.`)), host);
+    show('region');
+  }
+  /** Actions on the whole result list: the toolbar menu and the lower part of the row menu. */
+  function listItems() {
+    const none = !count() || busyScan, big = count() > SORT_MAX;
+    const capped = (l) => (big ? `${l} (up to ${nf.format(SORT_MAX)} results)` : l);
+    const sortItem = (key, desc, label) => ({
+      label: key === 'address' && !desc ? label : capped(label), run: () => sortBy(key, desc),
+      checked: sorted ? sorted.key === key && sorted.desc === desc : key === 'address' && !desc,
+      disabled: none || ((key !== 'address' || desc) && big),
+    });
+    return [
+      { label: 'Remove selected from the results', kbd: 'Del', run: removeSelected, disabled: none || cursor < 0 },
+      '-',
+      sortItem('address', false, 'Sort by address'),
+      sortItem('address', true, 'Sort by address, descending'),
+      sortItem('value', false, 'Sort by value (of the last scan)'),
+      sortItem('value', true, 'Sort by value, descending'),
+      '-',
+      { label: count() > COPY_MAX ? 'Copy all addresses (too many: export)…' : 'Copy all addresses', kbd: 'Ctrl Shift C', run: copyAll, disabled: none },
+      { label: 'Export all addresses to a file…', run: exportAll, disabled: none },
+      { label: 'Results per region / module…', run: statsDialog, disabled: none },
+    ];
+  }
+  const moreBtn = h('button.btn.ghost.icon#res-more', { type: 'button', 'aria-label': 'Result list actions: sort, remove, copy, export, summary', title: 'Sort, remove, copy, export, summary', 'aria-haspopup': 'menu', html: icon('more'),
+    onclick: () => { const r = moreBtn.getBoundingClientRect(); contextMenu(r.left, r.bottom + 4, listItems(), moreBtn); } });
+  $('.panel-head .hints', root).before(moreBtn);
+  helpAdd('Results', [['Del', 'Remove selected results (Ctrl Z brings them back)'], ['Ctrl Shift C', 'Copy every result address']]);
+
   function menu(x, y) {
     contextMenu(x, y, [
       { label: 'Add to table', kbd: 'Enter', run: addSelected, disabled: cursor < 0 },
@@ -155,6 +269,8 @@ export function initResults(root) {
       { label: 'Find out what accesses this address', kbd: 'F5', run: () => onAddr('debug:accesses'), disabled: cursor < 0 },
       { label: 'Find out what writes to this address', kbd: 'F6', run: () => onAddr('debug:writes'), disabled: cursor < 0 },
       { label: 'Pointer scan for this address…', run: () => onAddr('ptr:scan'), disabled: cursor < 0 },
+      '-',
+      ...listItems(),
     ], vp);
   }
 
@@ -167,7 +283,9 @@ export function initResults(root) {
     else if (k === 'Home') moveTo(0, e.shiftKey);
     else if (k === 'End') moveTo(count() - 1, e.shiftKey);
     else if (k === 'Enter' || k === 'Insert') addSelected();
+    else if (ctrl && e.shiftKey && k.toLowerCase() === 'c') copyAll();
     else if (ctrl && k.toLowerCase() === 'c') copySelected();
+    else if (k === 'Delete') removeSelected();
     else if (ctrl && k.toLowerCase() === 'm') browse();
     else if (k === 'F5') onAddr('debug:accesses');
     else if (k === 'F6') onAddr('debug:writes');
@@ -212,11 +330,9 @@ export function initResults(root) {
     /** New result set (or none). scan: {count, vtype, hex, len, utf16} */
     set(s) {
       scan = { ...scan, custom: null, custom_name: null, ...s, has: !!s.has };
-      resetRows();
+      resetRows(); sorted = null;
       columns(); showEmpty();
-      first = 0; cursor = -1; anchor = -1;
-      ignoreScroll = vp.scrollTop !== 0;
-      vp.scrollTop = 0;
+      toTop();
       countEl.textContent = s.count ? nf.format(s.count) : '';
       measure();
       render();

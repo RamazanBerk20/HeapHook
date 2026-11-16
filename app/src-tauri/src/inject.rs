@@ -21,7 +21,7 @@ pub struct CreateReq {
 }
 
 /// `a "b c" d` -> `[a, b c, d]`.
-fn split_args(s: &str) -> Vec<String> {
+pub(crate) fn split_args(s: &str) -> Vec<String> {
     let (mut out, mut cur, mut q, mut any) = (Vec::new(), String::new(), false, false);
     for c in s.chars() {
         match c {
@@ -102,6 +102,9 @@ impl App {
         let dbg = sess.as_ref().map(|s| lock(&s.dbg));
         let traced = sess.as_ref().filter(|_| dbg.as_ref().is_some_and(|d| d.is_some())).map(|s| s.info.pid);
         lock(&self.x.children).retain_mut(|c| Some(c.id()) == traced || !matches!(c.try_wait(), Ok(Some(_))));
+        // Processes started under the debugger have no `Child`: waited on by pid, never
+        // while traced (`debug_launch`).
+        lock(&self.x.launched).retain(|&pid| Some(pid) == traced || !reaped(pid));
         drop(dbg);
     }
 
@@ -143,6 +146,23 @@ impl App {
         let sh = self.speed_find()?.ok_or("this process was not started with the speedhack (use Create process)")?;
         sh.set_speed(speed).map_err(s)?;
         sh.status().map_err(s)
+    }
+}
+
+/// Waits for `pid` without blocking: true once it is gone (exited and reaped, or not our
+/// child any more).
+fn reaped(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        let mut st = 0;
+        // SAFETY: plain syscall on a pid HeapHook started; WNOHANG never blocks.
+        let r = unsafe { libc::waitpid(pid as i32, &mut st, libc::WNOHANG) };
+        r != 0
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        true
     }
 }
 

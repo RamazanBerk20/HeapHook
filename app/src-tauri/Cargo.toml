@@ -25,6 +25,10 @@ tauri = { version = "2", features = [] }
 tauri-plugin-dialog = "2"
 tauri-plugin-global-shortcut = "2"
 
+[target.'cfg(unix)'.dependencies]
+# waitpid for processes started under the debugger (they have no std `Child`).
+libc = "0.2"
+
 [features]
 # Development only: `heaphook --dev-bridge <port>` serves app/ui and the IPC commands over
 # HTTP on 127.0.0.1 (see src/bridge.rs). Never enabled for release bundles.

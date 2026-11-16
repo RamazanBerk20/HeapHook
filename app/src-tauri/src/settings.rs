@@ -43,6 +43,9 @@ pub struct Settings {
     pub hotkey_delay_ms: u64,
     /// HeapHook's own hotkeys: speedhack presets and pausing the process.
     pub app_hotkeys: Vec<AppHotkey>,
+    /// Auto Assembler `aobscan*` whose pattern matches more than once: `off` (take the first,
+    /// like Cheat Engine), `warn` (count the matches) or `fail` (refuse the script).
+    pub aob_unique: String,
 }
 
 /// One of HeapHook's own hotkeys (not a table's).
@@ -79,6 +82,7 @@ impl Default for Settings {
             scan_spill_dir: String::new(),
             hotkey_delay_ms: 150,
             app_hotkeys: Vec::new(),
+            aob_unique: "off".into(),
         }
     }
 }
@@ -106,6 +110,7 @@ impl Settings {
         pick(&mut self.bp_method, &["software", "hardware"], &d.bp_method);
         pick(&mut self.theme, &["system", "light", "dark"], &d.theme);
         pick(&mut self.scan_priority, &["normal", "low", "idle"], &d.scan_priority);
+        pick(&mut self.aob_unique, &["off", "warn", "fail"], &d.aob_unique);
         self.scan_spill_dir = self.scan_spill_dir.trim().to_string();
         self.hotkey_delay_ms = self.hotkey_delay_ms.min(10_000);
         self.app_hotkeys.retain(|h| !h.keys.is_empty() && h.keys.len() <= 6 && match h.action.as_str() {

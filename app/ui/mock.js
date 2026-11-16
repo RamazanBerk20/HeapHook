@@ -436,6 +436,17 @@ async function runScan(fn) {
 
 const tri = (v, flag) => v === 'any' || v == null || (v === 'yes') === flag;
 
+/** opts.kinds / modules / exclude_modules / ranges / size limits as region filters (ranges: a region overlapping one is scanned whole). */
+function regionOk(r, o) {
+  const m = modOf(r.start)?.name.toLowerCase() ?? null, has = (l) => l.map((x) => String(x).toLowerCase());
+  for (const n of [...(o.modules || []), ...(o.exclude_modules || [])]) if (!P.mods.some((x) => x.name.toLowerCase() === String(n).toLowerCase())) err(`unknown module ${n}`);
+  if (o.kinds?.length && !o.kinds.includes(r.kind)) return false;
+  if (o.modules?.length && !has(o.modules).includes(m)) return false;
+  if (o.exclude_modules?.length && has(o.exclude_modules).includes(m)) return false;
+  if (o.ranges?.length && !o.ranges.some((g) => r.start < A(g.end) && r.start + r.size > A(g.start))) return false;
+  return !(o.min_region_size && r.size < o.min_region_size) && !(o.max_region_size && r.size > o.max_region_size);
+}
+
 async function scanFirst(req) {
   need();
   const { scan_type } = req;
@@ -452,7 +463,7 @@ async function scanFirst(req) {
     const lo = opts.start ? parseAddr(opts.start) : 0, hi = opts.stop ? parseAddr(opts.stop) : Infinity;
     const regs = P.R.filter((r) => r.prot[0] === 'r' && tri(opts.writable, r.prot[1] === 'w') &&
       tri(opts.executable, r.prot[2] === 'x') && tri(opts.copy_on_write, r.kind === 'Mapped' && r.prot[1] === 'w') &&
-      r.start + r.size > lo && r.start < hi);
+      r.start + r.size > lo && r.start < hi && regionOk(r, opts));
     prog.total = regs.reduce((s, r) => s + r.size, 0);
     let out = new Uint32Array(Math.ceil(prog.total / align) + regs.length);
     let n = 0, doneBase = 0;
@@ -472,6 +483,7 @@ async function scanFirst(req) {
     }
     prog.done = prog.total;
     sc.results = out.subarray(0, n);
+    sc.ord = null;
     sc.saved = new Map();
     sc.first = sc.prev = m;
     sc.undo = null;
@@ -502,6 +514,7 @@ async function scanNext(req) {
       if (cancelled) err('scan cancelled');
     }
     S.undo = { results: S.results, prev: S.prev };
+    S.ord = null;
     S.results = out.subarray(0, n);
     S.prev = m;
     return { count: n };
@@ -573,7 +586,7 @@ const C = {
   scan_next: ({ req }) => scanNext(req),
   scan_undo() {
     if (!S?.undo) err('nothing to undo');
-    S.results = S.undo.results; S.prev = S.undo.prev; S.undo = null;
+    S.results = S.undo.results; S.prev = S.undo.prev; S.undo = null; S.ord = null;
     return null;
   },
   scan_new() { S = null; return null; },
@@ -582,17 +595,17 @@ const C = {
   scan_results({ offset, limit, saved }) {
     if (!S) return [];
     const sv = saved ? S.saved.get(saved) || err(`no saved scan named "${saved}"`) : null;
-    const out = [], end = Math.min(S.results.length, offset + limit);
+    const out = [], src = S.ord || S.results, end = Math.min(src.length, offset + limit);
     const o = { hex: S.opts.hex, utf16: S.opts.utf16 };
     for (let i = offset; i < end; i++) {
-      const f = S.results[i], z = S.size;
+      const f = src[i], z = S.size;
       // "all" scans: the mock calls small values 2-byte matches (the real scanner records the type that matched)
       const vt = S.vtype !== 'all' ? S.vtype : num(P.mem.subarray(f, f + 4), '4bytes') < 65536 ? '2bytes' : '4bytes';
       out.push({
         addr: hx(addrOfFlat(f)), value: fmt(P.mem.subarray(f, f + z), vt, o),
         previous: fmt(S.prev.subarray(f, f + z), vt, o), first: fmt(S.first.subarray(f, f + z), vt, o), vtype: vt,
         ...(S.vtype === 'binary' ? { bit: S.opts.bit_start ?? 0 } : {}),
-        ...(sv ? { saved: sv.set.has(f) ? fmt(sv.mem.subarray(f, f + z), vt, o) : null } : {}),
+        ...(sv ? { saved: fmt(sv.mem.subarray(f, f + z), vt, o) } : {}),
       });
     }
     return out;
@@ -698,10 +711,25 @@ function fakeCtx(rip, rbx) {
   return c;
 }
 function dbgTick() {
+  if (D) for (const b of D.bps) if (b.pending && !b.resolved && Date.now() >= b.resolveAt) {
+    try { b.addr = resolveExpr(b.pending); } catch { b.addr = CODE.w1[0]; }
+    b.resolved = true; b.armed = Date.now();
+    D.log.push({ seq: D.log.length + 1, text: `breakpoint ${b.id} resolved at ${hx(b.addr)}` });
+  }
   if (!D || D.state !== 'running') return;
-  const obj = P.obj;
+  const obj = P.obj, bo = D.breakOn;
+  if (bo && P.tick % 50 === 0 && bo.thread_created) { brk(CODE.w1[0], `thread ${P.pid + 3} created`); return; }
+  if (bo?.module_loaded?.length && P.tick % 75 === 0 && bo.module_loaded.some((p) => new RegExp('^' + p.replace(/[.+^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*').replace(/\?/g, '.') + '$', 'i').test('libz.so.1'))) { brk(CODE.w1[0], 'module loaded: libz.so.1'); return; }
   for (const b of D.bps) {
-    if (!b.enabled) continue;
+    if (!b.enabled || (b.pending && !b.resolved)) continue;
+    if (b.log) {
+      if (Date.now() - b.armed > 1500) {
+        b.armed = Date.now(); b.hits++;
+        const c = fakeCtx(CODE.w1[0], obj), v = { old: '64', new: '63', address: hx(b.addr).slice(2) };
+        D.log.push({ seq: D.log.length + 1, text: `tracepoint ${b.id} (thread ${b.thread || P.pid}): ${String(b.message || '').replace(/\{(\w+)\}/g, (m, k) => v[k] ?? (c[k] ? c[k].slice(2) : m))}` });
+      }
+      continue;
+    }
     const o = b.options || {};
     // Options like hh-debug: skip the first hits, switch off after one action or at max hits.
     const done = (why) => { b.enabled = false; b.note = why; D.log.push({ seq: D.log.length + 1, text: `breakpoint ${b.id} disabled: ${why}` }); };
@@ -841,24 +869,25 @@ const DBG = {
 
 // ---------- pointer scanner ----------
 let PS = null; // {count, max_level, target, seed}
-let pprog = { running: false, phase: '', done: 0, total: 0, found: 0 };
+let pprog = { running: false, phase: '', done: 0, total: 0, found: 0, paused: false };
 let pcancel = false;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 async function ptrRun(phase, steps, total, f) {
   if (pprog.running) err('a pointer scan is already running');
   pcancel = false;
-  pprog = { running: true, phase, done: 0, total, found: 0 };
+  pprog = { running: true, phase, done: 0, total, found: 0, paused: false };
   try {
     for (let i = 1; i <= steps; i++) {
       await sleep(60);
+      while (pprog.paused && !pcancel) await sleep(100);
       if (pcancel) { if (phase === 'collect') err('cancelled'); break; }
       pprog.done = Math.round((total * i) / steps);
       pprog.found = f(i / steps);
     }
     return pprog.found;
-  } finally { pprog.running = false; pprog.phase = ''; }
+  } finally { pprog.running = false; pprog.phase = ''; pprog.paused = false; }
 }
-const ptrInfo = () => ({ count: PS.count, max_level: PS.max_level, target: hx(PS.target) });
+const ptrInfo = () => ({ count: PS.count, max_level: PS.max_level, target: hx(PS.target), compact: PS.compact !== false });
 /** Row i of the fake result set: row 0 is the real "<exe>"+5A2B0 -> object path. */
 function ptrPath(i) {
   const L = PS.max_level, base = P.syms.player_base - P.mods[0].base, last = PS.target - P.obj;
@@ -919,7 +948,7 @@ const PTR = {
     need();
     fs ??= loadFs();
     const r = fs[path]?.pointer_results || err(`not a HeapHook pointer result file: ${path}`);
-    PS = { ...r };
+    PS = { ...r, compact: !/old/i.test(path) };
     return ptrInfo();
   },
 };
@@ -1114,7 +1143,7 @@ const hkBindings = () => {
   return out;
 };
 const SETTINGS = { scan_priority: 'normal', scan_spill_dir: '', hotkey_delay_ms: 150, freeze_interval_ms: 100, live_update_ms: 300, fast_scan: true, scan_alignment: 4, scan_writable: 'yes', scan_executable: 'any',
-  scan_copy_on_write: 'no', scan_threads: 0, lua_budget_ms: 30000, lua_memory_mb: 1024, table_script: 'ask', lua_allow_os: true, bp_method: 'software', hotkey_sound: false, theme: 'system', signals: {} };
+  scan_copy_on_write: 'no', scan_threads: 0, lua_budget_ms: 30000, lua_memory_mb: 1024, table_script: 'ask', lua_allow_os: true, aob_unique: 'off', bp_method: 'software', hotkey_sound: false, theme: 'system', signals: {} };
 function loadSettings() { try { return { ...SETTINGS, ...JSON.parse(localStorage.getItem('hh.mocksettings')) }; } catch { return { ...SETTINGS }; } }
 
 /** Seeded once so the table features can be tried without the real backend. */
@@ -1599,19 +1628,6 @@ const TOOLS = {
     C.table_save({ path, table: { blocks } });
     return { blocks: blocks.length, bytes: blocks.reduce((s, b) => s + b.hex.length / 2, 0) };
   },
-  mem_load({ path, relocate }) {
-    need();
-    fs ??= loadFs();
-    const f = fs[path]?.blocks ? fs[path] : err(`file not found: ${path}`);
-    const delta = relocate && f.blocks.length ? A(relocate) - parseAddr(f.blocks[0].addr) : 0;
-    let blocks = 0, bytes = 0;
-    const failed = [];
-    for (const b of f.blocks) {
-      const data = cleanHex(b.hex), a = parseAddr(b.addr) + delta;
-      if (writeMem(a, data)) { blocks++; bytes += data.length; } else failed.push(hx(a));
-    }
-    return { blocks, bytes, failed };
-  },
   mem_fill({ addr, len, pattern }) {
     need();
     const h = String(pattern).replace(/\s+/g, '');
@@ -1799,7 +1815,7 @@ const NEW = {
     S.saved.set(name, { mem: P.mem.slice(), set: { has }, count: r.length });
     return null;
   },
-  scan_saved: () => (S ? [...S.saved].map(([name, v]) => ({ name, count: v.count, kept: Math.min(v.count, 200000) })) : []),
+  scan_saved: () => (S ? [...S.saved].map(([name, v]) => ({ name, count: v.count, kept: v.count })) : []),
   scan_delete_saved({ name }) { if (!S?.saved.delete(name)) err(`no saved scan named "${name}"`); return null; },
   scan_pause() { if (prog.running) prog.paused = true; return null; },
   scan_resume() { prog.paused = false; return null; },
@@ -2046,6 +2062,390 @@ const C_get = C.table_get;
 C.table_get = () => ({ ...C_get(), untrusted: untrusted() });
 
 function loadFs() { try { return JSON.parse(localStorage.getItem('hh.mockfs')) || {}; } catch { return {}; } }
+
+
+// ---------- 1.0 RC: scanner sorting / filters, memory files, structure views, code filter, launch, tracepoints ----------
+const C_dis = C.disassemble, C_tpl = C.aa_template, C_aa2 = C.aa_execute, C_poll2 = C.lua_poll, C_addbp2 = C.debug_add_breakpoint, C_bps2 = C.debug_breakpoints;
+const C_threads = C.debug_threads, C_ctx = C.debug_context, C_trace = C.debug_trace;
+const regF = (f) => { const R = P.R; let lo = 0, hi = R.length - 1; while (lo < hi) { const m = (lo + hi + 1) >> 1; if (R[m].flat <= f) lo = m; else hi = m - 1; } return R[lo]; };
+const SV = new Map(); // "name@addr" -> {prev: [leaf values], locked: [leaf values] | null}
+const leavesOf = (fs) => fs.flatMap((f) => (f.children?.length ? leavesOf(f.children) : [f]));
+function viewKey(name, addr) { return `${name}@${A(addr)}`; }
+function evalLeaves(name, addr) { const r = TOOLS.struct_eval({ reqs: [{ name, addr }] })[0]; if (r.Err) err(r.Err); return r.Ok; }
+const CF = { rec: false, ran: [], not: [], last: 0, k: 0 };
+const cfPass = (f) => CF.ran.every((s) => s.has(f.addr)) && !CF.not.some((s) => s.has(f.addr));
+const cfState = () => ({ recording: CF.rec, armed: CF.rec, ran_sets: CF.ran.length, not_ran_sets: CF.not.length, last_hits: CF.last, matches: DIS ? DIS.funcs.filter(cfPass).length : 0 });
+const norm = (t) => String(t).toLowerCase().replace(/\s+/g, ' ');
+function selMods(modules) { return modules.length ? modules.map((n) => P.mods.find((m) => m.name.toLowerCase() === String(n).toLowerCase()) || err('no such module')) : P.mods; }
+/** Crude AT&T: reversed operands, % registers, disp(base) memory, $ immediates. */
+function att(text) {
+  const sp = text.indexOf(' ');
+  if (sp < 0) return text;
+  const m = text.slice(0, sp), ops = text.slice(sp + 1);
+  if (/^(call|jmp|j[a-z]+)$/.test(m)) return text;
+  const one = (o) => (/^\[(\w+)\+(\w+)\]$/.test(o) ? o.replace(/^\[(\w+)\+(\w+)\]$/, '0x$2(%$1)') : /^\[(\w+)\]$/.test(o) ? o.replace(/^\[(\w+)\]$/, '(%$1)')
+    : /^(r\w+|e\w+|xmm\d+)$/.test(o) ? '%' + o : /^[0-9A-F]+$/i.test(o) ? '$0x' + o.toLowerCase() : o.replace(/^(?:dword |qword )?ptr /, ''));
+  return `${m} ${ops.split(',').map(one).reverse().join(',')}`;
+}
+const memPlan = (path, relocate) => {
+  need(); fs ??= loadFs();
+  const f = fs[path]?.blocks ? fs[path] : err(`file not found: ${path}`);
+  const delta = relocate && f.blocks.length ? A(relocate) - parseAddr(f.blocks[0].addr) : 0;
+  return { f, delta, blocks: f.blocks.map((b, index) => { const len = b.hex.length / 2, a = parseAddr(b.addr) + delta, mapped = !!view(a, len); return { index, addr: hx(a), len, mapped, writable: mapped && regionOf(a).prot[1] === 'w' }; }) };
+};
+const grp = (rows, key) => { const m = new Map(); for (const r of rows) { const k = key(r), g = m.get(k) || { key: k, regions: 0, bytes: 0 }; g.regions++; g.bytes += r.size; m.set(k, g); } return [...m.values()]; };
+const snapBytes = (s, a, len) => { const b = s.blocks.find((x) => a >= x.addr && a + len <= x.addr + x.data.length); return b ? b.data.subarray(a - b.addr, a - b.addr + len) : null; };
+const mergeDis = (a, b) => {
+  const funcs = [...a.funcs, ...b.funcs].sort((x, y) => x.addr - y.addr), strs = [...a.strs, ...b.strs].sort((x, y) => x.addr - y.addr);
+  const caves = [...a.caves, ...b.caves].sort((x, y) => x.addr - y.addr), xr = [...a.xr, ...b.xr].sort((x, y) => x.to - y.to), s = a.summary, t = b.summary;
+  return { funcs, strs, caves, xr, summary: { modules: [...s.modules, ...t.modules], code_bytes: s.code_bytes + t.code_bytes, instructions: s.instructions + t.instructions, functions: funcs.length, refs: xr.length, strings: strs.length, caves: caves.length } };
+};
+const symRows = () => {
+  const rows = [], user = new Set((T.table.symbols || []).map((s) => s.name));
+  for (const s of T.table.symbols || []) try { rows.push({ name: s.name, module: modOf(resolveExpr(s.address))?.name ?? null, addr: resolveExpr(s.address), size: 0, user: true }); } catch { /* unresolved */ }
+  for (const [name, addr] of Object.entries(P.syms)) if (!user.has(name)) rows.push({ name, module: modOf(addr)?.name ?? null, addr, size: 0x40, user: false });
+  for (const m of P.mods) for (let i = 0; i < 120; i++) rows.push({ name: `${m.name.split('.')[0]}_fn_${i}`, module: m.name, addr: m.base + 0x1000 + i * 0x180, size: 0x180, user: false });
+  return rows;
+};
+const RC10 = {
+  scan_sort({ key, desc = false }) {
+    need();
+    if (!S) err('no first scan');
+    if (!['address', 'value'].includes(key)) err(`unknown sort key "${key}"`);
+    const src = S.results;
+    if (key === 'address') { S.ord = Uint32Array.from(src).sort(); if (desc) S.ord.reverse(); return null; }
+    if (src.length > 5_000_000) err(`sorting by value is refused for ${src.length} results (the cap is 5000000): narrow the scan first`);
+    const vt = S.vtype === 'all' ? '4bytes' : S.vtype, str = vt === 'string' || vt === 'aob';
+    const rows = Array.from(src, (f) => ({ f, k: str ? fmt(P.mem.subarray(f, f + S.size), vt, S.opts) : num(P.mem.subarray(f, f + S.size), vt) }));
+    rows.sort((x, y) => (str ? x.k.localeCompare(y.k) : (x.k > y.k) - (x.k < y.k)) || x.f - y.f);
+    if (desc) rows.reverse();
+    S.ord = Uint32Array.from(rows, (r) => r.f);
+    return null;
+  },
+  scan_remove({ addrs }) {
+    need();
+    if (!S) err('no first scan');
+    const gone = new Set(addrs.map((a) => flatOf(parseAddr(a))));
+    const keep = S.results.filter((f) => !gone.has(f)), n = S.results.length - keep.length;
+    S.undo = { results: S.results, prev: S.prev }; S.results = keep; S.ord = null;
+    return n;
+  },
+  scan_export_addresses({ path }) {
+    if (!S) err('no first scan');
+    if (!path) err('empty path');
+    C.table_save({ path, table: [...S.results].map((f) => addrOfFlat(f).toString(16).toUpperCase()).join('\n') + '\n' });
+    return S.results.length;
+  },
+  scan_copy_addresses() {
+    if (!S) err('no first scan');
+    if (S.results.length > 1_000_000) err(`${S.results.length} results are too many to copy (the cap is 1000000): export them to a file instead`);
+    return [...(S.ord || S.results)].map((f) => addrOfFlat(f).toString(16).toUpperCase()).join('\n');
+  },
+  scan_stats() {
+    if (!S) return [];
+    const cnt = new Map();
+    for (const f of S.results) { const r = regF(f); cnt.set(r, (cnt.get(r) || 0) + 1); }
+    return [...cnt].map(([r, count]) => ({ start: hx(r.start), size: r.size, kind: r.kind, path: r.path, module: modOf(r.start)?.name ?? null, count }));
+  },
+  scan_pointer({ req = {} }) {
+    need();
+    const o = req.opts || {}, mods = req.modules || [], rgs = req.ranges || [];
+    for (const n of mods) if (!P.mods.some((m) => m.name.toLowerCase() === String(n).toLowerCase())) err(`unknown module ${n}`);
+    const tg = [...P.mods.filter((m) => mods.some((n) => String(n).toLowerCase() === m.name.toLowerCase())).map((m) => [m.base, m.base + m.size]), ...rgs.map((g) => [A(g.start), A(g.end)])];
+    return runScan(async () => {
+      const regs = P.R.filter((r) => r.prot[0] === 'r' && tri(o.writable, r.prot[1] === 'w') && tri(o.executable, r.prot[2] === 'x') && regionOk(r, o));
+      prog.total = regs.reduce((s, r) => s + r.size, 0);
+      const out = [], m = P.mem.slice(), dv = P.dv;
+      let done = 0;
+      for (const r of regs) {
+        for (let i = 0; i + 8 <= r.size; i += 8) {
+          const f = r.flat + i, hi = dv.getUint32(f + 4, true);
+          if (!hi || hi >= 0x200000) continue;
+          const v = hi * 4294967296 + dv.getUint32(f, true);
+          if (tg.length ? tg.some(([s, e]) => v >= s && v < e) : regionOf(v)?.prot[0] === 'r') out.push(f);
+          if ((i & 0x3ffff) === 0) { prog.done = done + i; prog.found = out.length; await tick(); while (prog.paused && !cancelled) await sleep(100); if (cancelled) err('scan cancelled'); }
+        }
+        done += r.size;
+      }
+      prog.done = prog.total; prog.found = out.length;
+      S = { vtype: '8bytes', opts: { ...o, hex: true }, size: 8, results: Uint32Array.from(out), ord: null, first: m, prev: m, saved: new Map(), undo: null };
+      return { count: out.length };
+    });
+  },
+  lua_poll(a) {
+    const r = C_poll2(a), fails = [];
+    if (P) liveWalk(T.table.entries, (e) => {
+      if (!e.frozen || liveGroup(e) || typeof e.script === 'string') return;
+      try { const ad = entryAddr(e); if (!regionOf(ad)) fails.push({ id: e.id, addr: hx(ad), error: `cannot write memory at ${hx(ad)}` }); } catch (x) { fails.push({ id: e.id, addr: e.addr, error: String(x) }); }
+    });
+    r.freeze_failures = fails;
+    return r;
+  },
+  ptr_pause() { if (pprog.running) pprog.paused = true; return null; },
+  ptr_resume() { pprog.paused = false; return null; },
+
+  mem_load_plan({ path, relocate }) {
+    const { blocks } = memPlan(path, relocate);
+    return { blocks, bytes: blocks.reduce((s, b) => s + b.len, 0), unmapped: blocks.filter((b) => !b.mapped).length, read_only: blocks.filter((b) => b.mapped && !b.writable).length };
+  },
+  mem_load_approved({ path, relocate, blocks }) {
+    const { f, delta, blocks: plan } = memPlan(path, relocate);
+    for (let b of blocks) { b = typeof b === 'object' ? b : { index: b }; const p = plan[b.index]; if (!p || (b.addr != null && b.addr !== p.addr) || (b.len != null && b.len !== p.len)) err(`memory file changed since the plan (block ${b.index})`); }
+    let n = 0, bytes = 0;
+    const failed = [];
+    for (let b of blocks) {
+      b = typeof b === 'object' ? b : { index: b };
+      const data = cleanHex(f.blocks[b.index].hex), a = parseAddr(f.blocks[b.index].addr) + delta;
+      if (writeMem(a, data)) { n++; bytes += data.length; } else failed.push(hx(a));
+    }
+    return { blocks: n, bytes, failed };
+  },
+  mem_file_search({ req }) {
+    fs ??= loadFs();
+    const f = fs[req.path]?.blocks ? fs[req.path] : err(`file not found: ${req.path}`), max = Math.min(req.max || 1000, 100000);
+    let pat;
+    if (String(req.pattern || '').trim()) pat = parsePattern(req.pattern);
+    else {
+      if (req.value == null || req.value === '') err('give a pattern or a value');
+      const e = encode(req.vtype || '4bytes', String(req.value), req.fmt && typeof req.fmt === 'object' ? req.fmt : {});
+      pat = [...e.bytes].map((x, i) => (e.mask && !e.mask[i] ? null : x));
+    }
+    const out = [];
+    for (const b of f.blocks) {
+      const d = cleanHex(b.hex), a0 = parseAddr(b.addr);
+      for (let i = 0; i + pat.length <= d.length && out.length < max; i++) if (pat.every((x, k) => x == null || d[i + k] === x)) out.push(hx(a0 + i));
+    }
+    return out;
+  },
+  region_stats() {
+    need();
+    const rows = TOOLS.regions_info();
+    return { regions: rows.length, bytes: rows.reduce((s, r) => s + r.size, 0), by_prot: grp(rows, (r) => r.prot_text), by_tag: grp(rows, (r) => r.tag), by_kind: grp(rows, (r) => r.kind), by_module: grp(rows, (r) => r.module || '(none)') };
+  },
+  snapshot_change_map({ old, new: nw, start = null, end = null, cells = 1024 }) {
+    need();
+    const so = SNAPS.find((x) => x.id === old) || err(`no snapshot ${old}`), sn = SNAPS.find((x) => x.id === nw) || err(`no snapshot ${nw}`);
+    const lo = start != null ? A(start) : Math.min(...so.blocks.map((b) => b.addr)), hi = end != null ? A(end) : Math.max(...so.blocks.map((b) => b.addr + b.data.length));
+    if (!(hi > lo) || !(cells >= 1)) err('the range is empty');
+    const first = Math.floor(lo / 4096), pages = Math.ceil(hi / 4096) - first, per = Math.ceil(pages / cells), n = Math.ceil(pages / per);
+    const compared = new Array(n).fill(0), changed = new Array(n).fill(0);
+    for (const b of so.blocks) {
+      for (let pa = Math.max(Math.floor(b.addr / 4096), first); pa * 4096 < b.addr + b.data.length && pa < first + pages; pa++) {
+        const s = Math.max(pa * 4096, b.addr), e = Math.min(pa * 4096 + 4096, b.addr + b.data.length), x = b.data.subarray(s - b.addr, e - b.addr), y = snapBytes(sn, s, e - s);
+        if (!y) continue;
+        const c = Math.floor((pa - first) / per);
+        compared[c]++;
+        for (let i = 0; i < x.length; i++) if (x[i] !== y[i]) { changed[c]++; break; }
+      }
+    }
+    return { start: hx(first * 4096), cell_size: per * 4096, compared, changed };
+  },
+
+  struct_view({ reqs }) {
+    need();
+    return reqs.map(({ name, addr }) => {
+      try {
+        const fields = evalLeaves(name, addr), lv = leavesOf(fields), key = viewKey(name, addr), st = SV.get(key) || {}, cur = lv.map((x) => x.value), changed = [];
+        if (st.locked) { lv.forEach((x, i) => { if (cur[i] !== st.locked[i]) changed.push(i); x.value = st.locked[i] ?? x.value; }); }
+        else if (st.prev) cur.forEach((v, i) => { if (v !== st.prev[i]) changed.push(i); });
+        SV.set(key, { ...st, prev: cur });
+        return { Ok: { fields, changed, locked: !!st.locked, class: A(addr) === P.obj ? 'Player' : null } };
+      } catch (e) { return { Err: String(e) }; }
+    });
+  },
+  struct_lock({ name, addr, on }) {
+    need();
+    const key = viewKey(name, addr), st = SV.get(key) || {};
+    SV.set(key, { ...st, locked: on ? leavesOf(evalLeaves(name, addr)).map((x) => x.value) : null });
+    return null;
+  },
+  struct_write({ name, addr, leaf, value }) {
+    need();
+    const x = leavesOf(evalLeaves(name, addr))[leaf] || err(`no field ${leaf} in ${name}`), el = findSt(x.owner).elements[x.index];
+    return C.write_value({ addr: x.addr, vtype: x.vtype === 'pointer' ? '8bytes' : x.vtype, value, hex: x.vtype === 'pointer' || !!el.hex, utf16: !!el.utf16 });
+  },
+  struct_code({ names = [], lang }) {
+    if (!['c', 'csharp'].includes(lang)) err(`unknown language "${lang}"`);
+    const list = names.length ? names.map((n) => findSt(n) || err(`no such structure "${n}"`)) : structs();
+    if (!list.length) err('no structures to export');
+    const C_T = { byte: 'uint8_t', '2bytes': 'uint16_t', '4bytes': 'uint32_t', '8bytes': 'uint64_t', float: 'float', double: 'double' }, CS_T = { byte: 'byte', '2bytes': 'ushort', '4bytes': 'uint', '8bytes': 'ulong', float: 'float', double: 'double' };
+    const id = (el) => (el.description || `f_${hh(el.offset)}`).replace(/\W+/g, '_').replace(/^(\d)/, '_$1');
+    const cs = lang === 'csharp';
+    const body = (s) => s.elements.map((el) => {
+      const nm = id(el), off = `0x${hh(el.offset)}`;
+      if (cs) {
+        const t = el.vtype === 'pointer' ? 'IntPtr' : el.vtype === 'string' ? null : CS_T[el.vtype] || 'byte';
+        return `    [FieldOffset(${off})] public ${t ? `${t} ${nm};` : `fixed byte ${nm}[${elSize(el)}];`}`;
+      }
+      const t = el.vtype === 'pointer' ? (el.child ? `struct ${el.child}*` : 'void*') : el.vtype === 'string' ? null : C_T[el.vtype] || 'uint8_t';
+      return `    ${t ? `${t} ${nm};` : `char ${nm}[${elSize(el)}];`} /* ${off} */`;
+    }).join('\n');
+    if (cs) return `using System;\nusing System.Runtime.InteropServices;\n\n${list.map((s) => `[StructLayout(LayoutKind.Explicit)]\npublic unsafe struct ${s.name.replace(/\W+/g, '_')}\n{\n${body(s)}\n}\n`).join('\n')}`;
+    return `#include <stdint.h>\n\n${list.map((s) => `struct ${s.name.replace(/\W+/g, '_')} {\n${body(s)}\n};\n`).join('\n')}`;
+  },
+  struct_field_entry({ name, root, path }) {
+    need();
+    const go = (n, idx, pre) => {
+      const st = findSt(n) || err(`no such structure "${n}"`), el = st.elements[idx[0]] || err(`no element ${idx[0]} in ${n}`);
+      if (idx.length > 1) return go(el.child || err(`element ${idx[0]} of ${n} has no child structure`), idx.slice(1), [...pre, el.offset]);
+      return TOOLS.struct_entries({ name: n, root, path: pre, only: [idx[0]] })[0] || err(`element ${idx[0]} of ${n} cannot be a table entry`);
+    };
+    return go(name, path, []);
+  },
+
+  dissect_add({ modules = [] }) {
+    need();
+    const sel = selMods(modules).filter((m) => !DIS?.summary.modules.includes(m.name));
+    if (!sel.length && DIS) return DIS.summary;
+    return runJob('dissect', () => genDissect(sel), (d) => d.summary.functions).then((d) => { DIS = DIS ? mergeDis(DIS, d) : d; return DIS.summary; });
+  },
+  dissect_save({ path }) { dissNeed(); return C.table_save({ path, table: { dissection: DIS } }); },
+  dissect_load({ path }) {
+    need(); fs ??= loadFs();
+    const d = fs[path]?.dissection || err(`${path}: not a HeapHook dissection file`);
+    DIS = clone(d);
+    return DIS.summary;
+  },
+  code_filter_start() { dneed(); dissNeed(); CF.rec = true; return cfState(); },
+  code_filter_stop({ ran }) {
+    dneed(); dissNeed();
+    if (!CF.rec) err('the code filter is not recording');
+    const k = CF.k++, h = (a, j) => rng(Math.floor(a) + j * 977)();
+    const set = new Set(DIS.funcs.filter((f) => (ran ? h(f.addr, 0) < 0.3 && h(f.addr, k + 1) < 0.85 : h(f.addr, 0) < 0.1 && h(f.addr, k + 1) < 0.6)).map((f) => f.addr));
+    (ran ? CF.ran : CF.not).push(set); CF.last = set.size; CF.rec = false;
+    return cfState();
+  },
+  code_filter_state: () => cfState(),
+  code_filter_reset() { Object.assign(CF, { rec: false, ran: [], not: [], last: 0 }); return cfState(); },
+  code_filter_list({ offset = 0, limit = 100 }) {
+    dissNeed();
+    const rows = DIS.funcs.filter(cfPass);
+    return { total: rows.length, rows: rows.slice(offset, offset + limit).map((f) => ({ ...f, addr: hx(f.addr) })) };
+  },
+  asm_scan({ req }) {
+    need();
+    const res = String(req.pattern || '').split(';').map((p) => p.trim()).filter(Boolean).map((p) => new RegExp('^' + norm(p).replace(/[.+^${}()|[\]\\]/g, '\\$&').replace(/\?/g, '.').replace(/\*/g, '.*') + '$'));
+    if (!res.length) err('nothing to search for');
+    const start = A(req.start), end = req.end ? A(req.end) : start + 0x100000, max = Math.min(req.max || 100, 1000), hits = [];
+    if (end <= start) err('the range is empty');
+    let a = start, n = 0, step = 1;
+    for (; a < end && n < 400000; n++, a += step) {
+      const d = decode(a);
+      if (!d) { a = Math.floor(a / 4096) * 4096 + 4096 - 1; step = 1; continue; }
+      step = d.len || 1;
+      const texts = [];
+      let b = a;
+      for (const re of res) { const x = decode(b); if (!x || !re.test(norm(x.text))) break; texts.push(x.text); b += x.len; }
+      if (texts.length === res.length) { hits.push({ addr: hx(a), text: texts.join('; ') }); if (hits.length >= max) return { hits, next: hx(a + step) }; }
+    }
+    return { hits, next: a < end ? hx(a) : null };
+  },
+  find_reference({ from, target, forward = true, maxBytes = null }) {
+    need();
+    const f = A(from), t = A(target), lim = maxBytes || 0x100000;
+    if (DIS) {
+      let best = null;
+      for (let i = xrLower(t); i < DIS.xr.length && DIS.xr[i].to === t; i++) { const x = DIS.xr[i].from; if (forward ? x > f && (best == null || x < best) : x < f && (best == null || x > best)) best = x; }
+      return best != null && Math.abs(best - f) <= lim ? hx(best) : null;
+    }
+    for (let a = forward ? f + 1 : f - 1; Math.abs(a - f) <= lim; a += forward ? 1 : -1) { const d = decode(a); if (d && d.target === t) return hx(a); }
+    return null;
+  },
+  symbol_list({ module = null, filter = '', offset = 0, limit = 100 }) {
+    need();
+    if (module && !P.mods.some((m) => m.name.toLowerCase() === String(module).toLowerCase())) err(`no such module "${module}"`);
+    const f = String(filter || '').toLowerCase(), h = f.replace(/^0x/, '');
+    const rows = symRows().filter((r) => (!module || r.module?.toLowerCase() === String(module).toLowerCase()) && (!f || r.name.toLowerCase().includes(f) || r.addr.toString(16).includes(h))).sort((a, b) => a.addr - b.addr);
+    return { total: rows.length, rows: rows.slice(offset, offset + limit).map((r) => ({ ...r, addr: hx(r.addr) })) };
+  },
+  disassemble({ addr, count, opts }) {
+    const rows = C_dis({ addr, count });
+    if (!opts?.att && !opts?.typed) return rows;
+    for (const r of rows) {
+      if (opts.typed && r.text.includes('[')) r.comment = [r.comment, /^movss|^cvt/.test(r.text) ? '(float)1.5' : '(int)100'].filter(Boolean).join(' ');
+      if (opts.att) r.text = att(r.text);
+    }
+    return rows;
+  },
+  aa_template(a) {
+    if (a.kind !== 'api') return C_tpl(a);
+    return ['[ENABLE]', 'alloc(newmem,$1000)', 'label(original)', 'label(return)', 'registersymbol(newmem)', '',
+      'newmem:', '  // runs instead of the API function; rcx, rdx, r8, r9 hold the arguments', 'original:', '  // the first instructions of the API (copied here)', '  jmp return', '',
+      'libc.so.6!printf:', '  jmp newmem', 'return:', '', '[DISABLE]', 'libc.so.6!printf:', '  // the original bytes go back here', 'unregistersymbol(newmem)', 'dealloc(newmem)', ''].join('\n');
+  },
+  aa_execute(a) {
+    const r = C_aa2(a);
+    if (!a.enable) return r;
+    const scans = [], mode = loadSettings().aob_unique;
+    for (const l of String(a.script).split('\n')) {
+      const m = /^\s*aobscan\w*\s*\((.*)\)\s*$/i.exec(l.replace(/\/\/.*$/, '').replace(/\{.*?\}/g, ''));
+      if (!m) continue;
+      const args = m[1].split(','), name = args[0].trim(), pat = args[args.length - 1].trim(), matches = pat.includes('??') ? 2 : 1;
+      let hit = null;
+      try { hit = RC.mem_search({ req: { pattern: pat, start: '0x0', limit: 1 } })[0]; } catch { /* pattern the mock cannot search */ }
+      if (matches > 1 && mode === 'fail') err(`aobscan ${name}: the pattern matches ${matches} places and Settings require a unique match`);
+      if (matches > 1 && mode === 'warn') luaLog('info', `aobscan ${name}: ${matches} matches, the first is used`);
+      scans.push({ name, addr: hit ?? hx(CODE.w1[0]), matches });
+    }
+    return { ...(r || {}), scans };
+  },
+
+  debug_launch({ req }) {
+    const stop = req?.stop || 'entry';
+    if (!['entry', 'first', 'run'].includes(stop)) err(`unknown stop mode "${stop}"`);
+    const r = TOOLS.process_create({ req: { program: req?.program } });
+    DBG.debug_attach();
+    if (stop !== 'run') brk(P.mods[0].base + 0x1100, stop === 'entry' ? 'started: stopped at the entry point' : 'started: stopped before the first instruction');
+    return r;
+  },
+  debug_set_break_on({ on = {} }) { dneed().breakOn = { thread_created: !!on.thread_created, thread_exited: !!on.thread_exited, module_loaded: [...(on.module_loaded || [])], module_unloaded: [...(on.module_unloaded || [])] }; return null; },
+  debug_break_on: () => dneed().breakOn || { thread_created: false, thread_exited: false, module_loaded: [], module_unloaded: [] },
+  debug_add_breakpoint(a) {
+    dneed();
+    const r = a.req, pend = r.pending ? String(r.pending).trim() : null;
+    if (r.log && !String(r.message || '').trim()) err('a tracepoint needs a message');
+    const id = C_addbp2(pend ? { ...a, req: { ...r, addr: '0x0' } } : a), b = D.bps.find((x) => x.id === id);
+    if (pend) Object.assign(b, { pending: pend, resolved: false, resolveAt: Date.now() + 3000 });
+    Object.assign(b, { thread: r.thread ?? null, outside_module: r.outside_module ?? null, log: !!r.log, message: r.message ?? null, value_condition: r.value_condition ? checkCond(r.value_condition) : null, traceOpts: r.trace ? clone(r.trace) : null });
+    return id;
+  },
+  debug_breakpoints() {
+    const bs = dneed().bps;
+    return C_bps2().map((r) => { const b = bs.find((x) => x.id === r.id) || {}; return { ...r, pending: b.pending || null, resolved: !b.pending || !!b.resolved, thread: b.thread ?? null, outside_module: b.outside_module ?? null, log: !!b.log, message: b.message ?? null, value_condition: b.value_condition ?? null, trace: b.traceOpts || null }; });
+  },
+  debug_run_until_return({ tid, frame = 0 }) {
+    const d = dneed();
+    if (d.state !== 'broken') err('the process is not stopped');
+    const fr = DBG.debug_backtrace({ tid });
+    if (!(frame >= 0 && frame + 1 < fr.length)) err(`frame ${frame} has no caller to return to`);
+    brk(parseAddr(fr[frame + 1].addr), 'step');
+    return null;
+  },
+  debug_set_ip({ tid, addr }) {
+    const d = dneed();
+    if (d.state !== 'broken') err(`thread ${tid} is running`);
+    const a = A(addr), r = regionOf(a);
+    if (!r || r.prot[2] !== 'x') err(`${hx(a)} is not in executable memory`);
+    d.rip = a; d.ctx.rip = hx(a);
+    return null;
+  },
+  debug_threads(a) {
+    const d = dneed(), nm = ['main', 'worker-1', 'audio'];
+    return C_threads(a).map((t, i) => ({ ...t, name: nm[i] || `thread-${i}`, state: t.suspended ? 'suspended' : d.state === 'broken' ? 'stopped' : 'running', user_ms: P.tick * (7 - i * 2), kernel_ms: P.tick * (2 + i) }));
+  },
+  debug_context(a) {
+    const r = C_ctx(a);
+    if (r.fpu && !r.fpu.ymm_hi) { r.fpu.has_ymm = true; r.fpu.ymm_hi = Array.from({ length: 16 }, (_, i) => (i < 2 ? '0000803f000000400000404000008040' : '0'.repeat(32))); }
+    return r;
+  },
+  debug_trace(a) {
+    const rows = C_trace(a);
+    if (!D.bps.find((x) => x.id === a.id)?.traceOpts?.capture_memory) return rows;
+    return rows.map((r, i) => ({ ...r, accesses: [{ addr: hx(P.obj + 0x58), size: 4, read: true, write: i % 3 === 0, before: '00000064', after: i % 3 === 0 ? '00000063' : '00000064' }] }));
+  },
+};
+delete C.mem_load;
+Object.assign(C, RC10);
 
 /** invoke() look-alike: async, rejects with a string, returns JSON-cloned data. */
 export async function mockInvoke(cmd, args = {}) {
