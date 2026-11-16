@@ -4,7 +4,7 @@ HeapHook is an open-source memory scanner, editor and debugger for Linux and Win
 
 ## Status
 
-This is release candidate 1.0.0-rc.1. Linux is the tested platform. The Windows build is compiled and unit-tested in CI, but the application had not been run on a Windows machine at the time of writing.
+This is release candidate 1.0.0-rc.1. Linux is the tested platform. On Windows the code builds and its platform-neutral unit tests pass in CI, but every test that attaches to a real process is Linux-only: opening a process, scanning it, the debugger and the remote server's live paths have never been exercised on Windows, by tests or by hand. Treat the Windows files as untested.
 
 Progress against the Cheat Engine feature list is tracked row by row in [docs/PARITY.md](docs/PARITY.md). Of 712 rows: 428 done, 2 engine only (implemented in a library crate, no UI), 68 partial, 181 planned, 33 needing a design decision.
 
@@ -195,7 +195,7 @@ then connect HeapHook to `127.0.0.1:52736`. The debugger, speedhack and Create p
 
 ## Known issues and limits
 
-- Windows is untested: the code builds and passes its unit tests in CI, but nobody has run the application on Windows.
+- Windows is untested: it builds and its platform-neutral unit tests pass in CI, but nothing that touches a live process has ever run on Windows.
 - Global hotkeys are registered with the system, but delivery to HeapHook while another window has focus is unverified under Wayland. Table hotkeys are certain only while HeapHook has focus. On X11 they should work system-wide. A key without Ctrl, Shift, Alt or Win is never taken from other programs.
 - Page-range watches slow the target a lot, because every access to the watched pages stops it for a moment. Do not use them on stack memory (HeapHook refuses ranges inside a stack).
 - If HeapHook is force-killed while debugging, software breakpoint bytes (int3) stay in the target. Detach from the debugger before closing HeapHook.
