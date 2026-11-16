@@ -135,7 +135,7 @@ Linux package version: `app/src-tauri/tauri.linux.conf.json` sets the Linux pack
 With `kernel.yama.ptrace_scope=1` (the default on most distributions), a process may only trace its own children, so attaching to an unrelated process fails. Two options:
 
 - Launch the target from HeapHook's Create process dialog. It then is a child of HeapHook and no system change is needed.
-- Give the executable the ptrace capability: `sudo setcap cap_sys_ptrace+ep <path-to-heaphook>`. Run it again after each update of the binary.
+- Give the executable the ptrace capability: `sudo setcap cap_sys_ptrace=eip <path-to-heaphook>`. Run it again after each update of the binary.
 
 The capability lets the application read and write the memory of any process of your user. Apply it only to a binary you trust and that others cannot replace.
 
@@ -153,6 +153,8 @@ A cheat table can carry Lua. Lua in a table has full access to your files and ca
 Open tables only from sources you trust.
 
 ## Remote targets
+
+`hh-server` is not part of the deb or rpm package. Build it from source (see Build and run) or take it from the release workflow's artifacts, and copy it to the machine whose processes you want to reach.
 
 `hh-server` serves the processes of a machine to a HeapHook client:
 

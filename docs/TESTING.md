@@ -36,7 +36,7 @@ Set `kernel.yama.ptrace_scope` to 1 (`sudo sysctl kernel.yama.ptrace_scope=1`) f
 - [ ] Start a program in another terminal. In HeapHook press Ctrl P and open it. A dialog "HeapHook may not trace this process" appears with the `setcap` command and a Create process button.
 - [ ] The Copy button puts the command on the clipboard.
 - [ ] Press Create process and start a test program from the dialog. It opens without a permission error.
-- [ ] Run `sudo setcap cap_sys_ptrace+ep <path to the heaphook binary>` and restart. Now the unrelated process from the first step opens.
+- [ ] Run `sudo setcap cap_sys_ptrace=eip <path to the heaphook binary>` and restart. Now the unrelated process from the first step opens.
 - [ ] Remove the capability (`sudo setcap -r <path>`) afterwards, unless you want to keep it.
 
 ## 3. Scanner

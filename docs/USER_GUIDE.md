@@ -13,7 +13,7 @@ The window has a top bar and seven views, switched with Ctrl 1 to Ctrl 7: Scanne
 HeapHook reads another process through `ptrace`. With `kernel.yama.ptrace_scope=1`, which is the default on most distributions, a process can only trace its own children. There are two ways to deal with that.
 
 - Start the program from HeapHook (Create process, below). It becomes a child of HeapHook and needs no system change. This is the simplest way and the only one that works with the speedhack.
-- Give the HeapHook binary the capability: `sudo setcap cap_sys_ptrace+ep <path-to-heaphook>`, then restart HeapHook. Run the command again after you update the binary. The capability lets HeapHook read and write any process of your user, so use it only on a binary that others cannot replace.
+- Give the HeapHook binary the capability: `sudo setcap cap_sys_ptrace=eip <path-to-heaphook>`, then restart HeapHook. Run the command again after you update the binary. The capability lets HeapHook read and write any process of your user, so use it only on a binary that others cannot replace.
 
 If you try to open a process you may not trace, HeapHook shows a dialog that explains this and offers to copy the command or open Create process.
 
