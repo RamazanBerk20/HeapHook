@@ -1,0 +1,14 @@
+[package]
+name = "hh-lua"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+hh-core.workspace = true
+hh-scan.workspace = true
+hh-asm.workspace = true
+serde.workspace = true
+mlua = { version = "0.12", features = ["lua53", "vendored", "send"] }
+
+[dev-dependencies]
+serde_json = "1"

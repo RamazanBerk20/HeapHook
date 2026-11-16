@@ -1,0 +1,24 @@
+[package]
+name = "heaphook"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+hh-core.workspace = true
+hh-scan.workspace = true
+hh-asm.workspace = true
+hh-debug.workspace = true
+hh-ptr.workspace = true
+hh-lua.workspace = true
+hh-tools.workspace = true
+hh-inject.workspace = true
+iced-x86 = { version = "1.21", default-features = false, features = ["std", "decoder", "encoder", "intel", "op_code_info"] }
+serde.workspace = true
+serde_json = "1"
+roxmltree = "0.21"
+tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
+tauri-plugin-global-shortcut = "2"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }

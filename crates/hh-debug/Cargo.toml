@@ -1,0 +1,30 @@
+[package]
+name = "hh-debug"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+hh-core.workspace = true
+serde.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_Kernel",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Threading",
+] }
+
+[dev-dependencies]
+serde_json = "1"
+
+# Test target for the integration tests (known code addresses, threads, dlopen).
+[[bin]]
+name = "hh-debug-target"
+path = "src/bin/hh-debug-target.rs"
+test = false

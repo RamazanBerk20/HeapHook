@@ -1,0 +1,24 @@
+[workspace]
+resolver = "3"
+members = ["crates/hh-core", "crates/hh-scan", "crates/hh-asm", "crates/hh-target", "crates/hh-debug", "crates/hh-ptr", "app/src-tauri", "crates/hh-lua", "crates/hh-tools", "crates/hh-inject", "crates/hh-net"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+
+[workspace.dependencies]
+hh-core = { path = "crates/hh-core" }
+hh-scan = { path = "crates/hh-scan" }
+hh-asm = { path = "crates/hh-asm" }
+hh-debug = { path = "crates/hh-debug" }
+hh-ptr = { path = "crates/hh-ptr" }
+hh-lua = { path = "crates/hh-lua" }
+hh-tools = { path = "crates/hh-tools" }
+hh-inject = { path = "crates/hh-inject" }
+hh-net = { path = "crates/hh-net" }
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

@@ -1,0 +1,13 @@
+[package]
+name = "hh-inject"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+hh-core.workspace = true
+hh-asm.workspace = true
+serde.workspace = true
+
+# Only for the test target bin (src/bin/hh-speedhack-target.rs).
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"

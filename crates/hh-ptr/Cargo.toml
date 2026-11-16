@@ -1,0 +1,11 @@
+[package]
+name = "hh-ptr"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+hh-core.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json = "1"
+rayon = "1"

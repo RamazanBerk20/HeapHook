@@ -1,0 +1,765 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>HeapHook</title>
+<link rel="stylesheet" href="styles.css">
+<script type="module" src="app.js"></script>
+</head>
+<body>
+<header class="topbar">
+  <span class="brand">HeapHook</span>
+  <button id="proc-btn" class="proc-btn" type="button" aria-haspopup="dialog" title="Open process (Ctrl P)" data-icon="cpu">
+    <span class="proc-text"><span id="proc-label">No process</span><span id="proc-meta" class="muted mono"></span></span>
+    <kbd>Ctrl P</kbd>
+  </button>
+  <nav class="tabs" role="tablist" aria-label="Views">
+    <button role="tab" type="button" data-view="scan" title="Scanner" aria-controls="view-scan" aria-selected="true" data-icon="scan"><span class="bl">Scanner</span> <kbd>Ctrl 1</kbd></button>
+    <button role="tab" type="button" data-view="mem" title="Memory" aria-controls="view-mem" aria-selected="false" tabindex="-1" data-icon="memory"><span class="bl">Memory</span> <kbd>Ctrl 2</kbd></button>
+    <button role="tab" type="button" data-view="dbg" title="Debugger" aria-controls="view-dbg" aria-selected="false" tabindex="-1" data-icon="bug"><span class="bl">Debugger</span> <kbd>Ctrl 3</kbd></button>
+    <button role="tab" type="button" data-view="ptr" title="Pointers" aria-controls="view-ptr" aria-selected="false" tabindex="-1" data-icon="pointer"><span class="bl">Pointers</span> <kbd>Ctrl 4</kbd></button>
+    <button role="tab" type="button" data-view="lua" title="Lua console" aria-controls="view-lua" aria-selected="false" tabindex="-1" data-icon="terminal"><span class="bl">Lua</span> <kbd>Ctrl 5</kbd></button>
+    <button role="tab" type="button" data-view="struct" title="Structure dissector" aria-controls="view-struct" aria-selected="false" tabindex="-1" data-icon="struct"><span class="bl">Structures</span> <kbd>Ctrl 6</kbd></button>
+    <button role="tab" type="button" data-view="code" title="Code analysis" aria-controls="view-code" aria-selected="false" tabindex="-1" data-icon="code"><span class="bl">Code</span> <kbd>Ctrl 7</kbd></button>
+  </nav>
+  <span class="grow"></span>
+  <button id="dbg-btn" class="dbg-btn" type="button" data-state="detached" aria-describedby="dbg-state" title="Attach or detach the debugger (Ctrl Shift D)" data-icon="bug">
+    <span id="dbg-state" class="dbg-state" role="status">Debugger off</span>
+  </button>
+ <button id="speed-btn" class="dbg-btn speed-btn" type="button" hidden title="Speedhack (Ctrl Shift Up / Down / Backspace)" data-icon="clock"><span id="speed-text" class="mono">1×</span></button>
+  <span id="mock-badge" class="badge yellow" hidden title="No Tauri runtime: using the built-in mock backend">mock backend</span>
+  <button title="Open (Ctrl O)" id="tbl-open" class="btn ghost" type="button" data-icon="folder"><span class="bl">Open</span> <kbd>Ctrl O</kbd></button>
+  <button title="Save (Ctrl S)" id="tbl-save" class="btn ghost" type="button" data-icon="save"><span class="bl">Save</span> <kbd>Ctrl S</kbd></button>
+  <button id="settings-btn" class="btn ghost icon" type="button" aria-label="Settings (Ctrl ,)" title="Settings (Ctrl ,)" data-icon="gear"></button>
+  <button id="help-btn" class="btn ghost icon" type="button" aria-label="Keyboard shortcuts (F1)" title="Keyboard shortcuts (F1)" data-icon="keyboard"></button>
+</header>
+
+<main>
+  <!-- ======================= Scanner ======================= -->
+  <section id="view-scan" class="view view-scan" role="tabpanel" aria-label="Scanner">
+    <div id="scan-top" class="scan-top">
+      <section id="results" class="panel results" aria-labelledby="res-title">
+        <div class="panel-head">
+          <h2 id="res-title">Results <span id="res-count" class="count mono"></span></h2>
+          <span class="hints"><kbd>Alt 2</kbd> focus · <kbd>Enter</kbd> add to table · <kbd>Ctrl M</kbd> browse</span>
+        </div>
+        <div class="vl-head cols-res" role="presentation">
+          <span>Address</span><span>Value</span><span>Previous</span><span>First</span>
+        </div>
+        <div class="vl-viewport" role="grid" aria-label="Scan results" aria-multiselectable="true" tabindex="0">
+          <div class="vl-spacer"></div>
+          <div class="vl-rows cols-res" role="rowgroup"></div>
+        </div>
+      </section>
+
+      <div id="div-scan" class="divider dv-x" role="separator" aria-orientation="vertical" aria-label="Resize scan panel" tabindex="0"></div>
+
+      <aside id="scan-panel" class="panel scan-panel" aria-label="Scan">
+        <div class="sp-scroll">
+          <div class="sp-status">
+            <span id="found" class="found" role="status">No scan yet</span>
+          </div>
+          <div class="sp-actions">
+            <button id="btn-first" class="btn primary" type="button">First scan <kbd>Enter</kbd></button>
+            <button id="btn-next" class="btn" type="button" disabled>Next scan <kbd>Enter</kbd></button>
+            <button id="btn-undo" class="btn icon" type="button" disabled aria-label="Undo last scan (Ctrl Z)" title="Undo last scan (Ctrl Z)" data-icon="undo"></button>
+          </div>
+          <div id="scan-progress" class="sp-progress" hidden>
+            <div id="scan-bar-wrap" class="bar-wrap" role="progressbar" aria-label="Scan progress" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><div id="scan-bar" class="bar"></div></div>
+            <button id="btn-cancel" class="btn" type="button">Cancel <kbd>Esc</kbd></button>
+          </div>
+
+          <div id="v1-wrap" class="field">
+            <label for="v1"><span id="v1-label">Value</span> <kbd>Alt 1</kbd></label>
+            <input id="v1" class="mono" type="text" autocomplete="off" spellcheck="false">
+          </div>
+          <div id="v2-wrap" class="field" hidden>
+            <label for="v2">To</label>
+            <input id="v2" class="mono" type="text" autocomplete="off" spellcheck="false">
+          </div>
+          <div class="checks">
+            <label class="check"><input id="o-hex" type="checkbox"> Hex</label>
+            <label class="check"><input id="o-not" type="checkbox"> Not</label>
+            <label id="opt-percent" class="check" hidden><input id="o-percent" type="checkbox"> Percent</label>
+          </div>
+          <div class="field">
+            <label for="scan-type">Scan type</label>
+            <select id="scan-type"></select>
+          </div>
+          <div class="field">
+            <label for="vtype">Value type</label>
+            <select id="vtype">
+              <option value="binary">Binary</option>
+              <option value="byte">Byte</option>
+              <option value="2bytes">2 Bytes</option>
+              <option value="4bytes" selected>4 Bytes</option>
+              <option value="8bytes">8 Bytes</option>
+              <option value="float">Float</option>
+              <option value="double">Double</option>
+              <option value="string">String</option>
+              <option value="aob">Array of byte</option>
+              <option value="all">All</option>
+              <option value="grouped">Grouped</option>
+            </select>
+          </div>
+          <div id="opt-float" class="field" hidden>
+            <label for="o-round">Float matching</label>
+            <select id="o-round">
+              <option value="rounded">Rounded</option>
+              <option value="extreme">Rounded (extreme)</option>
+              <option value="truncated">Truncated</option>
+            </select>
+          </div>
+          <div id="opt-string" class="checks" hidden>
+            <label class="check"><input id="o-case" type="checkbox"> Case sensitive</label>
+            <label class="check"><input id="o-utf16" type="checkbox"> UTF-16</label>
+          </div>
+
+          <fieldset class="group">
+            <legend>Memory scan options</legend>
+            <div class="range">
+              <div class="field"><label for="o-start">Start</label><input id="o-start" class="mono" value="0" spellcheck="false" autocomplete="off"></div>
+              <div class="field"><label for="o-stop">Stop</label><input id="o-stop" class="mono" value="7FFFFFFFFFFF" spellcheck="false" autocomplete="off"></div>
+            </div>
+            <div class="tris">
+              <button class="tri" type="button" role="checkbox" data-key="writable" data-v="yes"><span class="tri-box" aria-hidden="true"></span>Writable <span class="tri-v"></span></button>
+              <button class="tri" type="button" role="checkbox" data-key="executable" data-v="any"><span class="tri-box" aria-hidden="true"></span>Executable <span class="tri-v"></span></button>
+              <button class="tri" type="button" role="checkbox" data-key="copy_on_write" data-v="no"><span class="tri-box" aria-hidden="true"></span>Copy-on-write <span class="tri-v"></span></button>
+            </div>
+            <div class="align-row">
+              <label class="check"><input id="o-fast" type="checkbox" checked> Fast scan, alignment</label>
+              <input id="o-align" class="mono num" type="number" min="1" max="64" value="4" aria-label="Alignment">
+            </div>
+            <label class="check"><input id="o-pause" type="checkbox"> Pause process while scanning</label>
+          </fieldset>
+        </div>
+      </aside>
+    </div>
+
+    <div id="div-table" class="divider dv-y" role="separator" aria-orientation="horizontal" aria-label="Resize cheat table" tabindex="0"></div>
+
+    <section id="table" class="panel table" aria-labelledby="tbl-title">
+      <div class="panel-head">
+        <h2 id="tbl-title">Cheat table <span id="tbl-count" class="count mono"></span></h2>
+        <div class="toolbar">
+          <button id="tb-add" class="btn ghost" type="button" data-icon="plus">Address <kbd>Ctrl Shift A</kbd></button>
+          <button id="tb-script" class="btn ghost" type="button" data-icon="code">Script</button>
+          <button id="tb-group" class="btn ghost" type="button" data-icon="group">Group <kbd>Ctrl G</kbd></button>
+          <button id="tb-lua" class="btn ghost" type="button" data-icon="terminal" title="The table's Lua script">Table script</button>
+          <button id="tb-comments" class="btn ghost icon" type="button" aria-label="Table comments" title="Table comments" data-icon="note"></button>
+          <button id="tb-delete" class="btn ghost icon" type="button" aria-label="Delete selected (Del)" title="Delete selected (Del)" data-icon="trash"></button>
+        </div>
+      </div>
+      <div class="tbl" role="treegrid" aria-label="Cheat table" aria-multiselectable="true" tabindex="0">
+        <div class="tbl-head cols-tbl" role="row">
+          <span role="columnheader">Active</span><span role="columnheader">Description</span><span role="columnheader">Address</span><span role="columnheader">Type</span><span role="columnheader">Value</span>
+        </div>
+        <div class="tbl-body" role="rowgroup"></div>
+        <p id="tbl-empty" class="empty">No entries. Select scan results and press <kbd>Enter</kbd>, or add one with <kbd>Ctrl Shift A</kbd>.</p>
+      </div>
+    </section>
+  </section>
+
+  <!-- ======================= Memory viewer ======================= -->
+  <section id="view-mem" class="view view-mem" role="tabpanel" aria-label="Memory viewer" hidden>
+    <div class="mem-main">
+      <section id="disasm-pane" class="panel" aria-labelledby="da-title">
+        <div class="panel-head">
+          <h2 id="da-title">Disassembler</h2>
+          <span class="hints"><kbd>Space</kbd> follow · <kbd>Backspace</kbd> back · <kbd>Enter</kbd> assemble · <kbd>F5</kbd> breakpoint</span>
+          <span id="dbg-ctl" class="toolbar dbg-ctl" role="toolbar" aria-label="Debug controls" hidden>
+            <button id="dc-cont" class="btn ghost icon" type="button" aria-label="Continue (F9)" title="Continue (F9)" data-icon="play"></button>
+            <button id="dc-pause" class="btn ghost icon" type="button" aria-label="Break (Shift F9)" title="Break (Shift F9)" data-icon="pause"></button>
+            <button id="dc-into" class="btn ghost icon" type="button" aria-label="Step into (F7)" title="Step into (F7)" data-icon="stepInto"></button>
+            <button id="dc-over" class="btn ghost icon" type="button" aria-label="Step over (F8)" title="Step over (F8)" data-icon="stepOver"></button>
+            <button id="dc-out" class="btn ghost icon" type="button" aria-label="Step out (Shift F8)" title="Step out (Shift F8)" data-icon="stepOut"></button>
+            <button id="dc-runto" class="btn ghost icon" type="button" aria-label="Run to cursor (F4)" title="Run to cursor (F4)" data-icon="runTo"></button>
+          </span>
+          <span class="toolbar">
+            <button id="da-back" class="btn ghost icon" type="button" disabled aria-label="Back (Backspace)" title="Back (Backspace)" data-icon="back"></button>
+            <button id="da-goto" class="btn ghost" type="button" data-icon="target">Go to <kbd>Ctrl G</kbd></button>
+          </span>
+        </div>
+        <div id="da-list" class="da-list mono" role="grid" aria-label="Disassembly" tabindex="0"></div>
+      </section>
+      <div id="div-mem" class="divider dv-y" role="separator" aria-orientation="horizontal" aria-label="Resize disassembler" tabindex="0"></div>
+      <section id="hex-pane" class="panel" aria-labelledby="hx-title">
+        <div class="panel-head">
+          <h2 id="hx-title">Memory <span id="hx-pos" class="count mono"></span></h2>
+          <span class="hints"><kbd>0-F</kbd> edit byte · <kbd>Enter</kbd> edit value</span>
+          <span class="toolbar">
+            <label class="sr-only" for="hx-type">Display type</label>
+            <select id="hx-type" class="compact">
+              <option value="byte">Hex bytes</option>
+              <option value="2bytes">2 Bytes</option>
+              <option value="4bytes">4 Bytes</option>
+              <option value="8bytes">8 Bytes</option>
+              <option value="float">Float</option>
+              <option value="double">Double</option>
+            </select>
+            <button id="hx-goto" class="btn ghost" type="button" data-icon="target">Go to <kbd>Ctrl G</kbd></button>
+            <button id="hx-tools" class="btn ghost" type="button" aria-haspopup="menu" data-icon="memory" title="Memory tools (Shift F10 in the hex view)"><span class="bl">Tools</span></button>
+          </span>
+        </div>
+        <div id="hx-list" class="hx-list mono" role="grid" aria-label="Hex dump" tabindex="0"></div>
+      </section>
+    </div>
+    <div id="div-side" class="divider dv-x" role="separator" aria-orientation="vertical" aria-label="Resize side panel" tabindex="0"></div>
+    <aside id="mem-side" class="panel mem-side" aria-label="Regions and modules">
+      <div class="panel-head">
+        <div role="tablist" class="subtabs" aria-label="Lists">
+          <button role="tab" type="button" aria-selected="true" aria-controls="reg-list">Regions <span id="reg-count" class="count mono"></span></button>
+          <button role="tab" type="button" aria-selected="false" aria-controls="mod-list" tabindex="-1">Modules <span id="mod-count" class="count mono"></span></button>
+          <button role="tab" type="button" aria-selected="false" aria-controls="cpu-list" tabindex="-1" class="dbg-only" hidden>Registers</button>
+          <button role="tab" type="button" aria-selected="false" aria-controls="stk-list" tabindex="-1" class="dbg-only" hidden>Stack</button>
+          <button role="tab" type="button" aria-selected="false" aria-controls="thr-list" tabindex="-1" class="dbg-only" hidden>Threads</button>
+        </div>
+      </div>
+      <div id="reg-list" class="reg-pane" role="tabpanel" aria-label="Memory regions">
+        <div class="reg-filter"><input id="reg-filter" type="text" placeholder="Filter: address, path, rwx, heap, stack…" aria-label="Filter regions" spellcheck="false" autocomplete="off"></div>
+        <div id="reg-vl" class="reg-vl"></div>
+      </div>
+      <div id="mod-list" class="list" role="tabpanel" aria-label="Modules" hidden></div>
+      <div id="cpu-list" class="list cpu" role="tabpanel" aria-label="Registers" hidden></div>
+      <div id="stk-list" class="list" role="tabpanel" aria-label="Stack" hidden></div>
+      <div id="thr-list" class="list" role="tabpanel" aria-label="Threads" hidden></div>
+    </aside>
+  </section>
+
+  <!-- ======================= Debugger ======================= -->
+  <section id="view-dbg" class="view view-dbg" role="tabpanel" aria-label="Debugger" hidden>
+    <section id="watch-pane" class="panel dbg-main" aria-labelledby="wl-title">
+      <div class="panel-head">
+        <h2 id="wl-title" class="sr-only">Watches</h2>
+        <div id="wl-tabs" role="tablist" class="subtabs wl-tabs" aria-label="Watches"></div>
+        <span class="toolbar">
+          <button title="Disassemble (Enter)" id="wl-show" class="btn ghost" type="button" data-icon="target"><span class="bl">Disassemble</span> <kbd>Enter</kbd></button>
+          <button title="Replace with NOPs (N)" id="wl-nop" class="btn ghost" type="button" data-icon="nop"><span class="bl">Replace with NOPs</span> <kbd>N</kbd></button>
+          <button title="Code list (L)" id="wl-code" class="btn ghost" type="button" data-icon="plus"><span class="bl">Code list</span> <kbd>L</kbd></button>
+          <button id="wl-clear" class="btn ghost icon" type="button" aria-label="Clear counts" title="Clear counts" data-icon="refresh"></button>
+          <button title="Stop (S)" id="wl-stop" class="btn ghost" type="button" data-icon="stop"><span class="bl">Stop</span> <kbd>S</kbd></button>
+          <button id="wl-close" class="btn ghost icon" type="button" aria-label="Close watch (Del)" title="Close watch (Del)" data-icon="x"></button>
+        </span>
+      </div>
+      <div id="wl-head" class="vl-head cols-wl" role="presentation"><span>Count</span><span>Address</span><span>Instruction</span><span>Accessed</span></div>
+      <div id="wl-list" class="wl-list" role="grid" aria-label="Watch records" tabindex="0"></div>
+      <p id="wl-empty" class="empty">No watches yet. On a cheat-table entry or scan result press <kbd>F6</kbd> (what writes) or <kbd>F5</kbd> (what accesses); in the disassembler use the context menu for instruction accesses and break-and-trace.</p>
+      <div id="wl-regs" class="regs-snap mono" aria-label="Registers at the selected record" role="group"></div>
+    </section>
+    <div id="div-dbg" class="divider dv-x" role="separator" aria-orientation="vertical" aria-label="Resize breakpoint panel" tabindex="0"></div>
+    <aside id="dbg-side" class="dbg-side">
+      <section id="bp-pane" class="panel" aria-labelledby="bp-title">
+        <div class="panel-head">
+          <h2 id="bp-title">Breakpoints <span id="bp-count" class="count mono"></span></h2>
+          <span class="hints"><kbd>Space</kbd> enable · <kbd>Del</kbd> remove</span>
+        </div>
+        <div id="bp-list" class="list" role="listbox" aria-label="Breakpoints" tabindex="0"></div>
+      </section>
+      <section id="code-pane" class="panel" aria-labelledby="cl-title">
+        <div class="panel-head">
+          <h2 id="cl-title">Code list <span id="cl-count" class="count mono"></span></h2>
+          <span class="hints"><kbd>Space</kbd> NOP / restore · <kbd>Del</kbd> remove</span>
+        </div>
+        <div id="cl-list" class="list" role="listbox" aria-label="Code list" tabindex="0"></div>
+      </section>
+    </aside>
+  </section>
+
+  <!-- ======================= Lua console ======================= -->
+  <section id="view-lua" class="view view-lua" role="tabpanel" aria-label="Lua console" hidden>
+    <section class="panel lua-pane" aria-labelledby="lua-title">
+      <div class="panel-head">
+        <h2 id="lua-title">Lua console <span id="lua-state" class="count" role="status"></span></h2>
+        <span class="hints"><kbd>Ctrl Enter</kbd> run · <kbd>Ctrl ↑↓</kbd> history · <kbd>Esc</kbd> interrupt</span>
+        <span class="toolbar">
+          <button id="lua-run" class="btn ghost" type="button" data-icon="play" title="Run (Ctrl Enter)"><span class="bl">Run</span> <kbd>Ctrl Enter</kbd></button>
+          <button id="lua-stop" class="btn ghost" type="button" data-icon="stop" title="Interrupt the running script (Esc)" disabled><span class="bl">Interrupt</span> <kbd>Esc</kbd></button>
+          <button id="lua-clear" class="btn ghost icon" type="button" aria-label="Clear output" title="Clear output" data-icon="trash"></button>
+          <button id="lua-tscript" class="btn ghost" type="button" data-icon="code" title="Edit the table's Lua script"><span class="bl">Table script</span></button>
+        </span>
+      </div>
+      <div id="lua-out" class="lua-out mono" role="log" aria-label="Lua output" tabindex="0"><p class="empty">Output of <code>print</code>, results and errors appear here. Scripts run against the opened process.</p></div>
+      <div id="div-lua" class="divider dv-y" role="separator" aria-orientation="horizontal" aria-label="Resize Lua editor" tabindex="0"></div>
+      <div id="lua-ed" class="aa-editor lua-editor">
+        <pre id="lua-gutter" class="aa-gutter mono" aria-hidden="true"></pre>
+        <textarea id="lua-text" class="mono" spellcheck="false" wrap="off" aria-label="Lua input" placeholder="print(readInteger(getAddressList().getMemoryRecordByDescription('Health').CurrentAddress))"></textarea>
+      </div>
+    </section>
+  </section>
+
+  <!-- ======================= Structure dissector ======================= -->
+  <section id="view-struct" class="view view-struct" role="tabpanel" aria-label="Structure dissector" hidden>
+    <section class="panel st-pane" aria-labelledby="st-title">
+      <div class="panel-head">
+        <h2 id="st-title">Structure</h2>
+        <label class="sr-only" for="st-sel">Structure</label>
+        <select id="st-sel" class="compact st-sel"></select>
+        <span class="hints"><kbd>→</kbd> expand · <kbd>Enter</kbd> edit value · <kbd>F2</kbd> description · <kbd>T</kbd> type · <kbd>Ins</kbd> <kbd>Del</kbd> element · <kbd>Ctrl Enter</kbd> add to table</span>
+        <span class="toolbar">
+          <button id="st-open" class="btn ghost" type="button" data-icon="target" title="Dissect at an address (G)"><span class="bl">Dissect at</span> <kbd>G</kbd></button>
+          <button id="st-addcol" class="btn ghost" type="button" data-icon="plus" title="Add an address column (A)"><span class="bl">Address</span> <kbd>A</kbd></button>
+          <button id="st-spider-btn" class="btn ghost" type="button" data-icon="pointer" title="Structure spider (Alt S)"><span class="bl">Spider</span> <kbd>Alt S</kbd></button>
+          <button id="st-rename" class="btn ghost icon" type="button" aria-label="Rename structure" title="Rename structure" data-icon="note"></button>
+          <button id="st-delete" class="btn ghost icon" type="button" aria-label="Delete structure" title="Delete structure" data-icon="trash"></button>
+        </span>
+      </div>
+      <div id="st-cols" class="st-cols" aria-label="Address columns"></div>
+      <div id="st-tree" class="st-tree"></div>
+      <section id="st-spider" class="st-spider" aria-labelledby="st-spider-title" hidden>
+        <div class="panel-head">
+          <h2 id="st-spider-title">Spider results <span id="st-spider-count" class="count mono"></span></h2>
+          <span class="hints"><kbd>Enter</kbd> add the field at the first address to the table</span>
+          <span class="toolbar"><button id="st-spider-close" class="btn ghost icon" type="button" aria-label="Close spider results" title="Close" data-icon="x"></button></span>
+        </div>
+        <div id="st-spider-host"></div>
+        <div id="st-spider-list" class="st-spider-list"></div>
+      </section>
+    </section>
+  </section>
+
+  <!-- ======================= Code analysis ======================= -->
+  <section id="view-code" class="view view-code" role="tabpanel" aria-label="Code analysis" hidden>
+    <aside class="panel dc-side" aria-labelledby="dc-title">
+      <div class="panel-head">
+        <h2 id="dc-title">Dissect code</h2>
+        <span class="toolbar"><button id="dc-all" class="btn ghost" type="button" title="Select all / none">All</button></span>
+      </div>
+      <div id="dc-mods" class="list dc-mods" role="group" aria-label="Modules to dissect"></div>
+      <div class="dc-opts">
+        <label class="check"><input id="dc-rec" type="checkbox" checked> Follow calls from entry points</label>
+        <div class="row2 row2-even">
+          <div class="field"><label for="dc-minstr">Min. string length</label><input id="dc-minstr" class="mono" type="number" min="1" value="4"></div>
+          <div class="field"><label for="dc-mincave">Min. cave bytes</label><input id="dc-mincave" class="mono" type="number" min="1" value="32"></div>
+        </div>
+        <button id="dc-run" class="btn primary" type="button" data-icon="play">Run <kbd>Ctrl Enter</kbd></button>
+        <div id="dc-progress"></div>
+        <p id="dc-summary" class="hint mono" role="status"></p>
+      </div>
+    </aside>
+    <div class="dc-main">
+      <section class="panel dc-items" aria-label="Dissection results">
+        <div class="panel-head">
+          <div id="dc-tabs" role="tablist" class="subtabs" aria-label="Result lists"></div>
+          <label class="sr-only" for="dc-filter">Filter</label>
+          <input id="dc-filter" class="mono dc-filter" type="text" placeholder="Filter (Ctrl F)" spellcheck="false" autocomplete="off">
+          <span class="hints"><kbd>Enter</kbd> disassemble · <kbd>Alt X</kbd> references</span>
+        </div>
+        <div id="dc-list" class="dc-list" role="tabpanel" aria-label="Items"></div>
+      </section>
+      <section class="panel dc-xpane" aria-labelledby="dc-xtitle">
+        <div class="panel-head"><h2><span id="dc-xtitle">References</span> <span id="dc-xcount" class="count mono"></span></h2><span class="hints"><kbd>Enter</kbd> go to the referencing instruction</span></div>
+        <div id="dc-xrefs" class="dc-list"></div>
+      </section>
+    </div>
+  </section>
+
+  <!-- ======================= Pointer scanner ======================= -->
+  <section id="view-ptr" class="view view-ptr" role="tabpanel" aria-label="Pointer scanner" hidden>
+    <section id="ptr-pane" class="panel ptr-pane" aria-labelledby="ptr-title">
+      <div class="panel-head">
+        <h2 id="ptr-title">Pointer paths <span id="ptr-count" class="count mono"></span></h2>
+        <span id="ptr-target" class="muted mono ptr-target"></span>
+        <span class="hints"><kbd>Enter</kbd> add to table</span>
+        <span class="toolbar">
+          <label class="sr-only" for="ptr-vtype">Value type</label>
+          <select id="ptr-vtype" class="compact"></select>
+          <button title="New scan (N)" id="ptr-new" class="btn ghost" type="button" data-icon="scan"><span class="bl">New scan</span> <kbd>N</kbd></button>
+          <button title="Rescan (R)" id="ptr-rescan" class="btn ghost" type="button" data-icon="refresh" disabled><span class="bl">Rescan</span> <kbd>R</kbd></button>
+          <button id="ptr-open" class="btn ghost icon" type="button" aria-label="Open results" title="Open results" data-icon="folder"></button>
+          <button id="ptr-save" class="btn ghost icon" type="button" aria-label="Save results" title="Save results" data-icon="save" disabled></button>
+          <button title="Save pointer map" id="ptr-map" class="btn ghost" type="button" data-icon="memory"><span class="bl">Save pointer map</span></button>
+        </span>
+      </div>
+      <div id="ptr-progress" class="sp-progress ptr-progress" hidden>
+        <span id="ptr-phase" class="muted mono"></span>
+        <div id="ptr-bar-wrap" class="bar-wrap" role="progressbar" aria-label="Pointer scan progress" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><div id="ptr-bar" class="bar"></div></div>
+        <button id="ptr-cancel" class="btn" type="button">Cancel <kbd>Esc</kbd></button>
+      </div>
+      <div id="ptr-head" class="vl-head" role="presentation"></div>
+      <div id="ptr-vp" class="vl-viewport" role="grid" aria-label="Pointer paths" tabindex="0">
+        <div class="vl-spacer"></div>
+        <div class="vl-rows" role="rowgroup"></div>
+      </div>
+      <p id="ptr-empty" class="empty">No pointer scan yet. Right-click a cheat-table entry or scan result and choose <b>Pointer scan for this address</b>, or press <kbd>N</kbd> here.</p>
+    </section>
+  </section>
+
+</main>
+
+<div id="toasts" class="toasts" aria-live="polite"></div>
+
+<!-- ======================= Dialogs ======================= -->
+<dialog id="dlg-proc" class="dlg dlg-proc" aria-labelledby="proc-title">
+  <div class="dlg-head">
+    <h2 id="proc-title">Open process</h2>
+    <button id="proc-refresh" class="btn ghost icon" type="button" aria-label="Refresh list" title="Refresh list" data-icon="refresh"></button>
+  </div>
+  <div class="search" data-icon="search">
+    <input id="proc-search" type="text" placeholder="Filter by name, PID or path" autocomplete="off" spellcheck="false"
+      role="combobox" aria-expanded="true" aria-controls="proc-list" aria-autocomplete="list" aria-label="Filter processes">
+  </div>
+  <div id="proc-list" class="proc-list" role="listbox" aria-label="Processes"></div>
+  <p id="proc-empty" class="empty" hidden>No matching process.</p>
+  <div class="proc-actions">
+    <p class="hint"><kbd>↑</kbd> <kbd>↓</kbd> select · <kbd>Enter</kbd> open · <kbd>Esc</kbd> close</p>
+    <button id="proc-create" class="btn" type="button" data-icon="play">Create process… <kbd>Ctrl N</kbd></button>
+    <button id="proc-close" class="btn" type="button" data-icon="x" hidden>Close process <kbd>Ctrl W</kbd></button>
+  </div>
+</dialog>
+
+<dialog id="dlg-create" class="dlg" aria-labelledby="cr-title">
+  <form method="dialog">
+    <h2 id="cr-title">Create process</h2>
+    <div class="field"><label for="cr-prog">Program</label>
+      <div class="inline"><input id="cr-prog" name="program" class="mono" autocomplete="off" spellcheck="false" required placeholder="/path/to/game"><button id="cr-browse" class="btn" type="button">Browse</button></div></div>
+    <div class="field"><label for="cr-args">Arguments</label><input id="cr-args" name="args" class="mono" autocomplete="off" spellcheck="false" placeholder='--windowed "My Save"'></div>
+    <div class="field"><label for="cr-cwd">Working directory</label><input id="cr-cwd" name="cwd" class="mono" autocomplete="off" spellcheck="false" placeholder="the program's directory"></div>
+    <label class="check"><input name="speedhack" type="checkbox"> Load the speedhack (Linux: preloaded library; changes the game's clock)</label>
+    <p class="hint">The process starts and HeapHook opens it. The speedhack only affects dynamically linked programs that use libc's time functions.</p>
+    <div class="dlg-actions">
+      <button class="btn primary" value="ok">Start <kbd>Enter</kbd></button>
+      <button class="btn" value="cancel" formnovalidate>Cancel <kbd>Esc</kbd></button>
+    </div>
+  </form>
+</dialog>
+
+<dialog id="dlg-speed" class="dlg dlg-sm" aria-labelledby="sp-title">
+  <form method="dialog">
+    <h2 id="sp-title">Speedhack</h2>
+    <div class="speed-row">
+      <input id="sp-range" type="range" min="-100" max="100" step="1" value="0" aria-label="Speed (logarithmic, 0.1× to 10×)">
+      <input id="sp-value" class="mono num" type="text" value="1" aria-label="Exact speed" spellcheck="false" autocomplete="off">
+    </div>
+    <div class="speed-marks mono" aria-hidden="true"><span>0.1×</span><span>1×</span><span>10×</span></div>
+    <p id="sp-status" class="hint mono"></p>
+    <p class="hint">Anywhere: <kbd>Ctrl Shift ↑</kbd> double · <kbd>Ctrl Shift ↓</kbd> halve · <kbd>Ctrl Shift Backspace</kbd> normal. A Lua <code>createHotkey</code> calling <code>speedhack_setSpeed</code> works as a global hotkey.</p>
+    <div class="dlg-actions">
+      <button class="btn primary" value="ok">Close <kbd>Esc</kbd></button>
+      <button id="sp-reset" class="btn" type="button">Reset to 1.0 <kbd>R</kbd></button>
+    </div>
+  </form>
+</dialog>
+
+<dialog id="dlg-entry" class="dlg" aria-labelledby="ed-title">
+  <form method="dialog">
+    <h2 id="ed-title">Add address</h2>
+    <div class="field"><label for="ed-desc">Description</label><input id="ed-desc" name="description" autocomplete="off"></div>
+    <div class="field"><label for="ed-addr">Address</label><input id="ed-addr" name="addr" class="mono" autocomplete="off" spellcheck="false" placeholder="7FFD12340000 or game.exe+1A2B"></div>
+    <div class="row2">
+      <div class="field"><label for="ed-vtype">Type</label><select id="ed-vtype" name="vtype"></select></div>
+      <div id="ed-len-wrap" class="field"><label for="ed-len">Length</label><input id="ed-len" name="len" class="mono num" type="number" min="1" max="4096"></div>
+    </div>
+    <div class="checks">
+      <label class="check" id="ed-utf16-wrap"><input name="utf16" type="checkbox"> UTF-16</label>
+      <label class="check"><input name="signed" type="checkbox"> Signed</label>
+      <label class="check"><input name="hex" type="checkbox"> Hexadecimal</label>
+      <label class="check"><input name="pointer" type="checkbox"> Pointer</label>
+    </div>
+    <div id="ed-ptr" class="ptr" hidden>
+      <p class="hint">Offsets in hex, applied top to bottom: each one reads a pointer and adds the offset.</p>
+      <div id="ed-offsets"></div>
+      <button id="ed-add-off" class="btn ghost" type="button" data-icon="plus">Offset</button>
+    </div>
+    <p id="ed-preview" class="preview mono" aria-live="polite"></p>
+    <div class="dlg-actions">
+      <button class="btn primary" value="ok">Save <kbd>Enter</kbd></button>
+      <button class="btn" value="cancel" formnovalidate>Cancel <kbd>Esc</kbd></button>
+    </div>
+  </form>
+</dialog>
+
+<dialog id="dlg-script" class="dlg dlg-script" aria-labelledby="aa-title">
+  <form method="dialog">
+    <div class="dlg-head">
+      <h2 id="aa-title">Auto Assembler script</h2>
+      <button id="aa-check" class="btn ghost" type="button" data-icon="check">Check</button>
+    </div>
+    <div class="aa-editor">
+      <pre id="aa-gutter" class="aa-gutter mono" aria-hidden="true"></pre>
+      <textarea id="aa-text" class="mono" spellcheck="false" aria-label="Script" aria-describedby="aa-status" wrap="off"></textarea>
+    </div>
+    <button id="aa-status" class="aa-status" type="button" aria-live="polite"></button>
+    <div class="dlg-actions">
+      <button class="btn primary" value="ok">Save <kbd>Ctrl S</kbd></button>
+      <button class="btn" value="cancel" formnovalidate>Cancel <kbd>Esc</kbd></button>
+    </div>
+  </form>
+</dialog>
+
+<dialog id="dlg-ptrscan" class="dlg dlg-wide" aria-labelledby="ps-title">
+  <form method="dialog">
+    <h2 id="ps-title">Pointer scan</h2>
+    <div class="row2 row2-wide">
+      <div class="field"><label for="ps-target">Address to find</label><input id="ps-target" name="target" class="mono" autocomplete="off" spellcheck="false" required></div>
+      <div class="field"><label for="ps-level">Max level</label><input id="ps-level" name="max_level" class="mono num" type="number" min="1" max="16" value="5"></div>
+    </div>
+    <div class="grid3">
+      <div class="field"><label for="ps-offset">Max offset (hex)</label><input id="ps-offset" name="max_offset" class="mono" value="1000" spellcheck="false"></div>
+      <div class="field"><label for="ps-children">Max offsets per node</label><input id="ps-children" name="max_children" class="mono" type="number" min="0" value="0"></div>
+      <div class="field"><label for="ps-max">Max results</label><input id="ps-max" name="max_results" class="mono" type="number" min="0" value="0"></div>
+    </div>
+    <div class="checks">
+      <label class="check"><input name="static_only" type="checkbox" checked> Static bases only</label>
+      <label class="check"><input name="allow_negative" type="checkbox"> Negative offsets</label>
+      <label class="check"><input name="no_loops" type="checkbox" checked> No loops</label>
+      <label class="check"><input name="heap_only" type="checkbox"> Heap-only nodes</label>
+      <label class="check"><input name="writable_only" type="checkbox"> Writable pointer sources only</label>
+    </div>
+    <div class="grid3">
+      <div class="field"><label for="ps-align">Pointer alignment</label>
+        <select id="ps-align" name="alignment"><option value="0">Pointer size</option><option value="4">4 bytes</option><option value="1">Unaligned</option></select></div>
+      <div class="field"><label for="ps-stack">Thread stacks, top bytes (hex)</label>
+        <div class="inline"><input name="thread_stacks" type="checkbox" checked aria-label="Use thread stacks as static bases"><input id="ps-stack" name="stack_max" class="mono" value="1000" spellcheck="false"></div></div>
+      <div class="field"><label for="ps-threads">Threads (0 = all)</label><input id="ps-threads" name="threads" class="mono" type="number" min="0" value="0"></div>
+    </div>
+    <div class="field"><label for="ps-mods">Base modules (comma separated, empty = all)</label><input id="ps-mods" name="base_modules" autocomplete="off" spellcheck="false"></div>
+    <div class="grid3">
+      <div class="field"><label for="ps-bs">Base from</label><input id="ps-bs" name="base_start" class="mono" placeholder="any" spellcheck="false"></div>
+      <div class="field"><label for="ps-be">Base to</label><input id="ps-be" name="base_end" class="mono" placeholder="any" spellcheck="false"></div>
+      <div class="field"><label for="ps-last">Last offset is one of</label><input id="ps-last" name="last_offsets" class="mono" placeholder="any, e.g. 10, 1C" spellcheck="false"></div>
+    </div>
+    <div class="field"><label for="ps-ends">Path ends with offsets</label><input id="ps-ends" name="ends_with" class="mono" placeholder="e.g. 18, 8" spellcheck="false"></div>
+    <div class="field"><label for="ps-mappath">Scan a saved pointer map instead of the process</label>
+      <div class="inline"><input id="ps-mappath" name="map_path" class="mono" placeholder="none" spellcheck="false"><button id="ps-mapbrowse" class="btn" type="button">Browse</button></div></div>
+    <fieldset class="group">
+      <legend>Compare with saved pointer maps</legend>
+      <p class="hint">Each path must also lead to the given address in each map (e.g. maps taken after restarting the game).</p>
+      <div id="ps-cmp"></div>
+      <button id="ps-cmp-add" class="btn ghost" type="button" data-icon="plus">Pointer map</button>
+    </fieldset>
+    <div class="dlg-actions">
+      <button class="btn primary" value="ok">Scan <kbd>Enter</kbd></button>
+      <button class="btn" value="cancel" formnovalidate>Cancel <kbd>Esc</kbd></button>
+    </div>
+  </form>
+</dialog>
+
+<dialog id="dlg-ptrrescan" class="dlg" aria-labelledby="pr-title">
+  <form method="dialog">
+    <h2 id="pr-title">Rescan pointer paths</h2>
+    <p class="hint">Keeps the paths that still resolve and pass every filter below.</p>
+    <div class="field"><label for="pr-target">Must point to address</label><input id="pr-target" name="target" class="mono" placeholder="any" spellcheck="false"></div>
+    <div class="row2">
+      <div class="field"><label for="pr-value">Value at the end of the path</label><input id="pr-value" name="value" class="mono" placeholder="any" spellcheck="false"></div>
+      <div class="field"><label for="pr-vtype">Type</label><select id="pr-vtype" name="vtype"></select></div>
+    </div>
+    <div class="row2 row2-even">
+      <div class="field"><label for="pr-bs">Base from</label><input id="pr-bs" name="base_start" class="mono" placeholder="any" spellcheck="false"></div>
+      <div class="field"><label for="pr-be">Base to</label><input id="pr-be" name="base_end" class="mono" placeholder="any" spellcheck="false"></div>
+    </div>
+    <div class="row2 row2-even">
+      <div class="field"><label for="pr-starts">Starts with offsets</label><input id="pr-starts" name="starts_with" class="mono" placeholder="e.g. 10" spellcheck="false"></div>
+      <div class="field"><label for="pr-ends">Ends with offsets</label><input id="pr-ends" name="ends_with" class="mono" placeholder="e.g. 8" spellcheck="false"></div>
+    </div>
+    <div class="row2">
+      <div class="field"><label for="pr-map">Against a saved pointer map instead of the process</label>
+        <div class="inline"><input id="pr-map" name="map_path" class="mono" placeholder="none" spellcheck="false"><button id="pr-mapbrowse" class="btn" type="button">Browse</button></div></div>
+      <div class="field"><label for="pr-level">Max level</label><input id="pr-level" name="max_level" class="mono num" type="number" min="0" max="16" value="0"></div>
+    </div>
+    <div class="dlg-actions">
+      <button class="btn primary" value="ok">Rescan <kbd>Enter</kbd></button>
+      <button class="btn" value="cancel" formnovalidate>Cancel <kbd>Esc</kbd></button>
+    </div>
+  </form>
+</dialog>
+
+<dialog id="dlg-trace" class="dlg dlg-sm" aria-labelledby="tr-title">
+  <form method="dialog">
+    <h2 id="tr-title">Break and trace</h2>
+    <p id="tr-at" class="hint mono"></p>
+    <div class="field"><label for="tr-steps">Instructions to trace</label><input id="tr-steps" name="steps" class="mono" type="number" min="1" max="100000" value="1000"></div>
+    <label class="check"><input name="step_over_calls" type="checkbox"> Step over calls</label>
+    <div class="dlg-actions">
+      <button class="btn primary" value="ok">Trace <kbd>Enter</kbd></button>
+      <button class="btn" value="cancel" formnovalidate>Cancel <kbd>Esc</kbd></button>
+    </div>
+  </form>
+</dialog>
+
+<dialog id="dlg-hotkeys" class="dlg dlg-wide" aria-labelledby="hk-title">
+  <form method="dialog">
+    <h2 id="hk-title">Hotkeys</h2>
+    <p class="hint">Click a key field and press the combination. Global when the system allows it, otherwise while HeapHook has focus.</p>
+    <div class="hk-head" aria-hidden="true"><span>Action</span><span>Keys</span><span>Value</span><span>Description</span><span></span></div>
+    <div id="hk-rows" class="hk-rows"></div>
+    <button id="hk-add" class="btn ghost" type="button" data-icon="plus">Hotkey</button>
+    <div class="dlg-actions">
+      <button class="btn primary" value="ok">Save <kbd>Ctrl Enter</kbd></button>
+      <button class="btn" value="cancel" formnovalidate>Cancel <kbd>Esc</kbd></button>
+    </div>
+  </form>
+</dialog>
+
+<dialog id="dlg-dropdown" class="dlg" aria-labelledby="dd-title">
+  <form method="dialog">
+    <h2 id="dd-title">Dropdown list</h2>
+    <div class="field"><label for="dd-items">One item per line, <code>value:text</code></label>
+      <textarea id="dd-items" name="items" class="mono dd-items" spellcheck="false" wrap="off" placeholder="0:Easy&#10;1:Normal&#10;2:Hard"></textarea></div>
+    <div class="checks checks-col">
+      <label class="check"><input name="read_only" type="checkbox"> Only allow values from the list</label>
+      <label class="check"><input name="description_only" type="checkbox"> Show only the text in the list</label>
+      <label class="check"><input name="display_value_as_item" type="checkbox"> Show the matching text instead of the value</label>
+    </div>
+    <div class="dlg-actions">
+      <button class="btn primary" value="ok">Save <kbd>Ctrl Enter</kbd></button>
+      <button id="dd-remove" class="btn" value="remove" type="submit">Remove list</button>
+      <button class="btn" value="cancel" formnovalidate>Cancel <kbd>Esc</kbd></button>
+    </div>
+  </form>
+</dialog>
+
+<dialog id="dlg-gopts" class="dlg dlg-sm" aria-labelledby="go-title">
+  <form method="dialog">
+    <h2 id="go-title">Group options</h2>
+    <div class="checks checks-col">
+      <label class="check"><input name="moActivateChildrenAsWell" type="checkbox"> Activating this activates its children</label>
+      <label class="check"><input name="moDeactivateChildrenAsWell" type="checkbox"> Deactivating this deactivates its children</label>
+      <label class="check"><input name="moHideChildren" type="checkbox"> Hide children while inactive</label>
+      <label class="check"><input name="moAllowManualCollapseAndExpand" type="checkbox"> Still allow expanding while inactive</label>
+      <label class="check"><input name="moAlwaysHideChildren" type="checkbox"> Always hide children</label>
+      <label class="check"><input name="moRecursiveSetValue" type="checkbox"> Changing the value sets it on the children</label>
+    </div>
+    <div class="dlg-actions">
+      <button class="btn primary" value="ok">Save <kbd>Enter</kbd></button>
+      <button class="btn" value="cancel" formnovalidate>Cancel <kbd>Esc</kbd></button>
+    </div>
+  </form>
+</dialog>
+
+<dialog id="dlg-text" class="dlg dlg-script" aria-labelledby="tx-title">
+  <form method="dialog">
+    <div class="dlg-head">
+      <h2 id="tx-title">Table Lua script</h2>
+      <span id="tx-hint" class="hint"></span>
+    </div>
+    <div class="aa-editor">
+      <pre id="tx-gutter" class="aa-gutter mono" aria-hidden="true"></pre>
+      <textarea id="tx-text" class="mono" spellcheck="false" wrap="off" aria-labelledby="tx-title"></textarea>
+    </div>
+    <div class="dlg-actions">
+      <button class="btn primary" value="ok">Save <kbd>Ctrl S</kbd></button>
+      <button id="tx-run" class="btn" value="run" type="submit">Save and run <kbd>Ctrl Enter</kbd></button>
+      <button class="btn" value="cancel" formnovalidate>Cancel <kbd>Esc</kbd></button>
+    </div>
+  </form>
+</dialog>
+
+<dialog id="dlg-settings" class="dlg dlg-wide" aria-labelledby="st-title">
+  <form method="dialog">
+    <h2 id="st-title">Settings</h2>
+    <fieldset class="group">
+      <legend>Appearance</legend>
+      <div class="field"><label for="st-theme">Theme</label>
+        <select id="st-theme" name="theme"><option value="system">Follow the system</option><option value="light">Light</option><option value="dark">Dark</option></select></div>
+    </fieldset>
+    <fieldset class="group">
+      <legend>Values</legend>
+      <div class="row2 row2-even">
+        <div class="field"><label for="st-freeze">Freeze interval (ms)</label><input id="st-freeze" name="freeze_interval_ms" class="mono" type="number" min="1" max="60000"></div>
+        <div class="field"><label for="st-live">Live update interval (ms)</label><input id="st-live" name="live_update_ms" class="mono" type="number" min="50" max="10000"></div>
+      </div>
+    </fieldset>
+    <fieldset class="group">
+      <legend>Scan defaults</legend>
+      <div class="align-row">
+        <label class="check"><input name="fast_scan" type="checkbox"> Fast scan, alignment</label>
+        <input name="scan_alignment" class="mono num" type="number" min="1" max="64" aria-label="Alignment">
+      </div>
+      <div class="grid3">
+        <div class="field"><label for="st-w">Writable</label><select id="st-w" name="scan_writable"><option>yes</option><option>no</option><option>any</option></select></div>
+        <div class="field"><label for="st-x">Executable</label><select id="st-x" name="scan_executable"><option>yes</option><option>no</option><option>any</option></select></div>
+        <div class="field"><label for="st-c">Copy-on-write</label><select id="st-c" name="scan_copy_on_write"><option>yes</option><option>no</option><option>any</option></select></div>
+      </div>
+      <div class="field"><label for="st-threads">Scan threads (0 = one per core)</label><input id="st-threads" name="scan_threads" class="mono num" type="number" min="0" max="256"></div>
+    </fieldset>
+    <fieldset class="group">
+      <legend>Lua</legend>
+      <div class="row2 row2-even">
+        <div class="field"><label for="st-budget">Time limit per run (ms, 0 = none)</label><input id="st-budget" name="lua_budget_ms" class="mono" type="number" min="0"></div>
+        <div class="field"><label for="st-ts">Lua script in a loaded table</label>
+          <select id="st-ts" name="table_script"><option value="ask">Always ask before running</option><option value="never">Never run</option></select></div>
+      </div>
+    </fieldset>
+    <fieldset class="group">
+      <legend>Debugger and hotkeys</legend>
+      <div class="row2 row2-even">
+        <div class="field"><label for="st-bp">Breakpoint method</label>
+          <select id="st-bp" name="bp_method"><option value="software">Software (int3)</option><option value="hardware">Hardware (debug registers)</option></select></div>
+        <label class="check st-sound"><input name="hotkey_sound" type="checkbox"> Beep when a hotkey fires</label>
+      </div>
+    </fieldset>
+    <p id="st-path" class="hint mono"></p>
+    <div class="dlg-actions">
+      <button class="btn primary" value="ok">Save <kbd>Enter</kbd></button>
+      <button class="btn" value="cancel" formnovalidate>Cancel <kbd>Esc</kbd></button>
+    </div>
+  </form>
+</dialog>
+
+<dialog id="dlg-help" class="dlg dlg-help" aria-labelledby="help-title">
+  <form method="dialog">
+    <h2 id="help-title">Keyboard shortcuts</h2>
+    <div class="help-cols">
+      <dl>
+        <dt>Global</dt>
+        <dd><kbd>Ctrl P</kbd> Open process</dd>
+        <dd><kbd>Ctrl 1</kbd>…<kbd>Ctrl 7</kbd> Scanner, Memory, Debugger, Pointers, Lua, Structures, Code</dd>
+        <dd><kbd>Ctrl Shift W</kbd> Close process · <kbd>Ctrl Shift ↑↓</kbd> Speedhack</dd>
+        <dd><kbd>Ctrl ,</kbd> Settings</dd>
+        <dd><kbd>Ctrl Shift D</kbd> Attach / detach debugger</dd>
+        <dd><kbd>Alt 1</kbd>…<kbd>Alt 5</kbd> Focus value, results, table, disassembler, hex</dd>
+        <dd><kbd>Ctrl O</kbd> / <kbd>Ctrl S</kbd> Open / save table</dd>
+        <dd><kbd>F1</kbd> This list</dd>
+        <dt>Scanning</dt>
+        <dd><kbd>Enter</kbd> First / next scan (in value field)</dd>
+        <dd><kbd>Ctrl Enter</kbd> First / next scan</dd>
+        <dd><kbd>Ctrl N</kbd> New scan</dd>
+        <dd><kbd>Ctrl Z</kbd> Undo last scan</dd>
+        <dd><kbd>Esc</kbd> Cancel running scan</dd>
+        <dt>Results</dt>
+        <dd><kbd>Shift ↑↓</kbd> Extend selection</dd>
+        <dd><kbd>Enter</kbd> Add selection to table</dd>
+        <dd><kbd>Ctrl C</kbd> Copy addresses · <kbd>Ctrl M</kbd> Browse memory</dd>
+        <dd><kbd>F6</kbd> / <kbd>F5</kbd> What writes / accesses (also in the table)</dd>
+        <dt>Pointer scanner</dt>
+        <dd><kbd>N</kbd> New scan · <kbd>R</kbd> Rescan (list focused)</dd>
+        <dd><kbd>Enter</kbd> Add path to table · <kbd>Esc</kbd> Cancel</dd>
+      </dl>
+      <dl>
+        <dt>Cheat table</dt>
+        <dd><kbd>Space</kbd> Activate / freeze</dd>
+        <dd><kbd>Enter</kbd> Edit value (script: edit script)</dd>
+        <dd><kbd>F2</kbd> Edit description · <kbd>Ctrl E</kbd> Edit entry</dd>
+        <dd><kbd>Ctrl Shift A</kbd> Add address</dd>
+        <dd><kbd>Ctrl G</kbd> Group selected · <kbd>Alt ↑↓</kbd> Move</dd>
+        <dd><kbd>Ctrl X C V</kbd> Cut, copy, paste · <kbd>Del</kbd> Delete</dd>
+        <dd><kbd>Ctrl Z</kbd> Restore deleted · <kbd>←→</kbd> Collapse / expand</dd>
+        <dd><kbd>Ctrl H</kbd> Hotkeys · <kbd>Ctrl M</kbd> / <kbd>Ctrl D</kbd> Browse / disassemble region</dd>
+        <dd><kbd>Shift F10</kbd> Context menu</dd>
+        <dt>Lua console</dt>
+        <dd><kbd>Ctrl Enter</kbd> Run · <kbd>Ctrl ↑↓</kbd> History</dd>
+        <dd><kbd>Esc</kbd> Interrupt a running script</dd>
+        <dt>Memory viewer</dt>
+        <dd><kbd>Ctrl G</kbd> Go to address</dd>
+        <dd><kbd>Space</kbd> Follow jump · <kbd>Backspace</kbd> Back</dd>
+        <dd><kbd>Enter</kbd> Assemble line / edit value</dd>
+        <dd><kbd>0-9 A-F</kbd> Type over bytes</dd>
+        <dd><kbd>Shift F10</kbd> Tools: fill, copy, snapshots, pointers to here</dd>
+        <dd><kbd>X</kbd> What references this (disassembler)</dd>
+        <dt>Structures</dt>
+        <dd><kbd>→ ←</kbd> Expand / collapse · <kbd>Enter</kbd> / <kbd>1-9</kbd> Edit value</dd>
+        <dd><kbd>F2</kbd> Description · <kbd>T</kbd> Type · <kbd>S</kbd> Size · <kbd>Ins</kbd> <kbd>Del</kbd> Element</dd>
+        <dd><kbd>A</kbd> Address column · <kbd>G</kbd> Dissect at · <kbd>Ctrl Enter</kbd> Add to table</dd>
+        <dt>Debugger</dt>
+        <dd><kbd>F5</kbd> Toggle breakpoint · <kbd>F4</kbd> Run to cursor</dd>
+        <dd><kbd>F9</kbd> Continue · <kbd>Shift F9</kbd> Break</dd>
+        <dd><kbd>F7</kbd> Into · <kbd>F8</kbd> Over · <kbd>Shift F8</kbd> Out</dd>
+        <dd>Watch list: <kbd>Enter</kbd> disassemble · <kbd>N</kbd> NOP · <kbd>L</kbd> code list · <kbd>S</kbd> stop · <kbd>Del</kbd> close</dd>
+      </dl>
+    </div>
+    <div class="dlg-actions"><button class="btn primary" value="ok">Close <kbd>Esc</kbd></button></div>
+  </form>
+</dialog>
+</body>
+</html>

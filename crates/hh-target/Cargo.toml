@@ -1,0 +1,4 @@
+[package]
+name = "hh-target"
+version.workspace = true
+edition.workspace = true

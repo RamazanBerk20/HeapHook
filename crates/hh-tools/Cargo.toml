@@ -1,0 +1,17 @@
+[package]
+name = "hh-tools"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+hh-core.workspace = true
+hh-asm.workspace = true
+hh-scan.workspace = true
+serde.workspace = true
+serde_json = "1"
+rayon = "1.10"
+roxmltree = "0.21"
+iced-x86 = { version = "1.21", default-features = false, features = ["std", "decoder", "instr_info"] }
+
+[dev-dependencies]
+tempfile = "3.10"

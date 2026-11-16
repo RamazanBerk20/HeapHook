@@ -1,0 +1,959 @@
+//! The command layer against a live hh-target child (ptrace_scope=1 only allows children).
+#![cfg(target_os = "linux")]
+use std::io::{BufRead, BufReader, Write};
+use std::path::PathBuf;
+use std::process::{Child, ChildStdin, Command, Stdio};
+use std::sync::OnceLock;
+use std::sync::mpsc::{Receiver, channel};
+use std::time::{Duration, Instant};
+
+use heaphook::commands::{App, parse_addr};
+use heaphook::debug::BpReq;
+use heaphook::ptr::{PtrRescanReq, PtrScanReq};
+use hh_scan::Fmt;
+use serde_json::{Value, json};
+
+const T: Duration = Duration::from_secs(10);
+
+/// Builds `bin` of `package` once per test binary and returns its path.
+fn exe(package: &'static str, bin: &'static str) -> PathBuf {
+    static BUILT: OnceLock<std::sync::Mutex<Vec<&'static str>>> = OnceLock::new();
+    let mut built = BUILT.get_or_init(Default::default).lock().unwrap();
+    if !built.contains(&bin) {
+        let ok = Command::new(env!("CARGO"))
+            .args(["build", "-q", "-p", package, "--bin", bin])
+            .current_dir(env!("CARGO_MANIFEST_DIR"))
+            .status()
+            .expect("run cargo")
+            .success();
+        assert!(ok, "cargo build -p {package} failed");
+        built.push(bin);
+    }
+    // This test binary lives in <target>/<profile>/deps/.
+    std::env::current_exe().unwrap().parent().unwrap().parent().unwrap().join(bin)
+}
+
+struct Target {
+    child: Child,
+    stdin: ChildStdin,
+    /// Lines from a reader thread, so a stopped target fails a test instead of hanging it.
+    lines: Receiver<String>,
+    info: Value,
+}
+
+impl Target {
+    fn spawn() -> Self {
+        Self::spawn_exe(exe("hh-target", "hh-target"))
+    }
+    fn spawn_exe(path: PathBuf) -> Self {
+        let mut child = Command::new(path).stdin(Stdio::piped()).stdout(Stdio::piped()).spawn().unwrap();
+        let stdin = child.stdin.take().unwrap();
+        let stdout = BufReader::new(child.stdout.take().unwrap());
+        let (tx, lines) = channel();
+        std::thread::spawn(move || {
+            for l in stdout.lines().map_while(Result::ok) {
+                if tx.send(l).is_err() {
+                    break;
+                }
+            }
+        });
+        let first = lines.recv_timeout(T).expect("target start line");
+        Target { child, stdin, lines, info: serde_json::from_str(&first).unwrap() }
+    }
+    fn addr(&self, key: &str) -> String {
+        self.info[key].as_str().unwrap().to_string()
+    }
+    fn send(&mut self, c: &str) {
+        writeln!(self.stdin, "{c}").unwrap();
+        self.stdin.flush().unwrap();
+    }
+    fn line(&mut self) -> String {
+        self.lines.recv_timeout(T).expect("target answer")
+    }
+    fn cmd(&mut self, c: &str) -> Value {
+        self.send(c);
+        serde_json::from_str(&self.line()).unwrap()
+    }
+}
+
+/// Polls `f` until it returns `Some`, failing after 10 s.
+fn wait<V>(what: &str, mut f: impl FnMut() -> Option<V>) -> V {
+    let t0 = Instant::now();
+    loop {
+        if let Some(v) = f() {
+            return v;
+        }
+        assert!(t0.elapsed() < T, "timed out waiting for {what}");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn tracer_pid(pid: u32) -> u32 {
+    let s = std::fs::read_to_string(format!("/proc/{pid}/status")).unwrap();
+    s.lines().find_map(|l| l.strip_prefix("TracerPid:")).unwrap().trim().parse().unwrap()
+}
+
+fn hex(a: u64) -> String {
+    format!("{a:#x}")
+}
+
+impl Drop for Target {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+fn de<T: serde::de::DeserializeOwned>(v: Value) -> T {
+    serde_json::from_value(v).unwrap()
+}
+
+#[test]
+fn commands_against_live_target() {
+    let mut t = Target::spawn();
+    let app = App::default();
+    let pid = t.child.id();
+    assert_eq!(app.regions().unwrap_err(), "no process opened");
+
+    let info = app.open_process(pid).unwrap();
+    assert_eq!((info.pid, info.name.as_str(), info.is_64bit), (pid, "hh-target", true));
+    assert!(app.list_processes().unwrap().iter().any(|p| p.pid == pid));
+    let regions = serde_json::to_value(app.regions().unwrap()).unwrap();
+    assert!(regions[0]["start"].as_str().unwrap().starts_with("0x") && regions[0]["size"].is_u64());
+
+    // First scan for the exact i32, inc, next scan "increased": the known address survives.
+    let i32_addr = t.addr("i32");
+    let first = app
+        .scan_first(&de(json!({"vtype": "4bytes", "scan_type": "exact", "value": "123456", "not": false,
+            "opts": {"start": "0x0", "stop": "0x7fffffffffff", "writable": "yes", "executable": "any",
+                     "copy_on_write": "any", "alignment": 4, "hex": false, "case_sensitive": false,
+                     "utf16": false, "rounding": "rounded", "percent": false, "pause_while_scanning": false}})))
+        .unwrap();
+    assert!(first.count >= 1, "first scan found nothing");
+    let p = app.scan_progress().unwrap();
+    assert!(!p.running && p.total > 0 && p.done == p.total, "{p:?}");
+    assert_eq!(t.cmd("inc")["i32"], 123457);
+    let next = app.scan_next(&de(json!({"scan_type": "increased", "value": "", "value2": null, "not": false}))).unwrap();
+    assert!(next.count >= 1 && next.count <= first.count);
+    let rows = app.scan_results(0, 10_000).unwrap();
+    let row = rows.iter().find(|r| r.addr == parse_addr(&i32_addr).unwrap()).expect("i32 survived next scan");
+    assert_eq!((row.value.as_deref(), row.previous.as_str(), row.first.as_str()), (Some("123457"), "123457", "123456"));
+    app.scan_undo().unwrap();
+    assert_eq!(app.scan_results(0, 10_000).unwrap().len() as u64, first.count);
+
+    // Write (with a 0x prefix, as the UI sends hex-displayed entries) and confirm via hh-target.
+    app.write_value(&i32_addr, de(json!("4bytes")), "0x3E8", &Fmt::default()).unwrap();
+    assert_eq!(t.cmd("get")["i32"], 1000);
+    let vals = app
+        .read_values(de(json!([{"addr": i32_addr, "vtype": "4bytes", "len": 0, "signed": true},
+                                {"addr": t.addr("str"), "vtype": "string", "len": 8},
+                                {"addr": t.addr("str16"), "vtype": "string", "len": 8, "utf16": true},
+                                {"addr": "0x10", "vtype": "4bytes"}])))
+        .unwrap();
+    assert_eq!(vals, [Some("1000".into()), Some("HeapHook".into()), Some("HeapHook".into()), None]);
+
+    // Freeze survives inc.
+    app.set_frozen(&de::<Vec<_>>(json!([{"addr": i32_addr, "vtype": "4bytes", "value": "777", "mode": "exact"}]))).unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+    t.cmd("inc");
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(t.cmd("get")["i32"], 777);
+    app.set_frozen(&[]).unwrap();
+
+    // Raw memory.
+    assert_eq!(app.read_memory(&t.addr("aob"), 8).unwrap(), "deadbeef1337c0de");
+    assert_eq!(app.read_memory("0x10", 3).unwrap(), "??????");
+    app.write_bytes(&t.addr("aob"), "11 22").unwrap();
+    assert_eq!(app.read_memory(&t.addr("aob"), 4).unwrap(), "1122beef");
+
+    // Pointer chain and module-relative expressions.
+    let offs: Vec<String> = t.info["chain_offsets"].as_array().unwrap().iter().map(|o| o.as_str().unwrap().into()).collect();
+    let expr = format!("[[[{}]+{}]+{}]+{}", t.addr("chain"), offs[0], offs[1], offs[2]);
+    assert_eq!(parse_addr(&app.resolve_address(&expr).unwrap()), parse_addr(&t.addr("chain_value")));
+    let module = app.modules().unwrap().into_iter().find(|m| m.name == "hh-target").expect("hh-target module");
+    let base = parse_addr(&module.base).unwrap();
+    assert_eq!(parse_addr(&app.resolve_address("\"hh-target\"+10").unwrap()).unwrap(), base + 0x10);
+
+    // Disassemble at the module's executable region.
+    let code = app
+        .regions()
+        .unwrap()
+        .into_iter()
+        .find(|r| r.prot.x && r.path.as_deref().is_some_and(|p| p.ends_with("hh-target")))
+        .expect("executable region of hh-target");
+    let lines = app.disassemble(&code.start, 20).unwrap();
+    assert_eq!(lines.len(), 20);
+    assert_eq!(lines[0].addr, code.start);
+    assert!(lines.iter().all(|l| l.bytes != "??" && !l.text.is_empty()), "{lines:?}");
+    assert_eq!(app.assemble(&code.start, "nop\nret").unwrap(), "90c3");
+
+    // Auto Assembler: alloc + write + registersymbol, then disable.
+    let script = "[ENABLE]\nalloc(hhmem,$100)\nregistersymbol(hhmem)\nhhmem:\n  db 11 22 33 44\n  mov eax,1\n  ret\n\n[DISABLE]\nunregistersymbol(hhmem)\ndealloc(hhmem)\n";
+    assert!(app.aa_check(script).unwrap().is_none());
+    let bad = app.aa_check("[ENABLE]\nfoo bar\n[DISABLE]\n").unwrap().expect("syntax error");
+    assert_eq!(bad.line, 2);
+    let st = app.aa_execute(script, true, None).unwrap();
+    let mem = app.resolve_address("hhmem").unwrap();
+    assert_eq!(app.read_memory(&mem, 4).unwrap(), "11223344");
+    assert_eq!(app.disassemble(&app.resolve_address("hhmem+4").unwrap(), 2).unwrap()[0].text, "mov eax,1");
+    // The state crosses IPC as JSON and comes back for disable.
+    let st: hh_asm::AaState = de(serde_json::to_value(&st).unwrap());
+    app.aa_execute(script, false, Some(&st)).unwrap();
+    assert!(app.resolve_address("hhmem").is_err(), "symbol still registered after disable");
+    assert_eq!(app.read_memory(&mem, 4).unwrap(), "????????", "alloc not freed");
+
+    // Switching process resets everything.
+    let mut t2 = Target::spawn();
+    app.open_process(t2.child.id()).unwrap();
+    assert!(app.scan_results(0, 10).unwrap().is_empty());
+    t2.cmd("get");
+}
+
+#[test]
+fn scan_progress_and_cancel_from_another_thread() {
+    let t = Target::spawn();
+    let app = App::default();
+    app.open_process(t.child.id()).unwrap();
+    let a2 = app.clone();
+    // "unknown" over everything, byte-aligned: long enough to observe and cancel.
+    let h = std::thread::spawn(move || {
+        a2.scan_first(&de(json!({"vtype": "byte", "scan_type": "unknown", "opts": {"alignment": 1}})))
+    });
+    let mut saw_running = false;
+    for _ in 0..200 {
+        let p = app.scan_progress().unwrap();
+        if p.running {
+            saw_running = true;
+            app.scan_cancel().unwrap();
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let r = h.join().unwrap();
+    if saw_running {
+        assert_eq!(r.unwrap_err(), "scan cancelled");
+    } else {
+        eprintln!("scan finished before it could be observed: {r:?}");
+    }
+    assert!(!app.scan_progress().unwrap().running);
+}
+
+#[test]
+fn permission_error_text_is_unchanged() {
+    // pid 1 is not our child: hh-core's Permission error must reach the UI as-is.
+    let e = App::default().open_process(1).unwrap_err();
+    assert!(e.starts_with("permission denied") || e.contains("ermission"), "{e}");
+}
+
+fn bp(v: Value) -> BpReq {
+    de(v)
+}
+
+fn scan_exact_i32(app: &App, value: &str) -> u64 {
+    app.scan_first(&de(json!({"vtype": "4bytes", "scan_type": "exact", "value": value, "not": false,
+        "opts": {"start": "0x0", "stop": "0x7fffffffffff", "writable": "yes", "executable": "any",
+                 "copy_on_write": "any", "alignment": 4}})))
+        .unwrap()
+        .count
+}
+
+#[test]
+fn find_what_writes_while_scans_and_freeze_keep_working() {
+    let mut t = Target::spawn();
+    let app = App::default();
+    let pid = t.child.id();
+    app.open_process(pid).unwrap();
+    let i32_addr = t.addr("i32");
+    let st = app.debug_attach().unwrap();
+    assert_eq!((st.attached, st.state), (true, "running"));
+    assert_ne!(tracer_pid(pid), 0);
+
+    // Find out what writes to the i32: inc writes it once.
+    let id = app.debug_add_breakpoint(&bp(json!({"addr": i32_addr, "kind": "write", "size": 4, "action": "record"}))).unwrap();
+    assert_eq!(t.cmd("inc")["i32"], 123457);
+    let recs = wait("a write record", || Some(app.debug_records(id).unwrap()).filter(|r| !r.is_empty()));
+    let r = &recs[0];
+    assert_eq!(r.count, 1);
+    // The trap ip is the next instruction; the record shows the one that wrote, ending at ip.
+    let (at, ip) = (parse_addr(&r.addr).unwrap(), parse_addr(&r.ip).unwrap());
+    assert_eq!(at + r.bytes.split(' ').count() as u64, ip, "{r:?}");
+    let dst = r.text.split(',').next().unwrap();
+    assert!(dst.contains('[') && (r.text.starts_with("mov") || r.text.starts_with("add") || r.text.starts_with("inc")), "not a write: {r:?}");
+    assert_eq!(app.debug_breakpoints().unwrap()[0].hits, 1);
+    assert_eq!(r.context["rip"], r.ip);
+
+    // Everything else keeps working through the debugger: scan, next scan, write, freeze.
+    let n = scan_exact_i32(&app, "123457");
+    assert!(n >= 1);
+    assert!(app.scan_results(0, 10_000).unwrap().iter().any(|x| x.addr == parse_addr(&i32_addr).unwrap()));
+    app.write_value(&i32_addr, de(json!("4bytes")), "500", &Fmt::default()).unwrap();
+    assert_eq!(t.cmd("get")["i32"], 500);
+    app.set_frozen(&de::<Vec<_>>(json!([{"addr": i32_addr, "vtype": "4bytes", "value": "777", "mode": "exact"}]))).unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+    t.cmd("inc");
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(t.cmd("get")["i32"], 777);
+    app.set_frozen(&[]).unwrap();
+    assert!(app.debug_records(id).unwrap()[0].count >= 2, "frozen writes and inc are recorded too");
+    assert_ne!(tracer_pid(pid), 0, "still attached");
+
+    // UTF-16 strings are written and frozen as UTF-16.
+    let s16 = t.addr("str16");
+    let utf16 = Fmt { utf16: true, ..Fmt::default() };
+    app.write_value(&s16, de(json!("string")), "Hook", &utf16).unwrap();
+    let read = |app: &App| app.read_values(de(json!([{"addr": s16, "vtype": "string", "len": 8, "utf16": true}]))).unwrap();
+    assert_eq!(read(&app), [Some("HookHook".into())]);
+    app.set_frozen(&de::<Vec<_>>(json!([{"addr": s16, "vtype": "string", "value": "Heap", "mode": "exact", "utf16": true, "len": 4}]))).unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(read(&app), [Some("HeapHook".into())]);
+    app.set_frozen(&[]).unwrap();
+
+    // Detach: the tracer goes away and memory access switches back.
+    app.debug_detach().unwrap();
+    assert_eq!(tracer_pid(pid), 0);
+    assert_eq!(app.debug_status().unwrap().state, "detached");
+    assert!(app.debug_records(id).is_err());
+    assert_eq!(t.cmd("inc")["i32"], 778);
+    assert!(scan_exact_i32(&app, "778") >= 1);
+    app.write_value(&i32_addr, de(json!("4bytes")), "5", &Fmt::default()).unwrap();
+    assert_eq!(t.cmd("get")["i32"], 5);
+}
+
+#[test]
+fn pointer_scan_finds_static_chain_rescans_and_exports() {
+    let mut t = Target::spawn();
+    let app = App::default();
+    app.open_process(t.child.id()).unwrap();
+    // Scanning while the debugger is attached goes through it.
+    app.debug_attach().unwrap();
+    let target = t.addr("chain_value");
+    let offs: Vec<String> = t.info["chain_offsets"].as_array().unwrap().iter().map(|o| format!("{:X}", parse_addr(o.as_str().unwrap()).unwrap())).collect();
+    let req: PtrScanReq = de(json!({"target": target, "opts": {"max_level": 3, "max_offset": 0x100, "static_only": true, "thread_stacks": false}}));
+    let info = app.ptr_scan(&req).unwrap();
+    assert!(info.count >= 1 && info.max_level == 3, "{info:?}");
+    let p = app.ptr_progress().unwrap();
+    assert!(!p.running && p.phase.is_empty());
+    let find = |app: &App, count: u64| {
+        let rows = app.ptr_results(0, count as usize, de(json!("4bytes")), &Fmt::default()).unwrap();
+        rows.iter().position(|r| r.base.starts_with("\"hh-target\"+") && r.offsets == offs).map(|i| (i, rows[i].clone()))
+    };
+    let (_, row) = find(&app, info.count).expect("\"hh-target\"+off chain");
+    assert_eq!(row.address.as_deref(), Some(target.as_str()));
+    assert_eq!(row.value.as_deref(), Some("4242"));
+
+    // Rescan after the value changed: same address, value filter.
+    assert_eq!(t.cmd("inc")["chain_value"], 4243);
+    let re: PtrRescanReq = de(json!({"target": target, "value": "4243", "vtype": "4bytes"}));
+    let info2 = app.ptr_rescan(&re).unwrap();
+    assert!(info2.count >= 1 && info2.count <= info.count);
+    let (_, row) = find(&app, info2.count).expect("chain survives the rescan");
+    assert_eq!(row.value.as_deref(), Some("4243"));
+    // Column sorts: by the first offset descending, then hh-ptr's base order.
+    let n = app.ptr_sort("offset", 0, true, de(json!("4bytes")), &Fmt::default()).unwrap().count;
+    let rows = app.ptr_results(0, n as usize, de(json!("4bytes")), &Fmt::default()).unwrap();
+    let first = |r: &heaphook::ptr::PtrRow| r.offsets.first().map(|o| i64::from_str_radix(o, 16).unwrap_or(0));
+    assert!(rows.windows(2).all(|w| first(&w[0]) >= first(&w[1])));
+    assert!(app.ptr_sort("value", 0, false, de(json!("4bytes")), &Fmt::default()).is_ok());
+    assert_eq!(app.ptr_sort("base", 0, false, de(json!("4bytes")), &Fmt::default()).unwrap().count, n);
+    let (i, _) = find(&app, n).expect("chain after sorting");
+    // A value filter that matches nothing empties the set.
+    let none: PtrRescanReq = de(json!({"value": "99999", "vtype": "4bytes"}));
+    let saved = std::env::temp_dir().join(format!("hh-test-{}.hhptr", std::process::id()));
+    app.ptr_save_results(saved.to_str().unwrap()).unwrap();
+    assert_eq!(app.ptr_rescan(&none).unwrap().count, 0);
+    assert_eq!(app.ptr_open_results(saved.to_str().unwrap()).unwrap().count, info2.count);
+
+    // Export as a table entry; the UI resolves it as [[[addr]+o1]+o2]+o3.
+    let e = app.ptr_entry(i as u64, "4bytes", "health").unwrap();
+    assert_eq!((e["vtype"].as_str(), e["description"].as_str()), (Some("4bytes"), Some("health")));
+    let expr = e["offsets"].as_array().unwrap().iter().fold(e["addr"].as_str().unwrap().to_string(), |x, o| format!("[{x}]+{}", o.as_str().unwrap()));
+    assert_eq!(parse_addr(&app.resolve_address(&expr).unwrap()).unwrap(), parse_addr(&target).unwrap());
+    let vals = app.read_values(de(json!([{"addr": app.resolve_address(&expr).unwrap(), "vtype": "4bytes"}]))).unwrap();
+    assert_eq!(vals, [Some("4243".into())]);
+
+    // Pointer map save works too.
+    let map = std::env::temp_dir().join(format!("hh-test-{}.hhpmap", std::process::id()));
+    app.ptr_save_map(map.to_str().unwrap()).unwrap();
+    assert!(std::fs::metadata(&map).unwrap().len() > 16);
+    std::fs::remove_file(&map).unwrap();
+    std::fs::remove_file(&saved).unwrap();
+    app.debug_detach().unwrap();
+}
+
+#[test]
+fn breakpoints_stepping_registers_trace() {
+    let mut t = Target::spawn_exe(exe("hh-debug", "hh-debug-target"));
+    let app = App::default();
+    let pid = t.child.id();
+    app.open_process(pid).unwrap();
+    app.debug_attach().unwrap();
+    let (store, load, outer, value) = (t.addr("store"), t.addr("load"), t.addr("outer"), t.addr("value"));
+    let store_a = parse_addr(&store).unwrap();
+    let broken = |app: &App| wait("a break", || Some(app.debug_status().unwrap()).filter(|s| s.state == "broken"));
+
+    // Software breakpoint on store(p, v): `mov [rdi], rsi; ret`.
+    let id = app.debug_add_breakpoint(&bp(json!({"addr": store}))).unwrap();
+    t.send("store");
+    let st = broken(&app);
+    let tid = st.tid.unwrap();
+    assert_eq!((st.rip.as_deref(), st.reason.as_deref()), (Some(store.as_str()), Some(format!("breakpoint {id}").as_str())));
+    assert!(app.debug_threads().unwrap().iter().any(|th| th.tid == tid));
+    let ctx = app.debug_context(tid).unwrap();
+    assert_eq!(ctx["rip"], store);
+    assert_eq!(ctx["rdi"], value);
+    assert_eq!(ctx["fpu"]["st"].as_array().unwrap().len(), 8);
+    // The return address is on top of the stack.
+    let stack = app.debug_stack(tid, 4).unwrap();
+    assert_eq!(stack[0].addr, ctx["rsp"]);
+    assert_ne!(parse_addr(&stack[0].value).unwrap(), 0);
+    // Edit a register and a flag, then step into: the store writes the edited value.
+    app.debug_set_register(tid, "rsi", "0x1234").unwrap();
+    let fl = parse_addr(app.debug_context(tid).unwrap()["rflags"].as_str().unwrap()).unwrap();
+    app.debug_set_register(tid, "rflags", &hex(fl ^ 0x80)).unwrap();
+    assert_eq!(parse_addr(app.debug_context(tid).unwrap()["rflags"].as_str().unwrap()).unwrap() & 0x80, (fl ^ 0x80) & 0x80);
+    app.debug_set_register(tid, "rflags", &hex(fl)).unwrap();
+    assert!(app.debug_set_register(tid, "xyz", "0x1").is_err());
+    app.debug_step(tid, "into").unwrap();
+    let st = wait("the step", || Some(app.debug_status().unwrap()).filter(|s| s.state == "broken" && s.rip.as_deref() == Some(hex(store_a + 3).as_str())));
+    assert_eq!(st.reason.as_deref(), Some("step"));
+    assert_eq!(app.read_values(de(json!([{"addr": value, "vtype": "8bytes"}]))).unwrap(), [Some("4660".into())]);
+    // Step out of store lands back in the caller.
+    app.debug_step(tid, "out").unwrap();
+    let st = wait("step out", || Some(app.debug_status().unwrap()).filter(|s| s.state == "broken" && s.reason.as_deref() == Some("step")));
+    let rip = parse_addr(st.rip.as_deref().unwrap()).unwrap();
+    assert!(rip < store_a || rip > store_a + 4, "still in store: {rip:#x}");
+    app.debug_continue(false).unwrap();
+    assert_eq!(t.line(), "ok 4660 200");
+    let b = &app.debug_breakpoints().unwrap()[0];
+    assert_eq!((b.hits, b.kind, b.method, b.action, b.enabled), (1, "execute", "software", "break", true));
+    // Disabled breakpoints stay listed and do not stop the target.
+    app.debug_set_enabled(id, false).unwrap();
+    assert_eq!(t.cmd_line("store"), "ok 4661 200");
+    app.debug_set_enabled(id, true).unwrap();
+    t.send("store");
+    assert_eq!(broken(&app).rip.as_deref(), Some(store.as_str()));
+    app.debug_remove_breakpoint(id).unwrap();
+    app.debug_continue(false).unwrap();
+    assert_eq!(t.line(), "ok 4662 200");
+    assert!(app.debug_breakpoints().unwrap().is_empty());
+
+    // Run to cursor: break at outer, run to the nop after its call.
+    let outer_a = parse_addr(&outer).unwrap();
+    let id = app.debug_add_breakpoint(&bp(json!({"addr": outer, "method": "hardware"}))).unwrap();
+    t.send("outer");
+    assert_eq!(broken(&app).rip.as_deref(), Some(outer.as_str()));
+    app.debug_remove_breakpoint(id).unwrap();
+    app.debug_run_to(&hex(outer_a + 6)).unwrap();
+    wait("run to", || Some(app.debug_status().unwrap()).filter(|s| s.state == "broken" && s.rip.as_deref() == Some(hex(outer_a + 6).as_str())));
+    app.debug_continue(false).unwrap();
+    assert_eq!(t.line(), "ok 4663 200");
+
+    // Pause and continue.
+    app.debug_pause().unwrap();
+    assert_eq!(broken(&app).reason.as_deref(), Some("paused"));
+    app.debug_continue(false).unwrap();
+
+    // What addresses does `mov rax, [rdi]` in load access?
+    let id = app.debug_add_breakpoint(&bp(json!({"addr": load, "action": "record", "ea": true}))).unwrap();
+    assert_eq!(t.cmd_line("load"), "ok 4663 200");
+    let recs = wait("an access record", || Some(app.debug_records(id).unwrap()).filter(|r| !r.is_empty()));
+    assert_eq!((recs[0].address.as_deref(), recs[0].addr.as_str(), recs[0].text.as_str()), (Some(value.as_str()), load.as_str(), "mov rax,[rdi]"));
+    app.debug_remove_breakpoint(id).unwrap();
+    // Not a memory instruction: refused.
+    assert!(app.debug_add_breakpoint(&bp(json!({"addr": outer, "action": "record", "ea": true}))).is_err());
+
+    // Break and trace from outer: nop, call store, mov [rdi],rsi, ret, nop...
+    let id = app.debug_add_breakpoint(&bp(json!({"addr": outer, "action": "trace", "steps": 5}))).unwrap();
+    assert_eq!(t.cmd_line("outer"), "ok 4664 200");
+    let tr = wait("a trace", || Some(app.debug_trace(id).unwrap()).filter(|r| r.len() >= 5));
+    assert_eq!(tr[0].addr, outer);
+    assert!(tr[1].text.starts_with("call"), "{:?}", tr.iter().map(|x| &x.text).collect::<Vec<_>>());
+    assert_eq!(tr[2].addr, store);
+    app.debug_remove_breakpoint(id).unwrap();
+
+    // Replace with NOPs, then restore.
+    let orig = app.nop_instruction(&store).unwrap();
+    assert_eq!(orig, "488937");
+    assert_eq!(t.cmd_line("store"), "ok 4664 200");
+    app.write_bytes(&store, &orig).unwrap();
+    assert_eq!(t.cmd_line("store"), "ok 4665 200");
+
+    app.debug_detach().unwrap();
+    assert_eq!(tracer_pid(pid), 0);
+    assert_eq!(t.cmd_line("store"), "ok 4666 200");
+}
+
+impl Target {
+    fn cmd_line(&mut self, c: &str) -> String {
+        self.send(c);
+        self.line()
+    }
+}
+
+#[test]
+fn breakpoint_needs_attached_debugger() {
+    let t = Target::spawn();
+    let app = App::default();
+    app.open_process(t.child.id()).unwrap();
+    let e = app.debug_add_breakpoint(&bp(json!({"addr": "0x1000"}))).unwrap_err();
+    assert_eq!(e, "the debugger is not attached");
+    assert!(app.ptr_results(0, 10, de(json!("4bytes")), &Fmt::default()).is_err());
+}
+
+// ---------------------------------------------------------------- Lua and the live table
+
+use heaphook::table::{Dropdown, DropdownItem, Entry, Hotkey, Table};
+
+fn log_text(app: &App) -> String {
+    app.lua_poll(0).unwrap().log.iter().map(|l| format!("{}: {}", l.kind, l.text)).collect::<Vec<_>>().join("\n")
+}
+
+fn i32_entry(id: i64, t: &Target) -> Entry {
+    Entry { id, description: "hp".into(), addr: t.addr("i32"), ..Entry::default() }
+}
+
+fn put(app: &App, entries: Vec<Entry>) {
+    let base = app.table_get().unwrap().version;
+    app.table_put(Table { entries, ..Table::default() }, base).unwrap();
+}
+
+fn entry(app: &App, id: i64) -> Entry {
+    fn find(l: &[Entry], id: i64) -> Option<Entry> {
+        l.iter().find_map(|e| if e.id == id { Some(e.clone()) } else { find(&e.children, id) })
+    }
+    find(&app.table_get().unwrap().table.entries, id).expect("entry")
+}
+
+#[test]
+fn lua_console_reads_writes_and_prints() {
+    let mut t = Target::spawn();
+    let app = App::default();
+    app.open_process(t.child.id()).unwrap();
+    let a = t.addr("i32");
+    app.lua_exec(&format!("local a = {a}\nprint('i32 =', readInteger(a))\nwriteInteger(a, 777)\nreturn readInteger(a) + 1")).unwrap();
+    let log = log_text(&app);
+    assert!(log.contains("out: i32 = 123456"), "{log}");
+    assert!(log.contains("result: 778"), "{log}");
+    assert_eq!(t.cmd("get")["i32"], 777);
+    // Errors carry the position and a traceback.
+    let err = app.lua_exec("local function f() error('boom') end\nf()").unwrap_err();
+    assert!(err.contains("console:1: boom") && err.contains("traceback"), "{err}");
+    assert!(log_text(&app).contains("err: console:1: boom"));
+    // Polling from a cursor returns only newer lines.
+    let next = app.lua_poll(0).unwrap().next;
+    app.lua_exec("print('later')").unwrap();
+    let p = app.lua_poll(next).unwrap();
+    assert_eq!(p.log.iter().map(|l| l.text.as_str()).collect::<Vec<_>>(), ["print('later')", "later"]);
+}
+
+#[test]
+fn aa_entry_with_lua_block_enables_and_disables() {
+    let mut t = Target::spawn();
+    let app = App::default();
+    app.open_process(t.child.id()).unwrap();
+    let a = parse_addr(&t.addr("i32")).unwrap();
+    let block = |v: u32, what: &str| {
+        format!("{{$lua}}\nif syntaxcheck then return nil end\nprint('{what} ' .. memrec.Description)\nreturn string.format('%X:\\ndd %X', {a:#x}, {v})\n{{$asm}}\n")
+    };
+    let script = format!("[ENABLE]\n{}[DISABLE]\n{}", block(4321, "enable"), block(123456, "disable"));
+    assert!(app.aa_check(&script).unwrap().is_none(), "{:?}", app.aa_check(&script));
+    let bad = "[ENABLE]\n{$lua}\nerror('lua says no')\n{$asm}\n[DISABLE]\n";
+    assert!(app.aa_check(bad).unwrap().expect("error").message.contains("lua says no"));
+    put(&app, vec![Entry { id: 1, description: "lua patch".into(), script: Some(script), ..Entry::default() }]);
+
+    app.table_set_active(&[1], true).unwrap();
+    assert_eq!(t.cmd("get")["i32"], 4321);
+    assert!(entry(&app, 1).frozen);
+    app.table_set_active(&[1], false).unwrap();
+    assert_eq!(t.cmd("get")["i32"], 123456);
+    assert!(!entry(&app, 1).frozen);
+    let log = log_text(&app);
+    assert!(log.contains("out: enable lua patch") && log.contains("out: disable lua patch"), "{log}");
+}
+
+#[test]
+fn lua_flips_active_table_reflects_and_freezer_enforces() {
+    let mut t = Target::spawn();
+    let app = App::default();
+    app.start_driver();
+    app.open_process(t.child.id()).unwrap();
+    let group = Entry {
+        id: 2,
+        description: "group".into(),
+        options: vec!["moActivateChildrenAsWell".into(), "moDeactivateChildrenAsWell".into()],
+        children: vec![Entry { id: 3, description: "i64".into(), addr: t.addr("i64"), vtype: hh_scan::VType::Bytes8, ..Entry::default() }],
+        ..Entry::default()
+    };
+    put(&app, vec![i32_entry(1, &t), group]);
+    let v0 = app.table_get().unwrap().version;
+
+    app.lua_exec("local r = getAddressList().getMemoryRecordByDescription('hp')\nr.Active = true\nassert(r.Active)").unwrap();
+    assert!(entry(&app, 1).frozen, "{}", log_text(&app));
+    assert!(app.lua_poll(0).unwrap().table_version > v0, "the UI sees a new version");
+    assert_eq!(t.cmd("inc")["i32"], 123457);
+    wait("freezer restores i32", || (t.cmd("get")["i32"] == 123456).then_some(()));
+
+    // A group activated from Lua takes its children along (driver applies the options).
+    let i64_before = t.cmd("get")["i64"].clone();
+    app.lua_exec("getAddressList().getMemoryRecordByID(2).Active = true").unwrap();
+    wait("child activated", || entry(&app, 3).frozen.then_some(()));
+    t.cmd("inc");
+    wait("freezer restores i64", || (t.cmd("get")["i64"] == i64_before).then_some(()));
+
+    app.lua_exec("getAddressList().getMemoryRecordByDescription('hp').Active = false\ngetAddressList().getMemoryRecordByID(2).Active = false").unwrap();
+    wait("child deactivated", || (!entry(&app, 3).frozen).then_some(()));
+    assert!(!entry(&app, 1).frozen);
+    std::thread::sleep(Duration::from_millis(300));
+    let v = t.cmd("inc");
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(t.cmd("get")["i32"], v["i32"], "no longer frozen");
+}
+
+#[test]
+fn runaway_script_is_interrupted() {
+    let app = App::default();
+    let mut s = app.settings_get().unwrap();
+    s.lua_budget_ms = 0;
+    app.settings_set(s.clone()).unwrap();
+    let a2 = app.clone();
+    let h = std::thread::spawn(move || a2.lua_exec("while true do end"));
+    wait("script busy", || app.lua_poll(0).unwrap().busy.then_some(()));
+    app.lua_interrupt().unwrap();
+    let r = h.join().unwrap();
+    assert!(r.unwrap_err().contains("interrupted"));
+    app.lua_exec("x = 1").unwrap();
+    // The budget setting reaches the engine too.
+    s.lua_budget_ms = 200;
+    app.settings_set(s).unwrap();
+    let t0 = Instant::now();
+    assert!(app.lua_exec("while true do end").unwrap_err().contains("budget"));
+    assert!(t0.elapsed() < Duration::from_secs(5));
+}
+
+#[test]
+fn hotkey_actions_at_the_command_layer() {
+    let mut t = Target::spawn();
+    let app = App::default();
+    app.start_driver();
+    app.open_process(t.child.id()).unwrap();
+    let hk = |action: &str, keys: Vec<u32>, value: Option<&str>| Hotkey { action: action.into(), keys, value: value.map(Into::into), description: None };
+    let mut e = i32_entry(1, &t);
+    e.hotkeys = vec![
+        hk("Toggle Activation", vec![17, 112], None),
+        hk("Set Value", vec![17, 113], Some("500")),
+        hk("Increase Value", vec![17, 114], Some("10")),
+        hk("Decrease Value", vec![17, 115], Some("3")),
+    ];
+    put(&app, vec![e]);
+    assert!(app.lua_poll(0).unwrap().hotkeys.contains(&vec![17, 112]));
+
+    app.table_hotkey(1, 0).unwrap();
+    assert!(entry(&app, 1).frozen);
+    app.table_hotkey(1, 1).unwrap();
+    assert_eq!(t.cmd("get")["i32"], 500);
+    t.cmd("inc");
+    wait("frozen to the new value", || (t.cmd("get")["i32"] == 500).then_some(()));
+    // Key order does not matter; a repeat within the dedupe window fires nothing.
+    assert_eq!(app.hotkey_press(&[112, 17]).unwrap(), 1);
+    assert!(!entry(&app, 1).frozen);
+    assert_eq!(app.hotkey_press(&[17, 112]).unwrap(), 0);
+    app.table_hotkey(1, 2).unwrap();
+    assert_eq!(t.cmd("get")["i32"], 510);
+    assert_eq!(app.hotkey_press(&[17, 115]).unwrap(), 1);
+    assert_eq!(t.cmd("get")["i32"], 507);
+    assert_eq!(app.hotkey_press(&[18, 65]).unwrap(), 0, "unbound combo");
+
+    // createHotkey from Lua goes through the same press path.
+    app.lua_exec(&format!("hk = createHotkey(function() writeInteger({}, 42) end, VK_CONTROL, VK_F9)", t.addr("i32"))).unwrap();
+    assert!(app.lua_poll(0).unwrap().hotkeys.contains(&vec![17, 120]));
+    assert_eq!(app.hotkey_press(&[17, 120]).unwrap(), 1);
+    assert_eq!(t.cmd("get")["i32"], 42);
+    app.lua_exec("hk.destroy()").unwrap();
+    assert!(!app.lua_poll(0).unwrap().hotkeys.contains(&vec![17, 120]));
+}
+
+#[test]
+fn ct_round_trip_of_the_live_table() {
+    let app = App::default();
+    let item = |v: &str, t: &str| DropdownItem { value: v.into(), text: t.into() };
+    let value = Entry {
+        id: 2,
+        description: "Difficulty".into(),
+        addr: "game.exe+200".into(),
+        vtype: hh_scan::VType::Byte,
+        dropdown: Some(Dropdown { options: vec![item("0", "Easy"), item("1", "Hard")], read_only: true, description_only: false, display_value_as_item: true }),
+        hotkeys: vec![
+            Hotkey { action: "Set Value".into(), keys: vec![17, 112], value: Some("1".into()), description: Some("hard".into()) },
+            Hotkey { action: "Toggle Activation".into(), keys: vec![18, 65], value: None, description: None },
+        ],
+        ..Entry::default()
+    };
+    let script = Entry { id: 3, description: "script".into(), script: Some("[ENABLE]\n{$lua}\nprint(1 < 2)\n{$asm}\n[DISABLE]\n".into()), ..Entry::default() };
+    let group = Entry {
+        id: 1,
+        description: "Group & co".into(),
+        options: vec!["moHideChildren".into(), "moActivateChildrenAsWell".into()],
+        children: vec![value, script],
+        ..Entry::default()
+    };
+    let t = Table {
+        entries: vec![group],
+        lua_script: "print('table <script>')\n".into(),
+        comments: "made by a test".into(),
+        codes: vec![heaphook::table::CodeEntry { description: "mov".into(), address: "game.exe+10".into(), bytes: "89 43 58".into(), ..Default::default() }],
+        ct_extra: vec![],
+        structures: hh_tools::structure::from_json(r#"[{"name":"player","elements":[{"offset":0,"vtype":"pointer","description":"inv","child":"inv"},{"offset":16,"vtype":"4bytes","signed":true},{"offset":24,"vtype":"string","size":12,"utf16":true}]},{"name":"inv","elements":[{"offset":8,"vtype":"float","description":"weight"}]}]"#).unwrap(),
+    };
+    app.table_put(t.clone(), 0).unwrap();
+    let dir = std::env::temp_dir().join(format!("hh-live-ct-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    for name in ["t.CT", "t.json"] {
+        let p = dir.join(name);
+        app.table_export(p.to_str().unwrap()).unwrap();
+        let back = app.table_open(p.to_str().unwrap()).unwrap();
+        assert_eq!(back.table, t, "{name}");
+    }
+    let ct = std::fs::read_to_string(dir.join("t.CT")).unwrap();
+    assert!(ct.contains("<LuaScript>print('table &lt;script&gt;')") && ct.contains("moHideChildren=\"1\""), "{ct}");
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+// ---------------------------------------------------------------- analysis tools (hh-tools)
+
+/// The element of structure `name` at `offset`.
+fn elem_at(app: &App, name: &str, offset: u64) -> usize {
+    let st = app.struct_get().unwrap().into_iter().find(|s| s.name == name).expect("structure");
+    st.elements.iter().position(|e| e.offset == offset).unwrap_or_else(|| panic!("no element at {offset:#x} in {:?}", st.elements))
+}
+
+#[test]
+fn structure_dissect_follows_the_chain_and_exports_an_entry() {
+    let mut t = Target::spawn();
+    let app = App::default();
+    app.open_process(t.child.id()).unwrap();
+    let chain = t.addr("chain");
+    let offs: Vec<u64> = t.info["chain_offsets"].as_array().unwrap().iter().map(|o| parse_addr(o.as_str().unwrap()).unwrap()).collect();
+    let root = app.struct_guess("root", &chain, 8).unwrap();
+    assert_eq!(serde_json::to_value(root.elements[0].vtype).unwrap(), "pointer");
+    // Expand [chain] -> l1, l1+o1 -> l2, l2+o2 -> l3; children are auto-guessed.
+    let mut cur = heaphook::tools::EvalReq { name: "root".into(), addr: chain.clone() };
+    let mut field = (0usize, parse_addr(&chain).unwrap());
+    for &o in &offs[..2] {
+        let next = app.struct_expand(&cur.name, field.0, &hex(field.1), 0x20).unwrap();
+        let base = parse_addr(&next.addr).unwrap();
+        field = (elem_at(&app, &next.name, o), base + o);
+        cur = next;
+    }
+    let last = app.struct_expand(&cur.name, field.0, &hex(field.1), 0x20).unwrap();
+    assert_eq!(app.resolve_address(&format!("[[[{chain}]+{:x}]+{:x}]", offs[0], offs[1])).unwrap(), last.addr);
+    let vals = app.struct_eval(std::slice::from_ref(&last)).unwrap().pop().unwrap().unwrap();
+    let f = vals.iter().find(|f| f.offset == offs[2]).expect("field at the last offset");
+    assert_eq!(f.value.as_deref(), Some("4242"));
+    // Export the field with its pointer path; the entry resolves to the value.
+    let idx = elem_at(&app, &last.name, offs[2]);
+    let es = app.struct_entries(&last.name, &chain, &[0, offs[0], offs[1]], Some(vec![idx])).unwrap();
+    assert_eq!(es.len(), 1);
+    let a = app.resolve_address(&heaphook::cheat::expr_of(&es[0])).unwrap();
+    assert_eq!(a, t.addr("chain_value"));
+    assert_eq!(t.cmd("inc")["chain_value"], 4243);
+    assert_eq!(app.read_values(de(json!([{"addr": a, "vtype": "4bytes"}]))).unwrap(), [Some("4243".into())]);
+    // Saved with the table: JSON and .CT keep the definitions.
+    let dir = std::env::temp_dir().join(format!("hh-structs-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let before = app.struct_get().unwrap();
+    for name in ["s.json", "s.CT"] {
+        let p = dir.join(name);
+        app.table_export(p.to_str().unwrap()).unwrap();
+        assert_eq!(app.table_open(p.to_str().unwrap()).unwrap().table.structures, before, "{name}");
+    }
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn dissect_code_functions_strings_xrefs() {
+    let t = Target::spawn();
+    let app = App::default();
+    app.open_process(t.child.id()).unwrap();
+    let sum = app.dissect_run(&["hh-target".into()], &Default::default()).unwrap();
+    assert!(sum.functions > 10 && sum.strings > 0 && sum.instructions > 1000, "{sum:?}");
+    let f = app.dissect_list("functions", "", 0, 10).unwrap();
+    assert_eq!(f.total, sum.functions);
+    let s = app.dissect_list("strings", "unknown command", 0, 10).unwrap();
+    assert!(s.total >= 1, "no referenced 'unknown command' string");
+    let saddr = s.rows[0]["addr"].as_str().unwrap().to_string();
+    let x = app.dissect_xrefs(&saddr, 1, 0, 10).unwrap();
+    assert!(x.total >= 1 && x.rows[0].func.is_some(), "{:?}", x.rows);
+    // The most-called function: its callers are listed as call references.
+    let called = app.dissect_list("called", "", 0, 1).unwrap();
+    let faddr = called.rows[0]["addr"].as_str().unwrap().to_string();
+    let callers = called.rows[0]["callers"].as_u64().unwrap();
+    let x = app.dissect_xrefs(&faddr, 1, 0, 1000).unwrap();
+    assert!(x.rows.iter().filter(|r| serde_json::to_value(r.kind).unwrap() == "call").count() as u64 >= callers.min(1), "{:?}", x.rows);
+    // The disassembler annotates call targets.
+    let line = &app.disassemble(&faddr, 1).unwrap()[0];
+    assert!(line.xrefs.as_ref().is_some_and(|c| c.calls >= 1), "{line:?}");
+}
+
+#[test]
+fn memory_tools_save_load_snapshot_pointers() {
+    let mut t = Target::spawn();
+    let app = App::default();
+    app.open_process(t.child.id()).unwrap();
+    let i32a = t.addr("i32");
+    let range: Vec<hh_tools::memory::Range> = de(json!([{"start": i32a, "size": 64}]));
+    let file = std::env::temp_dir().join(format!("hh-mem-{}.hhmem", std::process::id()));
+    let sum = app.mem_save(&range, file.to_str().unwrap()).unwrap();
+    assert_eq!(sum.bytes, 64);
+    app.write_value(&i32a, de(json!("4bytes")), "999", &Fmt::default()).unwrap();
+    assert_eq!(t.cmd("get")["i32"], 999);
+    let r = app.mem_load(file.to_str().unwrap(), None).unwrap();
+    assert!(r.failed.is_empty());
+    assert_eq!(t.cmd("get")["i32"], 123456);
+    std::fs::remove_file(&file).unwrap();
+
+    // Snapshot, inc, diff: the i32 changed.
+    let snap = app.snapshot_take(&range, "before inc").unwrap();
+    assert_eq!(snap.bytes, 64);
+    t.cmd("inc");
+    let d = app.snapshot_diff(snap.id, 100).unwrap();
+    let a = parse_addr(&i32a).unwrap();
+    assert!(d.iter().any(|x| x.addr <= a && a < x.addr + x.len), "{d:?}");
+    assert_eq!(app.snapshot_list().unwrap().len(), 1);
+
+    // Fill and copy.
+    app.mem_fill(&t.addr("aob"), 4, "AB").unwrap();
+    assert_eq!(app.read_memory(&t.addr("aob"), 8).unwrap(), "abababab1337c0de");
+    app.mem_copy(&hex(a), &t.addr("aob"), 4).unwrap();
+    assert_eq!(app.read_memory(&t.addr("aob"), 4).unwrap(), app.read_memory(&i32a, 4).unwrap());
+
+    // What points to the chain's last hop.
+    let l3 = app.resolve_address(&format!("[[[{}]+10]+18]", t.addr("chain"))).unwrap();
+    let hits = app.find_pointers(&de(json!({"target": l3, "max_offset": 0}))).unwrap();
+    assert!(!hits.is_empty() && hits.iter().all(|h| h.value == parse_addr(&l3).unwrap()));
+
+    // Regions with tags, module header.
+    let regs = app.regions_info().unwrap();
+    assert!(regs.iter().any(|r| r.module.as_deref() == Some("hh-target")));
+    let h = app.module_header("hh-target").unwrap();
+    assert_eq!(h.format, "elf");
+    assert!(!h.sections.is_empty());
+    assert!(app.tools_progress().unwrap().job.is_empty());
+}
+
+#[test]
+fn signatures_code_list_conditional_and_hardware_breakpoints() {
+    let mut t = Target::spawn_exe(exe("hh-debug", "hh-debug-target"));
+    let app = App::default();
+    app.open_process(t.child.id()).unwrap();
+    let (store, load) = (t.addr("store"), t.addr("load"));
+    // AOB signature: unique and found again by scanning.
+    let sig = app.aob_signature(&store).unwrap();
+    assert!(sig.sig.unique, "{:?}", sig.sig);
+    assert_eq!(sig.found, std::slice::from_ref(&store));
+    assert!(sig.sig.pattern.starts_with("48 89 37"), "{}", sig.sig.pattern);
+    let script = app.aa_template(&store, "aob").unwrap();
+    assert!(script.to_lowercase().contains("aobscanmodule"), "{script}");
+
+    // Code list: add, NOP (verified), restore.
+    assert_eq!(app.code_add(&store, "store").unwrap(), 0);
+    app.code_nop(0).unwrap();
+    let row = serde_json::to_value(&app.code_list().unwrap()[0]).unwrap();
+    assert_eq!((row["state"].as_str(), row["bytes"].as_str()), (Some("nopped"), Some("48 89 37")));
+    assert_eq!(t.cmd_line("store"), "ok 100 200");
+    app.code_restore(0, false).unwrap();
+    assert_eq!(t.cmd_line("store"), "ok 101 200");
+    app.code_remove(0).unwrap();
+
+    // Conditional breakpoint: store(p, v) is called with v = value + 1; break only at 103.
+    app.debug_attach().unwrap();
+    let broken = |app: &App| wait("a break", || Some(app.debug_status().unwrap()).filter(|s| s.state == "broken"));
+    assert!(app.debug_add_breakpoint(&bp(json!({"addr": store, "condition": "rsi == "}))).is_err());
+    let id = app.debug_add_breakpoint(&bp(json!({"addr": store, "condition": "rsi == 103 && rdi != 0"}))).unwrap();
+    assert_eq!(t.cmd_line("store"), "ok 102 200");
+    t.send("store");
+    let st = broken(&app);
+    assert_eq!(st.rip.as_deref(), Some(store.as_str()));
+    assert_eq!(app.debug_context(st.tid.unwrap()).unwrap()["rsi"], "0x67");
+    app.debug_continue(false).unwrap();
+    assert_eq!(t.line(), "ok 103 200");
+    // Changing the condition re-arms it.
+    app.debug_set_condition(id, "rsi == 0").unwrap();
+    assert_eq!(t.cmd_line("store"), "ok 104 200");
+    assert_eq!(app.debug_breakpoints().unwrap()[0].condition.as_deref(), Some("rsi == 0"));
+    app.debug_remove_breakpoint(id).unwrap();
+
+    // Hardware execute breakpoint (debug register).
+    let id = app.debug_add_breakpoint(&bp(json!({"addr": load, "method": "hardware"}))).unwrap();
+    t.send("load");
+    assert_eq!(broken(&app).rip.as_deref(), Some(load.as_str()));
+    let b = app.debug_breakpoints().unwrap().into_iter().find(|b| b.id == id).unwrap();
+    assert_eq!((b.method, b.kind, b.hits), ("hardware", "execute", 1));
+    assert!(b.slot.is_some());
+    app.debug_remove_breakpoint(id).unwrap();
+    app.debug_continue(false).unwrap();
+    assert_eq!(t.line(), "ok 104 200");
+    app.close_process().unwrap();
+    assert_eq!(tracer_pid(t.child.id()), 0);
+    assert_eq!(app.regions().unwrap_err(), "no process opened");
+}
+
+#[test]
+fn table_undo_redo_and_deleting_an_active_script() {
+    let mut t = Target::spawn();
+    let app = App::default();
+    app.open_process(t.child.id()).unwrap();
+    let a = parse_addr(&t.addr("i32")).unwrap();
+    put(&app, vec![i32_entry(1, &t)]);
+    put(&app, vec![i32_entry(1, &t), i32_entry(2, &t)]);
+    assert_eq!(app.table_history(false).unwrap().table.entries.len(), 1);
+    assert_eq!(app.table_history(false).unwrap().table.entries.len(), 0);
+    assert!(app.table_history(false).is_err());
+    assert_eq!(app.table_history(true).unwrap().table.entries.len(), 1);
+    assert_eq!(app.table_history(true).unwrap().table.entries.len(), 2);
+    assert!(app.table_history(true).is_err());
+
+    // Deleting an active script entry runs its [DISABLE] section first.
+    let script = format!("[ENABLE]\n{a:X}:\ndd #4321\n[DISABLE]\n{a:X}:\ndd #123456\n");
+    put(&app, vec![i32_entry(1, &t), Entry { id: 3, description: "patch".into(), script: Some(script), ..Entry::default() }]);
+    app.table_set_active(&[3], true).unwrap();
+    assert_eq!(t.cmd("get")["i32"], 4321);
+    put(&app, vec![i32_entry(1, &t)]);
+    assert_eq!(t.cmd("get")["i32"], 123456);
+    // Undo brings the entry back, inactive; undoing again past its activation is harmless.
+    let st = app.table_history(false).unwrap();
+    assert!(st.table.entries.iter().any(|e| e.id == 3 && !e.frozen));
+    app.table_set_active(&[3], true).unwrap();
+    assert_eq!(t.cmd("get")["i32"], 4321);
+    // Redo removes it again: disabled first.
+    app.table_history(true).unwrap();
+    assert_eq!(t.cmd("get")["i32"], 123456);
+}
+
+#[test]
+fn create_process_with_speedhack() {
+    let app = App::default();
+    let ok = Command::new(env!("CARGO"))
+        .args(["build", "-q", "--release", "--manifest-path"])
+        .arg(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../crates/hh-inject/payload/Cargo.toml"))
+        .status()
+        .unwrap()
+        .success();
+    assert!(ok, "building the speedhack payload failed");
+    let info = app.process_create(&de(json!({"program": "sleep", "args": "30", "speedhack": true}))).unwrap();
+    assert_eq!(info.name, "sleep");
+    let st = app.speed_set(2.5).unwrap();
+    assert_eq!(st.speed, 2.5);
+    assert_eq!(app.speed_get().unwrap().unwrap().speed, 2.5);
+    // Lua's speedhack_setSpeed drives the same control block.
+    app.lua_exec("print(speedhack_setSpeed(0.5))").unwrap();
+    assert!(log_text(&app).contains("out: true"), "{}", log_text(&app));
+    assert_eq!(app.speed_get().unwrap().unwrap().speed, 0.5);
+    app.close_process().unwrap();
+    let _ = Command::new("kill").arg(info.pid.to_string()).status();
+    // Without the speedhack there is no control block.
+    let info = app.process_create(&de(json!({"program": "sleep", "args": "30"}))).unwrap();
+    assert!(app.speed_get().unwrap().is_none());
+    assert!(app.speed_set(2.0).is_err());
+    let _ = Command::new("kill").arg(info.pid.to_string()).status();
+    app.close_process().unwrap();
+}

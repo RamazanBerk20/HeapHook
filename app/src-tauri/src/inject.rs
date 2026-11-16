@@ -1,0 +1,117 @@
+//! "Create process" and the speedhack over hh-inject. The speedhack lives in the Lua
+//! console's slot so Lua's `speedhack_setSpeed` and the UI drive the same control block.
+use std::path::PathBuf;
+use std::process::Child;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use hh_inject::{LaunchOptions, Speedhack, SpeedhackStatus};
+use serde::Deserialize;
+
+use crate::commands::{App, Opened, R, lock, s};
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct CreateReq {
+    pub program: String,
+    /// Shell-like: split on whitespace, `"..."` groups.
+    pub args: String,
+    pub cwd: String,
+    pub speedhack: bool,
+}
+
+/// `a "b c" d` -> `[a, b c, d]`.
+fn split_args(s: &str) -> Vec<String> {
+    let (mut out, mut cur, mut q, mut any) = (Vec::new(), String::new(), false, false);
+    for c in s.chars() {
+        match c {
+            '"' => (q, any) = (!q, true),
+            c if c.is_whitespace() && !q => {
+                if any {
+                    out.push(std::mem::take(&mut cur));
+                    any = false;
+                }
+            }
+            c => (cur.push(c), any = true).1,
+        }
+    }
+    if any {
+        out.push(cur);
+    }
+    out
+}
+
+impl App {
+    /// Launches `program` (with the speedhack library preloaded when asked) and opens it.
+    pub fn process_create(&self, req: &CreateReq) -> R<Opened> {
+        if req.program.trim().is_empty() {
+            return Err("no program given".into());
+        }
+        let o = LaunchOptions {
+            program: PathBuf::from(req.program.trim()),
+            args: split_args(&req.args),
+            cwd: Some(req.cwd.trim()).filter(|c| !c.is_empty()).map(PathBuf::from),
+            speedhack: req.speedhack,
+            ..LaunchOptions::default()
+        };
+        let l = hh_inject::launch(&o).map_err(s)?;
+        let pid = l.pid;
+        self.keep_child(l.child);
+        let info = self.open_process(pid)?;
+        if req.speedhack {
+            // The control block appears once the loader has run the library's initializer.
+            let t0 = Instant::now();
+            loop {
+                if self.speed_find()?.is_some() {
+                    break;
+                }
+                if t0.elapsed() > Duration::from_secs(2) {
+                    return Err(format!("{} started (pid {pid}) but the speedhack library did not load (static or setuid binary?)", info.name));
+                }
+                std::thread::sleep(Duration::from_millis(25));
+            }
+        }
+        Ok(info)
+    }
+
+    /// Children we launched are reaped here so they do not linger as zombies.
+    fn keep_child(&self, c: Child) {
+        let mut g = lock(&self.x.children);
+        g.retain_mut(|c| !matches!(c.try_wait(), Ok(Some(_))));
+        g.push(c);
+    }
+
+    /// Looks the control block up in the opened process (cached in the console slot).
+    fn speed_find(&self) -> R<Option<Arc<Speedhack>>> {
+        let slot = &self.x.lua.console.speedhack;
+        if let Some(s) = lock(slot).clone() {
+            return Ok(Some(s));
+        }
+        let found = Speedhack::find(self.session()?.proc.clone()).map_err(s)?.map(Arc::new);
+        *lock(slot) = found.clone();
+        Ok(found)
+    }
+
+    /// `None` when the process has no speedhack.
+    pub fn speed_get(&self) -> R<Option<SpeedhackStatus>> {
+        match self.speed_find()? {
+            Some(sh) => sh.status().map(Some).map_err(s),
+            None => Ok(None),
+        }
+    }
+
+    pub fn speed_set(&self, speed: f64) -> R<SpeedhackStatus> {
+        let sh = self.speed_find()?.ok_or("this process was not started with the speedhack (use Create process)")?;
+        sh.set_speed(speed).map_err(s)?;
+        sh.status().map_err(s)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn args() {
+        assert_eq!(super::split_args(r#"-a "b c"  d """#), ["-a", "b c", "d", ""]);
+        assert!(super::split_args("  ").is_empty());
+    }
+}
