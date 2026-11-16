@@ -371,6 +371,10 @@ impl App {
 
     pub fn ptr_save_results(&self, path: &str) -> R<()> {
         let f = self.session()?.ptr.file()?;
+        // Saving onto the open result file itself would truncate it before copying.
+        if std::fs::canonicalize(path).ok().is_some_and(|p| std::fs::canonicalize(f.path()).ok() == Some(p)) {
+            return Ok(());
+        }
         std::fs::copy(f.path(), path).map(drop).map_err(s)
     }
 

@@ -4,13 +4,16 @@
 // actions back with `ui_event` (OnClick, OnClose, …) and `ui_input` (Text, Checked, …).
 // Geometry is CE's: absolute Left/Top/Width/Height in pixels inside the parent, plus Align.
 import { api } from './backend.js';
-import { h, icon, toast, contextMenu } from './util.js';
-import { on } from './core.js';
+import { $, h, icon, toast, contextMenu, luaBadge } from './util.js';
+import { on, state } from './core.js';
 
 const AL = { none: 0, top: 1, bottom: 2, left: 3, right: 4, client: 5 };
 const CENTER = new Set([4, 5, 6, 7]); // poScreenCenter, poDesktopCenter, poMainFormCenter, poOwnerFormCenter
 const MENU = new Set(['TMainMenu', 'TPopupMenu', 'TMenuItem']);
 const TITLE_H = 30, TAB_H = 28, LEGEND_H = 18;
+/** Gap a form keeps from the window edges (and below the top bar). */
+const EDGE = 8;
+const topBar = () => ($('.topbar')?.getBoundingClientRect().bottom ?? 0) + EDGE;
 
 /** `&File` -> `File` (`&&` stays one `&`). */
 const cap = (s) => String(s ?? '').replace(/&(&?)/g, (_, a) => a);
@@ -103,7 +106,8 @@ export function initForms() {
       case 'TCEForm': {
         const title = h('span.lf-caption', { id: `lf-t-${id}` });
         const close = h('button.btn.ghost.icon.lf-close', { type: 'button', 'aria-label': 'Close', title: 'Close (Esc)', html: icon('x'), onclick: () => fire(id, 'OnClose') });
-        const head = h('div.lf-head', null, title, close);
+        // The badge is HeapHook's, outside anything the script controls: a form never passes for the app.
+        const head = h('div.lf-head', null, luaBadge(), title, close);
         n.menubar = h('div.lf-menubar', { role: 'menubar', hidden: true });
         body = h('div.lf-client');
         el = h('section.lf-form', { role: 'dialog', 'aria-labelledby': `lf-t-${id}`, tabindex: '-1' }, head, n.menubar, body);
@@ -112,9 +116,12 @@ export function initForms() {
         el.addEventListener('pointerdown', () => front(n), true);
         el.addEventListener('focusin', () => front(n));
         el.addEventListener('keydown', (e) => {
+          // While Lua runs, Esc is the interrupt (lua.js, capture phase): not a close request queued behind it.
+          if (e.key === 'Escape' && state.luaBusy) return;
           if (e.key === 'Escape' && !e.target.closest('.menu')) { e.preventDefault(); e.stopPropagation(); fire(id, 'OnClose'); }
           else if (e.key === 'F10' && !n.menubar.hidden) { e.preventDefault(); e.stopPropagation(); n.menubar.querySelector('button')?.focus(); }
-          else e.stopPropagation(); // keys typed into a script form are not app shortcuts
+          // Plain typing stays in the form; the app's shortcuts (Ctrl / Alt combos, F-keys) pass through.
+          else if (!e.ctrlKey && !e.metaKey && !e.altKey && !/^F\d+$/.test(e.key)) e.stopPropagation();
         });
         break;
       }
@@ -347,16 +354,18 @@ export function initForms() {
     if (!n || n.skip || !n.el) return;
     const p = n.props;
     if (n.cls === 'TCEForm') {
-      const w = Math.max(80, num(p.Width, 320)), hgt = Math.max(40, num(p.Height, 240));
+      // Inside the content area, below HeapHook's top bar and never covering all of it: a
+      // form cannot hide the app or pass for it, whatever size the script asked for.
+      const top = topBar(), areaW = innerWidth - 2 * EDGE, areaH = innerHeight - top - EDGE;
+      const w = Math.min(Math.max(80, num(p.Width, 320)), areaW - 2), hgt = Math.max(40, num(p.Height, 240));
       const mb = n.menubar.hidden ? 0 : 28;
       let x = num(p.Left), y = num(p.Top);
-      if (CENTER.has(num(p.Position)) && !n.moved) { x = (innerWidth - w) / 2; y = (innerHeight - hgt - TITLE_H) / 2; }
-      // Keep the title bar reachable whatever coordinates the script used (CE: screen pixels).
-      x = Math.max(0, Math.min(innerWidth - Math.min(w, innerWidth) - 2, x));
-      y = Math.max(0, Math.min(innerHeight - TITLE_H - 8, y));
+      if (CENTER.has(num(p.Position)) && !n.moved) { x = (innerWidth - w) / 2; y = top + (areaH - Math.min(hgt, areaH) - TITLE_H) / 2; }
+      x = Math.max(EDGE, Math.min(innerWidth - EDGE - w - 2, x));
+      y = Math.max(top, Math.min(innerHeight - TITLE_H - EDGE, y));
       Object.assign(n.el.style, { left: x + 'px', top: y + 'px', width: w + 2 + 'px' });
-      n.body.style.height = hgt + 'px';
-      n.body.style.maxHeight = `calc(100vh - ${y + TITLE_H + mb + 12}px)`;
+      n.body.style.height = Math.max(0, Math.min(hgt, innerHeight - y - TITLE_H - mb - EDGE - 2)) + 'px';
+      n.body.style.maxHeight = '';
     }
     if (!n.body) return;
     // The client area children are placed in (group box legend, tab strip offsets).
@@ -532,6 +541,14 @@ export function initForms() {
     } finally { polling = false; }
   }
   on('ui:seq', (seq) => { if (seq !== since) poll(); });
+  // Top bar: close every script window, whatever the script does (hidden here, then OnClose).
+  const closeAll = $('#lf-close-all');
+  const visibleForms = () => [...N.values()].filter((n) => n.cls === 'TCEForm' && n.el && !n.el.hidden);
+  closeAll?.addEventListener('click', () => {
+    for (const n of visibleForms()) { n.el.hidden = true; if (n.el.contains(document.activeElement)) n.prevFocus?.focus?.(); fire(n.id, 'OnClose'); }
+    closeAll.hidden = true;
+  });
+  setInterval(() => { if (closeAll) closeAll.hidden = !visibleForms().length; }, 500);
   window.addEventListener('resize', () => { for (const n of N.values()) if (n.cls === 'TCEForm') layout(n); });
   poll();
 

@@ -222,7 +222,7 @@ impl Host for Console {
         }
     }
     fn create_process(&self, path: &str, params: &str, debug: bool, _break_on_entry: bool) -> HResult<u32> {
-        let app = self.app()?;
+        let app = self.app_os("createProcess")?;
         let req = crate::inject::CreateReq { program: path.into(), args: params.into(), ..Default::default() };
         let o = app.process_create(&req).map_err(HError::Other)?;
         if debug {
@@ -234,11 +234,11 @@ impl Host for Console {
         Some(self.app().ok()?.session().ok()?.scanner.clone())
     }
     fn load_table(&self, path: &str, merge: bool) -> HResult<()> {
-        let app = self.app()?;
+        let app = self.app_os("loadTable")?;
         if merge { app.table_merge(path) } else { app.table_open(path, false).map(|_| ()) }.map_err(HError::Other)
     }
     fn save_table(&self, path: &str, _protect: bool) -> HResult<()> {
-        self.app()?.table_export(path).map_err(HError::Other)
+        self.app_os("saveTable")?.table_export(path).map_err(HError::Other)
     }
     fn is_key_pressed(&self, vk: i64) -> bool {
         let k = lock(&self.keys);
@@ -256,6 +256,16 @@ impl Host for Console {
 impl Console {
     fn app(&self) -> HResult<App> {
         self.app.get().and_then(App::upgrade).ok_or_else(|| HError::Other("HeapHook is shutting down".into()))
+    }
+
+    /// The app, for a host function that uses files or starts programs: refused like hh-lua's
+    /// own `io` / `os` when Settings turn that off.
+    fn app_os(&self, what: &str) -> HResult<App> {
+        let app = self.app()?;
+        if !app.x.lua.engine.allow_os() {
+            return Err(HError::Other(format!("{what}: Settings do not allow Lua scripts to access files and run programs")));
+        }
+        Ok(app)
     }
 }
 
@@ -300,7 +310,8 @@ impl UiHost for Console {
 /// into app commands that take it too: `loadTable`, `createProcess`, debugger functions).
 #[derive(Default)]
 pub(crate) struct ReLock {
-    m: Mutex<(Option<ThreadId>, usize)>,
+    /// Owner, depth, and since when it is held.
+    m: Mutex<(Option<ThreadId>, usize, Option<Instant>)>,
     cv: Condvar,
 }
 
@@ -313,9 +324,17 @@ impl ReLock {
         while g.0.is_some_and(|t| t != me) {
             g = self.cv.wait(g).unwrap_or_else(|e| e.into_inner());
         }
+        if g.0.is_none() {
+            g.2 = Some(Instant::now());
+        }
         g.0 = Some(me);
         g.1 += 1;
         ReGuard(self)
+    }
+
+    /// How long the current holder has had it.
+    fn held_for(&self) -> Option<Duration> {
+        lock(&self.m).2.map(|t| t.elapsed())
     }
 
     /// `None` while another thread holds it.
@@ -324,6 +343,9 @@ impl ReLock {
         let mut g = lock(&self.m);
         if g.0.is_some_and(|t| t != me) {
             return None;
+        }
+        if g.0.is_none() {
+            g.2 = Some(Instant::now());
         }
         g.0 = Some(me);
         g.1 += 1;
@@ -337,15 +359,54 @@ impl Drop for ReGuard<'_> {
         g.1 -= 1;
         if g.1 == 0 {
             g.0 = None;
+            g.2 = None;
             self.0.cv.notify_one();
         }
+    }
+}
+
+/// The engine, built on first use: `EngineOptions::allow_os` is fixed when it is built, so
+/// the setting is read then (`set_config_dir` sets it before anything uses the engine).
+pub(crate) struct LazyEngine {
+    cell: OnceLock<Engine>,
+    allow_os: AtomicBool,
+    live: Arc<Live>,
+    console: Arc<Console>,
+}
+
+impl LazyEngine {
+    /// Takes effect only if the engine was not built yet.
+    pub(crate) fn set_allow_os(&self, v: bool) {
+        if self.cell.get().is_none() {
+            self.allow_os.store(v, SeqCst);
+        }
+    }
+
+    /// What the (running or next) engine allows.
+    pub(crate) fn allow_os(&self) -> bool {
+        self.allow_os.load(SeqCst)
+    }
+}
+
+impl std::ops::Deref for LazyEngine {
+    type Target = Engine;
+    fn deref(&self) -> &Engine {
+        self.cell.get_or_init(|| {
+            // Lua::new and the API install only fail on hh-lua bugs.
+            let engine = Engine::new(EngineOptions { allow_os: self.allow_os.load(SeqCst), ..EngineOptions::default() }).expect("Lua engine init");
+            engine.set_host(self.console.clone());
+            engine.set_table(self.live.clone());
+            engine.set_ui_host(self.console.clone());
+            engine.set_debug_host(self.console.clone());
+            engine
+        })
     }
 }
 
 /// The engine plus the app's lock around it: one thread runs Lua and the table changes it
 /// makes at a time (hh-lua has its own gate; this one also covers the app-side steps).
 pub struct LuaCtx {
-    pub(crate) engine: Engine,
+    pub(crate) engine: LazyEngine,
     run: ReLock,
     pub(crate) console: Arc<Console>,
     busy: AtomicBool,
@@ -355,13 +416,8 @@ pub struct LuaCtx {
 
 impl LuaCtx {
     pub(crate) fn new(live: Arc<Live>) -> LuaCtx {
-        // Lua::new and the API install only fail on hh-lua bugs.
-        let engine = Engine::new(EngineOptions::default()).expect("Lua engine init");
         let console = Arc::new(Console::default());
-        engine.set_host(console.clone());
-        engine.set_table(live);
-        engine.set_ui_host(console.clone());
-        engine.set_debug_host(console.clone());
+        let engine = LazyEngine { cell: OnceLock::new(), allow_os: AtomicBool::new(EngineOptions::default().allow_os), live, console: console.clone() };
         LuaCtx { engine, run: ReLock::default(), console, busy: AtomicBool::new(false), onbp: AtomicBool::new(false) }
     }
 
@@ -464,14 +520,16 @@ impl App {
         }
     }
 
-    /// Runs the table's `<LuaScript>`. The UI only calls this after the user agreed.
+    /// Runs the table's `<LuaScript>`: the user's own table, or a loaded one the user agreed
+    /// to (`table_trust`); otherwise refused with the consent error.
     pub fn table_run_script(&self) -> R<()> {
         let src = self.x.live.state().table.lua_script;
         if src.trim().is_empty() {
             return Ok(());
         }
-        // Agreeing to the table's Lua script covers the `{$lua}` in its entries too.
-        *lock(&self.x.trust) = crate::cheat::Trust::Trusted;
+        if !self.x.live.trust().allows() {
+            return Err(self.consent_error("The table's Lua script"));
+        }
         self.x.lua.console.push("info", "-- running the table's Lua script");
         self.lua_run(&src, "table script", false)
     }
@@ -495,11 +553,20 @@ impl App {
             dialog: lock(&c.dialog).pending.clone(),
             table_version: self.x.live.version(),
             hotkeys,
-            busy: self.x.lua.busy.load(SeqCst),
+            // A console run or table script, or anything else (timer, form event, hotkey,
+            // activation) holding the engine long enough to look stuck: Esc and Stop apply.
+            busy: self.x.lua.busy.load(SeqCst) || self.x.lua.run.held_for().is_some_and(|d| d >= BUSY_AFTER),
             sound: c.sound.load(SeqCst),
             process: self.session().ok().map(|s| {
-                let alive = s.raw.is_alive();
-                let lost = if alive { None } else { self.remote_lost() };
+                // A local check is a cheap syscall; a remote one is a network round trip that
+                // can hang for the connection timeout, so the poll reads what the liveness
+                // thread found last (see `start_driver`).
+                let (alive, lost) = if s.info.remote.is_none() {
+                    (s.raw.is_alive(), None)
+                } else {
+                    let r = lock(&self.x.remote_alive);
+                    if r.sess == session_key(&s) { (r.alive, r.lost.clone()) } else { (true, None) }
+                };
                 ProcessState { info: s.info.clone(), alive, lost }
             }),
             selection: self.x.live.selection(),
@@ -547,6 +614,10 @@ impl App {
 
     /// An image file a form shows (`TImage.Picture.loadFromFile`) as a `data:` URL.
     pub fn ui_image(&self, path: &str) -> R<String> {
+        // The path is the script's (`Picture.loadFromFile`): a file read on its behalf.
+        if !self.x.lua.engine.allow_os() {
+            return Err(format!("{path}: Settings do not allow Lua scripts to access files"));
+        }
         let mime = match std::path::Path::new(path).extension().and_then(|e| e.to_str()).map(str::to_ascii_lowercase).as_deref() {
             Some("png") => "image/png",
             Some("jpg" | "jpeg") => "image/jpeg",
@@ -556,17 +627,15 @@ impl App {
             Some("svg") => "image/svg+xml",
             _ => return Err(format!("{path}: not an image HeapHook can show (png, jpg, gif, bmp, webp, svg)")),
         };
-        let len = std::fs::metadata(path).map_err(|e| format!("{path}: {e}"))?.len();
-        if len > MAX_IMAGE {
-            return Err(format!("{path}: larger than {} MiB", MAX_IMAGE >> 20));
-        }
-        let b = std::fs::read(path).map_err(|e| format!("{path}: {e}"))?;
+        let b = crate::table::read_capped(std::path::Path::new(path), MAX_IMAGE)?;
         Ok(format!("data:{mime};base64,{}", base64(&b)))
     }
 
-    /// Keys currently held in the app window (`isKeyPressed`).
+    /// Keys currently held in the app window (`isKeyPressed`). Ignored (cleared) while the
+    /// table is not trusted: only Lua the user agreed to may watch the keyboard.
     pub fn key_state(&self, keys: &[u32]) -> R<()> {
-        *lock(&self.x.lua.console.keys) = keys.iter().copied().collect();
+        let ok = self.x.live.trust().allows();
+        *lock(&self.x.lua.console.keys) = if ok { keys.iter().copied().collect() } else { HashSet::new() };
         Ok(())
     }
 
@@ -629,11 +698,21 @@ impl App {
         if errs.is_empty() { Ok(hits.len()) } else { Err(errs.join("\n")) }
     }
 
-    /// Registers the current combos with the OS when they changed.
-    fn sync_global_hotkeys(&self) {
-        let mut combos: Vec<Vec<u32>> = self.bindings().into_iter().map(|b| b.0).collect();
+    /// The combos registered with the OS (system-wide): only with a modifier key (a plain key
+    /// would be taken from every other program), and a table's entry hotkeys only once the
+    /// table is trusted. The rest work while HeapHook has focus.
+    pub fn global_combos(&self) -> Vec<Vec<u32>> {
+        let trusted = self.x.live.trust().allows();
+        let mut combos: Vec<Vec<u32>> =
+            self.bindings().into_iter().filter(|(k, t)| has_modifier(k) && (trusted || matches!(t, Target::Lua(_)))).map(|b| b.0).collect();
         combos.sort();
         combos.dedup();
+        combos
+    }
+
+    /// Registers the current combos with the OS when they changed.
+    fn sync_global_hotkeys(&self) {
+        let combos = self.global_combos();
         let mut g = lock(&self.x.hk);
         if g.registrar.is_none() || g.registered == combos {
             return;
@@ -655,6 +734,25 @@ impl App {
         if self.x.driver.swap(true, SeqCst) {
             return;
         }
+        // Remote liveness on its own thread: a server that stops answering blocks this one for
+        // the connection timeout, never the driver or the UI poll.
+        let weak = self.downgrade();
+        std::thread::Builder::new()
+            .name("hh-liveness".into())
+            .spawn(move || {
+                loop {
+                    std::thread::sleep(LIVENESS);
+                    let Some(app) = App::upgrade(&weak) else { break };
+                    let Ok(s) = app.session() else { continue };
+                    if s.info.remote.is_none() {
+                        continue;
+                    }
+                    let alive = s.raw.is_alive();
+                    let lost = if alive { None } else { app.remote_lost() };
+                    *lock(&app.x.remote_alive) = RemoteAlive { sess: session_key(&s), alive, lost };
+                }
+            })
+            .expect("spawn liveness thread");
         let weak = self.downgrade();
         std::thread::Builder::new()
             .name("hh-lua-driver".into())
@@ -685,6 +783,29 @@ impl App {
     }
 }
 
+/// Lua holding the engine this long counts as busy (the UI offers Stop).
+const BUSY_AFTER: Duration = Duration::from_millis(300);
+
+/// How often the liveness thread checks a remote target.
+const LIVENESS: Duration = Duration::from_millis(500);
+
+/// The last liveness check of a remote target, for the session it was made on.
+#[derive(Default)]
+pub(crate) struct RemoteAlive {
+    sess: usize,
+    alive: bool,
+    lost: Option<String>,
+}
+
+fn session_key(s: &Arc<crate::commands::Session>) -> usize {
+    Arc::as_ptr(s) as usize
+}
+
+/// A combo with Shift, Ctrl, Alt or the Windows key in it.
+fn has_modifier(keys: &[u32]) -> bool {
+    keys.iter().any(|k| matches!(k, 16..=18 | 91 | 92 | 160..=165))
+}
+
 /// Standard base64 with padding.
 fn base64(b: &[u8]) -> String {
     const A: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -700,6 +821,12 @@ fn base64(b: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn only_combos_with_a_modifier_are_system_wide() {
+        assert!(super::has_modifier(&[17, 112]) && super::has_modifier(&[65, 164]));
+        assert!(!super::has_modifier(&[112]) && !super::has_modifier(&[32]) && !super::has_modifier(&[65, 66]));
+    }
+
     #[test]
     fn base64_matches_rfc4648() {
         let t = |s: &str| super::base64(s.as_bytes());

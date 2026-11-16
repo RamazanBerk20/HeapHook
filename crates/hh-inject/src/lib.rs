@@ -83,30 +83,49 @@ pub fn payload_path() -> Result<PathBuf> {
     Ok(path)
 }
 
-/// The library is preloaded into every launched program: refuse one that other users can
-/// write, or that sits in a world-writable directory without the sticky bit (where anyone
-/// can swap the file).
+/// The library is preloaded into every launched program: refuse one another user could
+/// replace. See [`check_path_owners`].
 #[cfg(unix)]
 fn check_not_replaceable(lib: &Path) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    let mode = std::fs::metadata(lib)?.permissions().mode();
-    if mode & 0o022 != 0 {
-        return Err(Error::Permission(format!(
-            "refusing speedhack library {}: it is writable by group or others (mode {:o}); \
-             fix with `chmod go-w`",
+    check_path_owners(lib, unsafe { libc::geteuid() })
+}
+
+/// `lib` (a canonical path) and every directory above it must be owned by `me` or root and
+/// not writable by group or others. A group/world-writable directory is acceptable only with
+/// the sticky bit, as an ancestor whose next component is owned by `me` or root (then nobody
+/// else can rename or delete that component): `/tmp/<my dir>/lib.so` passes.
+#[cfg(unix)]
+fn check_path_owners(lib: &Path, me: u32) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let trusted = |uid: u32| uid == me || uid == 0;
+    let refuse = |what: &Path, why: String| {
+        Err(Error::Permission(format!(
+            "refusing speedhack library {}: {} {why}",
             lib.display(),
-            mode & 0o7777
-        )));
+            what.display()
+        )))
+    };
+    let m = std::fs::metadata(lib)?;
+    if !trusted(m.uid()) {
+        return refuse(lib, format!("is owned by another user (uid {})", m.uid()));
     }
-    if let Some(dir) = lib.parent() {
-        let mode = std::fs::metadata(dir)?.permissions().mode();
-        if mode & 0o002 != 0 && mode & 0o1000 == 0 {
-            return Err(Error::Permission(format!(
-                "refusing speedhack library {}: its directory is world-writable without the \
-                 sticky bit (mode {:o}), so anyone could replace it",
-                lib.display(),
-                mode & 0o7777
-            )));
+    if m.mode() & 0o022 != 0 {
+        return refuse(lib, format!("is writable by group or others (mode {:o}); fix with `chmod go-w`", m.mode() & 0o7777));
+    }
+    // Every component checked so far (the next one below `dir`) is owned by `me` or root.
+    for dir in lib.ancestors().skip(1) {
+        let m = std::fs::metadata(dir)?;
+        if !trusted(m.uid()) {
+            return refuse(dir, format!("(a directory above it) is owned by another user (uid {})", m.uid()));
+        }
+        if m.mode() & 0o022 != 0 && m.mode() & 0o1000 == 0 {
+            return refuse(
+                dir,
+                format!(
+                    "(a directory above it) is writable by group or others without the sticky bit (mode {:o}), so they could replace it",
+                    m.mode() & 0o7777
+                ),
+            );
         }
     }
     Ok(())
@@ -330,6 +349,61 @@ impl Speedhack {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Second release audit I1. Trees under the temp directory; another user's ownership is
+    /// simulated by checking as a different uid (real foreign-owned files need root).
+    #[cfg(unix)]
+    #[test]
+    fn library_path_ownership_and_modes() {
+        use std::os::unix::fs::PermissionsExt;
+        let me = unsafe { libc::geteuid() };
+        let base = std::env::temp_dir().join(format!("hh-inject-perm-{}", std::process::id()));
+        std::fs::create_dir_all(&base).unwrap();
+        let base = base.canonicalize().unwrap();
+        let chmod = |p: &Path, m: u32| std::fs::set_permissions(p, std::fs::Permissions::from_mode(m)).unwrap();
+        chmod(&base, 0o700);
+        if check_path_owners(&base, me).is_err() {
+            // The temp directory itself is not trustworthy here; nothing below it can pass.
+            eprintln!("skipping: {} fails the check", base.display());
+            return;
+        }
+        let (outer, inner) = (base.join("outer"), base.join("outer/inner"));
+        std::fs::create_dir_all(&inner).unwrap();
+        let lib = inner.join("lib.so");
+        std::fs::write(&lib, b"x").unwrap();
+        let set = |o: u32, i: u32, f: u32| {
+            chmod(&outer, o);
+            chmod(&inner, i);
+            chmod(&lib, f);
+        };
+        let ok = |what: &str| check_path_owners(&lib, me).unwrap_or_else(|e| panic!("{what}: {e}"));
+        let bad = |what: &str, needle: &str| {
+            let e = check_path_owners(&lib, me).expect_err(what).to_string();
+            assert!(e.contains(needle), "{what}: {e}");
+        };
+        set(0o755, 0o755, 0o644);
+        ok("plain tree");
+        set(0o755, 0o755, 0o664);
+        bad("group-writable file", "writable by group or others");
+        set(0o755, 0o775, 0o644);
+        bad("group-writable parent", "without the sticky bit");
+        // Above the immediate parent: missed before.
+        set(0o777, 0o755, 0o644);
+        bad("world-writable grandparent", "without the sticky bit");
+        // Sticky like /tmp, with our own directory below it: fine.
+        set(0o1777, 0o755, 0o644);
+        ok("sticky grandparent");
+        set(0o755, 0o1777, 0o644);
+        ok("sticky parent, file owned by us");
+        // A file (and directories) owned by someone else: checked as another uid.
+        set(0o755, 0o755, 0o644);
+        let e = check_path_owners(&lib, me.wrapping_add(4242)).unwrap_err().to_string();
+        if me != 0 {
+            assert!(e.contains("owned by another user"), "{e}");
+        }
+        chmod(&outer, 0o755);
+        std::fs::remove_dir_all(&base).unwrap();
+    }
 
     #[test]
     fn preload_appends() {

@@ -235,20 +235,64 @@ export function prompt(title, value = '', { label = title, hint = '', mono = tru
 
 export const kbdHint = (s) => h('kbd', null, s);
 
+/** Characters that hide or reorder text (controls, zero-width, bidi overrides): never shown raw from untrusted text. */
+const HIDDEN = /[\u0000-\u0008\u000b-\u001f\u007f-\u009f​-‏‪-‮⁠-⁩﻿]/g;
+
+/** Untrusted text (table, script, target) as one line of at most `n` characters. */
+export function excerpt(s, n = 80) {
+  const t = String(s ?? '').replace(HIDDEN, '').replace(/\s+/g, ' ').trim();
+  return t.length > n ? t.slice(0, n - 1) + '…' : t;
+}
+
+/** The "Lua script" mark on every window and dialog a script opens (app-owned: a script cannot change it). */
+export const luaBadge = () => h('span.badge.lua-badge', { title: 'Opened by a Lua script, not by HeapHook' }, 'Lua script');
+
 /**
- * Modal with text, an optional code preview and/or one input, and buttons
- * `[{label, value, primary?, kbd?}]`. Resolves to `{value, input}`; Esc resolves `cancel`.
+ * Untrusted source text for reading before a decision: wrapped, line numbers, long runs of
+ * blanks and hidden characters spelled out so nothing can sit out of sight.
  */
-export function modal({ title, text = '', pre = null, input = null, buttons, cancel = 'cancel', label = title }) {
+export function codeView(text, maxLines = Infinity) {
+  const lines = String(text ?? '').split('\n');
+  const shown = lines.slice(0, maxLines);
+  const row = (l, i) => {
+    const parts = [];
+    let last = 0;
+    for (const m of l.matchAll(/[ \t]{16,}|[\u0000-\u0008\u000b-\u001f\u007f-\u009f​-‏‪-‮⁠-⁩﻿]/g)) {
+      parts.push(l.slice(last, m.index));
+      const t = m[0];
+      parts.push(h('span.cv-mark', null, /^[ \t]+$/.test(t) ? `⟨${t.length} blanks⟩` : `⟨U+${t.codePointAt(0).toString(16).toUpperCase().padStart(4, '0')}⟩`));
+      last = m.index + t.length;
+    }
+    parts.push(l.slice(last));
+    return h('div.cv-line', null, h('span.cv-num', { 'aria-hidden': 'true' }, String(i + 1)), h('span.cv-text', null, ...parts));
+  };
+  return h('div.code-view.mono', { tabindex: '0', role: 'region', 'aria-label': 'Script text' }, shown.map(row),
+    lines.length > shown.length ? h('div.cv-more.muted', null, `… ${lines.length - shown.length} more lines`) : null);
+}
+
+/**
+ * Modal: `text` is HeapHook's own words and always stays in view (with the buttons); what
+ * a table, script or target supplied goes after it — `quote` as a one-line quoted excerpt,
+ * `pre` (or `body`, an element) in a scroll box. `lua`: the dialog comes from a Lua script
+ * (badge and frame). Buttons `[{label, value, primary?, kbd?, focus?}]`; resolves to
+ * `{value, input}`; Esc resolves `cancel`.
+ */
+export function modal({ title, text = '', quote = null, quoteLabel = 'From the table', pre = null, body = null, input = null, buttons, cancel = 'cancel', label = title, lua = false }) {
   return new Promise((resolve) => {
     const inp = input == null ? null : h('input.mono', { type: 'text', value: input, spellcheck: 'false', autocomplete: 'off' });
     const btns = buttons.map((b) => h('button.btn' + (b.primary ? '.primary' : ''), { value: b.value, type: 'submit' }, b.label, b.kbd ? ' ' : null, b.kbd ? h('kbd', null, b.kbd) : null));
-    const d = h('dialog.dlg.dlg-sm', { 'aria-label': label, role: 'alertdialog' },
+    const q = quote ? excerpt(quote) : '';
+    const scroll = [
+      q ? h('p.modal-quote', null, h('span.muted', null, quoteLabel + ': '), h('q', null, q)) : null,
+      pre != null ? h('pre.modal-pre.mono', { tabindex: '0' }, pre) : null,
+      body,
+      inp ? h('label.field', null, h('span', null, 'Value'), inp) : null,
+    ].filter(Boolean);
+    const d = h('dialog.dlg.dlg-sm.dlg-modal' + (lua ? '.dlg-lua' : ''), { 'aria-label': (lua ? 'Lua script: ' : '') + excerpt(label), role: 'alertdialog' },
       h('form', { method: 'dialog' },
-        title ? h('h2', null, title) : null,
+        title || lua ? h('div.modal-head', null, lua ? luaBadge() : null, title ? h('h2', null, lua ? excerpt(title) : title) : null) : null,
         text ? h('p.modal-text', null, text) : null,
-        pre != null ? h('pre.modal-pre.mono', { tabindex: '0' }, pre) : null,
-        inp ? h('label.field', null, h('span', null, 'Value'), inp) : null,
+        scroll.length ? h('div.modal-body', null, ...scroll) : null,
         h('div.dlg-actions', null, ...btns)));
     document.body.append(d);
     d.returnValue = cancel;

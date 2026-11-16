@@ -1959,3 +1959,104 @@ fn stress_stolen_main_thread_stops() {
     Arc::try_unwrap(d).ok().unwrap().detach().unwrap();
     assert_detached(&mut t, &[(hot, 0xf0)], "end");
 }
+
+/// Second release audit D1: detach while one thread cannot be stopped (the parent of a
+/// clone(CLONE_VFORK) without CLONE_VM, waiting for its child) and another keeps hitting a
+/// breakpoint on a multi-byte instruction (resumed at A+1 it executes ud2). Nothing may be
+/// left traced, patched, stopped or mid-instruction. With a 15 s vfork and the vfork parent
+/// not marked, this also drives detach's halt into its timeout (checked by hand: the halt
+/// times out, the target survives).
+#[test]
+fn detach_with_unstoppable_thread_and_hot_breakpoint() {
+    const ROUNDS: u64 = 50;
+    let mut t = Target::spawn();
+    let hot = t.addr("trip");
+    assert_eq!(t.cmd("bgtrip"), "ok");
+    let prog = |t: &mut Target| -> u64 {
+        let r = t.cmd("prog");
+        r.split_whitespace().nth(1).unwrap().parse().unwrap()
+    };
+    for round in 0..ROUNDS {
+        let d = Debugger::attach(t.pid()).unwrap();
+        let bp = Breakpoint {
+            action: Action::Record,
+            ..Breakpoint::execute(hot)
+        };
+        let id = d.add_breakpoint(bp, Hooks::default()).unwrap();
+        // Every tenth round the vfork outlasts the detach by far.
+        let vfork_ms = if round % 10 == 0 { 1500 } else { 300 };
+        assert_eq!(t.cmd(&format!("vforkbg {vfork_ms}")), "ok");
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(d.breakpoints().unwrap().iter().any(|b| b.id == id));
+        // The vfork parent is known to be unstoppable: no halt waits for it.
+        let t0 = std::time::Instant::now();
+        d.detach().unwrap();
+        if vfork_ms > 1000 {
+            assert!(
+                t0.elapsed() < Duration::from_millis(800),
+                "round {round}: detach waited for the vfork"
+            );
+        }
+        // A vfork parent is untraced by the kernel when the tracer thread exits, which can
+        // finish a moment after the join in `detach` returns.
+        for task in std::fs::read_dir(format!("/proc/{}/task", t.pid())).unwrap() {
+            let tid: u32 = task.unwrap().file_name().to_str().unwrap().parse().unwrap();
+            let t0 = std::time::Instant::now();
+            while tracer_pid(tid) != 0 {
+                assert!(
+                    t0.elapsed() < Duration::from_secs(1),
+                    "round {round}: task {tid} still traced"
+                );
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+        assert_ne!(raw_byte(t.pid(), hot), 0xcc, "round {round}");
+        let before = prog(&mut t);
+        std::thread::sleep(Duration::from_millis(20));
+        assert!(prog(&mut t) > before, "round {round}: hot thread stalled");
+        // The next attach needs the vfork to be over.
+        let t0 = std::time::Instant::now();
+        while t.cmd("vforks") != format!("vforks {}", round + 1) {
+            assert!(t0.elapsed() < T * 2, "round {round}: vfork never finished");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!matches!(proc_state(t.pid()), 't' | 'T'), "round {round}");
+    }
+    assert_eq!(t.cmd("bgstop"), "ok");
+    assert_eq!(t.cmd("store"), "ok 101 200");
+}
+
+/// Second release audit D2: a user-sent SIGSEGV carries no fault address, even when its
+/// si_addr field happens to point into a page whose watch was just removed. It must reach
+/// the signal policy instead of being swallowed as a stale fault.
+#[test]
+fn user_sent_segv_is_not_a_stale_fault() {
+    let mut t = Target::spawn();
+    let buf = t.addr("buf");
+    let d = Debugger::attach(t.pid()).unwrap();
+    let w = d
+        .add_watch_range(
+            buf,
+            64,
+            BpKind::Write,
+            Action::Record,
+            Hooks::default(),
+            BpOptions::default(),
+        )
+        .unwrap();
+    d.remove_breakpoint(w).unwrap();
+    t.send(&format!("fakesegv {buf}"));
+    let (tid, reason, _) = wait_break(&d);
+    assert_eq!(tid, t.pid());
+    assert_eq!(
+        reason,
+        BreakReason::Signal {
+            code: 11,
+            address: None
+        }
+    );
+    d.cont(false).unwrap();
+    assert_eq!(t.recv(), "ok");
+    d.detach().unwrap();
+    assert_eq!(t.cmd("store"), "ok 101 200");
+}

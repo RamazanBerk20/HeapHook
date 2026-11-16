@@ -137,8 +137,8 @@ pub struct Shared {
     pub(crate) driver: AtomicBool,
     /// Processes started by `process_create`, reaped when they exit.
     pub(crate) children: Mutex<Vec<std::process::Child>>,
-    /// Whether `{$lua}` in the table's scripts may run (a loaded table must be agreed to).
-    pub(crate) trust: Mutex<crate::cheat::Trust>,
+    /// Last liveness check of a remote target (see `lua_poll`).
+    pub(crate) remote_alive: Mutex<crate::lua::RemoteAlive>,
     /// The connected hh-server, if any.
     pub(crate) remote: Mutex<Option<crate::remote::Conn>>,
     /// User-defined symbols registered from the table: (table version, session, names).
@@ -158,7 +158,7 @@ impl Default for Shared {
             hk: Mutex::default(),
             driver: AtomicBool::new(false),
             children: Mutex::default(),
-            trust: Mutex::default(),
+            remote_alive: Mutex::default(),
             remote: Mutex::default(),
             user_syms: Mutex::default(),
             custom_frozen: Mutex::default(),
@@ -278,6 +278,8 @@ impl App {
     pub fn set_config_dir(&self, dir: &Path) {
         let s = Settings::load(&dir.join("settings.json"));
         *lock(&self.x.config) = Some(dir.to_path_buf());
+        // Before anything touches the engine: it is built with this on first use.
+        self.x.lua.engine.set_allow_os(s.lua_allow_os);
         self.apply_settings(&s);
         *lock(&self.x.settings) = s;
     }
@@ -304,6 +306,9 @@ impl App {
 
     /// The settings the backend enforces itself; the UI applies the rest.
     fn apply_settings(&self, s: &Settings) {
+        if s.table_script == "never" {
+            self.x.live.revoke_agreed();
+        }
         self.x.lua.engine.set_budget((s.lua_budget_ms > 0).then(|| Duration::from_millis(s.lua_budget_ms)));
         {
             let _g = self.x.lua.enter();
@@ -479,7 +484,9 @@ impl App {
     }
 
     pub fn app_info(&self) -> R<serde_json::Value> {
-        Ok(serde_json::json!({"version": env!("CARGO_PKG_VERSION"), "license": "Apache-2.0", "platform": std::env::consts::OS}))
+        // `lua_allow_os`: what the running Lua engine allows (a changed setting applies after a restart).
+        Ok(serde_json::json!({"version": env!("CARGO_PKG_VERSION"), "license": "Apache-2.0", "platform": std::env::consts::OS,
+            "lua_allow_os": self.x.lua.engine.allow_os()}))
     }
 
     pub fn resolve_address(&self, expr: &str) -> R<String> {
@@ -622,6 +629,10 @@ impl App {
     /// Symbols the script registers stay registered for later expressions. `{$lua}` blocks
     /// run in the app's engine (so they cannot hold the symbol lock: work on a copy, merge).
     pub fn aa_execute(&self, script: &str, enable: bool, state: Option<&AaState>) -> R<AaState> {
+        // Same gate as table entries: no `{$lua}` while a loaded table is not agreed to.
+        if crate::cheat::script_runs_lua(script) && !self.x.live.trust().allows() {
+            return Err(self.consent_error("this script"));
+        }
         let sess = self.session()?;
         let before = lock(&sess.syms).clone();
         let mut work = before.clone();
@@ -674,8 +685,11 @@ impl App {
         table::load(Path::new(path))
     }
 
+    /// Writes a table the UI built: like any JSON input, it may not carry raw `.CT` fragments.
     pub fn table_save(&self, path: &str, table: TableIn) -> R<()> {
-        table::save(Path::new(path), &table.into())
+        let mut t: Table = table.into();
+        table::clean_json(&mut t);
+        table::save(Path::new(path), &t)
     }
 }
 

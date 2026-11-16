@@ -393,10 +393,12 @@ impl Os {
                     1..=3 => false,
                     _ => ev != libc::PTRACE_EVENT_FORK,
                 };
+                // The parent of any CLONE_VFORK, shared memory or not, waits (unstoppable)
+                // until the child execs or exits: halting must not wait for it.
+                if ev == libc::PTRACE_EVENT_VFORK {
+                    t.vforking = true;
+                }
                 if shared {
-                    if ev == libc::PTRACE_EVENT_VFORK {
-                        t.vforking = true;
-                    }
                     self.th.insert(
                         new,
                         T {
@@ -486,8 +488,11 @@ impl Os {
                     t.pass = true;
                 }
                 let addr = match sig {
+                    // Only a fault the kernel raised (si_code > 0) has a fault address; for
+                    // kill/tgkill/sigqueue the field holds the sender's pid/uid or user data.
                     libc::SIGSEGV | libc::SIGBUS | libc::SIGILL | libc::SIGFPE => {
-                        Some(unsafe { self.siginfo(tid)?.si_addr() } as Addr)
+                        let si = self.siginfo(tid)?;
+                        (si.si_code > 0).then(|| unsafe { si.si_addr() } as Addr)
                     }
                     _ => None,
                 };
@@ -614,8 +619,25 @@ impl Os {
     }
 
     /// Stops every thread. Events that arrive instead of the requested stop are returned.
+    /// On failure the events collected so far go to the backlog (`take_backlog`, `poll`):
+    /// an int3 hit among them still needs its rewind, a forked child its release.
     pub fn halt_all(&mut self) -> Result<Vec<(Tid, Raw)>> {
         let mut out = Vec::new();
+        match self.halt_into(&mut out) {
+            Ok(()) => Ok(out),
+            Err(e) => {
+                self.backlog.extend(out);
+                Err(e)
+            }
+        }
+    }
+
+    /// Events a failed `halt_all` collected, oldest first.
+    pub fn take_backlog(&mut self) -> Vec<(Tid, Raw)> {
+        std::mem::take(&mut self.backlog)
+    }
+
+    fn halt_into(&mut self, out: &mut Vec<(Tid, Raw)>) -> Result<()> {
         loop {
             let running: Vec<Tid> = self
                 .th
@@ -624,16 +646,17 @@ impl Os {
                 .map(|(&k, _)| k)
                 .collect();
             if running.is_empty() {
-                self.take_queued_traps(&mut out)?;
-                return Ok(out);
+                return self.take_queued_traps(out);
             }
             for &t in &running {
                 let _ = pt(libc::PTRACE_INTERRUPT, t, 0, 0);
             }
             // Bounded: a thread that cannot stop (uninterruptible sleep) must not hang every
-            // debugger call. What was collected so far is handed to `poll` instead.
+            // debugger call. The others are still collected (their stops are pending by then),
+            // so none is left in an unseen stop, e.g. after an int3 at A+1.
             let deadline = std::time::Instant::now() + HALT_WAIT;
             let mut spins = 0;
+            let mut stuck = None;
             for t in running {
                 while self
                     .th
@@ -652,8 +675,8 @@ impl Os {
                             }
                         }
                         Ok(None) if std::time::Instant::now() > deadline => {
-                            self.backlog.extend(out);
-                            return Err(Error::Other(format!("thread {t} does not stop")));
+                            stuck.get_or_insert(t);
+                            break;
                         }
                         Ok(None) if spins < 2000 => {
                             spins += 1;
@@ -669,6 +692,11 @@ impl Os {
                         Err(e) => return Err(Error::Io(e)),
                     }
                 }
+            }
+            if let Some(t) = stuck {
+                // The threads that did stop may hold a queued int3 trap too.
+                let _ = self.take_queued_traps(out);
+                return Err(Error::Other(format!("thread {t} does not stop")));
             }
         }
     }
@@ -994,6 +1022,11 @@ impl Os {
             .filter(|t| t.stopped && t.pass)
             .map_or(0, |t| t.sig);
         if pt(libc::PTRACE_DETACH, tid, 0, sig as usize).is_ok() {
+            return;
+        }
+        // A vfork parent stops only when its child lets go, which may take any time. The
+        // kernel untraces it cleanly when the tracer thread exits, which follows the detach.
+        if self.th.get(&tid).is_some_and(|t| t.vforking) {
             return;
         }
         // Not in a ptrace stop: running, ours or not (ESRCH either way). If it is traced by

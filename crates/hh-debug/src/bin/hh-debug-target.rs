@@ -9,6 +9,7 @@
 //! - `rec(n)`: `test rdi,rdi; jz +; dec rdi; call rec; nop; ret` (offsets 0, 3, 5, 8, 13, 14).
 //! - `rep(dst, n)`: `mov rcx, rsi; mov al, 0x41; rep stosb; ret` (offsets 0, 3, 5, 7).
 //! - `call(f)`: `call rdi; ret` (offsets 0, 2).
+//! - `trip()`: `movabs rax, imm; ret`; entered at +1 it executes ud2 (SIGILL).
 //! - `buf`: a page-aligned 3-page buffer (zeroed); `execve`: libc's execve.
 //!
 //! `value` starts at 100 and `value2` at 200. Commands, one per line, each answered with
@@ -29,6 +30,11 @@
 //! buf+8, `churn` threads keep creating short-lived threads that call hot(&counter);
 //! `sleep_us` pauses between iterations. `mainhot <iters> <sleep_us>` calls hot(&counter)
 //! on the main thread (`hot <counter>`). `prog` answers `prog <counter> <writes> <churned>`.
+//! `fakesegv <addr>` (`ok` if it survives): sends itself a SIGSEGV with si_code SI_QUEUE
+//! and si_addr = addr.
+//! `bgtrip` (`ok`): a background thread calls trip() and hot(&counter) until `bgstop`.
+//! `vforkbg <ms>` (`ok`): a new thread does clone(CLONE_VFORK) without CLONE_VM; the child
+//! sleeps `ms` and exits, the thread waits for it. `vforks` answers `vforks <done>`.
 use std::io::{BufRead, Write};
 
 #[cfg(target_arch = "x86_64")]
@@ -70,6 +76,11 @@ std::arch::global_asm!(
     "hh_call:",
     "call rdi",
     "ret",
+    // Resumed one byte in (mid-instruction), the rest of the immediate decodes as ud2.
+    ".globl hh_trip",
+    "hh_trip:",
+    "movabs rax, 0x0b0f0b0f00000000",
+    "ret",
 );
 
 #[cfg(target_arch = "x86_64")]
@@ -81,6 +92,7 @@ unsafe extern "C" {
     fn hh_rec(n: u64);
     fn hh_rep(dst: *mut u8, n: u64);
     fn hh_call(f: extern "C" fn());
+    fn hh_trip();
 }
 
 #[cfg(target_os = "linux")]
@@ -91,6 +103,7 @@ mod lx {
     pub static SLEEP_MS: AtomicU64 = AtomicU64::new(0);
     pub static WRITES: AtomicU64 = AtomicU64::new(0);
     pub static CHURNED: AtomicU64 = AtomicU64::new(0);
+    pub static VFORKS: AtomicU64 = AtomicU64::new(0);
     pub static BG_STOP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     pub static BG: std::sync::Mutex<Vec<std::thread::JoinHandle<()>>> =
         std::sync::Mutex::new(Vec::new());
@@ -167,7 +180,7 @@ fn main() {
     let mut out = std::io::stdout().lock();
     writeln!(
         out,
-        r#"{{"pid":{},"store":"{:#x}","load":"{:#x}","outer":"{:#x}","hot":"{:#x}","rec":"{:#x}","rep":"{:#x}","call":"{:#x}","value":"{:#x}","value2":"{:#x}","buf":"{:#x}","counter":"{:#x}","execve":"{execve:#x}"}}"#,
+        r#"{{"pid":{},"store":"{:#x}","load":"{:#x}","outer":"{:#x}","hot":"{:#x}","rec":"{:#x}","rep":"{:#x}","call":"{:#x}","trip":"{:#x}","value":"{:#x}","value2":"{:#x}","buf":"{:#x}","counter":"{:#x}","execve":"{execve:#x}"}}"#,
         std::process::id(),
         hh_store as *const () as usize,
         hh_load as *const () as usize,
@@ -176,6 +189,7 @@ fn main() {
         hh_rec as *const () as usize,
         hh_rep as *const () as usize,
         hh_call as *const () as usize,
+        hh_trip as *const () as usize,
         st.v,
         st.v2,
         st.buf,
@@ -399,6 +413,61 @@ fn linux_command(st: &State, cmd: &str, num: &mut dyn FnMut() -> u64) -> String 
                 }
                 format!("hot {}", hh_load(st.counter as *const u64))
             }
+            "bgtrip" => {
+                let c = st.counter;
+                lx::BG_STOP.store(false, Ordering::SeqCst);
+                lx::BG.lock().unwrap().push(std::thread::spawn(move || {
+                    while !lx::BG_STOP.load(Ordering::SeqCst) {
+                        hh_trip();
+                        hh_hot(c as *mut u64);
+                    }
+                }));
+                "ok".into()
+            }
+            "vforkbg" => {
+                // clone(CLONE_VFORK) without CLONE_VM: a copied child, but the parent thread
+                // waits (unstoppable) until the child exits.
+                let us = (num() * 1000).min(u32::MAX as u64) as u32;
+                std::thread::spawn(move || {
+                    let r = libc::syscall(
+                        libc::SYS_clone,
+                        libc::CLONE_VFORK | libc::SIGCHLD,
+                        0,
+                        0,
+                        0,
+                        0,
+                    );
+                    if r == 0 {
+                        libc::usleep(us);
+                        libc::_exit(0);
+                    }
+                    if r > 0 {
+                        let mut s = 0;
+                        libc::waitpid(r as i32, &mut s, 0);
+                    }
+                    lx::VFORKS.fetch_add(1, Ordering::SeqCst);
+                });
+                "ok".into()
+            }
+            "fakesegv" => {
+                // A user-sent SIGSEGV (si_code SI_QUEUE) whose si_addr field holds `addr`.
+                let mut si: libc::siginfo_t = std::mem::zeroed();
+                si.si_signo = libc::SIGSEGV;
+                si.si_code = -1; // SI_QUEUE
+                (&mut si as *mut libc::siginfo_t as *mut u8)
+                    .add(16)
+                    .cast::<u64>()
+                    .write_unaligned(num());
+                libc::syscall(
+                    libc::SYS_rt_tgsigqueueinfo,
+                    libc::getpid(),
+                    libc::gettid(),
+                    libc::SIGSEGV,
+                    &si,
+                );
+                "ok".into()
+            }
+            "vforks" => format!("vforks {}", lx::VFORKS.load(Ordering::SeqCst)),
             "prog" => format!(
                 "prog {} {} {}",
                 hh_load(st.counter as *const u64),

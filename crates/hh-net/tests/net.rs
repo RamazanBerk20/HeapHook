@@ -755,6 +755,140 @@ fn hh_server_refuses_short_tokens() {
     assert!(!out.status.success());
 }
 
+// ------------------------------------------------------------------ hostile server
+
+/// A fake server on loopback that completes the handshake announcing `max_read`, then hands
+/// the authenticated socket to `then`.
+fn hostile_server(max_read: u32, then: impl FnOnce(TcpStream) + Send + 'static) -> std::net::SocketAddr {
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = l.local_addr().unwrap();
+    std::thread::spawn(move || {
+        let (mut s, _) = l.accept().unwrap();
+        let hello = proto::read_frame(&mut s, 1024).unwrap();
+        let cnonce = hello.body[proto::MAGIC.len() + 2..].to_vec();
+        let snonce = [9u8; 32];
+        s.write_all(&proto::frame(0, op::CHALLENGE, |e| {
+            e.u16(proto::VERSION);
+            e.0.extend_from_slice(&snonce);
+        }))
+        .unwrap();
+        proto::read_frame(&mut s, 1024).unwrap();
+        let proof = proto::server_proof(TOKEN.as_bytes(), &snonce, &cnonce);
+        s.write_all(&proto::frame(0, op::AUTH_OK, |e| {
+            e.0.extend_from_slice(&proof);
+            e.u32(max_read);
+        }))
+        .unwrap();
+        then(s);
+    });
+    addr
+}
+
+/// Reads the next request frame from the client.
+fn next_req(s: &mut TcpStream) -> Frame {
+    proto::read_frame(s, 1 << 20).unwrap()
+}
+
+#[test]
+fn hostile_server_cannot_raise_client_limits() {
+    let addr = hostile_server(u32::MAX, |mut s| {
+        let f = next_req(&mut s);
+        // A frame header announcing ~4 GiB: refused before anything is allocated.
+        s.write_all(&u32::MAX.to_le_bytes()).unwrap();
+        s.write_all(&f.id.to_le_bytes()).unwrap();
+        std::thread::sleep(Duration::from_secs(2));
+    });
+    let c = connect(addr, TOKEN).unwrap();
+    assert_eq!(c.max_read(), proto::CLIENT_MAX_READ);
+    assert!(c.is_connected());
+    let e = c.list_processes().unwrap_err();
+    assert!(matches!(&e, Error::Io(io) if io.kind() == ErrorKind::ConnectionAborted), "{e:?}");
+    assert!(e.to_string().contains("bad frame length"), "{e}");
+    assert!(!c.is_connected());
+}
+
+#[test]
+fn frame_buffer_grows_with_received_bytes() {
+    /// Header announcing a large frame, 10 body bytes, then EOF; records the largest buffer
+    /// `read_frame` asked to fill.
+    struct Stall(Vec<u8>, usize);
+    impl Read for Stall {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            self.1 = self.1.max(buf.len());
+            let n = buf.len().min(self.0.len());
+            buf[..n].copy_from_slice(&self.0[..n]);
+            self.0.drain(..n);
+            Ok(n)
+        }
+    }
+    let len = proto::CLIENT_MAX_FRAME as u32;
+    let mut r = Stall([&len.to_le_bytes()[..], &[0u8; 10]].concat(), 0);
+    let e = proto::read_frame(&mut r, proto::CLIENT_MAX_FRAME).unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::UnexpectedEof);
+    assert!(r.1 <= 64 << 10, "zero-filled {} bytes up front", r.1);
+    // Over the limit: rejected from the header alone.
+    let mut r = Stall((len + 1).to_le_bytes().to_vec(), 0);
+    assert_eq!(proto::read_frame(&mut r, proto::CLIENT_MAX_FRAME).unwrap_err().kind(), ErrorKind::InvalidData);
+    // Frames that do arrive whole still decode.
+    let f = proto::frame(7, 0, |e| e.0.extend(std::iter::repeat_n(5u8, 300 << 10)));
+    let got = proto::read_frame(&mut &f[..], proto::CLIENT_MAX_FRAME).unwrap();
+    assert_eq!((got.id, got.body.len()), (7, 300 << 10));
+    assert!(got.body.iter().all(|&b| b == 5));
+}
+
+#[test]
+fn hostile_server_list_counts_are_capped() {
+    let n = proto::MAX_LIST_ITEMS + 1;
+    let addr = hostile_server(4096, move |mut s| {
+        let f = next_req(&mut s); // OPEN
+        s.write_all(&proto::frame(f.id, proto::STATUS_OK, |e| {
+            e.u32(1);
+            e.u8(8);
+        }))
+        .unwrap();
+        let f = next_req(&mut s); // THREADS: a count the body really holds, above the cap
+        s.write_all(&proto::frame(f.id, proto::STATUS_OK, |e| {
+            e.u32(n as u32);
+            e.0.resize(e.0.len() + n * 4, 0);
+        }))
+        .unwrap();
+        let f = next_req(&mut s); // REGIONS: a count the body cannot hold
+        s.write_all(&proto::frame(f.id, proto::STATUS_OK, |e| e.u32(u32::MAX))).unwrap();
+        while proto::read_frame(&mut s, 1 << 20).is_ok() {}
+    });
+    let c = connect(addr, TOKEN).unwrap();
+    let p = c.open(1).unwrap();
+    let e = p.threads().unwrap_err();
+    assert!(e.to_string().contains("exceeds the limit"), "{e}");
+    let e = p.regions().unwrap_err();
+    assert!(e.to_string().contains("malformed count"), "{e}");
+}
+
+#[test]
+fn ping_and_is_connected() {
+    let (h, _) = start();
+    let c = connect(h.addr(), TOKEN).unwrap();
+    assert!(c.is_connected());
+    c.ping(Duration::from_secs(5)).unwrap();
+    c.ping(Duration::from_secs(5)).unwrap(); // the connection survives the handle-0 probe
+    assert_eq!(c.list_processes().unwrap().len(), 2);
+    h.shutdown();
+    eventually("disconnect noticed", || !c.is_connected());
+    assert!(c.ping(Duration::from_secs(5)).is_err());
+
+    // A server that stops answering: ping times out, the connection stays.
+    let addr = hostile_server(4096, |mut s| {
+        let _ = next_req(&mut s);
+        std::thread::sleep(Duration::from_secs(3));
+    });
+    let c = connect(addr, TOKEN).unwrap();
+    let t = Instant::now();
+    let e = c.ping(Duration::from_millis(200)).unwrap_err();
+    assert!(matches!(&e, Error::Io(io) if io.kind() == ErrorKind::TimedOut), "{e:?}");
+    assert!(t.elapsed() < Duration::from_secs(2));
+    assert!(c.is_connected());
+}
+
 // ------------------------------------------------------------------ benchmark
 
 /// `cargo test -p hh-net --release -- --ignored --nocapture bench`

@@ -203,17 +203,92 @@ pub fn check_limits(entries: &[Entry]) -> Result<(), String> {
     Ok(())
 }
 
-pub fn load(path: &Path) -> Result<Table, String> {
-    let size = std::fs::metadata(path).map_err(|e| format!("{}: {e}", path.display()))?.len();
-    if size > MAX_FILE {
-        return Err(format!("{}: {} MiB is too big for a table (limit {} MiB)", path.display(), size >> 20, MAX_FILE >> 20));
+/// Total size of the raw `.CT` fragments kept from one import.
+pub const MAX_CT_EXTRA: usize = 4 << 20;
+
+/// `.CT` elements HeapHook handles itself (or that run code): never carried as raw XML, so
+/// nothing the UI does not show can ride along into an exported `.CT`.
+const CT_NEVER_RAW: &[&str] = &[
+    "LuaScript", "AssemblerScript", "CheatEntries", "CheatEntry", "CheatTable", "Structures", "Structure", "UserdefinedSymbols",
+    "DisassemblerComments", "CheatCodes", "Comments", "CustomType", "HeapHookCustomType",
+];
+
+fn never_raw(n: Node) -> bool {
+    n.descendants().any(|d| d.is_element() && (d.tag_name().namespace().is_some() || CT_NEVER_RAW.contains(&d.tag_name().name())))
+}
+
+/// A raw fragment that may be written into a `.CT`: one element, none of [`CT_NEVER_RAW`]
+/// in it (checked again on export, whatever the table came from).
+fn raw_ok(x: &str) -> bool {
+    roxmltree::Document::parse(x).is_ok_and(|d| !never_raw(d.root_element()))
+}
+
+/// A Cheat Engine option name (`moHideChildren`): it becomes an XML attribute name.
+pub fn valid_option(o: &str) -> bool {
+    !o.is_empty() && o.len() <= 64 && o.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+}
+
+/// `#RRGGBB`, the only colour form a table entry may carry.
+pub fn valid_color(c: &str) -> bool {
+    c.len() == 7 && c.starts_with('#') && c[1..].bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// Drops option names that are not plain identifiers and colours that are not `#RRGGBB`
+/// (one entry; callers walk the tree).
+pub fn clean_entry(e: &mut Entry) {
+    e.options.retain(|o| valid_option(o));
+    if e.color.as_deref().is_some_and(|c| !valid_color(c)) {
+        e.color = None;
     }
-    let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
+}
+
+fn clean_tree(list: &mut [Entry], json: bool) {
+    for e in list {
+        clean_entry(e);
+        if json {
+            e.ct_extra.clear();
+        }
+        clean_tree(&mut e.children, json);
+    }
+}
+
+/// A table from JSON input (a file or the UI): no raw `.CT` fragments, clean options and colours.
+pub fn clean_json(t: &mut Table) {
+    t.ct_extra.clear();
+    clean_tree(&mut t.entries, true);
+}
+
+/// A regular file of at most `max` bytes, read with that bound (a FIFO or device would block
+/// or never end, whatever its reported size; a file growing meanwhile is cut off).
+pub(crate) fn read_capped(path: &Path, max: u64) -> Result<Vec<u8>, String> {
+    use std::io::Read;
+    let at = |e: std::io::Error| format!("{}: {e}", path.display());
+    let m = std::fs::metadata(path).map_err(at)?;
+    if !m.is_file() {
+        return Err(format!("{}: not a regular file", path.display()));
+    }
+    let too_big = |n: u64| format!("{}: {} MiB is too big (limit {} MiB)", path.display(), n >> 20, max >> 20);
+    if m.len() > max {
+        return Err(too_big(m.len()));
+    }
+    let mut b = Vec::with_capacity(m.len() as usize);
+    std::fs::File::open(path).map_err(at)?.take(max + 1).read_to_end(&mut b).map_err(at)?;
+    if b.len() as u64 > max {
+        return Err(too_big(b.len() as u64));
+    }
+    Ok(b)
+}
+
+pub fn load(path: &Path) -> Result<Table, String> {
+    let text = String::from_utf8(read_capped(path, MAX_FILE)?).map_err(|e| format!("{}: {e}", path.display()))?;
     let t = if is_ct(path) {
         from_ct(&text)?
     } else {
         // A bare entry array is accepted too. serde_json's recursion limit keeps this shallow.
-        serde_json::from_str::<TableIn>(&text).map(Table::from).map_err(|e| format!("{}: {e}", path.display()))?
+        let mut t = serde_json::from_str::<TableIn>(&text).map(Table::from).map_err(|e| format!("{}: {e}", path.display()))?;
+        check_limits(&t.entries).map_err(|e| format!("{}: {e}", path.display()))?;
+        clean_json(&mut t);
+        t
     };
     check_limits(&t.entries).map_err(|e| format!("{}: {e}", path.display()))?;
     Ok(t)
@@ -254,13 +329,14 @@ pub fn from_ct(xml: &str) -> Result<Table, String> {
             return Err(format!("the table nests groups more than {MAX_DEPTH} levels deep"));
         }
     }
+    let mut budget = MAX_CT_EXTRA;
     let structures = match child(root, "Structures") {
         Some(n) => hh_tools::structure::from_ct_xml(&xml.trim_start_matches('\u{feff}')[n.range()]).map_err(|e| e.to_string())?,
         None => Vec::new(),
     };
-    Ok(Table {
+    let mut t = Table {
         structures,
-        entries: child(root, "CheatEntries").map(entries).unwrap_or_default(),
+        entries: child(root, "CheatEntries").map(|l| entries(l, &mut budget)).unwrap_or_default(),
         lua_script: text(root, "LuaScript").unwrap_or_default(),
         comments: text(root, "Comments").unwrap_or_default(),
         codes: child(root, "CheatCodes").map(codes).unwrap_or_default(),
@@ -282,14 +358,30 @@ pub fn from_ct(xml: &str) -> Result<Table, String> {
             })
             .unwrap_or_default(),
         custom_types: Vec::new(),
-        ct_extra: unknown(root, &known),
-    })
+        ct_extra: Vec::new(),
+    };
+    t.ct_extra = unknown(root, &known, &mut budget);
+    clean_tree(&mut t.entries, false);
+    Ok(t)
 }
 
-/// Raw XML of the element children not named in `known`.
-fn unknown(n: Node, known: &[&str]) -> Vec<String> {
+/// Raw XML of the element children not named in `known` (each one whole element, so it
+/// re-parses on its own), minus [`CT_NEVER_RAW`] tags anywhere inside, within `budget` bytes.
+fn unknown(n: Node, known: &[&str], budget: &mut usize) -> Vec<String> {
     let src = n.document().input_text();
-    n.children().filter(|c| c.is_element() && !known.contains(&c.tag_name().name())).map(|c| src[c.range()].to_string()).collect()
+    n.children()
+        .filter(|c| c.is_element() && !known.contains(&c.tag_name().name()))
+        .filter(|c| !never_raw(*c))
+        .map(|c| src[c.range()].to_string())
+        .filter(|x| raw_ok(x))
+        .filter(|x| {
+            let ok = x.len() <= *budget;
+            if ok {
+                *budget -= x.len();
+            }
+            ok
+        })
+        .collect()
 }
 
 fn byte_list(n: Node, name: &str) -> String {
@@ -330,11 +422,11 @@ fn flag(n: Node, name: &str) -> bool {
     text(n, name).is_some_and(|t| t.trim() == "1")
 }
 
-fn entries(list: Node) -> Vec<Entry> {
-    list.children().filter(|c| c.has_tag_name("CheatEntry")).map(entry).collect()
+fn entries(list: Node, budget: &mut usize) -> Vec<Entry> {
+    list.children().filter(|c| c.has_tag_name("CheatEntry")).map(|c| entry(c, budget)).collect()
 }
 
-fn entry(n: Node) -> Entry {
+fn entry(n: Node, budget: &mut usize) -> Entry {
     let mut e = Entry {
         id: text(n, "ID").and_then(|t| t.trim().parse().ok()).unwrap_or(0),
         description: text(n, "Description").map(|d| unquote(&d)).unwrap_or_default(),
@@ -342,8 +434,8 @@ fn entry(n: Node) -> Entry {
         signed: flag(n, "ShowAsSigned"),
         hex: flag(n, "ShowAsHex"),
         color: text(n, "Color").and_then(|c| ce_color(&c)),
-        children: child(n, "CheatEntries").map(entries).unwrap_or_default(),
-        ct_extra: unknown(n, ENTRY_TAGS),
+        children: child(n, "CheatEntries").map(|l| entries(l, budget)).unwrap_or_default(),
+        ct_extra: unknown(n, ENTRY_TAGS, budget),
         ..Entry::default()
     };
     // CE lists offsets last-applied first.
@@ -390,7 +482,7 @@ fn entry(n: Node) -> Entry {
         e.addr.clear();
     }
     if let Some(o) = child(n, "Options") {
-        e.options = o.attributes().filter(|a| a.value() == "1").map(|a| a.name().to_string()).collect();
+        e.options = o.attributes().filter(|a| a.value() == "1" && a.namespace().is_none()).map(|a| a.name().to_string()).filter(|n| valid_option(n)).collect();
     }
     if let Some(d) = child(n, "DropDownList") {
         let attr = |k| d.attribute(k) == Some("1");
@@ -482,7 +574,7 @@ pub fn to_ct(t: &Table) -> String {
         }
         o.push_str("  </DisassemblerComments>\n");
     }
-    for x in &t.ct_extra {
+    for x in t.ct_extra.iter().filter(|x| raw_ok(x)) {
         o.push_str(&format!("  {x}\n"));
     }
     if !t.comments.is_empty() {
@@ -521,8 +613,24 @@ fn ct_from_attrs(n: Node) -> Option<CustomType> {
     ct.validate().ok().map(|_| ct)
 }
 
+/// XML text / double-quoted attribute value. Characters XML 1.0 cannot carry at all are
+/// dropped (they would make the whole file unreadable); CR is kept as a reference (a parser
+/// would turn a raw one into LF).
 fn esc(s: &str) -> String {
-    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
+    let mut o = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => o.push_str("&amp;"),
+            '<' => o.push_str("&lt;"),
+            '>' => o.push_str("&gt;"),
+            '"' => o.push_str("&quot;"),
+            '\r' => o.push_str("&#13;"),
+            '\t' | '\n' => o.push(c),
+            c if (c as u32) < 0x20 || c == '\u{fffe}' || c == '\u{ffff}' => {}
+            c => o.push(c),
+        }
+    }
+    o
 }
 
 fn write_entries(o: &mut String, list: &[Entry], d: usize) {
@@ -535,7 +643,8 @@ fn write_entries(o: &mut String, list: &[Entry], d: usize) {
         tag(o, "ID", &e.id.to_string());
         tag(o, "Description", &format!("\"{}\"", e.description));
         if !e.options.is_empty() {
-            let attrs: String = e.options.iter().map(|k| format!(" {}=\"1\"", esc(k))).collect();
+            // Only identifiers become attribute names (anything else would break the file).
+            let attrs: String = e.options.iter().filter(|k| valid_option(k)).map(|k| format!(" {k}=\"1\"")).collect();
             o.push_str(&format!("{p}  <Options{attrs}/>\n"));
         }
         if let Some(c) = e.color.as_deref().and_then(to_ce_color) {
@@ -628,7 +737,7 @@ fn write_entries(o: &mut String, list: &[Entry], d: usize) {
             }
             o.push_str(&format!("{p}  </Hotkeys>\n"));
         }
-        for x in &e.ct_extra {
+        for x in e.ct_extra.iter().filter(|x| raw_ok(x)) {
             o.push_str(&format!("{p}  {x}\n"));
         }
         if !e.children.is_empty() {
@@ -803,14 +912,55 @@ if hp and 1 &lt; 2 then print("loaded") end
     }
 
     #[test]
+    fn json_cannot_smuggle_raw_ct_and_bad_names_stay_readable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let js = tmp.path().join("smug.json");
+        std::fs::write(&js, r#"{"ct_extra":["<LuaScript>os.execute('x')</LuaScript>"],"entries":[{"id":1,"description":"a","addr":"0x10",
+            "options":["a b","moHideChildren","x\"/><LuaScript>y</LuaScript><z a=\""],"color":"transparent",
+            "ct_extra":["<AssemblerScript>[ENABLE]</AssemblerScript>","<Note>hi</Note>"],"children":[]}]}"#).unwrap();
+        let t = load(&js).unwrap();
+        assert!(t.ct_extra.is_empty() && t.entries[0].ct_extra.is_empty(), "JSON never carries raw .CT");
+        assert_eq!((t.entries[0].options.clone(), t.entries[0].color.clone()), (vec!["moHideChildren".to_string()], None));
+        // Even a table built in code: export writes no script it does not show, and stays readable.
+        let mut t2 = t.clone();
+        t2.ct_extra = vec!["<LuaScript>evil()</LuaScript>".into(), "<Foo><AssemblerScript>x</AssemblerScript></Foo>".into(), "<Keep a=\"1\"/>".into(), "not xml <".into()];
+        t2.entries[0].options.push("bad name".into());
+        t2.entries[0].description = "ctl\u{1}\r\nchars".into();
+        let xml = to_ct(&t2);
+        assert!(!xml.contains("LuaScript") && !xml.contains("AssemblerScript"), "{xml}");
+        let back = from_ct(&xml).unwrap();
+        assert!(back.lua_script.is_empty() && back.entries[0].script.is_none());
+        assert_eq!(back.ct_extra, ["<Keep a=\"1\"/>"]);
+        assert_eq!((back.entries[0].options.clone(), back.entries[0].description.as_str()), (vec!["moHideChildren".to_string()], "ctl\r\nchars"));
+        // A .CT keeps fragments it does not understand, but not ones that hide a script.
+        let ct = "<CheatTable><CheatEntries><CheatEntry><ID>1</ID><Description>\"a\"</Description><Address>10</Address><LuaScript>x</LuaScript><Extra/></CheatEntry></CheatEntries><Wrap><AssemblerScript>y</AssemblerScript></Wrap><Fine/></CheatTable>";
+        let c = from_ct(ct).unwrap();
+        assert_eq!((c.ct_extra.clone(), c.entries[0].ct_extra.clone()), (vec!["<Fine/>".to_string()], vec!["<Extra/>".to_string()]));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn only_regular_files_are_read_and_within_the_cap() {
+        assert!(read_capped(Path::new("/dev/zero"), 10).unwrap_err().contains("not a regular file"));
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("f");
+        std::fs::write(&p, [0u8; 11]).unwrap();
+        assert!(read_capped(&p, 10).unwrap_err().contains("too big"));
+        assert_eq!(read_capped(&p, 11).unwrap().len(), 11);
+    }
+
+    #[test]
     fn json_and_ct_files() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path();
         let t = from_ct(CT).unwrap();
-        for name in ["t.json", "t.CT"] {
+        // JSON never carries raw .CT fragments back in.
+        let mut no_raw = t.clone();
+        clean_json(&mut no_raw);
+        for (name, want) in [("t.json", &no_raw), ("t.CT", &t)] {
             let p = dir.join(name);
             save(&p, &t).unwrap();
-            assert_eq!(load(&p).unwrap(), t, "{name}");
+            assert_eq!(&load(&p).unwrap(), want, "{name}");
         }
         assert!(std::fs::read_to_string(dir.join("t.CT")).unwrap().contains("<CheatTable"));
         // The UI's own JSON shape: sparse entries, extra keys ignored.

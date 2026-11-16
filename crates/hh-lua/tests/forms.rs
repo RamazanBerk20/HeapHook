@@ -241,3 +241,96 @@ fn headless_forms_and_late_ui_host() {
     }
     let _ = Engine::new(EngineOptions::default()).unwrap().ui_snapshot();
 }
+
+// ------------------------------------------------------------------ second release audit L1
+
+fn script_err(e: &Engine, src: &str) -> String {
+    e.exec(src, "test").err().map(|x| x.to_string()).unwrap_or_else(|| panic!("script succeeded: {src}"))
+}
+
+#[test]
+fn form_nesting_and_size_caps() {
+    let e = Engine::new(EngineOptions::default()).unwrap();
+    let rec = Arc::new(Rec::default());
+    e.set_ui_host(rec.clone());
+    // Nesting: the 65th level is refused, as a Lua error; the tree stays usable.
+    let err = script_err(&e, "local p = createForm(false) for i = 1, 200000 do p = createPanel(p) end");
+    assert!(err.contains("nested deeper than 64"), "{err}");
+    let snap = e.ui_snapshot();
+    let mut depth = 0;
+    let mut level = snap.roots.iter().collect::<Vec<_>>();
+    while !level.is_empty() {
+        depth += 1;
+        level = level.iter().flat_map(|n| n.children.iter()).collect();
+    }
+    assert_eq!(depth, hh_lua::MAX_DEPTH);
+    // A late host gets the deep tree too, parents first.
+    let late = Arc::new(Rec::default());
+    e.set_ui_host(late.clone());
+    assert_eq!(late.0.lock().unwrap().len(), hh_lua::MAX_DEPTH);
+    // Reparenting a chain under another chain may not exceed the depth either.
+    let err = script_err(
+        &e,
+        "local a = createForm(false) for i = 1, 39 do a = createPanel(a) end
+         local b = createPanel(nil) local r = b for i = 1, 30 do r = createPanel(r) end
+         b.Parent = a",
+    );
+    assert!(err.contains("nested deeper than 64"), "{err}");
+    // One property: 1 MiB at most, strings and lists alike.
+    run(&e, "big = createForm(false) big.Caption = string.rep('x', 1024 * 1024 - 64)");
+    let err = script_err(&e, "big.Caption = string.rep('x', 1024 * 1024 + 1)");
+    assert!(err.contains("larger than 1048576 bytes"), "{err}");
+    let err = script_err(&e, "local t = {} for i = 1, 100000 do t[i] = 'item' end big.Items = t");
+    assert!(err.contains("larger than 1048576 bytes"), "{err}");
+    let err = script_err(&e, "createPopupMenu(big).popup(string.rep('y', 2 * 1024 * 1024), 0)");
+    assert!(err.contains("larger than 1048576 bytes"), "{err}");
+    // The whole tree: 64 MiB at most.
+    let err = script_err(&e, "local s = string.rep('z', 1000000) for i = 1, 100 do big['Big' .. i] = s .. i end");
+    assert!(err.contains("forms hold more than"), "{err}");
+    // Freeing makes room again.
+    run(&e, "big.destroy() local f = createForm(false) f.Caption = string.rep('x', 1000000)");
+}
+
+#[test]
+fn form_control_count_cap() {
+    let e = Engine::new(EngineOptions::default()).unwrap();
+    let err = script_err(&e, "local f = createForm(false) for i = 1, 20000 do createLabel(f) end");
+    assert!(err.contains("too many controls (at most 10000)"), "{err}");
+    let n = e.ui_snapshot().roots[0].children.len();
+    assert_eq!(n + 1, hh_lua::MAX_CONTROLS);
+    // Destroying them frees the budget.
+    e.clear_table_state().unwrap();
+    run(&e, "local f = createForm(false) for i = 1, 100 do createLabel(f) end");
+}
+
+#[test]
+fn change_log_coalesces_and_bounds() {
+    use hh_lua::ChangeLog;
+    let upd = |id, prop: &str, v: i64| UiChange::Update { id, prop: prop.into(), value: Prop::Int(v) };
+    let mut log = ChangeLog::new(100, 1 << 20);
+    for i in 0..1000 {
+        log.push(&upd(1, "Left", i));
+    }
+    log.push(&upd(1, "Top", 5));
+    let all = log.since(1).unwrap();
+    assert_eq!(all.len(), 2);
+    assert_eq!(all[0].1, upd(1, "Left", 999));
+    assert_eq!(log.seq(), 1001);
+    // A poller that saw an old sequence number still gets the newest value.
+    assert_eq!(log.since(500).unwrap().len(), 2);
+    assert!(log.since(0).is_none());
+    // Distinct changes past the count limit drop the oldest: an old poller must resync.
+    for i in 0..200 {
+        log.push(&upd(i, "Left", 0));
+    }
+    assert_eq!(log.since(log.seq() - 10).unwrap().len(), 10);
+    assert!(log.since(1).is_none());
+    // Byte limit.
+    let mut log = ChangeLog::new(1000, 4 << 20);
+    let big = Prop::Str("x".repeat(1 << 20));
+    for i in 0..10 {
+        log.push(&UiChange::Update { id: i, prop: "Caption".into(), value: big.clone() });
+    }
+    assert!(log.bytes() <= 4 << 20);
+    assert!(log.since(1).is_none());
+}

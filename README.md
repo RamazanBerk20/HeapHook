@@ -45,11 +45,14 @@ Build the speedhack library (Linux), needed for launching with speedhack:
 
     cargo build --release --manifest-path crates/hh-inject/payload/Cargo.toml
 
-HeapHook looks for `libhh_speedhack.so` next to its executable, then in `$HH_SPEEDHACK_LIB`, then in the payload build output above. If you move the executable elsewhere, copy the library beside it or set `HH_SPEEDHACK_LIB`.
+HeapHook looks for `libhh_speedhack.so` next to its executable, then in `<prefix>/lib/HeapHook/` (where the deb and rpm install it), then in `$HH_SPEEDHACK_LIB`, then (debug builds only) in the payload build output above.
 
-Release bundles (needs `cargo install tauri-cli --version "^2" --locked`, plus `patchelf` and `rpm` on Linux):
+Release bundles. Build the speedhack library first (it is packaged as a resource), then install the Tauri CLI once:
 
-    cd app/src-tauri && cargo tauri build
+    cargo install tauri-cli --version "^2" --locked
+    cd app/src-tauri && cargo tauri build --bundles deb,rpm
+
+The packages land in `target/release/bundle/deb/` and `target/release/bundle/rpm/`. The `rpm` bundler rejects `-` in versions, so `tauri.linux.conf.json` sets the Linux package version to `1.0.0+rc.1`; remove that override for the final `1.0.0`. The AppImage and Windows installer are built by CI only (`.github/workflows/release.yml`).
 
 ## Permissions on Linux
 

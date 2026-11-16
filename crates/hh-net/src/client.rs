@@ -51,10 +51,9 @@ impl Conn {
     }
 
     fn reader(&self, mut r: BufReader<TcpStream>) {
-        // shortcut: fixed slack for list/regions responses; raise if a target has >500k regions.
-        let max = self.max_read + (64 << 20);
+        // Independent of the server: max_read is already clamped to CLIENT_MAX_READ.
         loop {
-            match proto::read_frame(&mut r, max) {
+            match proto::read_frame(&mut r, proto::CLIENT_MAX_FRAME) {
                 Ok(f) => {
                     let tx = self.pending.lock().ok().and_then(|mut p| p.map.remove(&f.id));
                     if let Some(tx) = tx {
@@ -104,22 +103,25 @@ impl Conn {
 
     /// Waits for the response; returns the ok body or the remote error.
     fn wait(&self, id: u32, rx: Receiver<Frame>) -> Result<Vec<u8>> {
-        let t = Duration::from_millis(self.timeout_ms.load(Relaxed));
-        let f = match rx.recv_timeout(t) {
-            Ok(f) => f,
-            Err(RecvTimeoutError::Timeout) => {
-                self.forget(id);
-                return Err(Error::Io(io::Error::new(ErrorKind::TimedOut, "hh-net: server did not answer in time")));
-            }
-            Err(RecvTimeoutError::Disconnected) => {
-                let why = self.pending.lock().ok().and_then(|p| p.dead.clone()).unwrap_or_default();
-                return Err(lost(&why));
-            }
-        };
+        let f = self.wait_frame(id, rx, Duration::from_millis(self.timeout_ms.load(Relaxed)))?;
         match f.op {
             proto::STATUS_OK => Ok(f.body),
             proto::STATUS_ERR => Err(proto::dec_error(&mut Dec(&f.body))?),
             s => Err(Error::Parse(format!("hh-net: bad response status {s}"))),
+        }
+    }
+
+    fn wait_frame(&self, id: u32, rx: Receiver<Frame>, t: Duration) -> Result<Frame> {
+        match rx.recv_timeout(t) {
+            Ok(f) => Ok(f),
+            Err(RecvTimeoutError::Timeout) => {
+                self.forget(id);
+                Err(Error::Io(io::Error::new(ErrorKind::TimedOut, "hh-net: server did not answer in time")))
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                let why = self.pending.lock().ok().and_then(|p| p.dead.clone()).unwrap_or_default();
+                Err(lost(&why))
+            }
         }
     }
 
@@ -201,7 +203,8 @@ pub fn connect(addr: impl ToSocketAddrs, token: &str) -> Result<RemoteHost> {
     if !proto::verify_server(token.as_bytes(), &snonce, &cnonce, d.take(32)?) {
         return Err(Error::Permission("hh-net: server could not prove it knows the token".into()));
     }
-    let max_read = (d.u32()? as usize).max(4096);
+    // A hostile server must not be able to set the client's buffer sizes.
+    let max_read = (d.u32()? as usize).clamp(4096, proto::CLIENT_MAX_READ);
     r.get_ref().set_read_timeout(None)?;
 
     let conn = Arc::new(Conn {
@@ -231,9 +234,24 @@ impl RemoteHost {
         }
     }
 
-    /// Largest READ batch / WRITE the server accepts in one request.
+    /// Largest READ batch / WRITE the server accepts in one request (clamped to
+    /// [`proto::CLIENT_MAX_READ`]).
     pub fn max_read(&self) -> usize {
         self.conn().max_read
+    }
+
+    /// False once the connection is gone (server closed it, network error, framing error).
+    /// No network round trip: it reflects the reader thread's state.
+    pub fn is_connected(&self) -> bool {
+        self.conn().pending.lock().is_ok_and(|p| p.dead.is_none())
+    }
+
+    /// One cheap round trip: Ok if the server answered within `timeout`. Works with any
+    /// protocol-1 server (it asks about handle 0, which never exists, and accepts the error).
+    pub fn ping(&self, timeout: Duration) -> Result<()> {
+        let c = self.conn();
+        let (id, rx) = c.send(op::IS_ALIVE, |e| e.u32(0))?;
+        c.wait_frame(id, rx, timeout).map(drop)
     }
 
     pub fn list_processes(&self) -> Result<Vec<ProcessInfo>> {

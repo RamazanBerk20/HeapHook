@@ -925,7 +925,15 @@ const PTR = {
 };
 // ---------- live cheat table, Lua console, hotkeys, settings ----------
 // The table lives "in the backend" here too: versioned, activation owned by these commands.
-let T = { version: 0, table: { entries: [], lua_script: '', comments: '', codes: [] } };
+let T = { version: 0, table: { entries: [], lua_script: '', comments: '', codes: [] }, trust: 'own' };
+// The backend's consent gate, in short: a loaded table's Lua runs only once it is trusted.
+const trusted = () => T.trust === 'own' || T.trust === 'agreed';
+const runsLua = (e) => /\{\$lua\}/i.test(e.script || '') || (e.children || []).some(runsLua);
+function gate(what) {
+  if (trusted()) return;
+  if (loadSettings().table_script === 'never') err(`${what}: not run: it runs Lua from a loaded table and Settings say never to run a table's Lua`);
+  err(T.trust === 'declined' ? `${what}: not run: you chose not to run this table's Lua (open the table again to be asked again)` : `needs consent: ${what}: this table runs Lua code, which can use your files and the process`);
+}
 const fvals = new Map(); // id -> value the entry is frozen to
 const liveWalk = (list, f, parent = null) => list.forEach((e) => { f(e, parent); liveWalk(e.children || [], f, e); });
 function liveFind(id) { let r = null; liveWalk(T.table.entries, (e) => { if (e.id === id) r = e; }); return r; }
@@ -1106,7 +1114,7 @@ const hkBindings = () => {
   return out;
 };
 const SETTINGS = { scan_priority: 'normal', scan_spill_dir: '', hotkey_delay_ms: 150, freeze_interval_ms: 100, live_update_ms: 300, fast_scan: true, scan_alignment: 4, scan_writable: 'yes', scan_executable: 'any',
-  scan_copy_on_write: 'no', scan_threads: 0, lua_budget_ms: 30000, lua_memory_mb: 1024, table_script: 'ask', bp_method: 'software', hotkey_sound: false, theme: 'system', signals: {} };
+  scan_copy_on_write: 'no', scan_threads: 0, lua_budget_ms: 30000, lua_memory_mb: 1024, table_script: 'ask', lua_allow_os: true, bp_method: 'software', hotkey_sound: false, theme: 'system', signals: {} };
 function loadSettings() { try { return { ...SETTINGS, ...JSON.parse(localStorage.getItem('hh.mocksettings')) }; } catch { return { ...SETTINGS }; } }
 
 /** Seeded once so the table features can be tried without the real backend. */
@@ -1142,27 +1150,38 @@ const LIVE = {
     const prev = JSON.stringify(T.table);
     liveWalk(T.table.entries, (e) => { if (typeof e.script === 'string' && e.frozen && !ids.has(e.id)) try { liveActivate(e, false); } catch { e.frozen = false; } });
     if (prev !== JSON.stringify(table)) pushUndo(JSON.parse(prev));
-    T = { version: T.version + 1, table };
+    // Raw .CT fragments never come in through a put (the real backend keeps only its own).
+    const held = new Map();
+    liveWalk(T.table.entries, (e) => held.set(e.id, JSON.stringify(e.ct_extra || [])));
+    liveWalk(table.entries, (e) => { if (e.ct_extra?.length && held.get(e.id) !== JSON.stringify(e.ct_extra)) e.ct_extra = []; });
+    if (JSON.stringify(table.ct_extra || []) !== JSON.stringify(T.table.ct_extra || [])) table.ct_extra = [];
+    T = { ...T, version: T.version + 1, table };
     liveFreeze();
     return T.version;
   },
-  // The mock's scripts cannot fail to disable and run no Lua, so `force` and trust change nothing.
-  table_trust() { return null; },
+  // The mock's scripts cannot fail to disable, so `force` changes nothing.
+  table_trust({ trust }) {
+    if (trust && loadSettings().table_script === 'never' && T.trust !== 'own') err('Settings say never to run a table\'s Lua: change "Lua script in a loaded table" first');
+    T = { ...T, version: T.version + 1, trust: T.trust === 'own' ? 'own' : trust ? 'agreed' : 'declined' };
+    return null;
+  },
   table_open({ path }) {
     for (const c of [...UI.nodes.values()]) if (c.parent == null) uiDestroy(c.id); // forms go with the table
     fs ??= loadFs();
     if (path === 'demo.json' && !fs[path]) fs[path] = DEMO;
     const t = fs[path] ?? err(/\.ct$/i.test(path) ? `file not found: ${path} (.CT parsing needs the real backend)` : `file not found: ${path}`);
     const table = JSON.parse(JSON.stringify({ lua_script: '', comments: '', codes: [], ...(Array.isArray(t) ? { entries: t } : t) }));
-    liveWalk(table.entries, (e) => { e.frozen = false; });
+    liveWalk(table.entries, (e) => { e.frozen = false; e.ct_extra = []; });
+    table.ct_extra = [];
     fvals.clear(); undo.length = redo.length = 0;
-    T = { version: T.version + 1, table };
+    T = { version: T.version + 1, table, trust: 'ask' };
     liveFreeze();
     return T;
   },
   table_export({ path }) { return C.table_save({ path, table: T.table }); },
   table_set_active({ ids, active }) {
     const errs = [];
+    if (active) for (const id of ids) { const e = liveFind(id); if (e && runsLua(e)) gate(e.description); }
     for (const id of ids) { const e = liveFind(id); if (e) try { liveActivate(e, active); } catch (x) { errs.push(String(x)); } }
     bump();
     if (errs.length) err(errs.join('\n'));
@@ -1174,6 +1193,7 @@ const LIVE = {
   },
   table_hotkey({ id, index }) {
     const e = liveFind(id) || err(`no table entry ${id}`), k = e.hotkeys[index] || err('no such hotkey');
+    if (/^(Toggle Activation|Activate|Deactivate)/.test(k.action) && runsLua(e)) gate(e.description);
     const step = (sign) => {
       const cur = Number(liveRead(e)), d = Number(k.value);
       liveSetValue(e, String(e.vtype === 'float' || e.vtype === 'double' ? cur + sign * d : Math.trunc(cur + sign * d)));
@@ -1193,6 +1213,7 @@ const LIVE = {
   },
   async table_run_script() {
     if (!T.table.lua_script.trim()) return;
+    gate("The table's Lua script");
     luaLog('info', "-- running the table's Lua script");
     await luaRun(T.table.lua_script, 'table script');
   },
@@ -1250,6 +1271,7 @@ const LIVE = {
   settings_set({ settings }) {
     const s = { ...SETTINGS, ...settings };
     try { localStorage.setItem('hh.mocksettings', JSON.stringify(s)); } catch { /* storage blocked: session only */ }
+    if (s.table_script === 'never' && T.trust === 'agreed') T = { ...T, version: T.version + 1, trust: 'declined' };
     return s;
   },
 };
@@ -1266,7 +1288,7 @@ function applyTable(t) {
   liveWalk(t.entries, (e) => { ids.add(e.id); e.frozen = was.get(e.id) || false; });
   liveWalk(T.table.entries, (e) => { if (typeof e.script === 'string' && e.frozen && !ids.has(e.id)) try { liveActivate(e, false); } catch { e.frozen = false; } });
   for (const id of fvals.keys()) if (!ids.has(id)) fvals.delete(id);
-  T = { version: T.version + 1, table: t };
+  T = { ...T, version: T.version + 1, table: t };
   liveFreeze();
   return T;
 }
@@ -1868,7 +1890,7 @@ const NEW = {
     tEdit((t) => list.forEach((x) => putStruct(t, clone(x))));
     return list.map((x) => x.name);
   },
-  app_info: () => ({ version: '1.0.0-rc.1 (mock)', license: 'Apache-2.0', remote_ok: true, platform: 'linux-x86_64' }),
+  app_info: () => ({ version: '1.0.0-rc.1 (mock)', license: 'Apache-2.0', remote_ok: true, platform: 'linux-x86_64', lua_allow_os: loadSettings().lua_allow_os !== false }),
 };
 const C_read_values = C.read_values, C_write_value = C.write_value, C_set_frozen = C.set_frozen;
 let C_lua_poll = null;

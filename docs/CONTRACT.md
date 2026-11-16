@@ -88,31 +88,31 @@ decreased decreased_by changed unchanged same_as_first`, plus `not: bool` to inv
 | `ptr_results` | `offset, limit, vtype, fmt?` | `[{base, offsets: [hex], text, address, value}]` |
 | `ptr_entry` | `index, vtype, description` | cheat-table entry |
 | `ptr_save_map` / `ptr_save_results` / `ptr_open_results` | `path` | – / – / `{count, max_level, target}` |
-| `table_get` | – | `{version, table}`; the backend owns the live table (Lua and hotkeys change it too) |
-| `table_put` | `table, base` (version the edit is based on) | new version; rejects `stale table version …` (refetch, replay the edit); never changes activation |
+| `table_get` | – | `{version, table, trust}`; the backend owns the live table (Lua and hotkeys change it too); `trust`: `own` (built in this session), `agreed`, `ask` (opened from a file, or loaded / merged by a script), `declined` |
+| `table_put` | `table, base` (version the edit is based on) | new version; rejects `stale table version …` (refetch, replay the edit); never changes activation; keeps an entry's (or the table's) `ct_extra` only when it is exactly what the backend holds for it, drops option names that are not `[A-Za-z0-9_]+` and colours that are not `#RRGGBB` |
 | `table_open` / `table_export` | `path` (`.json` or `.CT`), `force?` | `{version, table}` (all inactive; the Lua script is NOT run; the current table's active scripts are disabled first, and if one cannot be the open is refused with `… could not be disabled …` unless `force`, which carries those entries over, still active, into a group) / – |
-| `table_trust` | `trust` | – (answer to a `needs consent: …` error from `table_set_active`: a table opened from a file runs no `{$lua}` until the user agrees, here or by running its table script; Settings `table_script: never` refuses instead of asking) |
+| `table_trust` | `trust` | – (the only way a loaded table's Lua becomes runnable: its table script and the `{$lua}` of its entries, on every route — click, hotkeys, group options, Lua `memrec.Active`, forms, timers, `aa_execute`, undo/redo. Until then each refuses with `needs consent: <what>: …` (`… you chose not to …` once declined); Settings `table_script: never` refuses instead, and `table_trust(true)` errors then. Entry hotkeys of an untrusted table are not registered system-wide; a hotkey without Ctrl/Shift/Alt/Win never is) |
 | `aa_check` (no execution) | | never runs `{$lua}` blocks (they count as empty text while checking) |
 | table limits | | groups nest at most 64 deep, at most 200000 entries, table files at most 64 MiB; `table_open`/`table_put` refuse more |
 | `close_process` (scripts) | | while the process lives, active scripts are disabled first (failures go to the Lua log, the close goes on); the app does the same on exit |
 | `table_set_active` | `ids, active` | – (CE activation: OnActivate/OnDeactivate, Auto Assembler with `{$lua}`, freeze, group options) |
 | `table_set_value` | `ids, value` | – (frozen entries freeze to the new value; groups with `moRecursiveSetValue` set children) |
 | `table_hotkey` | `id, index` | – (runs that entry hotkey's CE action) |
-| `table_run_script` | – | – (runs `table.lua_script`; only after the user agreed) |
+| `table_run_script` | – | – (runs `table.lua_script`; refused with the consent error unless `trust` is `own` or `agreed`) |
 | `hotkey_press` | `keys: [vk]` (CE virtual-key codes, any order) | number of hotkeys fired (table and `createHotkey`) |
 | `lua_exec` | `code` | – (echo, prints, results and errors with traceback go to the log) |
 | `lua_interrupt` | – | – (also answers an open script dialog with cancel) |
-| `lua_poll` | `since` | `{log: [{seq, kind: in/out/result/err/info, text}], next, dialog: {id, kind: message/dialog/input, title, text, dlg_type, buttons, initial} or null, table_version, hotkeys: [[vk]], busy, sound, process: {pid, name, is_64bit, alive} or null, selection: {seq, ids}, ui_seq}` (`process`: the opened process; the UI closes it when `alive` turns false and picks it up after a reload; `selection.seq` moves when a script sets `SelectedRecords`; `ui_seq` moves on every form change) |
+| `lua_poll` | `since` | `{log: [{seq, kind: in/out/result/err/info, text}], next, dialog: {id, kind: message/dialog/input, title, text, dlg_type, buttons, initial} or null, table_version, hotkeys: [[vk]], busy, sound, process: {pid, name, is_64bit, alive} or null, selection: {seq, ids}, ui_seq}` (`busy`: a console run or table script, or anything holding the Lua engine for 300 ms or more — `lua_interrupt` applies; `process`: the opened process — never a network round trip: a remote target's `alive`/`lost` is what a background check found last; the UI closes it when `alive` turns false and picks it up after a reload; `selection.seq` moves when a script sets `SelectedRecords`; `ui_seq` moves on every form change) |
 | `ui_poll` | `since` | `{next, changes: [{seq, op: create/update/event/reparent/destroy/call, …}], snapshot: {roots: [control with children]} or null}` (hh-lua `UiChange`s of the forms scripts build; a snapshot instead when `since` is 0 or older than the kept changes; the UI applies both idempotently) |
 | `ui_event` | `id, event, args?` | handler results (`OnClick`, `OnClose` (applies the close action), `OnDblClick`, `OnKeyPress`, …; no handler is not an error) |
 | `ui_input` | `id, prop, value` | – (the user changed `Text` / `Checked` / `ItemIndex` / `Position` / `Left` / `Top`; stored without echo, fires `OnChange` / `OnClick` like CE) |
 | `ui_image` | `path` | `data:` URL of a `TImage` picture file (png, jpg, gif, bmp, webp, svg; at most 8 MiB) |
-| `key_state` | `keys: [vk]` | – (keys held in the app window, for Lua `isKeyPressed`) |
+| `key_state` | `keys: [vk]` | – (keys held in the app window, for Lua `isKeyPressed`; ignored while the table is not trusted; the UI sends none while focus is in a field or a dialog) |
 | `table_select` | `ids` | – (the UI's selection, for Lua `SelectedRecord(s)`) |
 | `trainer_script` | `req: {title, about, beep, show_keys, entries: [{id, label, keys: [vk]}]}` | Lua trainer block (`-- BEGIN HEAPHOOK TRAINER` … `-- END HEAPHOOK TRAINER`): a form with one toggle per entry and its hotkey (keys the entry already toggles with are shown, not registered twice); the UI puts it into the table script. Runs inside HeapHook; no standalone .exe |
 | Lua hosts | | `createProcess` uses `process_create` (and attaches with `debug`); `getCurrentMemscan` is the scanner of the main scan; `loadTable(f)` = `table_open` (Lua state of the old table cleared), `loadTable(f, true)` appends entries with new ids; `saveTable` = `table_export`; `debug_setBreakpoint` & co drive this debugger (breakpoint functions run on the driver thread, the register globals are written back, returning non-zero continues); group options are applied by hh-lua once; record hotkeys fire through `hotkey_press` -> `fire_record_hotkey` (OnHotkey / OnPostHotkey) |
 | `lua_dialog_reply` | `id, value` (`mb*` button for `dialog`, string for `input`, null = cancel) | – |
-| `settings_get` / `settings_set` | – / `settings` | `{freeze_interval_ms, live_update_ms, fast_scan, scan_alignment, scan_writable, scan_executable, scan_copy_on_write, lua_budget_ms, lua_memory_mb (0 = unlimited), table_script: ask/never, bp_method, hotkey_sound, theme: system/light/dark, scan_threads, signals}` (stored in the platform config dir) |
+| `settings_get` / `settings_set` | – / `settings` | `{freeze_interval_ms, live_update_ms, fast_scan, scan_alignment, scan_writable, scan_executable, scan_copy_on_write, lua_budget_ms, lua_memory_mb (0 = unlimited), table_script: ask/never, lua_allow_os (files, programs, HeapHook's own memory; read when the engine is built, so it applies after a restart), bp_method, hotkey_sound, theme: system/light/dark, scan_threads, signals}` (stored in the platform config dir) |
 | `close_process` | – | – (detaches the debugger, stops scans/freezer, scripts marked off; patches stay) |
 | `process_create` | `req: {program, args (shell-like string), cwd, speedhack}` | `{pid, name, is_64bit}` (launched via hh-inject and opened) |
 | `speed_get` / `speed_set` | – / `speed` (0 < x <= 1000) | `{pid, addr, speed, generation}` or `null` / same (Lua `speedhack_setSpeed` uses it too) |
@@ -169,7 +169,7 @@ decreased decreased_by changed unchanged same_as_first`, plus `not: bool` to inv
 | `code_targets` | `addr` | `{start, end, source, rows: [{from, to, kind: call/jump/cond_jump, text, name}]}` (direct branches of the function holding `addr`) |
 | `mem_compare` | `path` (`.hhmem`), `max` | `[{addr, len, old, new}]` (file contents against live memory) |
 | `struct_export` / `struct_import` | `path, names` (empty = all) / `path` | – / `[name]` (`.json` `{structures}` or `.xml`/`.ct` CE `<Structures>`) |
-| `app_info` | – | `{version, license, platform}` |
+| `app_info` | – | `{version, license, platform, lua_allow_os}` (`lua_allow_os`: what the running Lua engine allows) |
 | settings (more) | | `scan_priority: normal/low/idle`, `scan_spill_dir` (empty = default), `hotkey_delay_ms` (a hotkey cannot fire again sooner) |
 | table (more) | | entry `custom` (CustomType) and `custom_name` (CE `<CustomType>` name; a name without a definition is kept as unsupported and written back unchanged); table `custom_types: [{name, ...CustomType}]`, `symbols: [{name, address}]` (CE `<UserdefinedSymbols>`, registered for address expressions while the table is loaded), `disasm_comments: [{address, comment}]` (CE `<DisassemblerComments>`) |
 
@@ -183,7 +183,10 @@ description_only, display_value_as_item}, hotkeys: [{action` (CE name, e.g. `Tog
 `Set Value`, `Increase Value`)`, keys: [vk], value, description, id?}], script` (auto-assembler text,
 makes it a script entry)`, options: [CE group option names], ct_extra: [raw .CT XML], children: []}`.
 Table: `{entries, lua_script, comments, codes: [{description, address, bytes, before, after}],
-ct_extra: [raw .CT XML of unknown <CheatTable> children]}`.
+ct_extra: [raw .CT XML of unknown <CheatTable> children]}`. `ct_extra` only ever comes from a `.CT`
+import (JSON input never carries it): whole elements HeapHook does not handle, none containing
+`LuaScript`, `AssemblerScript`, `CheatEntries`, `Structures`, `CustomType` and the other parts it
+handles itself, at most 4 MiB per import; the `.CT` export checks each fragment again.
 
 ## Development bridge (not shipped)
 

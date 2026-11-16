@@ -24,6 +24,9 @@ pub struct Settings {
     pub lua_memory_mb: u64,
     /// What to do with a table's Lua script on load: `ask` or `never`.
     pub table_script: String,
+    /// Lua may use files, run programs and touch HeapHook's own memory (Cheat Engine does).
+    /// Read when the Lua engine is built, so a change applies after a restart.
+    pub lua_allow_os: bool,
     /// Method for new execute breakpoints: `software` or `hardware`.
     pub bp_method: String,
     /// Beep when a hotkey fires.
@@ -54,6 +57,7 @@ impl Default for Settings {
             lua_budget_ms: 30_000,
             lua_memory_mb: 1024,
             table_script: "ask".into(),
+            lua_allow_os: true,
             bp_method: "software".into(),
             hotkey_sound: false,
             theme: "system".into(),

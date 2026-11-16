@@ -527,8 +527,35 @@ fieldset.group > .btn { align-self: flex-start; }
 .dd-items { height: 160px; padding: 6px 8px; resize: vertical; line-height: 18px; white-space: pre; }
 .checks-col { flex-direction: column; }
 .st-sound { align-self: end; height: 30px; }
-.modal-text { margin: 0; font-size: var(--fs-sm); white-space: pre-wrap; }
-.modal-pre { margin: 0; max-height: 220px; overflow: auto; padding: 8px 10px; font-size: var(--fs-xs); line-height: 16px; background: var(--canvas-2); border: var(--line); border-radius: var(--r); white-space: pre; }
+.modal-text { margin: 0; font-size: var(--fs-sm); white-space: pre-wrap; flex: none; }
+.modal-pre { margin: 0; max-height: 220px; overflow: auto; padding: 8px 10px; font-size: var(--fs-xs); line-height: 16px; background: var(--canvas-2); border: var(--line); border-radius: var(--r); white-space: pre-wrap; overflow-wrap: anywhere; }
+/* App text and buttons stay in view; only what a table or script supplied scrolls. */
+.dlg-modal { max-height: calc(100vh - 32px); overflow: hidden; }
+.dlg-modal form { max-height: calc(100vh - 32px - 2 * var(--s4) - 2px); }
+.dlg-modal .dlg-actions, .modal-head { flex: none; }
+.modal-head { display: flex; align-items: center; gap: var(--s2); min-width: 0; }
+.modal-head h2 { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.modal-body { flex: 0 1 auto; min-height: 0; overflow: auto; display: flex; flex-direction: column; gap: var(--s2); }
+.modal-quote { margin: 0; font-size: var(--fs-sm); overflow-wrap: anywhere; }
+.modal-quote q, .trust-hks q { color: var(--text); }
+.modal-script { margin: 0; font-size: var(--fs-sm); white-space: pre-wrap; overflow-wrap: anywhere; }
+.dlg-lua { border: 1px dashed var(--yellow); }
+.lua-badge { flex: none; background: var(--yellow-bg); color: var(--yellow); }
+.trust-facts { margin: 0; padding-left: 18px; font-size: var(--fs-sm); display: flex; flex-direction: column; gap: 2px; }
+.trust-facts .btn { height: 22px; padding: 0 6px; }
+.trust-hks { margin: 0; padding: 0; list-style: none; font-size: var(--fs-xs); border: var(--line); border-radius: var(--r); max-height: 160px; overflow: auto; }
+.trust-hks li { display: grid; grid-template-columns: minmax(80px, auto) auto 1fr auto; gap: var(--s2); padding: 3px 8px; border-bottom: var(--line); align-items: baseline; }
+.trust-hks li:last-child { border-bottom: 0; }
+.trust-hks q { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+.code-view { max-height: 50vh; overflow: auto; padding: 6px 0; font-size: var(--fs-xs); line-height: 16px; background: var(--canvas-2); border: var(--line); border-radius: var(--r); }
+.trust-body .code-view { max-height: 140px; }
+.cv-line { display: flex; }
+.cv-num { flex: none; width: 5ch; padding-right: 8px; text-align: right; color: var(--muted); user-select: none; }
+.cv-text { flex: 1; min-width: 0; padding-right: 8px; white-space: pre-wrap; overflow-wrap: anywhere; color: var(--text-2); }
+.cv-mark { padding: 0 2px; border-radius: var(--r-sm); background: var(--red-bg); color: var(--red); }
+.cv-more { padding: 2px 8px; }
+.lua-top { flex: none; }
+.lf-head .lua-badge { margin-right: 2px; }
 .dlg textarea:not(.mono) { font-family: var(--font-ui); }
 
 @keyframes pop { from { opacity: 0; transform: translateY(2px) scale(0.99); } to { opacity: 1; transform: none; } }

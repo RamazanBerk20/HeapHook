@@ -424,3 +424,105 @@ fn host_backed_functions() {
     assert_eq!(s.count(), 1, "the scan ran on the host's scanner");
     assert_eq!(*h.calls.lock().unwrap(), ["create /bin/game -w true false", "load /t/a.CT true", "save /t/b.CT false"]);
 }
+
+// ------------------------------------------------------------------ second release audit L2-L4
+
+fn lua_err(e: &Engine, src: &str) -> String {
+    e.exec(src, "test").err().map(|x| x.to_string()).unwrap_or_else(|| panic!("script succeeded: {src}"))
+}
+
+#[test]
+fn file_helpers_refuse_devices_and_huge_files() {
+    let (e, _, _) = engine();
+    for f in ["md5file('/dev/zero')", "readRegionFromFile('/dev/zero', 0x20000000)", "md5file('/tmp')"] {
+        let err = lua_err(&e, f);
+        assert!(err.contains("not a regular file"), "{f}: {err}");
+    }
+    let dir = std::env::temp_dir().join(format!("hh-lua-l2-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    // A FIFO must be refused without blocking on open.
+    let fifo = dir.join("fifo");
+    if std::process::Command::new("mkfifo").arg(&fifo).status().is_ok_and(|s| s.success()) {
+        let err = lua_err(&e, &format!("md5file('{}')", fifo.display()));
+        assert!(err.contains("not a regular file"), "{err}");
+    }
+    // Over the size cap (sparse: no disk space or memory used).
+    let big = dir.join("big");
+    std::fs::File::create(&big).unwrap().set_len((1 << 30) + 1).unwrap();
+    for f in ["md5file", "readRegionFromFile"] {
+        let err = lua_err(&e, &format!("{f}('{}', 0x20000000)", big.display()));
+        assert!(err.contains("larger than 1073741824 bytes"), "{f}: {err}");
+    }
+    // Streaming hash of a multi-chunk file matches the one-buffer hash.
+    let data: Vec<u8> = (0..(3 << 20) + 17u32).map(|i| (i * 31 % 253) as u8).collect();
+    let f = dir.join("data");
+    std::fs::write(&f, &data).unwrap();
+    e.lua().globals().set("DATA", e.lua().create_string(&data).unwrap()).unwrap();
+    run(&e, &format!("assert(md5file('{}') == stringToMD5String(DATA))", f.display()));
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn copy_memory_local_buffers_are_owned_and_capped() {
+    let (e, _, _) = engine();
+    run(
+        &e,
+        r#"
+        local base = getAddress('game.exe')
+        local mine = copyMemory(base + 0x3010, 6, nil, 1)
+        assert(readStringLocal(mine) == 'Hello')
+        assert(deAllocLocal(mine) == true and deAllocLocal(mine) == false)
+        -- the total cap is checked before anything is allocated
+        local ok, err = pcall(copyMemory, base + 0x3010, 300 * 1024 * 1024, nil, 1)
+        assert(not ok and tostring(err):find('would exceed 268435456'), tostring(err))
+        keep = copyMemory(base + 0x3010, 6, nil, 1)
+        local ok, err = pcall(copyMemory, base + 0x3010, 256 * 1024 * 1024 - 5, nil, 1)
+        assert(not ok and tostring(err):find('would exceed'), tostring(err))
+        -- a failed copy frees its buffer: the same failure twice, never the cap
+        for i = 1, 3 do
+          local ok, err = pcall(copyMemory, 0x7000000000, 200 * 1024 * 1024, nil, 1)
+          assert(not ok and not tostring(err):find('would exceed'), tostring(err))
+        end
+    "#,
+    );
+    // clear_table_state frees what is left.
+    e.clear_table_state().unwrap();
+    run(&e, "assert(deAllocLocal(keep) == false)");
+}
+
+#[test]
+fn os_access_checks_cover_host_functions() {
+    let e = Engine::new(EngineOptions { allow_os: false, ..Default::default() }).unwrap();
+    for (f, what) in [
+        ("createProcess('/bin/true')", "OS access is disabled"),
+        ("loadTable('/tmp/x.CT')", "file access is disabled"),
+        ("saveTable('/tmp/x.CT')", "file access is disabled"),
+        ("getTempFolder()", "OS access is disabled"),
+        ("md5file('/etc/hostname')", "file access is disabled"),
+        ("readRegionFromFile('/etc/hostname', 0)", "file access is disabled"),
+        ("shellExecute('true')", "OS access is disabled"),
+        (&format!("openProcess({})", std::process::id()), "own memory is disabled"),
+    ] {
+        let err = lua_err(&e, f);
+        assert!(err.contains(what), "{f}: {err}");
+    }
+    run(&e, "assert(fileExists('/etc/hostname') == false and directoryExists('/tmp') == false)");
+}
+
+#[test]
+fn host_side_sizes_and_result_counts_are_capped() {
+    let (e, _, _) = engine();
+    let err = lua_err(&e, "readBytes(0x20000000, 100 * 1024 * 1024, true)");
+    assert!(err.contains("more than 67108864"), "{err}");
+    let err = lua_err(&e, "writeString(0x20000000, string.rep('x', 65 * 1024 * 1024))");
+    assert!(err.contains("more than 67108864"), "{err}");
+    let err = lua_err(&e, "local t = {} for i = 1, 70 * 1024 * 1024 // 64 do t[i] = 0 end writeBytes(0x20000000, t, t, t, t, t, t, t, t, t, t, t, t, t, t, t, t, t, t, t, t, t, t, t, t, t, t, t, t, t, t, t, t, t, t, t, t, t, t, t, t, t, t, t, t, t, t, t, t, t, t, t, t, t, t, t, t, t, t, t, t, t, t, t, t, t)");
+    assert!(err.contains("more than 67108864"), "{err}");
+    // An AOB pattern matching every byte of this (large) process stops at the result cap.
+    e.set_process(Some(hh_core::open(std::process::id()).unwrap())).unwrap();
+    let err = lua_err(&e, "AOBScan('??')");
+    assert!(err.contains("more than 1048576 matches"), "{err}");
+    let err = lua_err(&e, "AOBScan('??', '', 1, '1')");
+    assert!(err.contains("more than 1048576 matches"), "{err}");
+    run(&e, "assert(AOBScanUnique('??') == nil)");
+}

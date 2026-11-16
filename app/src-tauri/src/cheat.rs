@@ -37,6 +37,12 @@ struct Inner {
     /// Earlier / undone tables of user edits (puts, structure and code-list changes).
     undo: Vec<Table>,
     redo: Vec<Table>,
+    /// Consent for this table's Lua.
+    trust: Trust,
+    /// Entry id -> script whose Lua may run whatever `trust` says: scripts that were already
+    /// allowed before the table changed hands (entries carried over by a forced open, the
+    /// current entries when a script merges a file in).
+    vetted: HashMap<i64, String>,
 }
 
 /// Table versions kept for undo.
@@ -64,7 +70,19 @@ impl Inner {
         }
         self.bump();
     }
+
+    /// THE trust gate: whether `e`'s script may run its Lua. Every way a record's script can
+    /// execute reads the record through `TableHost::get` (the engine runs what it gets) or
+    /// asks this first (the app's own pre-checks, for a clear error).
+    fn lua_ok(&self, e: &Entry) -> bool {
+        self.trust.allows() || !runs_lua(e) || self.vetted.get(&e.id) == e.script.as_ref()
+    }
 }
+
+/// What the Lua engine sees instead of the script of an entry whose Lua may not run: Auto
+/// Assembler refuses it on line 1 (an unknown directive), before anything executes, in both
+/// the enable and the disable section. `TableHost::set` never stores it back.
+pub const BLOCKED_SCRIPT: &str = "{$heaphook: not run, the Lua of this table needs your consent}";
 
 /// Ids of active script entries in `old` that `new` no longer has (they must be disabled
 /// before the edit lands, or their patches stay in the game with nothing to undo them).
@@ -106,28 +124,44 @@ fn hotkey_ids(hks: &[table::Hotkey]) -> Vec<u32> {
         .collect()
 }
 
-/// Consent for the Lua in a table's scripts (`{$lua}` blocks; the table script asks itself).
-#[derive(Debug, Clone, Copy, Default, PartialEq)]
+/// Consent for the Lua in a table: its table script and the `{$lua}` blocks of its entries.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Trust {
-    /// Built in this session, or the user agreed.
+    /// Built in this session (no table file opened yet): the user's own.
     #[default]
-    Trusted,
-    /// Loaded from a file; ask before the first `{$lua}` runs.
+    Own,
+    /// Loaded from a file and the user agreed (Settings "never" withdraws it).
+    Agreed,
+    /// Loaded from a file (or by a script); not asked yet.
     Ask,
     Declined,
+}
+
+impl Trust {
+    pub fn allows(self) -> bool {
+        matches!(self, Trust::Own | Trust::Agreed)
+    }
 }
 
 /// Error prefix the UI answers with a question and `table_trust`.
 pub const NEEDS_CONSENT: &str = "needs consent:";
 
+/// A script with a `{$lua}` block (hh-asm matches the directive case-insensitively).
+pub(crate) fn script_runs_lua(s: &str) -> bool {
+    s.to_ascii_lowercase().contains("{$lua}")
+}
+
 fn runs_lua(e: &Entry) -> bool {
-    e.script.as_deref().is_some_and(|s| s.to_ascii_lowercase().contains("{$lua}"))
+    e.script.as_deref().is_some_and(script_runs_lua)
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct TableState {
     pub version: u64,
     pub table: Table,
+    /// Consent for the table's Lua (`own`, `agreed`, `ask`, `declined`).
+    pub trust: Trust,
 }
 
 pub fn is_group(e: &Entry) -> bool {
@@ -221,7 +255,8 @@ fn color_out(c: u32) -> Option<String> {
     (c >> 24 == 0).then(|| format!("#{:02X}{:02X}{:02X}", c & 0xff, (c >> 8) & 0xff, (c >> 16) & 0xff))
 }
 
-fn record(e: &Entry, parent: Option<i64>, rt: Option<&Rt>) -> Record {
+/// `blocked`: the entry's Lua may not run, so the engine gets [`BLOCKED_SCRIPT`] as its script.
+fn record(e: &Entry, parent: Option<i64>, rt: Option<&Rt>, blocked: bool) -> Record {
     let mut r = Record::new(e.id as RecId, parent.map(|p| p as RecId));
     r.description = e.description.clone();
     r.address = e.addr.clone();
@@ -230,7 +265,7 @@ fn record(e: &Entry, parent: Option<i64>, rt: Option<&Rt>) -> Record {
     // which `sync_freeze` turns back into bytes (see `custom_frozen_value`).
     (r.vtype, r.fmt) = if e.custom.is_some() { (hh_scan::VType::Bytes8, Fmt::default()) } else { (e.vtype, fmt_of(e)) };
     r.group_header = is_group(e);
-    r.script = e.script.clone();
+    r.script = if blocked { Some(BLOCKED_SCRIPT.into()) } else { e.script.clone() };
     r.color = color_in(e.color.as_deref());
     r.active = e.frozen;
     r.options = e.options.clone();
@@ -260,7 +295,51 @@ fn record(e: &Entry, parent: Option<i64>, rt: Option<&Rt>) -> Record {
 impl Live {
     pub fn state(&self) -> TableState {
         let g = lock(&self.0);
-        TableState { version: g.version, table: g.table.clone() }
+        TableState { version: g.version, table: g.table.clone(), trust: g.trust }
+    }
+
+    pub fn trust(&self) -> Trust {
+        lock(&self.0).trust
+    }
+
+    pub(crate) fn set_trust(&self, t: Trust) {
+        let mut g = lock(&self.0);
+        if g.trust != t {
+            g.trust = t;
+            g.bump();
+        }
+    }
+
+    /// Settings turned to "never": a loaded table's Lua stops running (the user's own stays).
+    pub(crate) fn revoke_agreed(&self) {
+        let mut g = lock(&self.0);
+        if g.trust == Trust::Agreed || !g.vetted.is_empty() {
+            if g.trust == Trust::Agreed {
+                g.trust = Trust::Declined;
+            }
+            g.vetted.clear();
+            g.bump();
+        }
+    }
+
+    /// A script loaded more entries into this table: the table is untrusted again, but what
+    /// could run before keeps running (it was agreed to, or is the user's own).
+    pub(crate) fn distrust_keeping_current(&self) {
+        let mut g = lock(&self.0);
+        if g.trust.allows() {
+            let v: Vec<(i64, String)> = all(&g.table.entries).into_iter().filter(|(e, _)| runs_lua(e)).filter_map(|(e, _)| Some((e.id, e.script.clone()?))).collect();
+            g.vetted.extend(v);
+            g.trust = Trust::Ask;
+            g.bump();
+        }
+    }
+
+    /// Description of the first entry in the subtree of `id` whose script runs Lua it may
+    /// not run now (see `Inner::lua_ok`).
+    pub(crate) fn blocked(&self, id: i64) -> Option<String> {
+        let g = lock(&self.0);
+        let (e, _) = all(&g.table.entries).into_iter().find(|(e, _)| e.id == id)?;
+        all(std::slice::from_ref(e)).into_iter().find(|(c, _)| !g.lua_ok(c)).map(|(c, _)| c.description.clone())
     }
 
     pub fn version(&self) -> u64 {
@@ -272,7 +351,7 @@ impl Live {
     }
 
     /// Replaces the table with a UI edit based on `base`. Activation stays as it is here.
-    pub fn put(&self, t: Table, base: u64) -> R<u64> {
+    pub fn put(&self, mut t: Table, base: u64) -> R<u64> {
         let mut g = lock(&self.0);
         if base != g.version {
             return Err(format!("stale table version {base} (current {})", g.version));
@@ -282,6 +361,20 @@ impl Live {
         for (e, _) in all(&t.entries) {
             if e.id <= 0 || e.id > u32::MAX as i64 || !seen.insert(e.id) {
                 return Err(format!("bad or duplicate entry id {}", e.id));
+            }
+        }
+        // Raw `.CT` fragments only ever come from a `.CT` import: a put keeps one only when it
+        // is exactly what this table already holds for that entry.
+        {
+            let held: HashMap<i64, &Vec<String>> = all(&g.table.entries).into_iter().map(|(e, _)| (e.id, &e.ct_extra)).collect();
+            for_each_mut(&mut t.entries, &mut |e| {
+                if !e.ct_extra.is_empty() && held.get(&e.id) != Some(&&e.ct_extra) {
+                    e.ct_extra.clear();
+                }
+                table::clean_entry(e);
+            });
+            if t.ct_extra != g.table.ct_extra {
+                t.ct_extra.clear();
             }
         }
         g.install(t, true);
@@ -313,7 +406,7 @@ impl Live {
         let cur = g.table.clone();
         g.install(t, false);
         if redo { g.undo.push(cur) } else { g.redo.push(cur) }
-        Ok(TableState { version: g.version, table: g.table.clone() })
+        Ok(TableState { version: g.version, table: g.table.clone(), trust: g.trust })
     }
 
     /// (undo steps, redo steps) available.
@@ -324,14 +417,18 @@ impl Live {
 
     /// A freshly loaded table: everything inactive, except the old entries `keep` (active
     /// scripts that could not be disabled), carried over into a group so they still can be.
+    /// The new table is untrusted; the carried scripts stay runnable (they were before).
     pub fn replace(&self, mut t: Table, keep: &[i64]) -> TableState {
         for_each_mut(&mut t.entries, &mut |e| e.frozen = false);
         let mut g = lock(&self.0);
         let mut next = all(&t.entries).iter().map(|(e, _)| e.id).max().unwrap_or(0) + 1;
-        let (mut rt, mut carried) = (HashMap::new(), Vec::new());
+        let (mut rt, mut carried, mut vetted) = (HashMap::new(), Vec::new(), HashMap::new());
         for &id in keep {
             let Some(mut e) = find_mut(&mut g.table.entries, id).map(|e| e.clone()) else { continue };
             e.children.clear();
+            if let Some(s) = e.script.clone().filter(|_| g.lua_ok(&e)) {
+                vetted.insert(next, s);
+            }
             e.id = next;
             if let Some(r) = g.rt.remove(&id) {
                 rt.insert(next, r);
@@ -346,8 +443,10 @@ impl Live {
         g.rt = rt;
         g.undo.clear();
         g.redo.clear();
+        g.trust = Trust::Ask;
+        g.vetted = vetted;
         g.bump();
-        TableState { version: g.version, table: g.table.clone() }
+        TableState { version: g.version, table: g.table.clone(), trust: g.trust }
     }
 
     /// Process changed: scripts patched the old process, so they are off; value entries stay
@@ -424,7 +523,7 @@ impl TableHost for Live {
 
     fn get(&self, id: RecId) -> Option<Record> {
         let g = lock(&self.0);
-        all(&g.table.entries).into_iter().find(|(e, _)| e.id == id as i64).map(|(e, p)| record(e, p, g.rt.get(&e.id)))
+        all(&g.table.entries).into_iter().find(|(e, _)| e.id == id as i64).map(|(e, p)| record(e, p, g.rt.get(&e.id), !g.lua_ok(e)))
     }
 
     fn set(&self, rec: Record) -> HResult<()> {
@@ -433,7 +532,7 @@ impl TableHost for Live {
         let (old, parent) = all(&g.table.entries)
             .into_iter()
             .find(|(e, _)| e.id == id)
-            .map(|(e, p)| (record(e, p, None), p))
+            .map(|(e, p)| (record(e, p, None, false), p))
             .ok_or_else(|| Error::Other(format!("no record {id}")))?;
         let e = find_mut(&mut g.table.entries, id).expect("found above");
         e.description = rec.description.clone();
@@ -444,7 +543,10 @@ impl TableHost for Live {
         } else {
             // A header turned into a value entry needs an address to stay one.
             e.addr = if rec.address.trim().is_empty() && rec.script.is_none() { "0".into() } else { rec.address.clone() };
-            e.script = rec.script.clone();
+            // The placeholder `get` handed out for a blocked script is never stored.
+            if rec.script.as_deref() != Some(BLOCKED_SCRIPT) {
+                e.script = rec.script.clone();
+            }
             if e.custom.is_none() {
                 e.vtype = rec.vtype;
             }
@@ -493,6 +595,9 @@ impl TableHost for Live {
         }
         if old.color != rec.color {
             e.color = color_out(rec.color);
+        }
+        if old.options != rec.options {
+            table::clean_entry(e);
         }
         e.frozen = rec.active;
         let rt = g.rt.entry(id).or_default();
@@ -621,7 +726,6 @@ impl App {
             return Err(format!("{}
 the table was not opened: these active scripts could not be disabled (open anyway to keep them in the new table)", why.join("\n")));
         }
-        *lock(&self.x.trust) = Trust::Ask;
         let keep: Vec<i64> = failed.into_iter().map(|f| f.0).collect();
         let st = self.x.live.replace(t, &keep);
         self.x.live.select(Vec::new());
@@ -637,9 +741,11 @@ the table was not opened: these active scripts could not be disabled (open anywa
     }
 
     /// Lua `loadTable(file, true)`: appends the file's entries (new ids, inactive) and keeps
-    /// the current table, its scripts and their Lua state.
+    /// the current table, its scripts and their Lua state. The file is as untrusted as any
+    /// other: the table needs consent again for its new Lua (the current entries keep running).
     pub(crate) fn table_merge(&self, path: &str) -> R<()> {
         let add = table::load(Path::new(path))?;
+        self.x.live.distrust_keeping_current();
         let cur = self.x.live.state();
         let mut next = all(&cur.table.entries).iter().map(|(e, _)| e.id).max().unwrap_or(0);
         let mut entries = add.entries;
@@ -695,29 +801,39 @@ the table was not opened: these active scripts could not be disabled (open anywa
     }
 
     /// Refuses before anything runs when an entry (or a child a group option may enable)
-    /// would run `{$lua}` from a table the user has not agreed to.
+    /// would run `{$lua}` from a table the user has not agreed to. A clear error for the UI;
+    /// the gate itself is `Inner::lua_ok`, which the engine cannot get around.
     fn check_trust(&self, ids: &[i64]) -> R<()> {
-        let trust = *lock(&self.x.trust);
-        if trust == Trust::Trusted {
-            return Ok(());
+        match ids.iter().find_map(|&id| self.x.live.blocked(id)) {
+            Some(e) => Err(self.consent_error(&e)),
+            None => Ok(()),
         }
-        let Some(e) = ids.iter().filter_map(|&id| self.x.live.entry(id)).find_map(|e| {
-            all(std::slice::from_ref(&e)).into_iter().find(|(c, _)| runs_lua(c)).map(|(c, _)| c.description.clone())
-        }) else {
-            return Ok(());
-        };
-        if lock(&self.x.settings).table_script == "never" {
-            return Err(format!("{e}: not enabled: its script runs Lua and Settings say never to run a table's Lua"));
-        }
-        Err(match trust {
-            Trust::Declined => format!("{e}: not enabled: you chose not to run this table's Lua (open the table again to be asked again)"),
-            _ => format!("{NEEDS_CONSENT} {e}: this table's scripts run Lua code ({{$lua}}), which can use files and the process"),
-        })
     }
 
-    /// The user's answer to [`NEEDS_CONSENT`] (or to running the table's Lua script).
+    /// Why `what` (an entry, the table script) does not run now: [`NEEDS_CONSENT`] when the
+    /// user can still be asked.
+    pub(crate) fn consent_error(&self, what: &str) -> String {
+        if lock(&self.x.settings).table_script == "never" {
+            return format!("{what}: not run: it runs Lua from a loaded table and Settings say never to run a table's Lua");
+        }
+        match self.x.live.trust() {
+            Trust::Declined => format!("{what}: not run: you chose not to run this table's Lua (open the table again to be asked again)"),
+            _ => format!("{NEEDS_CONSENT} {what}: this table runs Lua code, which can use your files and the process"),
+        }
+    }
+
+    /// The user's answer to [`NEEDS_CONSENT`] (or to the question when the table was opened).
+    /// The only way a loaded table's Lua becomes runnable; refused while Settings say never.
     pub fn table_trust(&self, trust: bool) -> R<()> {
-        *lock(&self.x.trust) = if trust { Trust::Trusted } else { Trust::Declined };
+        let cur = self.x.live.trust();
+        if trust && lock(&self.x.settings).table_script == "never" && cur != Trust::Own {
+            return Err("Settings say never to run a table's Lua: change \"Lua script in a loaded table\" first".into());
+        }
+        self.x.live.set_trust(match (trust, cur) {
+            (_, Trust::Own) => Trust::Own,
+            (true, _) => Trust::Agreed,
+            (false, _) => Trust::Declined,
+        });
         Ok(())
     }
 
@@ -777,8 +893,12 @@ the table was not opened: these active scripts could not be disabled (open anywa
     pub fn table_hotkey(&self, id: i64, index: usize) -> R<()> {
         let e = self.x.live.entry(id).ok_or_else(|| format!("no table entry {id}"))?;
         let hk = e.hotkeys.get(index).ok_or_else(|| format!("{}: no hotkey {index}", e.description))?;
-        if !HK_ACTIONS.contains(&hk.action.as_str()) {
+        let Some(action) = HK_ACTIONS.iter().position(|a| *a == hk.action) else {
             return Err(format!("{}: unknown hotkey action {:?}", e.description, hk.action));
+        };
+        // Toggle / activate / deactivate run scripts (and group options their children's).
+        if action <= 4 {
+            self.check_trust(&[id])?;
         }
         if hk.action.starts_with("Toggle Activation Allow") {
             let m = if hk.action.ends_with("Increase") { FreezeMode::AllowIncrease } else { FreezeMode::AllowDecrease };

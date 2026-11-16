@@ -72,28 +72,40 @@ export function initLua({ openTableScript }) {
   splitter($('#div-lua'), $('#lua-ed'), { axis: 'y', key: 'split.lua', min: 80, max: () => innerHeight - 200, sign: -1, initial: 180 });
   lines();
 
+  // Reachable from anywhere (outside every Lua form): the top bar's stop button while Lua runs.
+  const topStop = $('#lua-stop-top');
+  topStop.addEventListener('click', () => api.luaInterrupt().catch(toast));
   function sync() {
     bStop.disabled = !busy;
     bRun.disabled = running;
     status.textContent = busy ? 'running…' : '';
+    topStop.hidden = !busy;
+    state.luaBusy = busy;
   }
+  // Esc stops a running script wherever focus is (a Lua form, a script dialog): capture phase,
+  // so nothing a script builds can swallow it.
+  window.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && busy && !e.repeat) { api.luaInterrupt().catch(() => {}); }
+  }, true);
 
   // ---------- dialogs from scripts ----------
   // The open script dialog; closed when the backend stops waiting for it (Lua interrupted).
+  // Marked as the script's (badge, frame); its text is the script's, shown as text in a scroll box.
   let dialogEl = null, dialogGone = false;
+  const said = (t) => (t ? h('p.modal-script', null, String(t)) : null);
   async function showDialog(d) {
     shownDialog = d.id;
     dialogGone = false;
     queueMicrotask(() => { dialogEl = document.querySelector('body > dialog.dlg[open]:last-of-type'); });
     let value = null;
     if (d.kind === 'message') {
-      await modal({ title: 'Message', text: d.text, buttons: [{ label: 'OK', value: 'ok', primary: true, kbd: 'Enter' }] });
+      await modal({ lua: true, title: 'Message', body: said(d.text), buttons: [{ label: 'OK', value: 'ok', primary: true, kbd: 'Enter' }] });
     } else if (d.kind === 'dialog') {
       const buttons = (d.buttons.length ? d.buttons : [2]).map((b, i) => ({ label: MB[b] ?? `Button ${b}`, value: String(b), primary: i === 0 }));
-      const r = await modal({ title: d.title || MT[d.dlg_type] || 'Question', text: d.text, buttons });
+      const r = await modal({ lua: true, title: d.title || MT[d.dlg_type] || 'Question', body: said(d.text), buttons });
       value = r.value === 'cancel' ? null : +r.value;
     } else {
-      const r = await modal({ title: d.title || 'Input', text: d.text, input: d.initial,
+      const r = await modal({ lua: true, title: d.title || 'Input', body: said(d.text), input: d.initial,
         buttons: [{ label: 'OK', value: 'ok', primary: true, kbd: 'Enter' }, { label: 'Cancel', value: 'cancel', kbd: 'Esc' }] });
       value = r.value === 'ok' ? r.input : null;
     }
@@ -140,12 +152,16 @@ export function initLua({ openTableScript }) {
   poll();
 
   // ---------- keys held in the window, for Lua isKeyPressed ----------
+  // Only for Lua the user agreed to (or wrote), and never while typing into a field (a
+  // password, a script form's edit) or answering an app dialog.
   let held = new Set(), heldKey = '';
   const sendHeld = () => {
     const k = [...held].sort((a, b) => a - b).join(',');
     if (k !== heldKey) { heldKey = k; api.keyState([...held]).catch(() => {}); }
   };
+  const private_ = (t) => !!t?.closest?.('input, textarea, select, [contenteditable], dialog[open]');
   const track = (e, down) => {
+    if (!['own', 'agreed'].includes(state.tableTrust ?? 'own') || private_(e.target)) { held.clear(); sendHeld(); return; }
     const v = vkOf(e.code);
     if (v != null) down ? held.add(v) : held.delete(v);
     // Modifier state from the event itself (a release outside the window is missed otherwise).
@@ -166,7 +182,7 @@ export function initLua({ openTableScript }) {
     const typing = e.target.matches?.('input, textarea, select, [contenteditable]');
     if (typing && !e.ctrlKey && !e.altKey && !e.metaKey && c.every((k) => k === 16 || PRINTABLE(k))) return;
     e.preventDefault(); e.stopPropagation();
-    api.hotkeyPress(c).catch(toast);
+    api.hotkeyPress(c).catch((err) => (String(err?.message || err).includes('needs consent:') ? emit('table:consent') : toast(err)));
   }, true);
 
   return {

@@ -79,6 +79,12 @@ pub const MAX_HANDSHAKE_FRAME: usize = 64;
 pub const MAX_RANGES: usize = 65536;
 /// Default per-request byte budget for READ / WRITE.
 pub const DEFAULT_MAX_READ: usize = 16 << 20;
+/// Largest `max_read` a client accepts from a server's AUTH_OK; larger values are clamped.
+pub const CLIENT_MAX_READ: usize = 64 << 20;
+/// Largest response frame a client accepts: a full READ batch plus room for list replies.
+pub const CLIENT_MAX_FRAME: usize = CLIENT_MAX_READ + (64 << 20);
+/// Most items a client accepts in one list reply (processes, regions, modules, threads).
+pub const MAX_LIST_ITEMS: usize = 1 << 21;
 pub const NONCE: usize = 32;
 
 pub mod op {
@@ -113,7 +119,8 @@ pub struct Frame {
 }
 
 /// Reads one frame; frames longer than `max` (excluding the length prefix) are an error.
-/// Allocation is bounded by `max`.
+/// Allocation is bounded by `max` and grows with the bytes actually received, so a peer that
+/// announces a large frame and then stalls costs at most 64 KiB.
 pub fn read_frame(r: &mut impl Read, max: usize) -> io::Result<Frame> {
     let mut h = [0u8; 4];
     r.read_exact(&mut h)?;
@@ -121,8 +128,15 @@ pub fn read_frame(r: &mut impl Read, max: usize) -> io::Result<Frame> {
     if !(5..=max).contains(&len) {
         return Err(io::Error::new(ErrorKind::InvalidData, format!("bad frame length {len}")));
     }
-    let mut v = vec![0u8; len];
-    r.read_exact(&mut v)?;
+    let mut v = Vec::new();
+    while v.len() < len {
+        // Double what has arrived, never past `len`: at most log2(len / 64 KiB) reallocations.
+        let start = v.len();
+        let want = (len - start).min(start.max(64 << 10));
+        v.reserve_exact(want);
+        v.resize(start + want, 0);
+        r.read_exact(&mut v[start..])?;
+    }
     let id = u32::from_le_bytes([v[0], v[1], v[2], v[3]]);
     let op = v[4];
     v.drain(..5);
@@ -425,9 +439,13 @@ pub fn enc_list<T>(e: &mut Enc, items: &[T], f: impl Fn(&mut Enc, &T)) {
     }
 }
 /// Decodes a list whose items are at least `min` bytes each, then checks the body is used up.
+/// At most [`MAX_LIST_ITEMS`] items.
 pub fn dec_list<T>(body: &[u8], min: usize, f: impl Fn(&mut Dec) -> Result<T>) -> Result<Vec<T>> {
     let mut d = Dec(body);
     let n = d.count(min)?;
+    if n > MAX_LIST_ITEMS {
+        return Err(Error::Parse(format!("hh-net: list of {n} items exceeds the limit {MAX_LIST_ITEMS}")));
+    }
     let mut v = Vec::with_capacity(n);
     for _ in 0..n {
         v.push(f(&mut d)?);

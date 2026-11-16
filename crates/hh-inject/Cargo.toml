@@ -9,6 +9,6 @@ hh-core.workspace = true
 hh-asm.workspace = true
 serde.workspace = true
 
-# Only for the test target bin (src/bin/hh-speedhack-target.rs).
-[target.'cfg(target_os = "linux")'.dependencies]
+# geteuid for the library ownership check; the test target bin (src/bin/hh-speedhack-target.rs).
+[target.'cfg(unix)'.dependencies]
 libc = "0.2"

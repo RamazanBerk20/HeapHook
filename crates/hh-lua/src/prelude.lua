@@ -1354,6 +1354,7 @@ function I.clear()
   bpfuncs = {}
   for id in pairs(myscans) do H.ms_free(id) end
   myscans = {}
+  H.ext_clear()
   if #errs > 0 then error(tconcat(errs, '\n'), 0) end
 end
 

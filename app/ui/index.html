@@ -15,6 +15,8 @@
     <kbd>Ctrl P</kbd>
   </button>
   <button id="remote-badge" class="badge blue remote-badge" type="button" hidden aria-haspopup="menu" title="The target is on a remote server. Click to disconnect."></button>
+  <button id="lua-stop-top" class="btn ghost lua-top" type="button" hidden title="Stop the running Lua script (Esc)" aria-label="Stop the running Lua script" data-icon="stop"><span class="bl">Stop script</span> <kbd>Esc</kbd></button>
+  <button id="lf-close-all" class="btn ghost lua-top" type="button" hidden title="Close every window a Lua script opened" aria-label="Close every window a Lua script opened" data-icon="x"><span class="bl">Close scripts</span></button>
   <nav class="tabs" role="tablist" aria-label="Views">
     <button role="tab" type="button" data-view="scan" title="Scanner" aria-controls="view-scan" aria-selected="true" data-icon="scan"><span class="bl">Scanner</span> <kbd>Ctrl 1</kbd></button>
     <button role="tab" type="button" data-view="mem" title="Memory" aria-controls="view-mem" aria-selected="false" tabindex="-1" data-icon="memory"><span class="bl">Memory</span> <kbd>Ctrl 2</kbd></button>
@@ -789,6 +791,8 @@
         <div class="field"><label for="st-ts">Lua script in a loaded table</label>
           <select id="st-ts" name="table_script"><option value="ask">Always ask before running</option><option value="never">Never run</option></select></div>
       </div>
+      <label class="check"><input name="lua_allow_os" type="checkbox"> Allow Lua scripts to access files and run programs</label>
+      <p class="hint">Cheat Engine allows it, and many tables need it. Off, scripts can still read and change the attached process. Applies after restarting HeapHook.</p>
     </fieldset>
     <fieldset class="group">
       <legend>Debugger and hotkeys</legend>

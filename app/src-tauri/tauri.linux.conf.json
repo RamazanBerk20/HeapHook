@@ -1,4 +1,5 @@
 {
+  "version": "1.0.0+rc.1",
   "bundle": {
     "resources": {
       "../../crates/hh-inject/payload/target/release/libhh_speedhack.so": "libhh_speedhack.so"

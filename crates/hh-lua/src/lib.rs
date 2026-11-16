@@ -47,7 +47,7 @@ mod ui;
 pub use api::button_result;
 pub use debug::{BpMethod, BpTrigger, BreakEvent, BreakResult, BreakpointSpec, ContinueMode, DebugHost, RegContext};
 pub use table::{MemTable, RecId, Record, RecordHotkey, TableHost};
-pub use ui::{Control, ControlId, ControlNode, Prop, UiChange, UiHost, UiSnapshot};
+pub use ui::{ChangeLog, Control, ControlId, ControlNode, MAX_CONTROLS, MAX_DEPTH, MAX_PROP_BYTES, MAX_UI_BYTES, Prop, UiChange, UiHost, UiSnapshot, change_size};
 
 /// Cheat Engine functions that exist as names but are not available: calling one raises a
 /// Lua error naming it (see [`stub_message`]). Categories in [`UNSUPPORTED`] can never work

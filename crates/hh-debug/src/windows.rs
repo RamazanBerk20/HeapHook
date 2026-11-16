@@ -237,6 +237,8 @@ pub(crate) struct Os {
     pending_breaks: u32,
     /// A 32-bit process under WOW64.
     wow64: bool,
+    /// Notifications a failed `halt_all` collected (already continued), for `poll`.
+    backlog: Vec<(Tid, Raw)>,
 }
 
 impl Os {
@@ -274,6 +276,7 @@ impl Os {
             brk,
             pending_breaks: 1,
             wow64: false,
+            backlog: Vec::new(),
         };
         // The system reports the existing process, threads and DLLs, then the break-in.
         loop {
@@ -512,6 +515,9 @@ impl Os {
     }
 
     pub fn poll(&mut self) -> Result<Option<(Tid, Raw)>> {
+        if !self.backlog.is_empty() {
+            return Ok(Some(self.backlog.remove(0)));
+        }
         if self.ev.is_some() {
             return Ok(None);
         }
@@ -527,6 +533,11 @@ impl Os {
         }
     }
 
+    /// Events a failed `halt_all` collected, oldest first.
+    pub fn take_backlog(&mut self) -> Vec<(Tid, Raw)> {
+        std::mem::take(&mut self.backlog)
+    }
+
     /// Freezes the process. Notifications seen on the way are returned; an exception that
     /// arrives before our break-in becomes the outstanding event and is returned too.
     pub fn halt_all(&mut self) -> Result<Vec<(Tid, Raw)>> {
@@ -539,9 +550,10 @@ impl Os {
         }
         self.pending_breaks += 1;
         loop {
-            let de = self
-                .wait(5000)
-                .ok_or_else(|| Error::Other("process did not stop".into()))?;
+            let Some(de) = self.wait(5000) else {
+                self.backlog.extend(out);
+                return Err(Error::Other("process did not stop".into()));
+            };
             let tid = de.dwThreadId;
             match self.translate(&de) {
                 Ev::BreakIn => return Ok(out),

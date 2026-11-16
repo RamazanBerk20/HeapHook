@@ -1206,23 +1206,15 @@ impl Engine {
     }
 
     /// A fault on a page we unprotected a moment ago (its watch was disabled while this fault
-    /// was already queued) is ours. On a read-write page that is certain; otherwise re-running
-    /// the instruction tells: a second fault at the same instruction is the program's own.
+    /// was already queued) is ours: re-run the instruction once. A second fault at the same
+    /// instruction is the program's own, even on a page that is read-write again (protection
+    /// keys, or a genuine fault), so it cannot loop.
     fn stale_fault(&mut self, tid: Tid, addr: Option<Addr>) -> Result<bool> {
         let Some(page) = addr.map(|a| a & !(PAGE - 1)) else {
             return Ok(false);
         };
         if !self.recent_pages.contains(&page) || self.pages.contains_key(&page) {
             return Ok(false);
-        }
-        // On a page readable and writable again no access can fault for protection.
-        let open = self.mem.regions().ok().and_then(|rs| {
-            rs.into_iter()
-                .find(|r| page >= r.start && page - r.start < r.size)
-                .map(|r| r.prot.r && r.prot.w)
-        });
-        if open == Some(true) {
-            return Ok(true);
         }
         let (pc, _) = self.os.pc_sp(tid)?;
         let th = self.th(tid);
@@ -1392,10 +1384,16 @@ impl Engine {
             .os
             .halt_all()
             .inspect_err(|e| self.note(format!("halt failed: {e}")))?;
+        self.defer_all(raws)
+    }
+
+    /// Records every event as deferred; one failing does not drop the rest.
+    fn defer_all(&mut self, raws: Vec<(Tid, Raw)>) -> Result<()> {
+        let mut r = Ok(());
         for (t, raw) in raws {
-            self.on_raw(t, raw, true)?;
+            r = r.and(self.on_raw(t, raw, true));
         }
-        Ok(())
+        r
     }
 
     fn running(&self) -> bool {
@@ -2090,8 +2088,12 @@ impl Engine {
         if !self.alive {
             return Ok(());
         }
-        // Halting classifies pending int3 hits, which rewinds their rip.
+        // Halting classifies pending int3 hits, which rewinds their rip. A halt that timed out
+        // (a thread in uninterruptible sleep) leaves what it collected in the backlog: rewind
+        // those hits and release forked children too.
         let halted = self.halt();
+        let backlog = self.os.take_backlog();
+        let _ = self.defer_all(backlog);
         // Faults on our watched pages must not reach the target as real signals.
         let ours: Vec<Tid> = self
             .deferred

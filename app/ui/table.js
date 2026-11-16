@@ -7,7 +7,7 @@
 // edit as a whole-table put based on the version it saw; a stale put is refetched and the
 // edit replayed. Activation and value writes are backend commands.
 import { api, askPath } from './backend.js';
-import { $, h, icon, fmtAddr, wire, isHexAddr, attempt, toast, contextMenu, store, modal, rafThrottle } from './util.js';
+import { $, h, icon, fmtAddr, wire, isHexAddr, attempt, toast, contextMenu, store, modal, rafThrottle, excerpt, codeView } from './util.js';
 import { listCustomTypes, editCustomType, ctLabel } from './custom.js';
 import { state, addSource, addTicker, emit, on, TICK_MS } from './core.js';
 import { comboOf, comboText, MODS } from './keys.js';
@@ -98,6 +98,7 @@ export function initTable(root) {
   const snapshot = () => ({ ...meta, entries: roots.map(strip) });
   function adopt(st) {
     version = st.version;
+    state.tableTrust = st.trust || 'own';
     const t = st.table;
     roots = (t.entries || []).map(norm);
     // Every table field rides along in puts (custom_types, symbols, disasm_comments, ...), not only the ones edited here.
@@ -320,17 +321,76 @@ export function initTable(root) {
   }
   /** Activation; a loaded table's {$lua} needs the user's yes once (the backend asks via the error). */
   async function setActive(ids, on_) {
-    try { await api.tableSetActive(ids, on_); } catch (err) {
-      const m = String(err?.message || err);
-      if (!m.startsWith('needs consent:')) throw err;
-      const r = await modal({
-        title: 'Run Lua from this table?',
-        text: m.replace(/^needs consent:\s*/, '') + '. Allow it only if you trust where the table came from. The answer holds until another table is opened.',
-        buttons: [{ label: 'Allow Lua', value: 'allow' }, { label: 'Do not run', value: 'cancel', kbd: 'Esc', primary: true }],
-      });
-      await api.tableTrust(r.value === 'allow');
-      if (r.value === 'allow') await api.tableSetActive(ids, on_);
+    await withConsent(() => api.tableSetActive(ids, on_), { what: ids.map(byId).find((e) => e && hasLua(e))?.description });
+  }
+  const NEEDS = 'needs consent:';
+  const LUA_RE = /\{\$lua\}/i;
+  const hasLua = (e) => LUA_RE.test(e.script || '') || e.children.some(hasLua);
+  /** Runs `fn`; when the backend answers that the table's Lua needs consent, asks and, agreed, runs it again. */
+  async function withConsent(fn, ask = {}) {
+    try { return await fn(); } catch (err) {
+      if (!String(err?.message || err).startsWith(NEEDS)) throw err;
+      if (await askTrust(ask)) return fn();
     }
+  }
+
+  // ---------- consent for a loaded table's Lua ----------
+  let asking = null;
+  /**
+   * The one question for a loaded table: may its Lua run (table script, {$lua} in entries) and
+   * its hotkeys work system-wide. HeapHook's warning comes first and stays in view; what the
+   * table wrote follows as a short quote or behind "View". Resolves true when trusted.
+   */
+  function askTrust(opts = {}) {
+    asking ??= askTrustNow(opts).finally(() => { asking = null; });
+    return asking;
+  }
+  async function askTrustNow({ what = '', open = false } = {}) {
+    if (state.settings.table_script === 'never') {
+      toast('Not run: this table\'s Lua needs your consent, and Settings say never to run a table\'s Lua', 'info');
+      return false;
+    }
+    const info = await api.appInfo().catch(() => null);
+    const script = meta.lua_script || '', lines = script ? script.split('\n').length : 0;
+    const luaEntries = all().filter((e) => LUA_RE.test(e.script || '')).length;
+    const hks = all().flatMap((e) => e.hotkeys.map((k) => ({ e, k })));
+    const sysWide = (keys) => keys.some((k) => MODS.has(k) || (k >= 160 && k <= 165));
+    const hkList = h('ul.trust-hks', { hidden: true, 'aria-label': 'Hotkeys this table defines' }, hks.map(({ e, k }) =>
+      h('li', null, h('span.mono', null, comboText(k.keys) || 'no keys'), h('span', null, (HK_ACTIONS.find((a) => a[0] === k.action)?.[1] || excerpt(k.action, 30)) + (HK_VALUE.has(k.action) && k.value ? ' ' + excerpt(k.value, 16) : '')),
+        h('q', null, excerpt(e.description, 60)), h('span.muted', null, sysWide(k.keys) ? 'system-wide once trusted' : 'only in HeapHook'))));
+    const hkBtn = h('button.btn.ghost', { type: 'button', 'aria-expanded': 'false', onclick: () => { hkList.hidden = !hkList.hidden; hkBtn.setAttribute('aria-expanded', String(!hkList.hidden)); hkBtn.firstChild.textContent = hkList.hidden ? 'Show hotkeys' : 'Hide hotkeys'; } }, 'Show hotkeys');
+    const facts = h('ul.trust-facts', null,
+      script ? h('li', null, `Table script: ${lines} line${lines === 1 ? '' : 's'}, ${script.length} characters `, h('button.btn.ghost', { type: 'button', onclick: () => viewScript(script) }, 'View full script')) : null,
+      luaEntries ? h('li', null, `${luaEntries} entr${luaEntries === 1 ? 'y runs' : 'ies run'} Lua when activated`) : null,
+      h('li', null, `This table defines ${hks.length} hotkey${hks.length === 1 ? '' : 's'}`, hks.length ? ' ' : null, hks.length ? hkBtn : null),
+    );
+    const body = h('div.trust-body', null, facts, hkList,
+      script ? h('div', null, h('p.hint', null, 'Start of the table script:'), codeView(script, 8)) : null);
+    const r = await modal({
+      title: 'Trust this table?',
+      label: 'Trust this table?',
+      text: 'Lua in a cheat table runs with your user account\'s rights. '
+        + (info?.lua_allow_os === false
+          ? 'Settings turn off Lua\'s access to files and programs: it can still read and change the attached process and run Auto Assembler in it.'
+          : 'It can read, change and delete your files, start programs, use the network, and read and change the attached process.')
+        + ' Trust a table only if you trust where it came from. Hotkeys with Ctrl, Shift or Alt work system-wide only after you trust it.',
+      quote: what || null, quoteLabel: 'Wanted by the entry',
+      body,
+      buttons: [
+        { label: open && script ? 'Trust and run its script' : 'Trust this table', value: 'trust' },
+        { label: 'Do not trust', value: 'cancel', kbd: 'Esc', primary: true, focus: true },
+      ],
+    });
+    const yes = r.value === 'trust';
+    await attempt(() => api.tableTrust(yes));
+    chain = chain.then(refetch);
+    return yes;
+  }
+  /** The whole table script, before any choice: line numbers, wrapped, hidden characters shown. */
+  function viewScript(script) {
+    const lines = script.split('\n').length;
+    return modal({ title: 'Table script', text: `The complete script: ${lines} lines, ${script.length} characters. Long runs of blanks and invisible characters are marked.`,
+      body: codeView(script), buttons: [{ label: 'Close', value: 'cancel', kbd: 'Esc', primary: true }] });
   }
   const edit = (ids, f) => commit(() => ids.forEach((id) => { const e = byId(id); if (e) f(e); }));
   function setMode(mode) { edit(selIds(), (e) => { e.freeze_mode = mode; }); }
@@ -859,7 +919,7 @@ export function initTable(root) {
   }
   async function runTableScript() {
     await chain;
-    await attempt(() => api.tableRunScript());
+    await attempt(() => withConsent(() => api.tableRunScript()));
     chain = chain.then(refetch);
   }
 
@@ -1090,7 +1150,10 @@ export function initTable(root) {
     try { st = await api.tableOpen(p); } catch (e) {
       const m = String(e?.message || e);
       if (!/could not be disabled/.test(m)) { toast(m); return; }
-      const r = await modal({ title: 'Scripts are still active', text: m, buttons: [{ label: 'Open anyway', value: 'force' }, { label: 'Cancel', value: 'cancel', kbd: 'Esc', primary: true }] });
+      // The details name entries (table text): after HeapHook's own words, in a scroll box.
+      const r = await modal({ title: 'Scripts are still active',
+        text: 'Some active scripts of the current table could not be disabled, so their changes are still in the process. Open anyway to keep them, still active, in a group of the new table, where you can disable them later.',
+        pre: m, buttons: [{ label: 'Open anyway', value: 'force' }, { label: 'Cancel', value: 'cancel', kbd: 'Esc', primary: true, focus: true }] });
       if (r.value !== 'force') return;
       st = await attempt(() => api.tableOpen(p, true));
     }
@@ -1098,30 +1161,26 @@ export function initTable(root) {
     rt.clear(); sel.clear(); collapsed.clear(); cursor = anchor = null; tablePath = p; store.set('tablePath', p);
     adopt(st);
     toast(`Loaded ${p}`, 'info');
-    if (meta.lua_script.trim()) await offerTableScript();
+    await offerTrust();
   }
-  /** Never runs code from a file without asking (Settings can turn the question into "no"). */
-  async function offerTableScript() {
+  /** Never runs code from a file, nor lets its hotkeys work system-wide, without asking (Settings can turn the question into "no"). */
+  async function offerTrust() {
+    if (state.tableTrust !== 'ask') return;
+    const lua = !!meta.lua_script.trim() || roots.some(hasLua), hks = all().some((e) => e.hotkeys.length);
+    if (!lua && !hks) return;
     if (state.settings.table_script === 'never') {
-      toast('This table has a Lua script. It was not run (Settings: never run table scripts).', 'info');
+      if (lua) toast('This table has Lua. It was not run (Settings: never run a table\'s Lua).', 'info');
       return;
     }
-    const lines = meta.lua_script.split('\n');
-    const pre = lines.slice(0, 16).join('\n') + (lines.length > 16 ? `\n… ${lines.length - 16} more lines` : '');
-    const r = await modal({
-      title: 'Run the table\'s Lua script?',
-      text: 'This table contains a Lua script. It can read and write the attached process and use files. Run it only if you trust where the table came from.',
-      pre,
-      buttons: [{ label: 'Run script', value: 'run', primary: true }, { label: 'Do not run', value: 'cancel', kbd: 'Esc', focus: true }, { label: 'View…', value: 'view' }],
-    });
-    if (r.value === 'run') await runTableScript();
-    else if (r.value === 'view') editTableScript();
+    if (await askTrust({ open: true }) && meta.lua_script.trim()) await runTableScript();
   }
 
   // The code list is backend-owned (the debugger view shows it); meta.codes only rides along in puts.
   on('table:script', ({ description, script }) => add([{ description, script }], { then: (e) => e && editScript(e.id) }));
   // Pointer entries come with an id from the backend; the table assigns its own.
   on('table:add', (items) => add(items.map(({ id, ...x }) => ({ ...x, len: x.len || 0 }))));
+  // A hotkey pressed (lua.js) for an entry whose Lua needs consent.
+  on('table:consent', () => askTrust());
   on('process:opened', () => { for (const r of rt.values()) { r.addr = null; r.value = null; } chain = chain.then(refetch); });
 
   $('#tb-add').addEventListener('click', () => entryDialog());

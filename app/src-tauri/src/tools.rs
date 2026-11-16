@@ -131,6 +131,21 @@ pub struct Targets {
     pub rows: Vec<TargetRow>,
 }
 
+/// Largest memory dump / snapshot file loaded (it is read into memory whole).
+const MAX_DUMP: u64 = 2 << 30;
+
+/// A dump file must be a regular file within [`MAX_DUMP`] (a FIFO or device has no real size).
+fn dump_file(path: &str) -> R<()> {
+    let m = std::fs::metadata(path).map_err(|e| format!("{path}: {e}"))?;
+    if !m.is_file() {
+        return Err(format!("{path}: not a regular file"));
+    }
+    if m.len() > MAX_DUMP {
+        return Err(format!("{path}: {} MiB is too big for a memory file (limit {} MiB)", m.len() >> 20, MAX_DUMP >> 20));
+    }
+    Ok(())
+}
+
 fn is_xml(path: &str) -> bool {
     let p = path.to_ascii_lowercase();
     p.ends_with(".xml") || p.ends_with(".ct")
@@ -212,11 +227,7 @@ impl App {
 
     /// Adds the file's structures, replacing those of the same name; returns their names.
     pub fn struct_import(&self, path: &str) -> R<Vec<String>> {
-        let len = std::fs::metadata(path).map_err(|e| format!("{path}: {e}"))?.len();
-        if len > crate::table::MAX_FILE {
-            return Err(format!("{path}: too big for a structure file"));
-        }
-        let text = std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?;
+        let text = String::from_utf8(crate::table::read_capped(Path::new(path), crate::table::MAX_FILE)?).map_err(|e| format!("{path}: {e}"))?;
         let add: Vec<Structure> = if is_xml(path) || text.trim_start().starts_with('<') {
             guard(structure::from_ct_xml(text.trim_start_matches('\u{feff}')))?
         } else {
@@ -427,6 +438,7 @@ impl App {
     /// Loads an `.hhmem` file back; `relocate` moves its first block there.
     pub fn mem_load(&self, path: &str, relocate: Option<&str>) -> R<RestoreSummary> {
         let to = relocate.filter(|r| !r.trim().is_empty()).map(|r| self.resolve_address(r).and_then(|a| parse_addr(&a))).transpose()?;
+        dump_file(path)?;
         guard(memory::load_memory(&*self.session()?.proc, Path::new(path), to))
     }
 
@@ -471,6 +483,7 @@ impl App {
 
     /// A saved `.hhmem` file against live memory.
     pub fn mem_compare(&self, path: &str, max: usize) -> R<Vec<DiffRange>> {
+        dump_file(path)?;
         let snap = guard(memory::load_snapshot(Path::new(path)))?;
         self.job("diff", |p, prog| memory::diff_live(p, &snap, max.clamp(1, 100_000), prog))
     }

@@ -16,7 +16,11 @@ use serde_json::{Value, json};
 
 type Dispatch = fn(&App, &str, &Value) -> Option<R<Value>>;
 
-const MAX_BODY: usize = 256 << 20;
+/// Largest request body (a whole-table put of the biggest table HeapHook loads fits).
+const MAX_BODY: usize = 96 << 20;
+/// Largest request line or header line, and most header lines.
+const MAX_LINE: u64 = 8 << 10;
+const MAX_HEADERS: usize = 64;
 
 /// `--dev-bridge <port>` from the command line.
 pub fn port_arg() -> Option<u16> {
@@ -108,9 +112,20 @@ impl Req {
     }
 }
 
+/// One line of at most [`MAX_LINE`] bytes (a longer one is an error, not a big allocation).
+fn read_line(r: &mut BufReader<&TcpStream>, line: &mut String) -> std::io::Result<usize> {
+    line.clear();
+    let n = r.by_ref().take(MAX_LINE + 1).read_line(line)?;
+    if n as u64 > MAX_LINE {
+        return Err(std::io::Error::other("header line too long"));
+    }
+    Ok(n)
+}
+
+/// Request line and headers; the body is read separately, after the token was checked.
 fn read_req(r: &mut BufReader<&TcpStream>) -> std::io::Result<Option<Req>> {
     let mut line = String::new();
-    if r.read_line(&mut line)? == 0 {
+    if read_line(r, &mut line)? == 0 {
         return Ok(None);
     }
     let mut parts = line.split_whitespace();
@@ -118,22 +133,26 @@ fn read_req(r: &mut BufReader<&TcpStream>) -> std::io::Result<Option<Req>> {
     let (path, query) = target.split_once('?').map_or((target.clone(), String::new()), |(p, q)| (p.to_string(), q.to_string()));
     let mut headers = Vec::new();
     loop {
-        line.clear();
-        if r.read_line(&mut line)? == 0 || line.trim().is_empty() {
+        if read_line(r, &mut line)? == 0 || line.trim().is_empty() {
             break;
+        }
+        if headers.len() >= MAX_HEADERS {
+            return Err(std::io::Error::other("too many headers"));
         }
         if let Some((k, v)) = line.split_once(':') {
             headers.push((k.trim().to_string(), v.trim().to_string()));
         }
     }
-    let mut req = Req { method, path, query, headers, body: Vec::new() };
+    Ok(Some(Req { method, path, query, headers, body: Vec::new() }))
+}
+
+fn read_body(r: &mut BufReader<&TcpStream>, req: &mut Req) -> std::io::Result<()> {
     let len: usize = req.header("content-length").and_then(|v| v.parse().ok()).unwrap_or(0);
     if len > MAX_BODY {
         return Err(std::io::Error::other("body too large"));
     }
     req.body.resize(len, 0);
-    r.read_exact(&mut req.body)?;
-    Ok(Some(req))
+    r.read_exact(&mut req.body)
 }
 
 fn respond(mut s: &TcpStream, status: &str, ctype: &str, extra: &str, body: &[u8]) -> std::io::Result<()> {
@@ -146,12 +165,15 @@ fn handle(conn: TcpStream, app: &App, tok: &str, ui: &Path, dispatch: Dispatch) 
     let _ = conn.set_nodelay(true);
     let mut r = BufReader::new(&conn);
     // Keep-alive: the browser reuses the connection for the next request.
-    while let Some(req) = read_req(&mut r)? {
-        if let Some(cmd) = req.path.strip_prefix("/invoke/") {
+    while let Some(mut req) = read_req(&mut r)? {
+        if let Some(cmd) = req.path.strip_prefix("/invoke/").map(str::to_string) {
+            let cmd = cmd.as_str();
             if req.method != "POST" || req.header("x-hh-token") != Some(tok) {
-                respond(&conn, "403 Forbidden", "text/plain", "", b"bad token")?;
-                continue;
+                // The body is never read without the token: answer and drop the connection.
+                respond(&conn, "403 Forbidden", "text/plain", "Connection: close\r\n", b"bad token")?;
+                return Ok(());
             }
+            read_body(&mut r, &mut req)?;
             let args: Value = serde_json::from_slice(&req.body).unwrap_or(Value::Null);
             let out = match dispatch(app, cmd, &args) {
                 Some(Ok(v)) => json!({ "ok": v }),
@@ -161,6 +183,11 @@ fn handle(conn: TcpStream, app: &App, tok: &str, ui: &Path, dispatch: Dispatch) 
             };
             respond(&conn, "200 OK", "application/json", "", out.to_string().as_bytes())?;
             continue;
+        }
+        // Pages are GETs without a body; one that sends a body is not kept alive.
+        if req.header("content-length").is_some_and(|l| l.trim() != "0") {
+            respond(&conn, "400 Bad Request", "text/plain", "Connection: close\r\n", b"unexpected body")?;
+            return Ok(());
         }
         let by_query = req.query_param("hh_token") == Some(tok);
         if req.method != "GET" || !(by_query || req.cookie("hh_token") == Some(tok)) {
@@ -196,5 +223,15 @@ mod tests {
         assert_eq!(super::camel("pass_signal"), "passSignal");
         assert_eq!(super::camel("field_addr"), "fieldAddr");
         assert_eq!(super::camel("addr"), "addr");
+    }
+
+    #[test]
+    fn oversized_header_lines_are_refused() {
+        use std::io::Write;
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut c = std::net::TcpStream::connect(l.local_addr().unwrap()).unwrap();
+        let (s, _) = l.accept().unwrap();
+        c.write_all(format!("GET / HTTP/1.1\r\nX: {}\r\n\r\n", "a".repeat(20_000)).as_bytes()).unwrap();
+        assert!(super::read_req(&mut std::io::BufReader::new(&s)).is_err());
     }
 }

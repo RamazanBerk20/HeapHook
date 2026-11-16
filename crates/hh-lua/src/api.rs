@@ -191,6 +191,10 @@ fn install_process(b: &B) -> LR<()> {
                 None => return Ok(false),
             },
         };
+        // HeapHook itself is off limits without OS access (see `State::target`).
+        if !st.allow_os && pid == std::process::id() {
+            return Err(mlua::Error::runtime("openProcess: access to HeapHook's own memory is disabled"));
+        }
         let Ok(p) = hh_core::open(pid) else { return Ok(false) };
         set_process(lua, st, Some(p))?;
         if let Ok(f) = lua.globals().get::<Function>("onOpenProcess") {
@@ -272,8 +276,13 @@ fn pid_of(name: &str) -> Option<u32> {
 
 // ---------------------------------------------------------------- memory
 
-/// Most values `readBytes` returns as separate results (the table form has no limit).
+/// Most values `readBytes` returns as separate results.
 const MAX_MULTI: usize = 8000;
+/// Most bytes one `readBytes` / `writeBytes` / `writeString` moves (the host-side copy is
+/// outside the Lua memory limit).
+pub(crate) const MAX_BYTES: usize = 64 << 20;
+/// Most results of one AOB scan (8 bytes each on the host side).
+pub(crate) const MAX_AOB_RESULTS: usize = 1 << 20;
 
 fn install_memory(b: &B) -> LR<()> {
     for local in [false, true] {
@@ -330,7 +339,11 @@ fn install_memory(b: &B) -> LR<()> {
             Ok(num_of(&v).is_some_and(|v| write_at(st, &a, local, &v.to_le_bytes())))
         })?;
         b.f(&format!("readBytes{sfx}"), move |lua, st, (a, n, as_table): (Value, Option<i64>, Option<bool>)| {
-            let mut b = vec![0u8; n.unwrap_or(1).clamp(0, 1 << 26) as usize];
+            let n = n.unwrap_or(1).max(0) as u64;
+            if n > MAX_BYTES as u64 {
+                return Err(mlua::Error::runtime(format!("readBytes: {n} bytes is more than {MAX_BYTES} in one call")));
+            }
+            let mut b = vec![0u8; n as usize];
             if !read_into(st, &a, local, &mut b) {
                 return Ok(MultiValue::from_iter([Value::Nil]));
             }
@@ -347,14 +360,21 @@ fn install_memory(b: &B) -> LR<()> {
         })?;
         b.f(&format!("writeBytes{sfx}"), move |_, st, args: Variadic<Value>| {
             let mut data = Vec::new();
+            let too_many = || mlua::Error::runtime(format!("writeBytes: more than {MAX_BYTES} bytes in one call"));
             for v in args.iter().skip(1) {
                 match v {
                     Value::Table(t) => {
+                        if data.len() + t.raw_len() > MAX_BYTES {
+                            return Err(too_many());
+                        }
                         for x in t.sequence_values::<Value>() {
                             data.push(int_of(&x?).unwrap_or(0) as u8);
                         }
                     }
                     v => data.push(int_of(v).unwrap_or(0) as u8),
+                }
+                if data.len() > MAX_BYTES {
+                    return Err(too_many());
                 }
             }
             Ok(write_at(st, &arg(&args, 0), local, &data))
@@ -375,11 +395,14 @@ fn install_memory(b: &B) -> LR<()> {
             Ok(Some(lua.create_string(&b[..end])?))
         })?;
         b.f(&format!("writeString{sfx}"), move |_, st, (a, s, wide): (Value, mlua::LuaString, Option<bool>)| {
-            let data: Vec<u8> = if wide.unwrap_or(false) {
-                s.to_string_lossy().encode_utf16().flat_map(|c| c.to_le_bytes()).collect()
-            } else {
-                s.as_bytes().to_vec()
-            };
+            let n = s.as_bytes().len();
+            if n.saturating_mul(if wide.unwrap_or(false) { 2 } else { 1 }) > MAX_BYTES {
+                return Err(mlua::Error::runtime(format!("writeString: more than {MAX_BYTES} bytes in one call")));
+            }
+            if !wide.unwrap_or(false) {
+                return Ok(write_at(st, &a, local, &s.as_bytes()));
+            }
+            let data: Vec<u8> = s.to_string_lossy().encode_utf16().flat_map(|c| c.to_le_bytes()).collect();
             Ok(write_at(st, &a, local, &data))
         })?;
     }
@@ -475,11 +498,15 @@ struct AobReq<'a> {
     range: (Addr, Addr),
 }
 
-fn aob(st: &State, r: &AobReq, max: usize) -> Result<Vec<Addr>> {
-    let p = st.proc().ok_or(Error::Other("no process opened".into()))?;
+/// Up to `max` matches; more than [`MAX_AOB_RESULTS`] is an error (as is a region with that
+/// many matches before the alignment filter).
+fn aob(st: &State, r: &AobReq, max: usize) -> LR<Vec<Addr>> {
+    let p = st.proc().ok_or(Error::Other("no process opened".into())).map_err(rt)?;
     let (w, x, c) = prot_flags(r.flags.as_deref());
+    let too_many = || mlua::Error::runtime(format!("AOBScan: more than {MAX_AOB_RESULTS} matches; use a longer pattern"));
     let mut hits = Vec::new();
-    for reg in p.regions()? {
+    for reg in p.regions().map_err(rt)? {
+        st.check()?;
         if !reg.prot.r || !tri_ok(w, reg.prot.w) || !tri_ok(x, reg.prot.x) || !tri_ok(c, is_cow(&reg)) {
             continue;
         }
@@ -487,8 +514,15 @@ fn aob(st: &State, r: &AobReq, max: usize) -> Result<Vec<Addr>> {
         if lo >= hi {
             continue;
         }
-        let found = hh_asm::aob_scan(&*p, lo, hi, r.pattern, usize::MAX)?;
+        let want = if r.align == 0 { max.saturating_sub(hits.len()) } else { usize::MAX };
+        let found = hh_asm::aob_scan(&*p, lo, hi, r.pattern, want.min(MAX_AOB_RESULTS + 1)).map_err(rt)?;
+        if found.len() > MAX_AOB_RESULTS && want > MAX_AOB_RESULTS {
+            return Err(too_many());
+        }
         hits.extend(found.into_iter().filter(|&a| align_ok(a, r.align, &r.param)));
+        if hits.len() > MAX_AOB_RESULTS && max > MAX_AOB_RESULTS {
+            return Err(too_many());
+        }
         if hits.len() >= max {
             hits.truncate(max);
             break;
@@ -580,7 +614,7 @@ fn install_scan(b: &B, h: &B) -> LR<()> {
             param: str_of(&arg(&a, 3)).unwrap_or_default(),
             range: (0, u64::MAX),
         };
-        let hits = aob(st, &req, usize::MAX).map_err(rt)?;
+        let hits = aob(st, &req, usize::MAX)?;
         Ok(Some(lua.create_sequence_from(hits.into_iter().map(|a| a as i64))?))
     })?;
     b.f("AOBScanUnique", |_, st, a: Variadic<Value>| {
@@ -592,7 +626,7 @@ fn install_scan(b: &B, h: &B) -> LR<()> {
             param: str_of(&arg(&a, 3)).unwrap_or_default(),
             range: (0, u64::MAX),
         };
-        let hits = aob(st, &req, 2).map_err(rt)?;
+        let hits = aob(st, &req, 2)?;
         Ok((hits.len() == 1).then(|| hits[0] as i64))
     })?;
     b.f("AOBScanModuleUnique", |_, st, a: Variadic<Value>| {
@@ -605,7 +639,7 @@ fn install_scan(b: &B, h: &B) -> LR<()> {
             param: str_of(&arg(&a, 4)).unwrap_or_default(),
             range,
         };
-        let hits = aob(st, &req, 2).map_err(rt)?;
+        let hits = aob(st, &req, 2)?;
         Ok((hits.len() == 1).then(|| hits[0] as i64))
     })?;
 

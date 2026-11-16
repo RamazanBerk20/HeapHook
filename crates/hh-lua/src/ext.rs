@@ -18,6 +18,57 @@ type LR<T> = mlua::Result<T>;
 pub(crate) struct ExtState {
     structs: Mutex<StructStore>,
     dissect: Mutex<Option<Dissection>>,
+    /// Buffers `copyMemory` allocated in HeapHook's memory, by address.
+    local_bufs: Mutex<LocalBufs>,
+}
+
+#[derive(Default)]
+struct LocalBufs {
+    map: std::collections::HashMap<Addr, Box<[u8]>>,
+    bytes: usize,
+}
+
+/// Largest buffer a host function holds at once on a script's behalf; bigger jobs stream.
+const CHUNK: usize = 1 << 20;
+/// Most bytes `readRegionFromFile` copies and `md5file` hashes.
+pub(crate) const MAX_FILE_BYTES: u64 = 1 << 30;
+/// Most bytes all of `copyMemory`'s buffers in HeapHook's memory hold together.
+pub(crate) const MAX_LOCAL_BUFS: usize = 256 << 20;
+
+/// Opens a regular file for reading (not a device, FIFO or directory: those can block or
+/// never end). Returns it with its size.
+fn open_regular(path: &str) -> LR<(std::fs::File, u64)> {
+    let not_regular = || err(format!("{path}: not a regular file"));
+    // stat first: opening a FIFO would block.
+    if !std::fs::metadata(path).map_err(|e| err(format!("{path}: {e}")))?.is_file() {
+        return Err(not_regular());
+    }
+    let f = std::fs::File::open(path).map_err(|e| err(format!("{path}: {e}")))?;
+    let m = f.metadata().map_err(|e| err(format!("{path}: {e}")))?;
+    if !m.is_file() {
+        return Err(not_regular());
+    }
+    Ok((f, m.len()))
+}
+
+/// Feeds `len` bytes at `a` of `p` to `f` in chunks, checking the script's budget between them.
+fn read_chunks(st: &State, p: &dyn hh_core::Process, a: Addr, len: usize, mut f: impl FnMut(usize, &[u8]) -> LR<bool>) -> LR<()> {
+    let mut buf = vec![0u8; len.min(CHUNK)];
+    let mut off = 0;
+    while off < len {
+        st.check()?;
+        let n = (len - off).min(CHUNK);
+        p.read_exact(a.wrapping_add(off as u64), &mut buf[..n]).map_err(rt)?;
+        if !f(off, &buf[..n])? {
+            break;
+        }
+        off += n;
+    }
+    Ok(())
+}
+
+pub(crate) fn free_local_bufs(st: &State) {
+    *st.ext.local_bufs.lock().unwrap() = LocalBufs::default();
 }
 
 #[derive(Default)]
@@ -64,11 +115,23 @@ fn install_memory(b: &B) -> LR<()> {
         let (sp, dp) = (need_proc(st, sl)?, need_proc(st, dl)?);
         let size = u64::try_from(size).ok().filter(|&s| s > 0 && s <= 1 << 30).ok_or_else(|| err("copyMemory: bad size"))?;
         let src = addr(st, &src, sl).map_err(rt)?;
+        let mut ours = None;
         let dst = match dst.filter(|v| !v.is_nil()) {
             Some(v) => addr(st, &v, dl).map_err(rt)?,
             None if dl => {
+                // Owned, freed by deAllocLocal and clear_table_state.
+                let mut lb = st.ext.local_bufs.lock().unwrap();
+                if lb.bytes + size as usize > MAX_LOCAL_BUFS {
+                    return Err(err(format!(
+                        "copyMemory: buffers in HeapHook's memory would exceed {MAX_LOCAL_BUFS} bytes; free some with deAllocLocal"
+                    )));
+                }
                 let v = vec![0u8; size as usize].into_boxed_slice();
-                Box::leak(v).as_ptr() as Addr
+                let a = v.as_ptr() as Addr;
+                lb.bytes += v.len();
+                lb.map.insert(a, v);
+                ours = Some(a);
+                a
             }
             None => {
                 let a = dp.alloc(size, Prot { r: true, w: true, x: true }, None).map_err(rt)?;
@@ -76,14 +139,34 @@ fn install_memory(b: &B) -> LR<()> {
                 a
             }
         };
-        if !sl && !dl {
-            hh_tools::memory::copy(&*sp, src, dst, size).map_err(rt)?;
+        let r = if sl == dl {
+            // One process (overlap-safe).
+            hh_tools::memory::copy(&*sp, src, dst, size).map_err(rt)
         } else {
-            let mut buf = vec![0u8; size as usize];
-            sp.read_exact(src, &mut buf).map_err(rt)?;
-            dp.write(dst, &buf).map_err(rt)?;
+            read_chunks(st, &*sp, src, size as usize, |off, b| {
+                dp.write(dst.wrapping_add(off as u64), b).map_err(rt)?;
+                Ok(true)
+            })
+        };
+        if let (Err(_), Some(a)) = (&r, ours) {
+            let mut lb = st.ext.local_bufs.lock().unwrap();
+            if let Some(v) = lb.map.remove(&a) {
+                lb.bytes -= v.len();
+            }
         }
-        Ok(dst as i64)
+        r.map(|_| dst as i64)
+    })?;
+    // deAllocLocal(address): frees a buffer copyMemory allocated in HeapHook's memory.
+    b.f("deAllocLocal", |_, st, a: Value| {
+        let Some(a) = int_of(&a) else { return Ok(false) };
+        let mut lb = st.ext.local_bufs.lock().unwrap();
+        Ok(match lb.map.remove(&(a as Addr)) {
+            Some(v) => {
+                lb.bytes -= v.len();
+                true
+            }
+            None => false,
+        })
     })?;
     // compareMemory(a1, a2, size, method OPTIONAL): 0 target/target, 1 target/CE, 2 CE/CE.
     // Returns true, or false and the index of the first difference.
@@ -92,10 +175,16 @@ fn install_memory(b: &B) -> LR<()> {
         let (l1, l2) = (method == 2, method >= 1);
         let size = usize::try_from(size).ok().filter(|&s| s <= 1 << 30).ok_or_else(|| err("compareMemory: bad size"))?;
         let (p1, p2) = (need_proc(st, l1)?, need_proc(st, l2)?);
-        let (mut x, mut y) = (vec![0u8; size], vec![0u8; size]);
-        p1.read_exact(addr(st, &a1, l1).map_err(rt)?, &mut x).map_err(rt)?;
-        p2.read_exact(addr(st, &a2, l2).map_err(rt)?, &mut y).map_err(rt)?;
-        Ok(match x.iter().zip(&y).position(|(a, b)| a != b) {
+        let (a1, a2) = (addr(st, &a1, l1).map_err(rt)?, addr(st, &a2, l2).map_err(rt)?);
+        let mut y = vec![0u8; size.min(CHUNK)];
+        let mut diff = None;
+        read_chunks(st, &*p1, a1, size, |off, x| {
+            let y = &mut y[..x.len()];
+            p2.read_exact(a2.wrapping_add(off as u64), y).map_err(rt)?;
+            diff = x.iter().zip(&*y).position(|(a, b)| a != b).map(|i| off + i);
+            Ok(diff.is_none())
+        })?;
+        Ok(match diff {
             None => (true, None),
             Some(i) => (false, Some(i as i64)),
         })
@@ -150,9 +239,25 @@ fn install_memory(b: &B) -> LR<()> {
         }
         let p = need_proc(st, false)?;
         let a = addr(st, &a, false).map_err(rt)?;
-        let data = std::fs::read(&path).map_err(|e| err(format!("{path}: {e}")))?;
-        p.write(a, &data).map_err(rt)?;
-        Ok(data.len() as i64)
+        let (mut f, len) = open_regular(&path)?;
+        if len > MAX_FILE_BYTES {
+            return Err(err(format!("readRegionFromFile: {path} is larger than {MAX_FILE_BYTES} bytes")));
+        }
+        let mut buf = vec![0u8; CHUNK];
+        let mut done = 0u64;
+        loop {
+            st.check()?;
+            let n = std::io::Read::read(&mut f, &mut buf).map_err(|e| err(format!("{path}: {e}")))?;
+            if n == 0 {
+                break;
+            }
+            if done + n as u64 > MAX_FILE_BYTES {
+                return Err(err(format!("readRegionFromFile: {path} is larger than {MAX_FILE_BYTES} bytes")));
+            }
+            p.write(a.wrapping_add(done), &buf[..n]).map_err(rt)?;
+            done += n as u64;
+        }
+        Ok(done as i64)
     })?;
     b.f("writeRegionToFile", |_, st, (path, a, size): (String, Value, i64)| {
         if !st.allow_os {
@@ -161,9 +266,11 @@ fn install_memory(b: &B) -> LR<()> {
         let p = need_proc(st, false)?;
         let a = addr(st, &a, false).map_err(rt)?;
         let size = usize::try_from(size).ok().filter(|&s| s <= 1 << 30).ok_or_else(|| err("writeRegionToFile: bad size"))?;
-        let mut buf = vec![0u8; size];
-        p.read_exact(a, &mut buf).map_err(rt)?;
-        std::fs::write(&path, &buf).map_err(|e| err(format!("{path}: {e}")))?;
+        let mut f = std::fs::File::create(&path).map_err(|e| err(format!("{path}: {e}")))?;
+        read_chunks(st, &*p, a, size, |_, b| {
+            std::io::Write::write_all(&mut f, b).map_err(|e| err(format!("{path}: {e}")))?;
+            Ok(true)
+        })?;
         Ok(size as i64)
     })?;
     Ok(())
@@ -223,6 +330,9 @@ fn install_symbols(b: &B, h: &B) -> LR<()> {
 
 fn install_host(b: &B, h: &B) -> LR<()> {
     b.f("createProcess", |lua, st, (path, params, debug, brk): (String, Option<String>, Option<bool>, Option<bool>)| {
+        if !st.allow_os {
+            return Err(err("createProcess: OS access is disabled"));
+        }
         let pid = st.host().create_process(&path, &params.unwrap_or_default(), debug.unwrap_or(false), brk.unwrap_or(false)).map_err(rt)?;
         if let Ok(f) = lua.globals().get::<mlua::Function>("onOpenProcess") {
             f.call::<()>(pid)?;
@@ -230,10 +340,20 @@ fn install_host(b: &B, h: &B) -> LR<()> {
         Ok(pid)
     })?;
     b.f("loadTable", |_, st, (path, merge): (String, Option<bool>)| {
+        if !st.allow_os {
+            return Err(err("loadTable: file access is disabled"));
+        }
         st.host().load_table(&path, merge.unwrap_or(false)).map_err(rt)
     })?;
     b.f("saveTable", |_, st, (path, protect): (String, Option<bool>)| {
+        if !st.allow_os {
+            return Err(err("saveTable: file access is disabled"));
+        }
         st.host().save_table(&path, protect.unwrap_or(false)).map_err(rt)
+    })?;
+    h.f("ext_clear", |_, st, ()| {
+        free_local_bufs(st);
+        Ok(())
     })?;
     b.f("isKeyPressed", |_, st, k: Value| Ok(int_of(&k).is_some_and(|k| st.host().is_key_pressed(k))))?;
     // The host's memscan registered like createMemScan's; returns its id.
@@ -252,23 +372,72 @@ fn install_host(b: &B, h: &B) -> LR<()> {
 
 // ---------------------------------------------------------------- strings / files
 
-/// MD5 (RFC 1321).
+/// MD5 (RFC 1321) of one buffer.
 pub(crate) fn md5(data: &[u8]) -> [u8; 16] {
+    let mut m = Md5::default();
+    m.update(data);
+    m.finish()
+}
+
+/// Incremental MD5: memory use does not grow with the input.
+pub(crate) struct Md5 {
+    h: [u32; 4],
+    tail: Vec<u8>,
+    len: u64,
+}
+
+impl Default for Md5 {
+    fn default() -> Self {
+        Md5 { h: [0x67452301, 0xefcdab89, 0x98badcfe, 0x10325476], tail: Vec::with_capacity(64), len: 0 }
+    }
+}
+
+impl Md5 {
+    pub(crate) fn update(&mut self, mut data: &[u8]) {
+        self.len = self.len.wrapping_add(data.len() as u64);
+        if !self.tail.is_empty() {
+            let n = (64 - self.tail.len()).min(data.len());
+            self.tail.extend_from_slice(&data[..n]);
+            data = &data[n..];
+            if self.tail.len() < 64 {
+                return;
+            }
+            let block: [u8; 64] = self.tail[..].try_into().unwrap_or([0; 64]);
+            md5_block(&mut self.h, &block);
+            self.tail.clear();
+        }
+        let mut chunks = data.chunks_exact(64);
+        for c in &mut chunks {
+            md5_block(&mut self.h, c);
+        }
+        self.tail.extend_from_slice(chunks.remainder());
+    }
+
+    pub(crate) fn finish(mut self) -> [u8; 16] {
+        let bits = self.len.wrapping_mul(8);
+        let mut pad = vec![0x80u8];
+        pad.resize((55usize.wrapping_sub(self.tail.len()) % 64) + 1, 0);
+        pad.extend_from_slice(&bits.to_le_bytes());
+        let len = self.len;
+        self.update(&pad);
+        self.len = len;
+        let mut out = [0u8; 16];
+        for (i, w) in self.h.iter().enumerate() {
+            out[i * 4..i * 4 + 4].copy_from_slice(&w.to_le_bytes());
+        }
+        out
+    }
+}
+
+fn md5_block(h: &mut [u32; 4], chunk: &[u8]) {
     const S: [u32; 64] = [
         7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20, 4,
         11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21,
     ];
-    let k: Vec<u32> = (0..64).map(|i| ((i as f64 + 1.0).sin().abs() * 4294967296.0) as u32).collect();
-    let mut h: [u32; 4] = [0x67452301, 0xefcdab89, 0x98badcfe, 0x10325476];
-    let mut msg = data.to_vec();
-    msg.push(0x80);
-    while msg.len() % 64 != 56 {
-        msg.push(0);
-    }
-    msg.extend_from_slice(&((data.len() as u64).wrapping_mul(8)).to_le_bytes());
-    for chunk in msg.chunks_exact(64) {
+    let k: [u32; 64] = std::array::from_fn(|i| ((i as f64 + 1.0).sin().abs() * 4294967296.0) as u32);
+    {
         let m: Vec<u32> = chunk.chunks_exact(4).map(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]])).collect();
-        let [mut a, mut b, mut c, mut d] = h;
+        let [mut a, mut b, mut c, mut d] = *h;
         for i in 0..64 {
             let (f, g) = match i / 16 {
                 0 => ((b & c) | (!b & d), i),
@@ -286,11 +455,6 @@ pub(crate) fn md5(data: &[u8]) -> [u8; 16] {
             *x = x.wrapping_add(y);
         }
     }
-    let mut out = [0u8; 16];
-    for (i, w) in h.iter().enumerate() {
-        out[i * 4..i * 4 + 4].copy_from_slice(&w.to_le_bytes());
-    }
-    out
 }
 
 fn hex(b: &[u8]) -> String {
@@ -333,16 +497,35 @@ fn install_strings(b: &B) -> LR<()> {
     b.f("md5memory", |_, st, (a, size): (Value, i64)| {
         let p = need_proc(st, false)?;
         let size = usize::try_from(size).ok().filter(|&s| s <= 1 << 30).ok_or_else(|| err("md5memory: bad size"))?;
-        let mut buf = vec![0u8; size];
-        p.read_exact(addr(st, &a, false).map_err(rt)?, &mut buf).map_err(rt)?;
-        Ok(hex(&md5(&buf)))
+        let mut m = Md5::default();
+        read_chunks(st, &*p, addr(st, &a, false).map_err(rt)?, size, |_, b| {
+            m.update(b);
+            Ok(true)
+        })?;
+        Ok(hex(&m.finish()))
     })?;
     b.f("md5file", |_, st, path: String| {
         if !st.allow_os {
             return Err(err("md5file: file access is disabled"));
         }
-        let data = std::fs::read(&path).map_err(|e| err(format!("{path}: {e}")))?;
-        Ok(hex(&md5(&data)))
+        let (mut f, len) = open_regular(&path)?;
+        if len > MAX_FILE_BYTES {
+            return Err(err(format!("md5file: {path} is larger than {MAX_FILE_BYTES} bytes")));
+        }
+        let (mut m, mut buf, mut done) = (Md5::default(), vec![0u8; CHUNK], 0u64);
+        loop {
+            st.check()?;
+            let n = std::io::Read::read(&mut f, &mut buf).map_err(|e| err(format!("{path}: {e}")))?;
+            if n == 0 {
+                break;
+            }
+            done += n as u64;
+            if done > MAX_FILE_BYTES {
+                return Err(err(format!("md5file: {path} is larger than {MAX_FILE_BYTES} bytes")));
+            }
+            m.update(&buf[..n]);
+        }
+        Ok(hex(&m.finish()))
     })?;
     b.f("ansiToUtf8", |_, _, s: mlua::LuaString| Ok(ansi_to_utf8(&s.as_bytes())))?;
     b.f("utf8ToAnsi", |lua, _, s: String| lua.create_string(utf8_to_ansi(&s)))?;
@@ -358,7 +541,10 @@ fn install_strings(b: &B) -> LR<()> {
     })?;
     b.f("fileExists", |_, st, p: String| Ok(st.allow_os && std::path::Path::new(&p).is_file()))?;
     b.f("directoryExists", |_, st, p: String| Ok(st.allow_os && std::path::Path::new(&p).is_dir()))?;
-    b.f("getTempFolder", |_, _, ()| {
+    b.f("getTempFolder", |_, st, ()| {
+        if !st.allow_os {
+            return Err(err("getTempFolder: OS access is disabled"));
+        }
         let mut d = std::env::temp_dir().display().to_string();
         if !d.ends_with(std::path::MAIN_SEPARATOR) {
             d.push(std::path::MAIN_SEPARATOR);
@@ -829,6 +1015,19 @@ mod tests {
 
     #[test]
     fn md5_vectors() {
+        // Streaming in odd pieces gives the same digest as one buffer.
+        let data: Vec<u8> = (0..10_000u32).map(|i| (i * 7 % 251) as u8).collect();
+        for step in [1, 3, 63, 64, 65, 1000] {
+            let mut m = Md5::default();
+            data.chunks(step).for_each(|c| m.update(c));
+            assert_eq!(m.finish(), md5(&data), "step {step}");
+        }
+        for n in 50..70 {
+            let mut m = Md5::default();
+            m.update(&data[..n]);
+            let one = md5(&data[..n]);
+            assert_eq!(m.finish(), one);
+        }
         assert_eq!(hex(&md5(b"")), "d41d8cd98f00b204e9800998ecf8427e");
         assert_eq!(hex(&md5(b"The quick brown fox jumps over the lazy dog")), "9e107d9d372bb6826bd81d3542a419d6");
         assert_eq!(hex(&md5(&[b'a'; 1000])), "cabe45dcc9ae5b66ba86600cca6b8ba8");

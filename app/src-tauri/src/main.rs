@@ -257,7 +257,11 @@ fn shortcut_of(keys: &[u32]) -> Option<Shortcut> {
             _ => code = Some(code_name(k)?.parse::<Code>().ok()?),
         }
     }
-    Some(Shortcut::new((!mods.is_empty()).then_some(mods), code?))
+    // Never a plain key system-wide (the backend filters these out too).
+    if mods.is_empty() {
+        return None;
+    }
+    Some(Shortcut::new(Some(mods), code?))
 }
 
 /// Native open/save dialog; `None` when the user cancels. `filters`: `[[name, [ext, ..]], ..]`.
