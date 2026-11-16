@@ -66,6 +66,8 @@ pub(crate) struct B<'a> {
     pub(crate) t: Table,
     pub(crate) st: &'a Arc<State>,
     pub(crate) names: std::cell::RefCell<Vec<String>>,
+    /// Set when this interpreter is discarded: its host functions never run again.
+    pub(crate) dead: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl B<'_> {
@@ -76,12 +78,17 @@ impl B<'_> {
         F: Fn(&Lua, &Arc<State>, A) -> LR<R> + Send + 'static,
     {
         let st = self.st.clone();
+        let dead = self.dead.clone();
         // The error path itself (messages, tracebacks) keeps working while a reset is pending.
         let always = matches!(name, "traceback" | "errtext" | "aborted");
         self.names.borrow_mut().push(name.to_string());
         self.t.set(
             name,
             self.lua.create_function(move |lua, a: A| {
+                // This interpreter was discarded: nothing of it reaches the host again.
+                if dead.load(Ordering::SeqCst) {
+                    return Err(mlua::Error::runtime("this Lua state was discarded"));
+                }
                 // A reset is pending: the state is being discarded, nothing more runs.
                 if !always && st.reset_pending.load(Ordering::SeqCst) {
                     return Err(mlua::Error::runtime("the table's Lua was stopped"));
@@ -1136,7 +1143,19 @@ fn install_records(h: &B) -> LR<()> {
         st.table().set_selected(&ids);
         Ok(())
     })?;
-    h.f("mr_create", |_, st, parent: Option<RecId>| Ok(st.table().create(parent)))?;
+    h.f("mr_create", |_, st, parent: Option<RecId>| Ok(st.table().create_as(parent, *st.principal.lock().unwrap())))?;
+    h.f("mr_wrote", |_, st, id: RecId| {
+        st.table().wrote_executable(id, *st.principal.lock().unwrap());
+        Ok(())
+    })?;
+    h.f("principal", |_, st, ()| Ok(if *st.principal.lock().unwrap() == crate::Principal::Console { "console" } else { "table" }))?;
+    // Runs a callback the console registered, as the console.
+    h.f("as_console", |_, st, (f, args): (Function, MultiValue)| {
+        let old = std::mem::replace(&mut *st.principal.lock().unwrap(), crate::Principal::Console);
+        let r = f.call::<MultiValue>(args);
+        *st.principal.lock().unwrap() = old;
+        r
+    })?;
     h.f("mr_delete", |_, st, id: RecId| {
         st.table().delete(id);
         Ok(())
@@ -1291,7 +1310,12 @@ fn install_records(h: &B) -> LR<()> {
             }
             _ => return Err(mlua::Error::runtime(format!("unknown memory record property {key}"))),
         }
-        t.set(r).map_err(rt)
+        let executable = matches!(key.as_str(), "Script" | "Hotkeys") || (key == "Type" && r.script.is_some());
+        t.set(r).map_err(rt)?;
+        if executable {
+            t.wrote_executable(id, *st.principal.lock().unwrap());
+        }
+        Ok(())
     })?;
     // Whether the record's Lua callbacks may run (its capabilities).
     h.f("mr_trusted", |_, st, id: RecId| Ok(st.table().caps(id) == Caps::Full))?;
@@ -1465,11 +1489,11 @@ fn install_misc(b: &B, h: &B) -> LR<()> {
     Ok(())
 }
 
-pub(crate) fn install(lua: &Lua, st: &Arc<State>, allow_os: bool) -> LR<Internals> {
+pub(crate) fn install(lua: &Lua, st: &Arc<State>, allow_os: bool, dead: &Arc<std::sync::atomic::AtomicBool>) -> LR<Internals> {
     // The engine's own references, captured before any script runs.
     lua.set_named_registry_value("hh_tostring", lua.globals().get::<Function>("tostring")?)?;
-    let b = B { lua, t: lua.globals(), st, names: Default::default() };
-    let h = B { lua, t: lua.create_table()?, st, names: Default::default() };
+    let b = B { lua, t: lua.globals(), st, names: Default::default(), dead: dead.clone() };
+    let h = B { lua, t: lua.create_table()?, st, names: Default::default(), dead: dead.clone() };
     install_process(&b)?;
     install_memory(&b)?;
     install_scan(&b, &h)?;

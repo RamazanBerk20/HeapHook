@@ -7,7 +7,7 @@
 // edit as a whole-table put based on the version it saw; a stale put is refetched and the
 // edit replayed. Activation and value writes are backend commands.
 import { api, askPath } from './backend.js';
-import { $, h, icon, fmtAddr, wire, isHexAddr, attempt, toast, contextMenu, store, modal, rafThrottle, excerpt, codeView } from './util.js';
+import { $, h, icon, fmtAddr, wire, isHexAddr, attempt, toast, contextMenu, store, modal, rafThrottle, excerpt, codeView, cancelConsent } from './util.js';
 import { listCustomTypes, editCustomType, ctLabel } from './custom.js';
 import { state, addSource, addTicker, emit, on, TICK_MS } from './core.js';
 import { comboOf, comboText, MODS } from './keys.js';
@@ -62,6 +62,7 @@ export function initTable(root) {
   let sortCol = null, sortDir = 1, filter = '';
   const hiddenCols = new Set(store.get('tbl.hiddenCols', []));
   let untrusted = new Set(); // entries whose Lua came from another table and waits for consent
+  let tableGen = null; // TableState.generation: consent answers name the table they were asked about
   let failing = new Map(); // id -> why freezing it fails now (lua_poll.freeze_failures)
   const rt = new Map(); // id -> {addr: BigInt|null, value, chgAt}
   const R = (id) => { let r = rt.get(id); if (!r) rt.set(id, (r = { addr: null, value: null, chgAt: 0 })); return r; };
@@ -136,6 +137,9 @@ export function initTable(root) {
   function adopt(st) {
     version = st.version;
     state.tableTrust = st.trust || 'own';
+    // Another table: a question about the old one must not answer for this one.
+    if (tableGen != null && st.generation !== tableGen) cancelConsent();
+    tableGen = st.generation ?? 0;
     untrusted = new Set(st.untrusted || []);
     markDirtySoon();
     const t = st.table;
@@ -402,6 +406,7 @@ export function initTable(root) {
   }
   /** Entries pasted, merged or dropped in from another table: their Lua asks for itself. */
   async function askEntryTrust({ ids = [] } = {}, msg = '') {
+    const gen = tableGen;
     if (state.settings.table_script === 'never') { toast('Not run: it runs Lua from another table, and Settings say never to run a table\'s Lua', 'info'); return false; }
     const under = new Set();
     for (const id of ids) { const e = byId(id); if (e) walk([e], (x) => { if (untrusted.has(x.id)) under.add(x.id); }); }
@@ -415,9 +420,10 @@ export function initTable(root) {
       text: 'These entries came into this table from another one (pasted, merged or dropped in) and run Lua code when activated. That code runs with your user account\'s rights: it can read, change and delete your files, start programs and change the attached process. Agree only if you trust where they came from.',
       quote: msg.slice(NEEDS_ENTRIES.length).split(':')[0].trim() || null, quoteLabel: 'Wanted by the entry', body,
       buttons: [{ label: list.length > 1 ? `Trust these ${list.length} entries` : 'Trust this entry', value: 'trust' }, { label: 'Do not run', value: 'cancel', kbd: 'Esc', primary: true, focus: true }],
+      consent: true,
     });
     if (r.value !== 'trust') return false;
-    const ok = await attempt(async () => { await api.tableTrustEntries(list.length ? list.map((e) => e.id) : ids); return true; });
+    const ok = await attempt(async () => { await api.tableTrustEntries(list.length ? list.map((e) => e.id) : ids, gen); return true; });
     chain = chain.then(refetch);
     return !!ok;
   }
@@ -434,6 +440,7 @@ export function initTable(root) {
     return asking;
   }
   async function askTrustNow({ what = '', open = false } = {}) {
+    const gen = tableGen;
     if (state.settings.table_script === 'never') {
       toast('Not run: this table\'s Lua needs your consent, and Settings say never to run a table\'s Lua', 'info');
       return false;
@@ -468,11 +475,13 @@ export function initTable(root) {
         { label: open && script ? 'Trust and run its script' : 'Trust this table', value: 'trust' },
         { label: 'Do not trust', value: 'cancel', kbd: 'Esc', primary: true, focus: true },
       ],
+      consent: true,
     });
     const yes = r.value === 'trust';
-    await attempt(() => api.tableTrust(yes));
+    // Names the table it asked about: refused if another one was opened meanwhile.
+    const ok = await attempt(async () => { await api.tableTrust(yes, gen); return true; });
     chain = chain.then(refetch);
-    return yes;
+    return yes && !!ok && gen === tableGen;
   }
   /** The whole table script, before any choice: line numbers, wrapped, hidden characters shown. */
   function viewScript(script) {
@@ -1065,7 +1074,8 @@ export function initTable(root) {
   }
   async function runTableScript() {
     await chain;
-    await attempt(() => withConsent(() => api.tableRunScript()));
+    const gen = tableGen;
+    await attempt(() => withConsent(() => api.tableRunScript(gen)));
     chain = chain.then(refetch);
   }
 

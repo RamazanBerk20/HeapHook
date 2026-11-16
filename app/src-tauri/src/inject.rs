@@ -3,7 +3,7 @@
 use std::path::PathBuf;
 use std::process::Child;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use hh_inject::{LaunchOptions, Speedhack, SpeedhackStatus};
 use serde::Deserialize;
@@ -66,21 +66,19 @@ impl App {
         };
         if req.speedhack {
             // The control block appears once the loader has run the library's initializer.
-            let t0 = Instant::now();
-            loop {
-                let err = match self.speed_find() {
-                    Ok(Some(_)) => break,
-                    Ok(None) if t0.elapsed() <= Duration::from_secs(2) => None,
-                    Ok(None) => Some(format!("{} (pid {pid}) was stopped: the speedhack library did not load (static or setuid binary?)", info.name)),
-                    Err(e) => Some(e),
-                };
-                if let Some(e) = err {
-                    // Do not leave a half-started process open that the UI does not show.
-                    let _ = self.close_process();
-                    self.kill_child(pid);
-                    return Err(e);
+            let err = match Speedhack::wait(self.session()?.proc.clone(), Duration::from_secs(5)) {
+                Ok(Some(sh)) => {
+                    *lock(&self.x.lua.console.speedhack) = Some(Arc::new(sh));
+                    None
                 }
-                std::thread::sleep(Duration::from_millis(25));
+                Ok(None) => Some(format!("{} (pid {pid}) was stopped: the speedhack library did not load (static or setuid binary?)", info.name)),
+                Err(e) => Some(s(e)),
+            };
+            if let Some(e) = err {
+                // Do not leave a half-started process open that the UI does not show.
+                let _ = self.close_process();
+                self.kill_child(pid);
+                return Err(e);
             }
         }
         Ok(info)

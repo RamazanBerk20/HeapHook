@@ -757,7 +757,7 @@ function buildAaWindow() {
   let path = null, loaded = null, execState = null, executed = false, errLine = 0, checkT = 0;
   // The backend's session for this window: it knows whether a file was loaded into it (then its
   // content gets Lua and file access only after consent). The text sent along proves nothing.
-  let session = null;
+  let session = null, loadNo = 0;
   const sess = async () => (session ??= await api.aaSession());
 
   const show = (msg, kind) => { status.textContent = msg; status.className = 'aa-status ' + kind; };
@@ -807,7 +807,7 @@ function buildAaWindow() {
       const msg = errText(e);
       if (!msg.startsWith(NEEDS) || msg.includes('Settings say never')) return failRun(msg);
       if (!(await askLua(script, msg))) { ta.focus(); return show('Not run: it needs your consent for Lua or file access', 'err'); }
-      try { await api.aaTrust(s_); r = await go(); } catch (e2) { ta.focus(); return failRun(errText(e2)); }
+      try { await api.aaTrust(s_, loadNo); r = await go(); } catch (e2) { ta.focus(); return failRun(errText(e2)); }
       ta.focus();
     }
     execState = enable ? r : null;
@@ -841,6 +841,7 @@ function buildAaWindow() {
       // "New" meanwhile started another (trusted) session: the file's text never goes there.
       if (session !== s_) return;
       const text = typeof r === 'string' ? r : r?.script ?? '';
+      loadNo = r?.load ?? 0;
       const big = tooBig(text);
       if (big) { fail(big); ta.focus(); return; }
       ta.value = text;

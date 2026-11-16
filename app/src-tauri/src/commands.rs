@@ -864,15 +864,27 @@ impl App {
     /// An Auto Assembler script file loaded into session `session`: the session's content is
     /// untrusted from now on (whatever is typed into it later) until `aa_trust`.
     pub fn aa_load_file(&self, path: &str, session: u64) -> R<String> {
-        self.x.live.aa_loaded(session)?;
-        let b = table::read_capped(Path::new(path), table::MAX_FILE)?;
-        String::from_utf8(b).map_err(|e| format!("{path}: {e}"))
+        self.aa_load(path, session).map(|l| l.script)
     }
 
     /// The user's yes for what was loaded into session `session` (refused while Settings say
     /// never; "never" withdraws it again).
     pub fn aa_trust(&self, session: u64) -> R<()> {
         self.x.live.grant(crate::cheat::Grant::AaSession(session))
+    }
+
+    /// [`App::aa_trust`] for file load `load` (what `aa_load` returned): refused when another
+    /// file was loaded into the session since (IPC).
+    pub fn aa_trust_at(&self, session: u64, load: u64) -> R<()> {
+        self.x.live.grant_at(crate::cheat::Grant::AaSession(session), Some(load))
+    }
+
+    /// [`App::aa_load_file`] with the number of the load, for the consent answer (IPC).
+    pub fn aa_load(&self, path: &str, session: u64) -> R<AaLoaded> {
+        let load = self.x.live.aa_loaded(session)?;
+        let b = table::read_capped(Path::new(path), table::MAX_FILE)?;
+        let script = String::from_utf8(b).map_err(|e| format!("{path}: {e}"))?;
+        Ok(AaLoaded { script, load })
     }
 
     /// "Assign to table": the session's script as a new entry after `after`, keeping the
@@ -929,6 +941,13 @@ impl App {
         table::clean_json(&mut t);
         table::save(Path::new(path), &t)
     }
+}
+
+/// `aa_load_file` answer: the script and the number of this load.
+#[derive(Debug, Clone, Serialize)]
+pub struct AaLoaded {
+    pub script: String,
+    pub load: u64,
 }
 
 /// Cheat Engine's stock custom type names, as `CustomType::preset` knows them.

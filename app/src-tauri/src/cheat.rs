@@ -87,6 +87,11 @@ struct Inner {
     /// Auto Assemble window sessions (`aa_session`).
     aa: HashMap<u64, AaSess>,
     aa_next: u64,
+    /// Session -> the number of the file load its content came from (a grant names it).
+    aa_load: HashMap<u64, u64>,
+    aa_loads: u64,
+    /// Moves with every table opened: a consent answer names the table it was asked about.
+    generation: u64,
     /// Content hash of the table when it was last opened or saved (`dirty`).
     saved: u64,
 }
@@ -158,7 +163,7 @@ impl Inner {
             .map(|(e, _)| e.id)
             .collect();
         untrusted.sort_unstable();
-        TableState { version: self.version, table: self.table.clone(), trust: self.trust, untrusted }
+        TableState { version: self.version, table: self.table.clone(), trust: self.trust, untrusted, generation: self.generation }
     }
 }
 
@@ -222,6 +227,9 @@ impl Trust {
     }
 }
 
+/// A consent answer about a table (or file) that is no longer the one open.
+pub const STALE: &str = "not granted: the table changed since you were asked; ask again";
+
 /// Error prefix the UI answers with a question and `table_trust`.
 pub const NEEDS_CONSENT: &str = "needs consent:";
 /// Error prefix for an entry that came from another table: the UI asks about the entries and
@@ -237,6 +245,9 @@ pub struct TableState {
     /// Entries that came from another table (paste, merge, ...) and still need the user's
     /// consent before their script gets Lua or file access, or their callbacks run.
     pub untrusted: Vec<i64>,
+    /// The table's generation: consent answers (`table_trust`, `table_trust_entries`,
+    /// `table_run_script`) name it and are refused once another table was opened.
+    pub generation: u64,
 }
 
 pub fn is_group(e: &Entry) -> bool {
@@ -399,9 +410,30 @@ impl Live {
     /// entries that came with it), to entries from elsewhere, or to what was loaded into an
     /// Auto Assemble window. Refused while Settings say never. Editing never grants it.
     pub(crate) fn grant(&self, what: Grant) -> R<()> {
+        self.grant_at(what, None)
+    }
+
+    /// [`Live::grant`] for the question asked about table generation `asked` (for an Auto
+    /// Assemble session: about file load `asked`): refused when it no longer matches.
+    pub(crate) fn grant_at(&self, what: Grant, asked: Option<u64>) -> R<()> {
         let mut g = lock(&self.0);
         if g.never {
             return Err("Settings say never to run a table's Lua: change \"Lua script in a loaded table\" first".into());
+        }
+        if let Some(asked) = asked {
+            let now = match &what {
+                Grant::AaSession(s) => g.aa_load.get(s).copied().unwrap_or(0),
+                _ => g.generation,
+            };
+            if asked != now {
+                return Err(STALE.into());
+            }
+            if let Grant::Entries(ids) = &what {
+                let have: HashSet<i64> = all(&g.table.entries).into_iter().map(|(e, _)| e.id).collect();
+                if let Some(id) = ids.iter().find(|i| !have.contains(i)) {
+                    return Err(format!("{STALE} (no entry {id})"));
+                }
+            }
         }
         match what {
             Grant::Table => {
@@ -476,11 +508,19 @@ impl Live {
 
     /// A file was loaded into session `s`: its content is untrusted until consent, whatever
     /// is typed into it afterwards.
-    pub(crate) fn aa_loaded(&self, s: u64) -> R<()> {
+    /// Returns the number of this load (a consent for it names it).
+    pub(crate) fn aa_loaded(&self, s: u64) -> R<u64> {
         let mut g = lock(&self.0);
         let x = g.aa.get_mut(&s).ok_or_else(|| format!("no Auto Assemble session {s}"))?;
         *x = AaSess::File { agreed: false };
-        Ok(())
+        g.aa_loads += 1;
+        let n = g.aa_loads;
+        g.aa_load.insert(s, n);
+        Ok(n)
+    }
+
+    pub(crate) fn generation(&self) -> u64 {
+        lock(&self.0).generation
     }
 
     /// What session `s` may run; no (or an unknown) session: nothing (the backend cannot tell
@@ -648,6 +688,7 @@ impl Live {
         g.origin = origin;
         g.agreed = agreed;
         g.next_id = next;
+        g.generation += 1;
         g.saved = content_hash(&g.table);
         g.bump();
         g.st()
@@ -895,13 +936,20 @@ impl TableHost for Live {
     }
 
     fn create(&self, parent: Option<RecId>) -> RecId {
+        self.create_as(parent, hh_lua::Principal::Table)
+    }
+
+    /// What Lua creates belongs to whoever runs: the user's console command makes the user's
+    /// own record; a table's code makes a record of that table (it loses its abilities with the
+    /// table's consent). In a table built in this session (no file opened) all is the user's.
+    fn create_as(&self, parent: Option<RecId>, who: hh_lua::Principal) -> RecId {
         let mut g = lock(&self.0);
-        // Only trusted Lua runs, so what it creates is the user's own. No ids left: id 0
-        // names no record (every later use of it fails).
+        // No ids left: id 0 names no record (every later use of it fails).
         if g.next_id >= u32::MAX as i64 {
             return 0;
         }
-        let id = g.issue(Origin::Own);
+        let origin = if who == hh_lua::Principal::Console || g.trust == Trust::Own { Origin::Own } else { Origin::Table };
+        let id = g.issue(origin);
         let e = Entry { id, description: "No description".into(), addr: "0".into(), ..Entry::default() };
         // Past the depth limit the new record goes to the top level instead.
         let parent = parent.filter(|&p| depth_of(&g.table.entries, p as i64) < table::MAX_DEPTH);
@@ -948,6 +996,16 @@ impl TableHost for Live {
 
     fn caps(&self, id: RecId) -> Caps {
         Live::caps(self, id as i64)
+    }
+
+    /// A table's code wrote a record's script, hotkeys or callbacks: the record is the table's
+    /// from now on (it can only lose privilege this way, never gain it).
+    fn wrote_executable(&self, id: RecId, who: hh_lua::Principal) {
+        let mut g = lock(&self.0);
+        if who == hh_lua::Principal::Table && g.trust != Trust::Own && g.origin.get(&(id as i64)) == Some(&Origin::Own) {
+            g.origin.insert(id as i64, Origin::Table);
+            g.bump();
+        }
     }
 
     fn mark_untrusted(&self, id: RecId) -> bool {
@@ -1018,10 +1076,14 @@ impl App {
 the table was not opened: these active scripts could not be disabled (open anyway to keep them in the new table)", why.join("\n")));
         }
         let keep: Vec<i64> = failed.into_iter().map(|f| f.0).collect();
-        let st = self.x.live.replace(t, &keep);
+        // Nothing of the previous table's Lua may carry over: a new interpreter first, and the
+        // Lua lock held until the new table is in (no tick of the old one sees it).
+        let st = {
+            let _g = self.x.lua.enter();
+            self.reset_lua("another table was opened");
+            self.x.live.replace(t, &keep)
+        };
         self.x.live.select(Vec::new());
-        // Nothing of the previous table's Lua may carry over: a new interpreter.
-        self.reset_lua("another table was opened");
         self.sync_freeze();
         Ok(st)
     }
@@ -1179,6 +1241,23 @@ the table was not opened: these active scripts could not be disabled (open anywa
     /// refused while Settings say never.
     pub fn table_trust_entries(&self, ids: &[i64]) -> R<()> {
         self.x.live.grant(Grant::Entries(ids))
+    }
+
+    /// [`App::table_trust_entries`] for the question asked about table `generation` (IPC):
+    /// refused when another table was opened since, or an entry is not in this one.
+    pub fn table_trust_entries_at(&self, ids: &[i64], generation: u64) -> R<()> {
+        self.x.live.grant_at(Grant::Entries(ids), Some(generation))
+    }
+
+    /// [`App::table_trust`] for the question asked about table `generation` (IPC).
+    pub fn table_trust_at(&self, trust: bool, generation: u64) -> R<()> {
+        if generation != self.x.live.generation() {
+            return Err(STALE.into());
+        }
+        if trust {
+            return self.x.live.grant_at(Grant::Table, Some(generation));
+        }
+        self.table_trust(false)
     }
 
     /// Pastes (or drops) entries after entry `after`: new ids, inactive, every one of them

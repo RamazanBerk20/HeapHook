@@ -55,7 +55,7 @@ mod ui;
 
 pub use api::button_result;
 pub use debug::{BpMethod, BpTrigger, BreakEvent, BreakResult, BreakpointSpec, ContinueMode, DebugHost, RegContext};
-pub use table::{Caps, MemTable, RecId, Record, RecordHotkey, TableHost};
+pub use table::{Caps, MemTable, Principal, RecId, Record, RecordHotkey, TableHost};
 pub use ui::{ChangeLog, Control, ControlId, ControlNode, MAX_CONTROLS, MAX_DEPTH, MAX_PROP_BYTES, MAX_UI_BYTES, Prop, UiChange, UiHost, UiSnapshot, change_size};
 
 /// Cheat Engine functions that exist as names but are not available: calling one raises a
@@ -291,6 +291,10 @@ pub(crate) struct State {
     lua_hotkeys: Mutex<std::collections::HashSet<u32>>,
     /// The Lua state's memory limit (a reset applies it to the new state).
     memory_limit: Mutex<Option<usize>>,
+    /// The engine's interpreter slot, for a reset performed when the outermost guard drops.
+    core: OnceLock<std::sync::Weak<Mutex<Core>>>,
+    /// Who the outermost entry runs for (see [`Principal`]).
+    principal: Mutex<Principal>,
     pub(crate) ui: ui::UiState,
     pub(crate) dbg: debug::DebugState,
     pub(crate) ext: ext::ExtState,
@@ -355,6 +359,8 @@ pub(crate) fn guard(st: &Arc<State>) -> Guard {
         }
         g.owner = Some(me);
         g.depth = 1;
+        // Every outermost entry runs for the table unless the host says otherwise.
+        *st.principal.lock().unwrap() = Principal::Table;
         st.interrupt.store(false, Ordering::SeqCst);
         *st.abort.lock().unwrap() = None;
         *st.deadline.lock().unwrap() = st.budget.lock().unwrap().map(|b| Instant::now() + b);
@@ -371,6 +377,13 @@ impl Drop for Guard {
             *self.0.deadline.lock().unwrap() = None;
             drop(g);
             self.0.gate_cv.notify_one();
+            // A reset asked for from inside happens at the outermost exit, whichever entry
+            // that was (also a `{$lua}` block or lookup callback reached from the host).
+            if self.0.reset_pending.load(Ordering::SeqCst)
+                && let Some(slot) = self.0.core.get().and_then(std::sync::Weak::upgrade)
+            {
+                let _ = do_reset(&self.0, &slot);
+            }
         }
     }
 }
@@ -393,7 +406,17 @@ struct Internals {
 struct Core {
     lua: Lua,
     i: Arc<Internals>,
+    /// Set when the interpreter is discarded (its host functions refuse from then on).
+    dead: Arc<AtomicBool>,
 }
+
+/// Discarded interpreters, never closed: closing a Lua state runs every pending `__gc`
+/// finalizer, and Lua 5.3 runs finalizers with hooks off, so a table's finalizer would run
+/// with OS access exactly when its consent is withdrawn. Their garbage collector is stopped
+/// and their host functions refuse, so nothing of them runs again. shortcut: a bounded leak
+/// for the process lifetime (each at most the Lua memory limit, one per reset; resets only
+/// follow user actions: withdrawing consent, "never", opening a table).
+static PARKED: Mutex<Vec<Core>> = Mutex::new(Vec::new());
 
 /// A Lua state with the Cheat Engine API. Cheap to clone (shared state; every clone sees a
 /// [`Engine::reset`]).
@@ -401,6 +424,45 @@ struct Core {
 pub struct Engine {
     core: Arc<Mutex<Core>>,
     st: Arc<State>,
+}
+
+/// Replaces the interpreter of `slot` (see [`Engine::reset`]).
+fn do_reset(st: &Arc<State>, slot: &Arc<Mutex<Core>>) -> Result<()> {
+    let _g = guard(st);
+    if !st.reset_pending.load(Ordering::SeqCst) {
+        return Ok(()); // another thread did it meanwhile
+    }
+    let old = slot.lock().unwrap().clone();
+    // From now on nothing of the old interpreter runs: its host functions refuse, every call
+    // and instruction errors, and its collector never runs (no finalizer, ever).
+    old.dead.store(true, Ordering::SeqCst);
+    let _ = old.lua.set_global_hook(HookTriggers { on_calls: true, every_nth_instruction: Some(1), ..Default::default() }, |_, _| {
+        Err(mlua::Error::runtime("this Lua state was discarded"))
+    });
+    old.lua.gc_stop();
+    for id in std::mem::take(&mut *st.lua_hotkeys.lock().unwrap()) {
+        st.host().unregister_hotkey(id);
+    }
+    for id in st.ui.children(None) {
+        st.ui.destroy(id);
+    }
+    debug::clear(st);
+    *st.dbg.broken.lock().unwrap() = None;
+    ext::release(st);
+    st.scans.lock().unwrap().clear();
+    *st.hooks.lock().unwrap() = hooks::Regs::default();
+    st.in_symlookup.store(false, Ordering::SeqCst);
+    st.denied.lock().unwrap().clear();
+    st.tainted.lock().unwrap().clear();
+    st.allocs.lock().unwrap().clear();
+    *st.speed.lock().unwrap() = 1.0;
+    st.reset_pending.store(false, Ordering::SeqCst);
+    let core = build_core(st)?;
+    let old = std::mem::replace(&mut *slot.lock().unwrap(), core);
+    // Parked, never dropped: dropping the last handle would close the state.
+    PARKED.lock().unwrap().push(old);
+    *st.abort.lock().unwrap() = None;
+    Ok(())
 }
 
 /// A fresh interpreter for `st`: memory limit, instruction hook, the API and the prelude, the
@@ -414,13 +476,14 @@ fn build_core(st: &Arc<State>) -> Result<Core> {
     let hook_st = st.clone();
     lua.set_global_hook(HookTriggers::new().every_nth_instruction(1000), move |_, _| hook_st.check().map(|_| VmState::Continue))
         .map_err(lua_err)?;
-    let i = api::install(&lua, st, st.allow_os).map_err(lua_err)?;
+    let dead = Arc::new(AtomicBool::new(false));
+    let i = api::install(&lua, st, st.allow_os, &dead).map_err(lua_err)?;
     let name = st.proc().and_then(|p| {
         let pid = p.pid();
         hh_core::list_processes().ok()?.into_iter().find(|i| i.pid == pid).map(|i| i.name)
     });
     lua.globals().set("process", name).map_err(lua_err)?;
-    Ok(Core { lua, i: Arc::new(i) })
+    Ok(Core { lua, i: Arc::new(i), dead })
 }
 
 fn lua_err(e: mlua::Error) -> Error {
@@ -458,12 +521,15 @@ impl Engine {
             reset_pending: AtomicBool::new(false),
             lua_hotkeys: Mutex::new(Default::default()),
             memory_limit: Mutex::new(opts.memory_limit),
+            core: OnceLock::new(),
+            principal: Mutex::new(Principal::Table),
             ui: ui::UiState::default(),
             dbg: debug::DebugState::default(),
             ext: ext::ExtState::default(),
         });
-        let core = build_core(&st)?;
-        Ok(Engine { core: Arc::new(Mutex::new(core)), st })
+        let core = Arc::new(Mutex::new(build_core(&st)?));
+        let _ = st.core.set(Arc::downgrade(&core));
+        Ok(Engine { core, st })
     }
 
     fn core(&self) -> Core {
@@ -516,39 +582,7 @@ impl Engine {
     }
 
     fn do_reset(&self) -> Result<()> {
-        let _g = guard(&self.st);
-        if !self.st.reset_pending.load(Ordering::SeqCst) {
-            return Ok(()); // another thread did it meanwhile
-        }
-        let old = self.core();
-        // Every call and every instruction of the old state errors from now on (its `__gc`
-        // finalizers included, now and whenever the last handle goes).
-        let _ = old.lua.set_global_hook(HookTriggers { on_calls: true, every_nth_instruction: Some(1), ..Default::default() }, |_, _| {
-            Err(mlua::Error::runtime("this Lua state was discarded"))
-        });
-        let st = &self.st;
-        for id in std::mem::take(&mut *st.lua_hotkeys.lock().unwrap()) {
-            st.host().unregister_hotkey(id);
-        }
-        for id in st.ui.children(None) {
-            st.ui.destroy(id);
-        }
-        debug::clear(st);
-        *st.dbg.broken.lock().unwrap() = None;
-        ext::release(st);
-        st.scans.lock().unwrap().clear();
-        *st.hooks.lock().unwrap() = hooks::Regs::default();
-        st.in_symlookup.store(false, Ordering::SeqCst);
-        st.denied.lock().unwrap().clear();
-        st.tainted.lock().unwrap().clear();
-        st.allocs.lock().unwrap().clear();
-        *st.speed.lock().unwrap() = 1.0;
-        st.reset_pending.store(false, Ordering::SeqCst);
-        let core = build_core(st)?;
-        let old = std::mem::replace(&mut *self.core.lock().unwrap(), core);
-        drop(old);
-        *st.abort.lock().unwrap() = None;
-        Ok(())
+        do_reset(&self.st, &self.core)
     }
 
     /// Performs a pending reset when this thread is not inside the engine.
@@ -621,7 +655,15 @@ impl Engine {
     /// Runs a chunk (table script, console line). Returns its results converted with
     /// `tostring`. Errors carry the message, `name:line:` position and a traceback.
     pub fn exec(&self, src: &str, name: &str) -> Result<Vec<String>> {
+        self.exec_as(src, name, Principal::Table)
+    }
+
+    /// [`Engine::exec`] for `who`: [`Principal::Console`] for a command the user typed (what
+    /// it creates is theirs, and callbacks it registers keep running as theirs);
+    /// [`Engine::exec`] runs as [`Principal::Table`].
+    pub fn exec_as(&self, src: &str, name: &str, who: Principal) -> Result<Vec<String>> {
         self.entry(|| {
+            *self.st.principal.lock().unwrap() = who;
             let lua = self.lua();
             let f = lua.load(src).set_name(format!("={name}")).set_mode(ChunkMode::Text).into_function().map_err(lua_err)?;
             let r = self.call(f, MultiValue::new())?;

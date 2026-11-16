@@ -515,7 +515,9 @@ impl App {
         }
         let _g = l.enter();
         l.busy.store(true, SeqCst);
-        let r = l.engine.exec(code, name);
+        // The console's command is the user's own; the table script is the table's.
+        let who = if echo { hh_lua::Principal::Console } else { hh_lua::Principal::Table };
+        let r = l.engine.exec_as(code, name, who);
         l.busy.store(false, SeqCst);
         l.refresh_onbp();
         drop(_g);
@@ -536,6 +538,15 @@ impl App {
 
     /// Runs the table's `<LuaScript>`: the user's own table, or a loaded one the user agreed
     /// to (`table_trust`); otherwise refused with the consent error.
+    /// [`App::table_run_script`] for table `generation` (IPC): refused once another table was
+    /// opened since the user chose to run it.
+    pub fn table_run_script_at(&self, generation: u64) -> R<()> {
+        if generation != self.x.live.generation() {
+            return Err(crate::cheat::STALE.into());
+        }
+        self.table_run_script()
+    }
+
     pub fn table_run_script(&self) -> R<()> {
         let src = self.x.live.state().table.lua_script;
         if src.trim().is_empty() {

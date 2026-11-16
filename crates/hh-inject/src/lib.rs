@@ -241,6 +241,16 @@ pub fn launch(o: &LaunchOptions) -> Result<Launched> {
         };
         cmd.env("LD_PRELOAD", preload_value(existing.as_deref(), &payload_path()?)?);
     }
+    // Without a pre_exec hook std spawns with posix_spawn (vfork), which resumes us when the
+    // child releases our address space, before the kernel has switched it to the new image:
+    // a handle opened then (`/proc/<pid>/mem`, comm, exe) still describes HeapHook itself.
+    // With a hook std forks and waits for its close-on-exec pipe to close, which happens only
+    // after the new image is installed.
+    #[cfg(unix)]
+    unsafe {
+        // SAFETY: the hook does nothing, so it is trivially async-signal-safe.
+        std::os::unix::process::CommandExt::pre_exec(&mut cmd, || Ok(()));
+    }
     let child = cmd.spawn()?;
     Ok(Launched {
         pid: child.id(),
@@ -270,7 +280,15 @@ fn preload_value(existing: Option<&OsStr>, lib: &Path) -> Result<OsString> {
 pub struct Speedhack {
     process: Arc<dyn Process>,
     addr: Addr,
+    /// Where the library was mapped when found: an exec or a reused pid moves or drops it.
+    module: (Addr, String),
 }
+
+/// Error text while the loader has not finished mapping or initializing the library.
+pub const NOT_READY: &str = "speedhack library not ready yet";
+/// Error text once the process behind a [`Speedhack`] exec'd, exited or its pid was reused.
+pub const PROCESS_CHANGED: &str = "process changed since the speedhack was found (exec'd, exited or pid reused)";
+const BLOCK_LEN: u64 = 32;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SpeedhackStatus {
@@ -283,9 +301,35 @@ pub struct SpeedhackStatus {
 }
 
 impl Speedhack {
-    /// The payload's control block, or None when the library is not (yet) loaded or its
-    /// initializer has not run yet (right after `launch`; retry shortly).
+    /// The payload's control block, or None when the library is not (yet) loaded or not
+    /// ready: mapped readable and writable, initialized (magic and version present), and the
+    /// same on two looks a few ms apart. Right after `launch` use [`Speedhack::wait`].
     pub fn find(process: Arc<dyn Process>) -> Result<Option<Speedhack>> {
+        let Some(s) = Self::look(process)? else {
+            return Ok(None);
+        };
+        // The loader maps a library one segment at a time; a second look confirms the
+        // module and block did not move under us.
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        Ok(Self::look(s.process.clone())?.filter(|again| again.addr == s.addr && again.module == s.module))
+    }
+
+    /// Calls [`Speedhack::find`] until it succeeds, or returns None once the process exited
+    /// or `timeout` passed without the library loading (e.g. a static or setuid binary).
+    pub fn wait(process: Arc<dyn Process>, timeout: std::time::Duration) -> Result<Option<Speedhack>> {
+        let t0 = std::time::Instant::now();
+        loop {
+            match Self::find(process.clone()) {
+                Ok(Some(s)) => return Ok(Some(s)),
+                Ok(None) if process.is_alive() && t0.elapsed() <= timeout => {}
+                Ok(None) | Err(Error::ProcessGone) => return Ok(None),
+                Err(e) => return Err(e),
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    fn look(process: Arc<dyn Process>) -> Result<Option<Speedhack>> {
         let Some(m) = process
             .modules()?
             .into_iter()
@@ -298,14 +342,46 @@ impl Speedhack {
             .find(|s| s.name == SYMBOL)
             .map(|s| s.addr)
             .ok_or_else(|| Error::Other(format!("{} exports no {SYMBOL}", m.path)))?;
-        let s = Speedhack { process, addr };
-        if s.read_u32(OFF_MAGIC)? != MAGIC {
-            return Ok(None);
+        let s = Speedhack { process, addr, module: (m.base, m.path) };
+        match s.block_ready() {
+            Ok(()) => Ok(Some(s)),
+            Err(Error::Other(e)) if e == NOT_READY => Ok(None),
+            Err(e) => Err(e),
         }
-        match s.read_u32(OFF_VERSION)? {
-            1 => Ok(Some(s)),
+    }
+
+    /// The block is mapped readable and writable and carries the magic; version checked.
+    fn block_ready(&self) -> Result<()> {
+        let not_ready = || Error::Other(NOT_READY.into());
+        let end = self.addr + BLOCK_LEN;
+        let mapped = self.process.regions()?.iter().any(|r| {
+            r.start <= self.addr && end <= r.start + r.size && r.prot.r && r.prot.w
+        });
+        if !mapped || self.read_u32(OFF_MAGIC).map_err(|_| not_ready())? != MAGIC {
+            return Err(not_ready());
+        }
+        match self.read_u32(OFF_VERSION).map_err(|_| not_ready())? {
+            1 => Ok(()),
             v => Err(Error::Other(format!("speedhack control block version {v}, want 1"))),
         }
+    }
+
+    /// Before every access: the library is still where it was found (else
+    /// [`PROCESS_CHANGED`]) and the block is ready (else [`NOT_READY`]).
+    fn validate(&self) -> Result<()> {
+        let here = self
+            .process
+            .modules()?
+            .into_iter()
+            .any(|m| m.name == PAYLOAD_FILE && (m.base, &m.path) == (self.module.0, &self.module.1));
+        if !here {
+            return Err(if self.process.is_alive() {
+                Error::Other(PROCESS_CHANGED.into())
+            } else {
+                Error::ProcessGone
+            });
+        }
+        self.block_ready()
     }
 
     fn read_u32(&self, off: Addr) -> Result<u32> {
@@ -321,6 +397,7 @@ impl Speedhack {
                 "invalid speed {speed}: must be > 0 and <= {MAX_SPEED}"
             )));
         }
+        self.validate()?;
         // Speed first, then the generation bump the payload polls for.
         self.process
             .write(self.addr + OFF_SPEED, &speed.to_le_bytes())?;
@@ -331,12 +408,14 @@ impl Speedhack {
 
     /// The speed last written to the control block.
     pub fn speed(&self) -> Result<f64> {
+        self.validate()?;
         let mut b = [0; 8];
         self.process.read_exact(self.addr + OFF_SPEED, &mut b)?;
         Ok(f64::from_le_bytes(b))
     }
 
     pub fn status(&self) -> Result<SpeedhackStatus> {
+        // speed() validates.
         Ok(SpeedhackStatus {
             pid: self.process.pid(),
             addr: format!("{:#x}", self.addr),
@@ -349,6 +428,7 @@ impl Speedhack {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hh_core::Memory;
 
     /// Second release audit I1. Trees under the temp directory; another user's ownership is
     /// simulated by checking as a different uid (real foreign-owned files need root).
@@ -474,12 +554,59 @@ mod tests {
         std::fs::remove_dir_all(&d).unwrap();
     }
 
+    /// A mock process whose payload module (base 0x1000) and writable block can be changed.
+    struct Mapped {
+        mem: hh_core::MockProcess,
+        module_base: std::sync::Mutex<Addr>,
+        writable: std::sync::atomic::AtomicBool,
+    }
+    impl hh_core::Memory for Mapped {
+        fn read(&self, a: Addr, b: &mut [u8]) -> Result<usize> {
+            self.mem.read(a, b)
+        }
+        fn write(&self, a: Addr, d: &[u8]) -> Result<()> {
+            self.mem.write(a, d)
+        }
+        fn pointer_size(&self) -> usize {
+            8
+        }
+    }
+    impl Process for Mapped {
+        fn pid(&self) -> Pid {
+            1
+        }
+        fn regions(&self) -> Result<Vec<hh_core::Region>> {
+            let w = self.writable.load(std::sync::atomic::Ordering::Relaxed);
+            Ok(vec![hh_core::Region {
+                start: 0x1000,
+                size: 32,
+                prot: hh_core::Prot { r: true, w, x: false },
+                kind: hh_core::RegionKind::Image,
+                shared: false,
+                cow: false,
+                path: None,
+            }])
+        }
+        fn modules(&self) -> Result<Vec<hh_core::Module>> {
+            let base = *self.module_base.lock().unwrap();
+            Ok(vec![hh_core::Module { name: PAYLOAD_FILE.into(), path: "/x".into(), base, size: 32 }])
+        }
+    }
+
     #[test]
     fn control_block_roundtrip_on_mock() {
-        let p = Arc::new(hh_core::MockProcess::new(0x1000, vec![0; 32]));
+        let mut block = vec![0; 32];
+        block[..4].copy_from_slice(&MAGIC.to_le_bytes());
+        block[4] = 1;
+        let p = Arc::new(Mapped {
+            mem: hh_core::MockProcess::new(0x1000, block),
+            module_base: std::sync::Mutex::new(0x1000),
+            writable: true.into(),
+        });
         let s = Speedhack {
-            process: p,
+            process: p.clone(),
             addr: 0x1000,
+            module: (0x1000, "/x".into()),
         };
         s.set_speed(2.5).unwrap();
         assert_eq!(s.speed().unwrap(), 2.5);
@@ -488,5 +615,18 @@ mod tests {
         }
         let st = s.status().unwrap();
         assert_eq!((st.speed, st.generation, st.addr.as_str()), (2.5, 1, "0x1000"));
+        // A block that is not writable (yet), or lost its magic, is "not ready", not a raw
+        // memory error.
+        p.writable.store(false, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(s.set_speed(1.0).unwrap_err().to_string(), NOT_READY);
+        p.writable.store(true, std::sync::atomic::Ordering::Relaxed);
+        p.mem.write(0x1000, &[0; 4]).unwrap();
+        assert_eq!(s.speed().unwrap_err().to_string(), NOT_READY);
+        p.mem.write(0x1000, &MAGIC.to_le_bytes()).unwrap();
+        s.set_speed(1.0).unwrap();
+        // The library moved (exec, pid reuse): the handle refuses.
+        *p.module_base.lock().unwrap() = 0x2000;
+        assert_eq!(s.set_speed(1.0).unwrap_err().to_string(), PROCESS_CHANGED);
+        assert_eq!(s.status().unwrap_err().to_string(), PROCESS_CHANGED);
     }
 }

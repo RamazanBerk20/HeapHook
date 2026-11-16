@@ -3055,7 +3055,7 @@ impl Rng {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 enum FuzzOp {
     Open,
     OpenData,
@@ -3086,8 +3086,10 @@ enum FuzzOp {
     Callback,
     Execute,
     Console,
+    TableLuaCreate,
+    TableLuaModify,
 }
-const FUZZ_OPS: [FuzzOp; 29] = [
+const FUZZ_OPS: [FuzzOp; 31] = [
     FuzzOp::Open,
     FuzzOp::OpenData,
     FuzzOp::LuaLoadTable,
@@ -3117,6 +3119,8 @@ const FUZZ_OPS: [FuzzOp; 29] = [
     FuzzOp::Callback,
     FuzzOp::Execute,
     FuzzOp::Console,
+    FuzzOp::TableLuaCreate,
+    FuzzOp::TableLuaModify,
 ];
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -3137,6 +3141,10 @@ struct Model {
     /// A table script ran with consent that is still in force (its globals may exist).
     script_live: bool,
     remote: bool,
+    /// No table was opened (nor a script merged in): the session's own table, all the user's.
+    opened: bool,
+    /// The record the table script (put in by `TableLuaModify`) scripts when it runs.
+    script_target: Option<i64>,
 }
 
 impl Model {
@@ -3149,6 +3157,8 @@ impl Model {
         }
     }
     fn opened(&mut self, ids: Vec<i64>) {
+        self.opened = true;
+        self.script_target = None;
         self.kind.clear();
         self.agreed.clear();
         self.table_agreed = false;
@@ -3159,6 +3169,25 @@ impl Model {
             self.max_id = self.max_id.max(id);
         }
     }
+    /// The table script ran (as the table): it needed consent unless the table is the
+    /// session's own; an own record it scripted is the table's from now on.
+    fn script_ran(&mut self, app: &App) -> Result<(), String> {
+        if !self.opened {
+            return Ok(());
+        }
+        if !(self.table_agreed && !self.never) {
+            return Err("the table script ran without consent".into());
+        }
+        self.script_live = true;
+        if let Some(id) = self.script_target
+            && self.kind.get(&id) == Some(&Kind2::Own)
+            && live_ids(app).contains(&id)
+        {
+            self.kind.insert(id, Kind2::Table);
+        }
+        Ok(())
+    }
+
     /// Consent for the table withdrawn (the app resets Lua when it was in force).
     fn table_withdrawn(&mut self) {
         if self.table_agreed {
@@ -3278,6 +3307,7 @@ fn fuzz_run(env: &FuzzEnv, ops: &[(FuzzOp, u64)]) -> Result<(), (usize, String)>
                         }
                     }
                     m.table_agreed = false;
+                    m.opened = true;
                 }
                 mint = Some(Kind2::Foreign);
             }
@@ -3432,15 +3462,10 @@ fn fuzz_run(env: &FuzzEnv, ops: &[(FuzzOp, u64)]) -> Result<(), (usize, String)>
             }
             FuzzOp::RunScript => {
                 let has = !app.table_get().unwrap().table.lua_script.trim().is_empty();
-                match app.table_run_script() {
-                    Ok(()) if has => {
-                        if !(m.table_agreed && !m.never) {
-                            return Err((step, "the table script ran without consent".into()));
-                        }
-                        m.script_live = true;
-                    }
-                    _ => {}
+                if app.table_run_script().is_ok() && has {
+                    m.script_ran(&app).map_err(|e| (step, e))?;
                 }
+                mint = Some(if m.opened { Kind2::Table } else { Kind2::Own });
             }
             FuzzOp::Callback => {
                 if !before.is_empty() {
@@ -3476,6 +3501,26 @@ fn fuzz_run(env: &FuzzEnv, ops: &[(FuzzOp, u64)]) -> Result<(), (usize, String)>
                     }
                     let _ = app.lua_exec("getAddressList().disableAllWithoutExecute()");
                 }
+            }
+            FuzzOp::TableLuaCreate | FuzzOp::TableLuaModify => {
+                // The table's own script (edited in, then run as the table): what it creates is
+                // the table's, and an own record it scripts becomes the table's.
+                let target = (!before.is_empty()).then(|| before[r.below(before.len())]);
+                let code = match (op, target) {
+                    (FuzzOp::TableLuaModify, Some(id)) => format!(
+                        "local r = getAddressList().getMemoryRecordByID({id}) if r then r.Script = {:?} end",
+                        fuzz_script(&marker)
+                    ),
+                    _ => format!("local m = getAddressList().createMemoryRecord() m.Type = vtAutoAssembler m.Script = {:?}", fuzz_script(&marker)),
+                };
+                let cur = app.table_get().unwrap();
+                if app.table_put(Table { lua_script: code, ..cur.table }, cur.version).is_ok() {
+                    m.script_target = if op == FuzzOp::TableLuaModify { target } else { None };
+                    if app.table_run_script().is_ok() {
+                        m.script_ran(&app).map_err(|e| (step, e))?;
+                    }
+                }
+                mint = Some(if m.opened { Kind2::Table } else { Kind2::Own });
             }
             FuzzOp::Console => {
                 let _ = take_marks(&marker);
@@ -3693,4 +3738,145 @@ fn loaded_ids_are_renumbered_when_invalid() {
     // New ones come after all of them.
     let n = app.table_new(vec![e(0)], None, None).unwrap().ids[0];
     assert!(n > *ids.iter().max().unwrap());
+}
+
+/// Records a table's Lua creates or scripts belong to that table: while it is trusted they
+/// work; once its consent is withdrawn (or Settings say never, or another table is opened)
+/// none of them runs on any route, and their hotkeys are not system-wide.
+#[test]
+fn records_a_table_made_lose_their_abilities_with_its_consent() {
+    let t = Target::spawn();
+    let dir = tempfile::tempdir().unwrap();
+    for how in ["decline", "never", "open another table"] {
+        let app = App::default();
+        app.open_process(t.child.id()).unwrap();
+        let marker = dir.path().join(format!("m-{}", how.len()));
+        let script = format!("[ENABLE]\n{{$lua}}\nlocal f = io.open({:?}, 'a') f:write('ran\\n') f:close()\nreturn ''\n{{$asm}}\n[DISABLE]\n", marker.to_str().unwrap());
+        let file = dir.path().join("made.json");
+        let lua = format!(
+            "made = getAddressList().createMemoryRecord() made.Description = 'made' made.Type = vtAutoAssembler made.Script = {script:?}\n\
+             made.createHotkey({{VK_CONTROL, VK_F8}}, mrhToggleActivation)\n\
+             local own = getAddressList().getMemoryRecordByDescription('mine') own.Script = {script:?}"
+        );
+        heaphook::table::save(&file, &Table { lua_script: lua, ..Table::default() }).unwrap();
+        app.table_open(file.to_str().unwrap(), false).unwrap();
+        // The user's own record (made in the console), later scripted by the table.
+        app.lua_exec("local m = getAddressList().createMemoryRecord() m.Description = 'mine' m.Type = vtAutoAssembler m.Script = '[ENABLE]\\n[DISABLE]\\n'").unwrap();
+        let mine = find_desc(&app, "mine");
+        assert_eq!(app.table_caps(mine), hh_lua::Caps::Full, "the console's record is the user's");
+        app.table_trust(true).unwrap();
+        app.table_run_script().unwrap();
+        let made = find_desc(&app, "made");
+        // Trusted: it works.
+        app.table_set_active(&[made], true).unwrap();
+        app.table_set_active(&[made], false).unwrap();
+        assert_eq!(marks(&marker), "ran\n");
+        assert!(app.global_combos().contains(&vec![17, 119]));
+        let _ = std::fs::remove_file(&marker);
+        match how {
+            "decline" => app.table_trust(false).unwrap(),
+            "never" => set_never(&app, true),
+            _ => {
+                let empty = dir.path().join("empty.json");
+                heaphook::table::save(&empty, &Table::default()).unwrap();
+                app.table_open(empty.to_str().unwrap(), false).unwrap();
+                assert!(live_ids(&app).is_empty(), "the old table's records went with it");
+                continue;
+            }
+        }
+        for id in [made, mine] {
+            assert_eq!(app.table_caps(id), hh_lua::Caps::None, "{how}: record {id}");
+            let gid = app.table_new(vec![Entry { description: "g".into(), options: vec!["moActivateChildrenAsWell".into()], ..Entry::default() }], None, None).unwrap().ids[0];
+            let cur = app.table_get().unwrap();
+            let mut tb = cur.table.clone();
+            let e = take_entry(&mut tb.entries, id).unwrap();
+            tb.entries.iter_mut().find(|g| g.id == gid).unwrap().children.push(e);
+            app.table_put(tb, cur.version).unwrap();
+            assert!(app.table_set_active(&[id], true).is_err(), "{how}: click");
+            assert!(app.table_set_active(&[gid], true).is_err(), "{how}: cascade");
+            let _ = app.table_set_active(&[gid], false);
+            app.lua_exec(&format!("getAddressList().getMemoryRecordByID({id}).Active = true")).unwrap();
+        }
+        assert!(app.table_hotkey(made, 0).is_err(), "{how}: table hotkey");
+        assert!(app.hotkey_press(&[17, 119]).is_err(), "{how}: hotkey press");
+        assert!(!app.global_combos().contains(&vec![17, 119]), "{how}: still system-wide");
+        assert_eq!(marks(&marker), "", "{how}: a record the table made ran\n{}", log_text(&app));
+    }
+}
+
+/// A trusted table's finalizers: it cannot install any (`setmetatable` refuses `__gc`, adding
+/// `__gc` later does not register one, host userdata metatables are locked), whether the
+/// object would sit in a global, an upvalue of a registered callback or a lookup callback; and
+/// on every way consent ends nothing of it runs (no marker, no new entry).
+#[test]
+fn a_tables_finalizers_never_run() {
+    let dir = tempfile::tempdir().unwrap();
+    for how in ["decline", "never", "open another table"] {
+        let app = App::default();
+        let marker = dir.path().join(format!("gc-{}", how.len()));
+        let m = format!("{:?}", marker.to_str().unwrap());
+        let script = format!(
+            "local o = io.open\nlocal function fin() local f = o({m}, 'a') f:write('gc\\n') f:close() getAddressList().createMemoryRecord().Description = 'from gc' end\n\
+             tried = 0\n\
+             local function try(f) local ok = pcall(f) if not ok then tried = tried + 1 end end\n\
+             try(function() held = setmetatable({{}}, {{ __gc = fin }}) end)\n\
+             local up\n\
+             try(function() up = setmetatable({{}}, {{ __gc = fin }}) end)\n\
+             tm = createTimer(nil) tm.OnTimer = function() return up end\n\
+             try(function() local x = setmetatable({{}}, {{ __gc = fin }}) registerSymbolLookupCallback(function() return x end, slFailure) end)\n\
+             try(function() local ok, t = autoAssemble('[ENABLE]\\n[DISABLE]\\n') getmetatable(t.__state).__gc = fin end)\n\
+             local mt = {{}} keep = setmetatable({{}}, mt) mt.__gc = fin\n"
+        );
+        let file = dir.path().join("gc.json");
+        heaphook::table::save(&file, &Table { lua_script: script, ..Table::default() }).unwrap();
+        app.table_open(file.to_str().unwrap(), false).unwrap();
+        app.table_trust(true).unwrap();
+        app.table_run_script().unwrap();
+        assert_eq!(app.lua_exec("assert(tried == 4, tried)").map(|_| ()), Ok(()), "{}", log_text(&app));
+        let before = live_ids(&app).len();
+        match how {
+            "decline" => app.table_trust(false).unwrap(),
+            "never" => set_never(&app, true),
+            _ => {
+                let empty = dir.path().join("e.json");
+                heaphook::table::save(&empty, &Table::default()).unwrap();
+                app.table_open(empty.to_str().unwrap(), false).unwrap();
+            }
+        }
+        app.lua_exec("collectgarbage() collectgarbage()").unwrap();
+        assert_eq!(marks(&marker), "", "{how}: a finalizer ran");
+        assert_eq!(live_ids(&app).len(), if how == "open another table" { 0 } else { before }, "{how}: a finalizer made an entry");
+    }
+}
+
+/// A consent answer names the table (or file) it was asked about: once another one is open,
+/// it is refused and grants nothing.
+#[test]
+fn stale_consent_answers_are_refused() {
+    let app = App::default();
+    let dir = tempfile::tempdir().unwrap();
+    let a = dir.path().join("a.json");
+    let b = dir.path().join("b.json");
+    let e = Entry { id: 1, description: "x".into(), script: Some("[ENABLE]\n[DISABLE]\n".into()), ..Entry::default() };
+    heaphook::table::save(&a, &Table { entries: vec![e.clone()], lua_script: "x = 1".into(), ..Table::default() }).unwrap();
+    heaphook::table::save(&b, &Table { entries: vec![e.clone()], lua_script: "y = 1".into(), ..Table::default() }).unwrap();
+    let asked = app.table_open(a.to_str().unwrap(), false).unwrap().generation;
+    app.table_open(b.to_str().unwrap(), false).unwrap();
+    assert!(app.table_trust_at(true, asked).unwrap_err().contains("changed"));
+    assert_eq!(app.table_get().unwrap().trust, heaphook::cheat::Trust::Ask);
+    assert!(app.table_run_script_at(asked).unwrap_err().contains("changed"));
+    let p = app.table_paste(vec![e.clone()], None, None).unwrap().ids[0];
+    assert!(app.table_trust_entries_at(&[p], asked).unwrap_err().contains("changed"));
+    let now = app.table_get().unwrap().generation;
+    assert!(app.table_trust_entries_at(&[p, 9999], now).unwrap_err().contains("no entry"));
+    assert!(app.table_get().unwrap().untrusted.contains(&p));
+    app.table_trust_entries_at(&[p], now).unwrap();
+    app.table_trust_at(true, now).unwrap();
+    // An Auto Assemble session: consent for one load is not consent for the next.
+    let f1 = dir.path().join("1.cea");
+    std::fs::write(&f1, "[ENABLE]\n[DISABLE]\n").unwrap();
+    let s = app.aa_session().unwrap();
+    let first = app.aa_load(f1.to_str().unwrap(), s).unwrap().load;
+    app.aa_load(f1.to_str().unwrap(), s).unwrap();
+    assert!(app.aa_trust_at(s, first).unwrap_err().contains("changed"));
 }

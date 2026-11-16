@@ -223,6 +223,14 @@ Lua in a table can read, change and delete your files, start programs and use th
 - If trusted Lua copies the script of an entry that waits for consent into another entry, that entry waits for consent too. HeapHook follows the text only as long as the script copies or embeds it: text a script rewrites (for example with `gsub`) is no longer recognised, so trust scripts that edit other entries only as far as you trust the table.
 - A label or `registersymbol` can never take the name of a loaded module; module names always win. Labels that came with a table you have not trusted are marked in the Labels dialog.
 
+Limits to know:
+
+1. Auto Assembler scripts from any table can register symbols. Module names always win, but a symbol can take the name of an export (such as `malloc`) or of one of your own labels.
+2. HeapHook follows a script's text from an untrusted entry only while Lua copies it unchanged. A trusted table that rewrites such text, or builds a script from an entry's description, takes responsibility for running it.
+3. Withdrawing consent, switching to "Never run", or opening another table restarts Lua: globals typed in the console are lost too. Patches a script already made stay in the game until you disable them, and disabling a script whose consent was withdrawn may ask for consent again.
+4. Consent is given to where an entry came from, not to its text: undo can bring back text you removed before you agreed.
+5. Records that a table's Lua creates or scripts belong to that table. They lose their abilities (Lua, file access, hotkeys outside HeapHook) when the table's consent is withdrawn.
+
 Open tables only from sources you trust.
 
 ## 6. The debugger

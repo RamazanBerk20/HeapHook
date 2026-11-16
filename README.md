@@ -150,6 +150,14 @@ A cheat table can carry Lua. Lua in a table has full access to your files and ca
 - Settings > Lua > "Allow Lua scripts to access files and run programs" turns off file and program access for Lua. Scripts can still read and change the attached process. It applies after a restart.
 - Auto Assembler scripts loaded from a file ask in the same way before their `{$lua}` blocks or `loadbinary` run.
 
+Limits to know:
+
+1. Auto Assembler scripts from any table can register symbols. Module names always win, but a symbol can take the name of an export (such as `malloc`) or of one of your own labels.
+2. HeapHook follows a script's text from an untrusted entry only while Lua copies it unchanged. A trusted table that rewrites such text, or builds a script from an entry's description, takes responsibility for running it.
+3. Withdrawing consent, switching to "Never run", or opening another table restarts Lua: globals typed in the console are lost too. Patches a script already made stay in the game until you disable them, and disabling a script whose consent was withdrawn may ask for consent again.
+4. Consent is given to where an entry came from, not to its text: undo can bring back text you removed before you agreed.
+5. Records that a table's Lua creates or scripts belong to that table. They lose their abilities (Lua, file access, hotkeys outside HeapHook) when the table's consent is withdrawn.
+
 Open tables only from sources you trust.
 
 ## Remote targets

@@ -1,6 +1,6 @@
 // Entry point: wires panels, process picker, view switching, global shortcuts, splitters.
 import { api, isMock, isBridge } from './backend.js';
-import { $, $$, h, icon, splitter, toast, closeMenu, attempt, busy, busyCancel, store, contextMenu } from './util.js';
+import { $, $$, h, icon, splitter, toast, closeMenu, attempt, busy, busyCancel, store, contextMenu, consentOpen } from './util.js';
 import { state, emit, on } from './core.js';
 import { initResults } from './results.js';
 import { initScan } from './scan.js';
@@ -426,7 +426,10 @@ on('backend:window', async (w) => {
   if (w.drop_seq !== dropSeq) {
     dropSeq = w.drop_seq;
     const p = w.drops.find((x) => TABLE_FILE.test(x));
-    if (p) table.openPath(p); else if (w.drops.length) toast('Drop a cheat table (.CT or .json) to open it', 'info');
+    // While a consent question is open, a dropped table is ignored (its answer is for the
+    // table on screen).
+    if (p && consentOpen()) toast('Answer the open question first, then drop the table again', 'info');
+    else if (p) table.openPath(p); else if (w.drops.length) toast('Drop a cheat table (.CT or .json) to open it', 'info');
   }
   if (w.close_seq !== closeSeq) {
     closeSeq = w.close_seq;
@@ -442,6 +445,7 @@ document.addEventListener('drop', async (e) => {
   if (!f) return;
   e.preventDefault();
   if (!TABLE_FILE.test(f.name)) { toast('Drop a cheat table (.CT or .json) to open it', 'info'); return; }
+  if (consentOpen()) { toast('Answer the open question first, then drop the table again', 'info'); return; }
   if (f.size > 64 << 20) { toast(`${f.name} is larger than 64 MiB`); return; }
   table.openPath(f.name, { data: await f.text() });
 });

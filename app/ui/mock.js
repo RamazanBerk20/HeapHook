@@ -2018,7 +2018,7 @@ const RC = {
     C.table_save({ path: '\u0000drop', table: t });
     return RC.table_open({ path: '\u0000drop' });
   },
-  table_open(a) { const r = LIVE_open(a); T.untrusted = []; SAVED = plainJson(T.table); return r; },
+  table_open(a) { const r = LIVE_open(a); T.untrusted = []; T.generation = (T.generation || 0) + 1; SAVED = plainJson(T.table); return { ...r, generation: T.generation }; },
   table_export(a) { const r = C_export(a); SAVED = plainJson(T.table); return r; },
   table_set_active(a) {
     if (a.active) for (const id of a.ids) {
@@ -2037,7 +2037,7 @@ const RC = {
     if (!SESS.has(session)) err(`no Auto Assemble session ${session}`);
     fs ??= loadFs(); const t = fs[path] ?? err(`file not found: ${path}`); const s = typeof t === 'string' ? t : t.script ?? err(`${path}: not a script`);
     SESS.set(session, 'file');
-    return s;
+    return { script: s, load: ++SESS_NEXT };
   },
   aa_trust({ session }) {
     if (loadSettings().table_script === 'never') err('Settings say never to run a table\'s Lua: change "Lua script in a loaded table" first');
@@ -2098,7 +2098,7 @@ const C_addbp = C.debug_add_breakpoint, C_bps = C.debug_breakpoints, C_poll = C.
 Object.assign(C, RC);
 // The table's get carries the untrusted list too.
 const C_get = C.table_get;
-C.table_get = () => ({ ...C_get(), untrusted: untrusted() });
+C.table_get = () => ({ ...C_get(), untrusted: untrusted(), generation: T.generation || 0 });
 
 function loadFs() { try { return JSON.parse(localStorage.getItem('hh.mockfs')) || {}; } catch { return {}; } }
 

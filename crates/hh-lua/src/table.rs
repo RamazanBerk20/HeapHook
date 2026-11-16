@@ -10,6 +10,19 @@ use hh_tools::structure::Structure;
 
 pub type RecId = u32;
 
+/// Who the running Lua runs for. The host says it for the outermost entry
+/// ([`crate::Engine::exec_as`]); everything else (table scripts, timers, forms, hotkeys,
+/// record callbacks, `{$lua}` blocks) is `Table`. A callback registered while `Console` ran
+/// keeps running as `Console`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Principal {
+    /// The user's own command in the console.
+    Console,
+    /// A table's code (the safe default).
+    #[default]
+    Table,
+}
+
 /// What a record's script may do beyond plain Auto Assembler. The host decides it per record
 /// by where the record came from ([`TableHost::caps`]), never by what its text says.
 ///
@@ -147,6 +160,13 @@ pub trait TableHost: Send + Sync {
     fn caps(&self, _id: RecId) -> Caps {
         Caps::None
     }
+    /// `createMemoryRecord` while `who` runs. Default: [`TableHost::create`].
+    fn create_as(&self, parent: Option<RecId>, _who: Principal) -> RecId {
+        self.create(parent)
+    }
+    /// Lua running for `who` wrote executable content of record `id` (its script, hotkeys or
+    /// callbacks). Default: nothing.
+    fn wrote_executable(&self, _id: RecId, _who: Principal) {}
     /// Trusted Lua is making record `id`'s script out of text it read from a record without
     /// capabilities: make `id` untrusted too (return true; it then asks for consent like a
     /// pasted entry), or refuse the assignment (false, the default).

@@ -35,6 +35,25 @@ end
 -- The engine's own references from here on (a script may replace the globals).
 local pcall, getmetatable, next = pcall, getmetatable, next
 
+-- Who a callback runs for: one registered while the user's own console command ran keeps
+-- running as the console; everything else runs as the table (the safe default).
+local function owned(f)
+  if type(f) ~= 'function' or H.principal() ~= 'console' then return f end
+  local as_console = H.as_console
+  return function(...) return as_console(f, ...) end
+end
+
+-- No finalizers: Lua 5.3 runs `__gc` with hooks off, and a state's finalizers would run when
+-- it is closed. `__gc` counts only if present when setmetatable is called (5.3), so refusing
+-- it here covers tables; `debug` (debug.setmetatable) is not loaded.
+do
+  local raw_setmetatable = setmetatable
+  _G.setmetatable = function(t, mt)
+    if type(mt) == 'table' and rawget(mt, '__gc') ~= nil then error('__gc finalizers are not available in HeapHook', 2) end
+    return raw_setmetatable(t, mt)
+  end
+end
+
 -------------------------------------------------------------------- Rust errors -> strings
 -- Errors from Rust functions arrive as userdata; CE scripts expect strings (err:find, ..).
 do
@@ -428,7 +447,7 @@ function createTimer(owner, enabled, ...)
       OnTimer = function() return st.ontimer end, Owner = function() return owner end },
     { Interval = function(v) st.interval = math.max(1, toint(v)); st.due = now() + st.interval end,
       Enabled = function(v) st.enabled = v and true or false; st.due = now() + st.interval end,
-      OnTimer = function(f) st.ontimer = f end },
+      OnTimer = function(f) st.ontimer = owned(f) end },
     { destroy = function() timers[t] = nil; st.enabled = false end })
   st.due = now() + st.interval
   timers[t] = st
@@ -499,10 +518,10 @@ function createHotkey(f, ...)
   local keys = { ... }
   if type(keys[1]) == 'table' then keys = keys[1] end
   hkid = hkid + 1
-  local id, st = hkid, { f = f }
+  local id, st = hkid, { f = owned(f) }
   local hk = object(
     { ID = function() return id end, OnHotkey = function() return st.f end, Keys = function() return keys end },
-    { OnHotkey = function(v) st.f = v end },
+    { OnHotkey = function(v) st.f = owned(v) end },
     { destroy = function() hotkeys[id] = nil; H.hotkey_unregister(id) end })
   hotkeys[id] = { hk, st }
   H.hotkey_register(id, keys)
@@ -555,7 +574,7 @@ local function rhk(id, hid)
     end
   end
   local function cb(n) return function() return hkcbs[key] and hkcbs[key][n] end end
-  local function setcb(n) return function(f) hkcbs[key] = hkcbs[key] or {}; hkcbs[key][n] = f end end
+  local function setcb(n) return function(f) hkcbs[key] = hkcbs[key] or {}; hkcbs[key][n] = owned(f); H.mr_wrote(id) end end
   local o = object(
     { ID = function() return hid end, Owner = function() return mr(id) end, Description = g 'Description',
       Keys = g 'Keys', Action = g 'Action', action = g 'Action', Value = g 'Value', value = g 'Value',
@@ -632,7 +651,8 @@ mr = function(id)
   local function setcb(name)
     return function(f)
       cbs[id] = cbs[id] or {}
-      cbs[id][name] = f
+      cbs[id][name] = owned(f)
+      H.mr_wrote(id)
       if name == 'OnValueChanged' then lastval[id] = f and H.mr_get(id, 'Value') or nil end
     end
   end
@@ -1016,7 +1036,7 @@ function debug_setBreakpoint(address, ...)
   end
   local addr = getAddress(address)
   H.dbg_set(addr, a[1], a[2], a[3])
-  bpfuncs[addr] = fn
+  bpfuncs[addr] = owned(fn)
   return true
 end
 function debug_removeBreakpoint(address)
@@ -1339,7 +1359,7 @@ ui = function(id, cls)
       if not uiobj[id] then error('control was destroyed', 2) end
       if type(k) ~= 'string' then rawset(o, k, v) return end
       if k:sub(1, 2) == 'On' and (type(v) == 'function' or v == nil) then
-        uievents[id][k] = v
+        uievents[id][k] = owned(v)
         H.ui_event(id, k, v ~= nil)
         return
       end

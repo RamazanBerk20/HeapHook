@@ -93,14 +93,14 @@ decreased decreased_by changed unchanged same_as_first`, plus `not: bool` to inv
 | `table_put` (ids) | | edits, moves, regroups and deletes only: an entry id the backend did not issue is rejected (`entry id N was not issued by HeapHook: add entries with table_new`); a put never changes an id's origin |
 | `table_new` | `entries, after?, base?` | `{version, ids}`: the user's own new entries (new address, script, group, from results, structures, pointer scans, the disassembler), new ids after entry `after` or at the end |
 | `table_open` / `table_export` | `path` (`.json` or `.CT`), `force?` | `{version, table}` (all inactive; the Lua script is NOT run; the current table's active scripts are disabled first, and if one cannot be the open is refused with `… could not be disabled …` unless `force`, which carries those entries over, still active, into a group) / – |
-| `table_trust` | `trust` | – (consent for a loaded table: its table script and the capabilities of the entries that came with it, on every route. `false` declines; if consent had been given it is withdrawn and the table's running Lua is stopped (see "Script consent"). `true` errors while Settings say never. Entry hotkeys without capabilities are not registered system-wide; a hotkey without Ctrl/Shift/Alt/Win never is) |
+| `table_trust` | `trust, generation` | – (`generation`: `TableState.generation` of the table the question was about; refused with `not granted: the table changed …` once another table was opened. Consent for a loaded table: its table script and the capabilities of the entries that came with it, on every route. `false` declines; if consent had been given it is withdrawn and the table's running Lua is stopped (see "Script consent"). `true` errors while Settings say never. Entry hotkeys without capabilities are not registered system-wide; a hotkey without Ctrl/Shift/Alt/Win never is) |
 | `aa_check` (no execution) | | never runs Lua: with capabilities `{$lua}` blocks count as empty text and registered commands expand to nothing; without them each directive that needs one is an error containing `is not available to this script` |
 | table limits | | groups nest at most 64 deep, at most 200000 entries, table files at most 64 MiB; `table_open`/`table_put` refuse more |
 | `close_process` (scripts) | | while the process lives, active scripts are disabled first (failures go to the Lua log, the close goes on); the app does the same on exit |
 | `table_set_active` | `ids, active` | – (CE activation: OnActivate/OnDeactivate, Auto Assembler with `{$lua}`, freeze, group options) |
 | `table_set_value` | `ids, value` | – (frozen entries freeze to the new value; groups with `moRecursiveSetValue` set children) |
 | `table_hotkey` | `id, index` | – (runs that entry hotkey's CE action) |
-| `table_run_script` | – | – (runs `table.lua_script`; refused with the consent error unless `trust` is `own` or `agreed`) |
+| `table_run_script` | `generation` | – (refused once another table was opened; runs `table.lua_script`; refused with the consent error unless `trust` is `own` or `agreed`) |
 | `hotkey_press` | `keys: [vk]` (CE virtual-key codes, any order) | number of hotkeys fired (table and `createHotkey`) |
 | `lua_exec` | `code` | – (echo, prints, results and errors with traceback go to the log) |
 | `lua_interrupt` | – | – (also answers an open script dialog with cancel) |
@@ -182,14 +182,14 @@ decreased decreased_by changed unchanged same_as_first`, plus `not: bool` to inv
 | `table_export_text` | `path` | – (tab-separated listing: description indented by depth, address expression, type, live value) |
 | `table_merge` | `path` | `TableState` (entries appended with new ids, inactive, every one untrusted; a table script it brings into a table without one makes the table `ask`) |
 | `table_paste` | `entries, after?, base?` | `{version, ids}` (new ids after entry `after` in its list, or at the end; every entry arrives untrusted) |
-| `table_trust_entries` | `ids` | – (consent for the untrusted entries in those subtrees; refused while Settings say never; "never" withdraws it again) |
+| `table_trust_entries` | `ids, generation` | – (refused when the table changed or an id is not in it; consent for the untrusted entries in those subtrees; refused while Settings say never; "never" withdraws it again) |
 | `table_add_template` | `addr, kind, description, after?, base?` | `{version, ids}`: `aa_template` inserted as a new script entry by the backend; untrusted when the target is remote (its text embeds names the server reported) |
 | `table_resolve` | `ids` | `[addr or null]`: entries' addresses, each resolved with the lookups its origin allows (the table rows use this, not `resolve_many`) |
 | per-entry trust | | `TableState.untrusted: [id]`: entries that came from elsewhere (paste, merge, `loadTable(f, true)`, a remote template, a script assigned from an Auto Assemble window a file was loaded into) and wait for their own consent (`table_trust_entries`), whatever the table's own trust; their hotkeys are not registered system-wide before that |
 | `table_dirty` | – | bool (the table differs from what was last opened or saved; activation does not count) |
 | `table_open_data` | `name, data, force?` | like `table_open` for a file's text (a browser drop; `.CT` by name) |
 | `aa_session` | | `id`: a new Auto Assemble window session; what is typed into it is the user's own |
-| `aa_load_file` / `aa_trust` | `path, session` / `session` | script text / – (a file loaded into a session makes the session untrusted until `aa_trust(session)`, whatever is typed into it afterwards; refused while Settings say never) |
+| `aa_load_file` / `aa_trust` | `path, session` / `session, load` | `{script, load}` / – (`load` names the file load the consent is for: refused once another file was loaded into the session; a file loaded into a session makes the session untrusted until `aa_trust(session)`, whatever is typed into it afterwards; refused while Settings say never) |
 | `aa_assign` | `session, script, description, after?, base?` | `{version, ids}`: "Assign to table" — the script as a new entry keeping the session's origin (a loaded file arrives untrusted, or agreed if the session was) |
 | `app_args` | – | `{table, pid, attach, launch: {program, args}}` or `null` (command line, handed out once) |
 | `app_quit` | `quit` | – (desktop app only: the answer to `lua_poll.window.close_seq`, a close with unsaved changes; closing again while asked closes) |
@@ -298,6 +298,14 @@ Trust is decided by origin, never by content, and the engine fails closed.
   coroutine or callback of the old one survives; console globals are lost too, and the console
   log says "Lua was reset"). A `loadTable(f)` from a script ends that script. A process change
   does not reset Lua.
+- **Principal.** Lua runs for the user only while their console command (`lua_exec`) runs, or
+  in a callback that command registered (timer, form event, hotkey, record callback,
+  breakpoint function); everything else (table script, `{$lua}`, other callbacks) runs for the
+  table. Records Lua creates for the table, and the user's records whose script, hotkeys or
+  callbacks the table's Lua writes, belong to the table from then on (`Origin::Table`: they
+  lose their abilities with its consent). In a table built in this session all stays the
+  user's.
+- **Finalizers.** Scripts cannot install `__gc`; a discarded interpreter is never closed.
 - **Taint.** A script trusted Lua takes from an untrusted entry (`memrec.Script`) stays
   untrusted: `autoAssemble` of text containing it runs without capabilities, and assigning it
   to another record's `Script` makes that record untrusted (Foreign).

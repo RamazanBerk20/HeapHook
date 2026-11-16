@@ -60,14 +60,15 @@ export const api = {
   /** Loads a .json/.CT file as the live table (everything inactive) -> {version, table} */
   tableOpen: (path, force = false) => call('table_open', { path, force }),
   /** Answer to a "needs consent:" error: may the loaded table's {$lua} blocks run? */
-  tableTrust: (trust) => call('table_trust', { trust }),
+  /** generation: the table's (TableState.generation) when the question was asked; refused once another table was opened */
+  tableTrust: (trust, generation) => call('table_trust', { trust, generation }),
   tableExport: (path) => call('table_export', { path }),
   /** CE activation: OnActivate/OnDeactivate, Auto Assembler, freeze, group options */
   tableSetActive: (ids, active) => call('table_set_active', { ids, active }),
   tableSetValue: (ids, value) => call('table_set_value', { ids, value }),
   tableHotkey: (id, index) => call('table_hotkey', { id, index }),
   /** Runs the table's Lua script; only after the user agreed. */
-  tableRunScript: () => call('table_run_script', {}),
+  tableRunScript: (generation) => call('table_run_script', { generation }),
   /** keys: virtual-key codes -> how many hotkeys fired */
   hotkeyPress: (keys) => call('hotkey_press', { keys }),
   // ---------- Lua ----------
@@ -280,7 +281,7 @@ export const api = {
   /** The user's new entries (new address, script, group, from results / structures / pointers / disassembler): the backend issues their ids -> {version, ids}. A put cannot add entries. */
   tableNew: (entries, after, base) => call('table_new', { entries, after: after ?? null, base: base ?? null }),
   /** Consent for the Lua of these entries (and their children) that arrived from another table */
-  tableTrustEntries: (ids) => call('table_trust_entries', { ids }),
+  tableTrustEntries: (ids, generation) => call('table_trust_entries', { ids, generation }),
   /** -> true when the table changed since it was opened or saved */
   tableDirty: () => call('table_dirty', {}),
   /** A dropped file's text (browser drop) opened like table_open -> {version, table, trust, untrusted} */
@@ -288,9 +289,11 @@ export const api = {
   /** A new Auto Assemble window session -> id: typed text is the user's own */
   aaSession: () => call('aa_session', {}),
   /** Reads an Auto Assembler script file into session `session`: from now on its content gets Lua and file access only after aaTrust */
+  /** -> {script, load}: `load` names this load for aaTrust */
   aaLoadFile: (path, session) => call('aa_load_file', { path, session }),
   /** Consent for what was loaded into the session */
-  aaTrust: (session) => call('aa_trust', { session }),
+  /** load: what aaLoadFile returned; refused once another file was loaded into the session */
+  aaTrust: (session, load) => call('aa_trust', { session, load }),
   /** "Assign to table": the session's script as a new entry (a loaded file stays untrusted) -> {version, ids} */
   aaAssign: (session, script, description, after, base) => call('aa_assign', { session, script, description, after: after ?? null, base: base ?? null }),
   /** An injection template (kind aob | code | full | api) at addr as a new entry; untrusted for a remote target -> {version, ids} */

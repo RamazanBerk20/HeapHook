@@ -299,7 +299,14 @@ export function codeView(text, maxLines = Infinity) {
  * (badge and frame). Buttons `[{label, value, primary?, kbd?, focus?}]`; resolves to
  * `{value, input}`; Esc resolves `cancel`.
  */
-export function modal({ title, text = '', quote = null, quoteLabel = 'From the table', pre = null, body = null, input = null, buttons, cancel = 'cancel', label = title, lua = false }) {
+/** Closes every open consent question as "no" (the table they ask about is gone). */
+export function cancelConsent() {
+  document.querySelectorAll('dialog[data-consent][open]').forEach((d) => d.close('cancel'));
+}
+/** Whether a consent question is on screen. */
+export const consentOpen = () => !!document.querySelector('dialog[data-consent][open]');
+
+export function modal({ title, text = '', quote = null, quoteLabel = 'From the table', pre = null, body = null, input = null, buttons, cancel = 'cancel', label = title, lua = false, consent = false }) {
   return new Promise((resolve) => {
     const inp = input == null ? null : h('input.mono', { type: 'text', value: input, spellcheck: 'false', autocomplete: 'off' });
     const btns = buttons.map((b) => h('button.btn' + (b.primary ? '.primary' : ''), { value: b.value, type: 'submit' }, b.label, b.kbd ? ' ' : null, b.kbd ? h('kbd', null, b.kbd) : null));
@@ -316,6 +323,8 @@ export function modal({ title, text = '', quote = null, quoteLabel = 'From the t
         text ? h('p.modal-text', null, text) : null,
         scroll.length ? h('div.modal-body', null, ...scroll) : null,
         h('div.dlg-actions', null, ...btns)));
+    // A consent question: closed (as "no") when the table it is about is replaced.
+    if (consent) d.dataset.consent = '1';
     document.body.append(d);
     d.returnValue = cancel;
     d.addEventListener('close', () => { resolve({ value: d.returnValue || cancel, input: inp?.value ?? null }); d.remove(); });

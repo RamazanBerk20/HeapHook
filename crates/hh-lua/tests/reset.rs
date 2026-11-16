@@ -89,7 +89,6 @@ parked = coroutine.create(function() while true do coroutine.yield(mark()) end e
 coroutine.resume(parked)
 createThread(function(t) while true do mark() sleep(1) end end)
 tm = createTimer(nil) tm.Interval = 1 tm.OnTimer = mark
-setmetatable({}, { __gc = mark })
 hk = createHotkey(mark, VK_CONTROL, VK_F9)
 f = createForm() f.OnDestroy = mark
 debug_setBreakpoint(0x1234, mark)
@@ -155,4 +154,52 @@ fn reset_while_another_thread_runs_lua() {
     let r = t.join().unwrap();
     assert!(r.is_err());
     assert_eq!(e.exec("return busy", "c").unwrap(), ["nil"]);
+}
+
+/// No finalizer of a discarded interpreter ever runs: the state is never closed (finalizers run
+/// on close, with hooks off) and its collector is stopped. Objects with `__gc` are made from
+/// Rust here (scripts cannot make them, see below), kept alive in a global, in an upvalue of a
+/// registered callback and in the registry, then the engine is reset and the old handles go.
+#[test]
+fn finalizers_of_a_discarded_state_never_run() {
+    let (e, _p, rec, _ui, _dbg) = setup();
+    let lua = e.lua();
+    // Not a host function (those refuse once discarded): like a captured `io.open`.
+    let ran = Arc::new(Mutex::new(0));
+    let r2 = ran.clone();
+    let fin = lua.create_function(move |_, ()| {
+        *r2.lock().unwrap() += 1;
+        Ok(())
+    }).unwrap();
+    let make = || {
+        let t = lua.create_table().unwrap();
+        let mt = lua.create_table().unwrap();
+        mt.set("__gc", fin.clone()).unwrap();
+        t.set_metatable(Some(mt)).unwrap();
+        t
+    };
+    lua.globals().set("held", make()).unwrap();
+    lua.globals().set("keep", make()).unwrap();
+    e.exec("local k = keep keep = nil tm = createTimer(nil) tm.OnTimer = function() return k end", "table").unwrap();
+    lua.set_named_registry_value("hh_test_held", make()).unwrap();
+    drop(make());
+    drop(lua);
+    rec.out.lock().unwrap().clear();
+    e.reset().unwrap();
+    e.exec("collectgarbage() collectgarbage()", "console").unwrap();
+    assert!(rec.out.lock().unwrap().is_empty(), "{:?}", rec.out.lock().unwrap());
+    assert_eq!(*ran.lock().unwrap(), 0, "a finalizer of the discarded state ran");
+}
+
+/// Scripts cannot install finalizers: `setmetatable` refuses `__gc`, adding it to a metatable
+/// later does not register one (Lua 5.3), host userdata metatables are protected, and there
+/// is no `debug.setmetatable`.
+#[test]
+fn scripts_cannot_install_finalizers() {
+    let (e, _p, rec, _ui, _dbg) = setup();
+    let err = e.exec("setmetatable({}, { __gc = function() print('gc') end })", "c").unwrap_err().to_string();
+    assert!(err.contains("__gc finalizers are not available"), "{err}");
+    e.exec("local mt = {} x = setmetatable({}, mt) mt.__gc = function() print('gc') end x = nil collectgarbage() collectgarbage()", "c").unwrap();
+    assert_eq!(e.exec("local ok, t = autoAssemble('[ENABLE]\\n[DISABLE]\\n') return getmetatable(t.__state), debug.setmetatable, debug.getregistry", "c").unwrap(), ["false", "nil", "nil"]);
+    assert!(!rec.out.lock().unwrap().iter().any(|l| l == "gc"));
 }
