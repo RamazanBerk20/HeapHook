@@ -277,6 +277,8 @@ export const api = {
   tableMerge: (path) => call('table_merge', { path }),
   /** Inserts entries (new ids) after entry `after` (null: at the end); every one arrives untrusted -> {version, ids} */
   tablePaste: (entries, after, base) => call('table_paste', { entries, after, base }),
+  /** The user's new entries (new address, script, group, from results / structures / pointers / disassembler): the backend issues their ids -> {version, ids}. A put cannot add entries. */
+  tableNew: (entries, after, base) => call('table_new', { entries, after: after ?? null, base: base ?? null }),
   /** Consent for the Lua of these entries (and their children) that arrived from another table */
   tableTrustEntries: (ids) => call('table_trust_entries', { ids }),
   /** -> true when the table changed since it was opened or saved */

@@ -512,9 +512,39 @@ fn i32_entry(id: i64, t: &Target) -> Entry {
     Entry { id, description: "hp".into(), addr: t.addr("i32"), ..Entry::default() }
 }
 
+/// Makes the table hold `entries`: ones it has keep their id (a put edits them), new ones are
+/// created through `table_new` first (their ids must be the next the backend issues).
 fn put(app: &App, entries: Vec<Entry>) {
-    let base = app.table_get().unwrap().version;
-    app.table_put(Table { entries, ..Table::default() }, base).unwrap();
+    let mut have = Vec::new();
+    preorder(&app.table_get().unwrap().table.entries, &mut have);
+    for e in entries.iter().filter(|e| !have.contains(&e.id)) {
+        let got = app.table_new(vec![e.clone()], None, None).unwrap().ids;
+        assert_eq!(got, [e.id], "the test's new entry ids must be the next ones issued");
+    }
+    let st = app.table_get().unwrap();
+    app.table_put(Table { entries, ..st.table }, st.version).unwrap();
+}
+
+fn preorder(l: &[Entry], out: &mut Vec<i64>) {
+    for e in l {
+        out.push(e.id);
+        preorder(&e.children, out);
+    }
+}
+
+/// Builds `t` in an empty table the way the UI does: the entries through `table_new` (the
+/// backend issues ids 1.. in pre-order, which the test's ids must match), the rest by a put.
+fn fill(app: &App, t: Table) {
+    let mut want = Vec::new();
+    preorder(&t.entries, &mut want);
+    if !t.entries.is_empty() {
+        app.table_new(t.entries.clone(), None, None).unwrap();
+    }
+    let st = app.table_get().unwrap();
+    let mut got = Vec::new();
+    preorder(&st.table.entries, &mut got);
+    assert_eq!(got, want, "the test's entry ids must be 1.. in pre-order");
+    app.table_put(Table { entries: st.table.entries, ..t }, st.version).unwrap();
 }
 
 fn entry(app: &App, id: i64) -> Entry {
@@ -707,7 +737,7 @@ fn ct_round_trip_of_the_live_table() {
         structures: hh_tools::structure::from_json(r#"[{"name":"player","elements":[{"offset":0,"vtype":"pointer","description":"inv","child":"inv"},{"offset":16,"vtype":"4bytes","signed":true},{"offset":24,"vtype":"string","size":12,"utf16":true}]},{"name":"inv","elements":[{"offset":8,"vtype":"float","description":"weight"}]}]"#).unwrap(),
         ..Table::default()
     };
-    app.table_put(t.clone(), 0).unwrap();
+    fill(&app, t.clone());
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path();
     for name in ["t.CT", "t.json"] {
@@ -1072,8 +1102,7 @@ fn deep_or_huge_tables_are_refused_not_crashing() {
     for id in 2..=66 {
         deep = Entry { id, children: vec![deep], ..Entry::default() };
     }
-    let base = app.table_get().unwrap().version;
-    assert!(app.table_put(Table { entries: vec![deep.clone()], ..Table::default() }, base).unwrap_err().contains("64 levels"));
+    assert!(app.table_new(vec![deep.clone()], None, None).unwrap_err().contains("64 levels"));
     let js = tmp.path().join("deep.json");
     heaphook::table::save(&js, &Table { entries: vec![deep], ..Table::default() }).unwrap();
     assert!(app.table_open(js.to_str().unwrap(), false).is_err());
@@ -1112,10 +1141,8 @@ fn opening_a_table_or_closing_disables_active_scripts() {
     assert!(g.children[0].frozen && g.children[0].description == "stuck");
 
     // close_process undoes what it can.
-    let mut cur = app.table_get().unwrap();
-    cur.table.entries.push(Entry { id: 99, description: "ok".into(), script: Some(format!("[ENABLE]\n{a}:\ndd #5\n[DISABLE]\n{a}:\ndd #123456\n")), ..Entry::default() });
-    app.table_put(cur.table, cur.version).unwrap();
-    app.table_set_active(&[99], true).unwrap();
+    let ok = app.table_new(vec![Entry { description: "ok".into(), script: Some(format!("[ENABLE]\n{a}:\ndd #5\n[DISABLE]\n{a}:\ndd #123456\n")), ..Entry::default() }], None, None).unwrap().ids[0];
+    app.table_set_active(&[ok], true).unwrap();
     assert_eq!(t.cmd("get")["i32"], 5);
     app.close_process().unwrap();
     assert_eq!(t.cmd("get")["i32"], 123456, "close_process left the script's patch in");
@@ -1564,9 +1591,9 @@ fn big_endian_custom_type_scan_read_write_freeze_and_round_trip() {
     app.table_set_active(&[1], false).unwrap();
     // A non-preset custom type and an unknown CE custom type survive JSON and .CT.
     let fixed = hh_scan::CustomType { scale: 0.01, signed: true, ..hh_scan::CustomType::int(2, true) };
+    app.table_new(vec![Entry { description: "fixed".into(), addr: i32a.clone(), custom: Some(fixed), custom_name: Some("fixed".into()), ..Entry::default() }], None, None).unwrap();
     let base = app.table_get().unwrap().version;
     let mut tb = app.table_get().unwrap().table;
-    tb.entries.push(Entry { id: 2, description: "fixed".into(), addr: i32a.clone(), custom: Some(fixed), custom_name: Some("fixed".into()), ..Entry::default() });
     tb.custom_types.push(heaphook::table::NamedCustom { name: "fixed".into(), ct: fixed });
     app.table_put(tb, base).unwrap();
     let dir = tempfile::tempdir().unwrap();
@@ -1845,9 +1872,29 @@ enum Route {
     AaFileCrlf,
     AaAssign,
     RemoteTemplate,
+    // Inserted by a foreign route, then undo past the insert and redo it.
+    PasteRedo,
+    MergeRedo,
+    LoadTableMergeRedo,
+    AaAssignRedo,
+    RemoteTemplateRedo,
 }
 
-const ROUTES: [Route; 13] = [
+impl Route {
+    /// (the route that brings the entry, whether it is then undone past and redone).
+    fn base(self) -> (Route, bool) {
+        match self {
+            Route::PasteRedo => (Route::Paste, true),
+            Route::MergeRedo => (Route::MergeUi, true),
+            Route::LoadTableMergeRedo => (Route::LoadTableMerge, true),
+            Route::AaAssignRedo => (Route::AaAssign, true),
+            Route::RemoteTemplateRedo => (Route::RemoteTemplate, true),
+            r => (r, false),
+        }
+    }
+}
+
+const ROUTES: [Route; 18] = [
     Route::OpenCt,
     Route::OpenJson,
     Route::MergeUi,
@@ -1861,6 +1908,11 @@ const ROUTES: [Route; 13] = [
     Route::AaFileCrlf,
     Route::AaAssign,
     Route::RemoteTemplate,
+    Route::PasteRedo,
+    Route::MergeRedo,
+    Route::LoadTableMergeRedo,
+    Route::AaAssignRedo,
+    Route::RemoteTemplateRedo,
 ];
 
 /// What the content tries to do (each kind leaves its own trace when it runs).
@@ -1978,12 +2030,12 @@ fn trusted_registrations(kind: Kind, marker: &std::path::Path, slot: &str, id: O
 }
 
 fn is_aa_window(r: Route) -> bool {
-    matches!(r, Route::AaFileLf | Route::AaFileCrlf)
+    matches!(r.base().0, Route::AaFileLf | Route::AaFileCrlf)
 }
 
 /// The routes whose data brings a table script along.
 fn brings_table_script(r: Route) -> bool {
-    matches!(r, Route::OpenCt | Route::OpenJson | Route::Dropped | Route::LoadTable | Route::MergeUi | Route::LoadTableMerge)
+    matches!(r.base().0, Route::OpenCt | Route::OpenJson | Route::Dropped | Route::LoadTable | Route::MergeUi | Route::LoadTableMerge)
 }
 
 /// Routes that apply to a (route, payload) cell. Empty: the cell does not exist (listed in
@@ -2084,15 +2136,13 @@ fn take_entry(l: &mut Vec<Entry>, id: i64) -> Option<Entry> {
     l.iter_mut().find_map(|e| take_entry(&mut e.children, id))
 }
 
-fn max_id(l: &[Entry]) -> i64 {
-    l.iter().map(|e| e.id.max(max_id(&e.children))).max().unwrap_or(0)
-}
 
 impl Cell {
     #[allow(clippy::too_many_arguments)]
     fn new(route: Route, p: &Payload, never: bool, pid: u32, slot: &str, dir: &std::path::Path, server: &str, n: usize) -> Cell {
         let app = App::default();
-        if route == Route::RemoteTemplate {
+        let (base_route, redo) = route.base();
+        if base_route == Route::RemoteTemplate {
             app.remote_connect(server, TOKEN, false).unwrap();
             app.remote_open(pid).unwrap();
         } else {
@@ -2115,7 +2165,7 @@ impl Cell {
         let mut cell = Cell { app, route, payload_name: p.name.clone(), kind: p.kind, script: p.script.clone(), id: None, group: None, session: None, marker, slot: slot.into(), base, log_at: 0 };
         let app = &cell.app;
         let paste = || app.table_paste(vec![entry.clone()], None, None).unwrap().ids[0];
-        match route {
+        match base_route {
             Route::OpenCt => {
                 let ct = cdir.join("evil.CT");
                 heaphook::table::save(&ct, &table).unwrap();
@@ -2156,14 +2206,14 @@ impl Cell {
             }
             Route::AaFileLf | Route::AaFileCrlf | Route::AaAssign => {
                 let f = cdir.join("evil.cea");
-                let text = if route == Route::AaFileCrlf { p.script.replace('\n', "\r\n") } else { p.script.clone() };
+                let text = if base_route == Route::AaFileCrlf { p.script.replace('\n', "\r\n") } else { p.script.clone() };
                 std::fs::write(&f, &text).unwrap();
                 let s = app.aa_session().unwrap();
                 let loaded = app.aa_load_file(f.to_str().unwrap(), s).unwrap();
                 // The window's textarea normalizes line endings: the backend must not care.
                 cell.script = loaded.replace("\r\n", "\n");
                 cell.session = Some(s);
-                if route == Route::AaAssign {
+                if base_route == Route::AaAssign {
                     app.aa_assign(s, &cell.script, "payload", None, None).unwrap();
                 }
             }
@@ -2178,18 +2228,34 @@ impl Cell {
                 t.entries.iter_mut().find(|e| e.id == r.ids[0]).unwrap().script = Some(p.script.clone());
                 app.table_put(t, cur.version).unwrap();
             }
+            _ => unreachable!(),
+        }
+        if redo {
+            // Undo past the insert (the entry is gone), then redo it all: the entry comes back
+            // with the id and origin it had.
+            let mut n = 0;
+            let has = |app: &App| { let mut ids = Vec::new(); preorder(&app.table_get().unwrap().table.entries, &mut ids); ids.iter().any(|&i| crate::entry(app, i).description == "payload") };
+            while has(app) {
+                app.table_history(false).unwrap();
+                n += 1;
+                assert!(n < 5, "the insert does not undo");
+            }
+            for _ in 0..n {
+                app.table_history(true).unwrap();
+            }
         }
         if !is_aa_window(route) {
-            // Into a group that activates its children, with two hotkeys: frontend edits,
-            // which keep the entry's origin.
+            // Into a group that activates its children (the user's own, made through the
+            // backend like the UI does), with two hotkeys: frontend edits, which keep the
+            // entry's origin.
             let id = find_desc(app, "payload");
+            let gid = app.table_new(vec![Entry { description: "grp".into(), options: vec!["moActivateChildrenAsWell".into(), "moDeactivateChildrenAsWell".into()], ..Entry::default() }], None, None).unwrap().ids[0];
             let cur = app.table_get().unwrap();
             let mut t = cur.table.clone();
             let mut e = take_entry(&mut t.entries, id).unwrap();
             let hk = |keys: Vec<u32>| Hotkey { action: "Activate".into(), keys, value: None, description: None, id: None };
             e.hotkeys = vec![hk(vec![17, 118]), hk(vec![17, 119])];
-            let gid = max_id(&t.entries).max(id) + 1000;
-            t.entries.push(Entry { id: gid, description: "grp".into(), options: vec!["moActivateChildrenAsWell".into(), "moDeactivateChildrenAsWell".into()], children: vec![e], ..Entry::default() });
+            t.entries.iter_mut().find(|g| g.id == gid).unwrap().children = vec![e];
             app.table_put(t, cur.version).unwrap();
             cell.id = Some(id);
             cell.group = Some(gid);
@@ -2257,7 +2323,7 @@ impl Cell {
 
     fn grant(&self) -> Result<(), String> {
         let app = &self.app;
-        match self.route {
+        match self.route.base().0 {
             Route::AaFileLf | Route::AaFileCrlf => app.aa_trust(self.session.unwrap()),
             Route::OpenCt | Route::OpenJson | Route::Dropped | Route::LoadTable => app.table_trust(true),
             _ if self.kind == Kind::TableScript => app.table_trust(true),
@@ -2560,13 +2626,13 @@ fn search_alloc_pause_trace_files_and_dirty() {
     // The table as text, and unsaved changes (activation does not count).
     app.open_process(pid).unwrap();
     assert!(!app.table_dirty().unwrap(), "an empty new table has nothing to save");
-    let group = Entry { id: 2, description: "Player".into(), children: vec![i32_entry(1, &t)], ..Entry::default() };
+    let group = Entry { id: 1, description: "Player".into(), children: vec![i32_entry(2, &t)], ..Entry::default() };
     put(&app, vec![group]);
     assert!(app.table_dirty().unwrap());
     let tp = dir.path().join("t.json");
     app.table_export(tp.to_str().unwrap()).unwrap();
     assert!(!app.table_dirty().unwrap());
-    app.table_set_active(&[1], true).unwrap();
+    app.table_set_active(&[2], true).unwrap();
     assert!(!app.table_dirty().unwrap(), "activation is not an unsaved change");
     let txt = dir.path().join("t.txt");
     app.table_export_text(txt.to_str().unwrap()).unwrap();
@@ -2909,4 +2975,395 @@ fn memory_file_search_stats_change_map_and_structure_view() {
     assert_eq!(e.vtype, de::<hh_scan::VType>(json!("8bytes")));
     // Bad definitions are refused.
     assert!(app.struct_set(de(json!([{"name": "B", "elements": [{"offset": 0, "description": "x", "vtype": "float", "bit_len": 3}]}]))).is_err());
+}
+
+// ---------- origin through undo / redo, and a state-machine fuzz of the trust model ----------
+
+fn live_ids(app: &App) -> Vec<i64> {
+    let mut v = Vec::new();
+    preorder(&app.table_get().unwrap().table.entries, &mut v);
+    v
+}
+
+/// The fourth audit's bypass: an inserted entry undone and redone must come back with the
+/// origin it had (it came back as the user's own). Consent given to that id may stay; ids are
+/// never reused; a put can neither bring in an id the backend did not issue nor change an
+/// existing id's origin.
+#[test]
+fn undo_redo_never_forgets_origin() {
+    use hh_lua::Caps;
+    let app = App::default();
+    let e = |d: &str| Entry { description: d.into(), script: Some("[ENABLE]\n{$lua}\nreturn ''\n{$asm}\n[DISABLE]\n".into()), ..Entry::default() };
+    let a = app.table_paste(vec![e("a")], None, None).unwrap().ids[0];
+    assert_eq!(app.table_caps(a), Caps::None);
+    app.table_history(false).unwrap();
+    app.table_history(true).unwrap();
+    assert_eq!(app.table_caps(a), Caps::None, "undo + redo laundered the pasted entry");
+    assert!(app.table_get().unwrap().untrusted.contains(&a));
+    // Granted, undone past the insert, redone: the grant stays with that id.
+    app.table_trust_entries(&[a]).unwrap();
+    app.table_history(false).unwrap();
+    app.table_history(true).unwrap();
+    assert_eq!(app.table_caps(a), Caps::Full);
+    // A second one, never granted: undone and redone, it stays untrusted.
+    let b = app.table_paste(vec![e("b")], None, None).unwrap().ids[0];
+    app.table_history(false).unwrap();
+    app.table_history(true).unwrap();
+    assert_eq!(app.table_caps(b), Caps::None);
+    // Undone, then something new: a new id, never the old one.
+    app.table_history(false).unwrap();
+    let c = app.table_new(vec![e("c")], None, None).unwrap().ids[0];
+    assert!(c > b, "id {b} reused as {c}");
+    assert_eq!(app.table_caps(c), Caps::Full);
+    // A put cannot change an origin (move, rename, retype) nor bring in an unissued id.
+    let cur = app.table_get().unwrap();
+    let mut t = cur.table.clone();
+    t.entries.retain(|x| x.id != c);
+    let mut moved = cur.table.entries.iter().find(|x| x.id == c).unwrap().clone();
+    moved.description = "now under a".into();
+    t.entries.iter_mut().find(|x| x.id == a).unwrap().children.push(moved);
+    app.table_put(t, cur.version).unwrap();
+    assert_eq!(app.table_caps(c), Caps::Full);
+    let cur = app.table_get().unwrap();
+    let mut t = cur.table.clone();
+    t.entries.push(Entry { id: 9999, ..e("typed?") });
+    assert!(app.table_put(t, cur.version).unwrap_err().contains("not issued"));
+    // The old id of b is in no table any more; putting it back cannot make it the user's.
+    let cur = app.table_get().unwrap();
+    let mut t = cur.table.clone();
+    t.entries.push(Entry { id: b, ..e("b again") });
+    app.table_put(t, cur.version).unwrap();
+    assert_eq!(app.table_caps(b), Caps::None);
+}
+
+/// xorshift64*: deterministic, no dependency.
+struct Rng(u64);
+impl Rng {
+    fn next(&mut self) -> u64 {
+        self.0 ^= self.0 >> 12;
+        self.0 ^= self.0 << 25;
+        self.0 ^= self.0 >> 27;
+        self.0.wrapping_mul(0x2545_f491_4f6c_dd1d)
+    }
+    fn below(&mut self, n: usize) -> usize {
+        (self.next() % n.max(1) as u64) as usize
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum FuzzOp {
+    Open,
+    Paste,
+    Merge,
+    LuaMerge,
+    AaAssign,
+    TypedAssign,
+    New,
+    LuaCreate,
+    PutEdits,
+    Delete,
+    Undo,
+    Redo,
+    GrantEntries,
+    GrantTable,
+    Revoke,
+    NeverOn,
+    NeverOff,
+}
+const FUZZ_OPS: [FuzzOp; 17] = [
+    FuzzOp::Open,
+    FuzzOp::Paste,
+    FuzzOp::Merge,
+    FuzzOp::LuaMerge,
+    FuzzOp::AaAssign,
+    FuzzOp::TypedAssign,
+    FuzzOp::New,
+    FuzzOp::LuaCreate,
+    FuzzOp::PutEdits,
+    FuzzOp::Delete,
+    FuzzOp::Undo,
+    FuzzOp::Redo,
+    FuzzOp::GrantEntries,
+    FuzzOp::GrantTable,
+    FuzzOp::Revoke,
+    FuzzOp::NeverOn,
+    FuzzOp::NeverOff,
+];
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Kind2 {
+    Own,
+    Table,
+    Foreign,
+}
+
+/// What the trust model says, kept independently of the backend.
+#[derive(Default)]
+struct Model {
+    kind: std::collections::HashMap<i64, Kind2>,
+    agreed: std::collections::HashSet<i64>,
+    table_agreed: bool,
+    never: bool,
+    max_id: i64,
+}
+
+impl Model {
+    fn allowed(&self, id: i64) -> bool {
+        match self.kind.get(&id) {
+            Some(Kind2::Own) => true,
+            Some(Kind2::Table) => self.table_agreed && !self.never,
+            Some(Kind2::Foreign) => self.agreed.contains(&id) && !self.never,
+            None => false,
+        }
+    }
+}
+
+fn fuzz_entries(r: &mut Rng, tag: &str) -> Vec<Entry> {
+    (0..1 + r.below(3))
+        .map(|i| {
+            let kids = if r.below(3) == 0 { vec![Entry { description: format!("{tag}{i}k"), addr: "0x10".into(), ..Entry::default() }] } else { vec![] };
+            Entry { description: format!("{tag}{i}"), script: Some("[ENABLE]\n{$lua}\nreturn ''\n{$asm}\n[DISABLE]\n".into()), children: kids, ..Entry::default() }
+        })
+        .collect()
+}
+
+fn set_never(app: &App, on: bool) {
+    let mut st = app.settings_get().unwrap();
+    st.table_script = if on { "never" } else { "ask" }.into();
+    app.settings_set(st).unwrap();
+}
+
+/// Runs `ops` (each with its own random word); Err((step, why)) at the first broken invariant.
+fn fuzz_run(ops: &[(FuzzOp, u64)]) -> Result<(), (usize, String)> {
+    let app = App::default();
+    let dir = tempfile::tempdir().unwrap();
+    let mut m = Model::default();
+    for (step, &(op, word)) in ops.iter().enumerate() {
+        let mut r = Rng(word | 1);
+        let before = live_ids(&app);
+        let file = |r: &mut Rng, name: &str| {
+            let p = dir.path().join(format!("{name}{step}.json"));
+            heaphook::table::save(&p, &Table { entries: fuzz_entries(r, name), ..Table::default() }).unwrap();
+            p
+        };
+        // The kind the ids this op mints get (None: it mints none).
+        let mut mint: Option<Kind2> = None;
+        match op {
+            FuzzOp::Open => {
+                let p = file(&mut r, "open");
+                app.table_open(p.to_str().unwrap(), false).unwrap();
+                m.kind.clear();
+                m.agreed.clear();
+                m.table_agreed = false;
+                m.max_id = 0;
+                for id in live_ids(&app) {
+                    m.kind.insert(id, Kind2::Table);
+                    m.max_id = m.max_id.max(id);
+                }
+                continue;
+            }
+            FuzzOp::Paste => {
+                let after = (!before.is_empty() && r.below(2) == 0).then(|| before[r.below(before.len())]);
+                let _ = app.table_paste(fuzz_entries(&mut r, "paste"), after, None);
+                mint = Some(Kind2::Foreign);
+            }
+            FuzzOp::Merge => {
+                let p = file(&mut r, "merge");
+                let _ = app.table_merge(p.to_str().unwrap());
+                mint = Some(Kind2::Foreign);
+            }
+            FuzzOp::LuaMerge => {
+                let p = file(&mut r, "lmerge");
+                let _ = app.lua_exec(&format!("loadTable({:?}, true)", p.to_str().unwrap()));
+                mint = Some(Kind2::Foreign);
+            }
+            FuzzOp::AaAssign => {
+                let f = dir.path().join(format!("s{step}.cea"));
+                std::fs::write(&f, "[ENABLE]\n{$lua}\nreturn ''\n{$asm}\n[DISABLE]\n").unwrap();
+                let s = app.aa_session().unwrap();
+                app.aa_load_file(f.to_str().unwrap(), s).unwrap();
+                let agree = r.below(2) == 0 && app.aa_trust(s).is_ok();
+                let before_ids = live_ids(&app);
+                let _ = app.aa_assign(s, "[ENABLE]\n[DISABLE]\n", "assigned", None, None);
+                for id in live_ids(&app).into_iter().filter(|i| !before_ids.contains(i)) {
+                    if agree {
+                        m.agreed.insert(id);
+                    }
+                }
+                mint = Some(Kind2::Foreign);
+            }
+            FuzzOp::TypedAssign => {
+                let s = app.aa_session().unwrap();
+                let _ = app.aa_assign(s, "[ENABLE]\n[DISABLE]\n", "typed", None, None);
+                mint = Some(Kind2::Own);
+            }
+            FuzzOp::New => {
+                let _ = app.table_new(fuzz_entries(&mut r, "new"), None, None);
+                mint = Some(Kind2::Own);
+            }
+            FuzzOp::LuaCreate => {
+                let _ = app.lua_exec("getAddressList().createMemoryRecord().Description = 'lua'");
+                mint = Some(Kind2::Own);
+            }
+            FuzzOp::PutEdits | FuzzOp::Delete => {
+                let cur = app.table_get().unwrap();
+                let mut t = cur.table.clone();
+                let ids = live_ids(&app);
+                for _ in 0..1 + r.below(3) {
+                    if ids.is_empty() {
+                        break;
+                    }
+                    let id = ids[r.below(ids.len())];
+                    match if matches!(op, FuzzOp::Delete) { 0 } else { r.below(4) } {
+                        0 => {
+                            take_entry(&mut t.entries, id);
+                        }
+                        1 => {
+                            if let Some(mut e) = take_entry(&mut t.entries, id) {
+                                e.description = format!("edited {}", r.next() % 100);
+                                e.script = Some(format!("// edited\n{}", e.script.unwrap_or_default()));
+                                t.entries.insert(r.below(t.entries.len() + 1), e);
+                            }
+                        }
+                        _ => {
+                            // regroup: move under another entry (or to the top)
+                            let to = ids[r.below(ids.len())];
+                            if let Some(e) = take_entry(&mut t.entries, id) {
+                                fn find(l: &mut [Entry], id: i64) -> Option<&mut Entry> {
+                                    for x in l {
+                                        if x.id == id {
+                                            return Some(x);
+                                        }
+                                        if let Some(y) = find(&mut x.children, id) {
+                                            return Some(y);
+                                        }
+                                    }
+                                    None
+                                }
+                                match find(&mut t.entries, to) {
+                                    Some(p) => p.children.push(e),
+                                    None => t.entries.push(e),
+                                }
+                            }
+                        }
+                    }
+                }
+                let _ = app.table_put(t, cur.version);
+            }
+            FuzzOp::Undo => {
+                let _ = app.table_history(false);
+            }
+            FuzzOp::Redo => {
+                let _ = app.table_history(true);
+            }
+            FuzzOp::GrantEntries => {
+                let st = app.table_get().unwrap();
+                if !st.untrusted.is_empty() {
+                    let pick = st.untrusted[r.below(st.untrusted.len())];
+                    if app.table_trust_entries(&[pick]).is_ok() {
+                        // consent covers the subtree's foreign entries
+                        fn sub(l: &[Entry], id: i64, out: &mut Vec<i64>, inside: bool) {
+                            for e in l {
+                                let now = inside || e.id == id;
+                                if now {
+                                    out.push(e.id);
+                                }
+                                sub(&e.children, id, out, now);
+                            }
+                        }
+                        let mut v = Vec::new();
+                        sub(&st.table.entries, pick, &mut v, false);
+                        for id in v.into_iter().filter(|i| m.kind.get(i) == Some(&Kind2::Foreign)) {
+                            m.agreed.insert(id);
+                        }
+                    } else if !m.never {
+                        return Err((step, "a grant was refused without never".into()));
+                    }
+                }
+            }
+            FuzzOp::GrantTable => {
+                if app.table_trust(true).is_ok() {
+                    m.table_agreed = true;
+                } else if !m.never {
+                    return Err((step, "the table grant was refused without never".into()));
+                }
+            }
+            FuzzOp::Revoke => {
+                app.table_trust(false).unwrap();
+                m.table_agreed = false;
+            }
+            FuzzOp::NeverOn => {
+                set_never(&app, true);
+                m.never = true;
+                m.table_agreed = false;
+                m.agreed.clear();
+            }
+            FuzzOp::NeverOff => {
+                set_never(&app, false);
+                m.never = false;
+            }
+        }
+        // Ids: only inserting ops mint, always past every id issued before.
+        let fresh: Vec<i64> = live_ids(&app).into_iter().filter(|i| !m.kind.contains_key(i)).collect();
+        for id in fresh {
+            let Some(k) = mint else { return Err((step, format!("{op:?} brought in id {id} nobody issued"))) };
+            if id <= m.max_id {
+                return Err((step, format!("{op:?} reused id {id} (max issued {})", m.max_id)));
+            }
+            m.kind.insert(id, k);
+        }
+        m.max_id = m.max_id.max(m.kind.keys().copied().max().unwrap_or(0));
+        // The invariant, for every live entry.
+        for id in live_ids(&app) {
+            let full = app.table_caps(id) == hh_lua::Caps::Full;
+            if full && !m.allowed(id) {
+                return Err((step, format!("after {op:?}: id {id} ({:?}) has capabilities the model does not grant (never {})", m.kind.get(&id), m.never)));
+            }
+            if m.never && full && m.kind.get(&id) != Some(&Kind2::Own) {
+                return Err((step, format!("after {op:?}: id {id} is Full under never")));
+            }
+            if !full && m.allowed(id) {
+                return Err((step, format!("after {op:?}: id {id} ({:?}) lost capabilities the model grants", m.kind.get(&id))));
+            }
+        }
+    }
+    if std::env::var("HH_FUZZ_STATS").is_ok() {
+        let ids = live_ids(&app);
+        let full = ids.iter().filter(|&&i| app.table_caps(i) == hh_lua::Caps::Full).count();
+        eprintln!("end: {} live entries, {full} with capabilities, {} ids issued, never {}", ids.len(), m.kind.len(), m.never);
+    }
+    Ok(())
+}
+
+/// Seeded random sequences over every operation that touches entries or consent; after every
+/// step each live entry's capabilities match an independent model. On failure: the seed and a
+/// greedily shortened sequence.
+#[test]
+fn trust_model_fuzz() {
+    let seeds: Vec<u64> = match std::env::var("HH_FUZZ_SEED") {
+        Ok(s) => vec![s.parse().unwrap()],
+        Err(_) => vec![0x9e37_79b9, 1, 42, 0xdead_beef, 7_777_777],
+    };
+    let steps: usize = std::env::var("HH_FUZZ_STEPS").ok().and_then(|s| s.parse().ok()).unwrap_or(600);
+    let mut total = 0;
+    for seed in seeds {
+        let mut r = Rng(seed | 1);
+        let ops: Vec<(FuzzOp, u64)> = (0..steps).map(|_| (FUZZ_OPS[r.below(FUZZ_OPS.len())], r.next())).collect();
+        if let Err((at, why)) = fuzz_run(&ops) {
+            let mut short: Vec<(FuzzOp, u64)> = ops[..=at].to_vec();
+            let mut i = short.len();
+            while i > 0 {
+                i -= 1;
+                let mut t = short.clone();
+                t.remove(i);
+                if fuzz_run(&t).is_err() {
+                    short = t;
+                }
+            }
+            let last = fuzz_run(&short).unwrap_err();
+            panic!("seed {seed}: step {at}: {why}\nshortened to {} steps: {:?}\nfails with: {}", short.len(), short, last.1);
+        }
+        total += ops.len();
+    }
+    eprintln!("trust model fuzz: {total} steps");
 }

@@ -233,6 +233,7 @@ commands! {
     run table_merge(path: String) -> TableState = |a| a.table_merge(&path);
     run table_paste(entries: Vec<heaphook::table::Entry>, after: Option<i64>, base: Option<u64>) -> heaphook::cheat::PasteOut = |a| a.table_paste(entries, after, base);
     run table_trust_entries(ids: Vec<i64>) -> () = |a| a.table_trust_entries(&ids);
+    run table_new(entries: Vec<heaphook::table::Entry>, after: Option<i64>, base: Option<u64>) -> heaphook::cheat::PasteOut = |a| a.table_new(entries, after, base);
     run table_dirty() -> bool = |a| a.table_dirty();
     run table_open_data(name: String, data: String, force: Option<bool>) -> TableState = |a| a.table_open_data(&name, &data, force.unwrap_or(false));
     run aa_load_file(path: String, session: u64) -> String = |a| a.aa_load_file(&path, session);

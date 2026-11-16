@@ -28,13 +28,16 @@ struct Rt {
     frozen_value: Option<String>,
 }
 
-/// Where an entry's content came from. Trust is decided by this, never by the content: an
-/// entry typed or generated in this session (no origin recorded) is the user's own; one
-/// from outside is untrusted until the user consents (`Live::grant`). Kept per entry id
-/// through edits, puts, moves, undo / redo and saves; editing an untrusted entry does not
-/// make it trusted (only consent does).
+/// Where an entry's content came from. Trust is decided by this, never by the content. The
+/// backend issues every entry id (ids only grow for the lifetime of a table, never reused) and
+/// records its origin when it issues it; neither ever changes afterwards (a put, an undo or a
+/// redo cannot touch them), and nothing is forgotten until another table is opened. Editing
+/// an untrusted entry does not make it trusted: only consent does (`Live::grant`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Origin {
+pub enum Origin {
+    /// Made in this session by the user (`table_new`, a typed Auto Assemble window's "Assign
+    /// to table", a local template) or by trusted Lua (`createMemoryRecord`).
+    Own,
     /// Came with the table file that was opened (a dropped file, the command line, Lua's
     /// `loadTable(f)`): under the table's consent ([`Trust`]).
     Table,
@@ -71,9 +74,12 @@ struct Inner {
     redo: Vec<Table>,
     /// Consent for this table's Lua script and its [`Origin::Table`] entries.
     trust: Trust,
-    /// Entry id -> origin; absent = the user's own. Ids that left the table stay while an
-    /// undo / redo step still holds them.
+    /// Entry id -> origin, for every id issued since the table was opened (never pruned: an
+    /// id that left the table may come back by undo / redo). An id without one was not
+    /// issued by the backend: no capabilities, and a put may not bring it in.
     origin: HashMap<i64, Origin>,
+    /// The last id issued; ids only grow until another table is opened.
+    next_id: i64,
     /// [`Origin::Foreign`] entries the user consented to.
     agreed: HashSet<i64>,
     /// Settings say never to run a loaded table's Lua: nothing but the user's own runs Lua.
@@ -123,26 +129,22 @@ impl Inner {
             }
             self.redo.clear();
         }
-        self.prune();
         self.bump();
     }
 
-    /// Forgets the origin of ids neither the table nor any undo / redo step holds (a new
-    /// entry that reuses such an id is the user's own).
-    fn prune(&mut self) {
-        let mut keep: HashSet<i64> = HashSet::new();
-        for t in std::iter::once(&self.table).chain(&self.undo).chain(&self.redo) {
-            keep.extend(all(&t.entries).into_iter().map(|(e, _)| e.id));
-        }
-        self.origin.retain(|id, _| keep.contains(id));
-        self.agreed.retain(|id| keep.contains(id));
+    /// Issues a new entry id with its origin.
+    fn issue(&mut self, origin: Origin) -> i64 {
+        self.next_id += 1;
+        self.origin.insert(self.next_id, origin);
+        self.next_id
     }
 
     /// THE capability decision for entry `id`: what its script and callbacks may do on every
     /// route (the engine asks through `TableHost::caps`, the app's own routes ask here).
     fn caps(&self, id: i64) -> Caps {
         let ok = match self.origin.get(&id) {
-            None => true,
+            None => false,
+            Some(Origin::Own) => true,
             Some(Origin::Table) => self.trust.allows() && !self.never,
             Some(Origin::Foreign) => self.agreed.contains(&id) && !self.never,
         };
@@ -493,10 +495,10 @@ impl Live {
     }
 
     /// The origin (and consent) an entry assigned from session `s` keeps.
-    pub(crate) fn aa_origin(&self, s: u64) -> R<(Option<Origin>, bool)> {
+    pub(crate) fn aa_origin(&self, s: u64) -> R<(Origin, bool)> {
         match lock(&self.0).aa.get(&s) {
-            Some(AaSess::Typed) => Ok((None, false)),
-            Some(AaSess::File { agreed }) => Ok((Some(Origin::Foreign), *agreed)),
+            Some(AaSess::Typed) => Ok((Origin::Own, false)),
+            Some(AaSess::File { agreed }) => Ok((Origin::Foreign, *agreed)),
             None => Err(format!("no Auto Assemble session {s}")),
         }
     }
@@ -521,6 +523,11 @@ impl Live {
         for (e, _) in all(&t.entries) {
             if e.id <= 0 || e.id > u32::MAX as i64 || !seen.insert(e.id) {
                 return Err(format!("bad or duplicate entry id {}", e.id));
+            }
+            // New entries come from the backend commands that say where they came from
+            // (`table_new`, `table_paste`, ...): a put only edits, moves and deletes.
+            if !g.origin.contains_key(&e.id) {
+                return Err(format!("entry id {} was not issued by HeapHook: add entries with table_new", e.id));
             }
         }
         // Raw `.CT` fragments only ever come from a `.CT` import: a put keeps one only when it
@@ -592,13 +599,13 @@ impl Live {
         for &id in keep {
             let Some(mut e) = find_mut(&mut g.table.entries, id).map(|e| e.clone()) else { continue };
             e.children.clear();
-            if g.origin.contains_key(&id) {
+            if g.origin.get(&id) == Some(&Origin::Own) {
+                origin.insert(next, Origin::Own);
+            } else {
                 origin.insert(next, Origin::Foreign);
                 if g.caps(id) == Caps::Full {
                     agreed.insert(next);
                 }
-            } else {
-                origin.remove(&next);
             }
             e.id = next;
             if let Some(r) = g.rt.remove(&id) {
@@ -607,7 +614,10 @@ impl Live {
             carried.push(e);
             next += 1;
         }
-        if !carried.is_empty() {
+        if carried.is_empty() {
+            next -= 1;
+        } else {
+            origin.insert(next, Origin::Own);
             t.entries.push(Entry { id: next, description: "Still active from the previous table".into(), children: carried, ..Entry::default() });
         }
         g.table = t;
@@ -617,22 +627,27 @@ impl Live {
         g.trust = Trust::Ask;
         g.origin = origin;
         g.agreed = agreed;
+        g.next_id = next;
         g.saved = content_hash(&g.table);
         g.bump();
         g.st()
     }
 
     /// Inserts `entries` (new ids, inactive) after entry `after` (in its list) or at the end,
-    /// all of them (children too) with `origin` (`None`: the user's own), already agreed or
-    /// not. A paste, a merge or a drop from another table never carries consent along.
-    /// Returns the new version and the new top-level ids.
-    pub(crate) fn insert(&self, mut entries: Vec<Entry>, after: Option<i64>, base: Option<u64>, origin: Option<Origin>, agreed: bool) -> R<(u64, Vec<i64>)> {
+    /// all of them (children too) with fresh ids issued with `origin`, already agreed or not.
+    /// A paste, a merge or a drop from another table never carries consent along. Returns
+    /// the new version and the new top-level ids.
+    pub(crate) fn insert(&self, mut entries: Vec<Entry>, after: Option<i64>, base: Option<u64>, origin: Origin, agreed: bool) -> R<(u64, Vec<i64>)> {
         let mut g = lock(&self.0);
         if let Some(b) = base.filter(|b| *b != g.version) {
             return Err(format!("stale table version {b} (current {})", g.version));
         }
-        // Past every id an undo / redo step holds too: a restored entry keeps its own origin.
-        let mut next = std::iter::once(&g.table).chain(&g.undo).chain(&g.redo).flat_map(|t| all(&t.entries)).map(|(e, _)| e.id).max().unwrap_or(0);
+        let mut n = 0;
+        for_each_mut(&mut entries, &mut |_| n += 1);
+        let (first, mut next) = (g.next_id + 1, g.next_id);
+        if first.saturating_add(n) > u32::MAX as i64 {
+            return Err("no entry ids left in this table".into());
+        }
         for_each_mut(&mut entries, &mut |e| {
             next += 1;
             e.id = next;
@@ -663,14 +678,13 @@ impl Live {
             t.entries.extend(rest);
         }
         table::check_limits(&t.entries)?;
-        let added: Vec<i64> = ids.iter().filter_map(|id| all(&t.entries).into_iter().find(|(e, _)| e.id == *id).map(|(e, _)| all(std::slice::from_ref(e)).into_iter().map(|(c, _)| c.id).collect::<Vec<_>>())).flatten().collect();
-        // Before the install: a new id may reuse one an undo step holds.
-        for id in &added {
-            match origin {
-                Some(o) => g.origin.insert(*id, o),
-                None => g.origin.remove(id),
-            };
-            if agreed { g.agreed.insert(*id) } else { g.agreed.remove(id) };
+        // Issued only now that the insert cannot fail any more.
+        for id in first..=next {
+            let got = g.issue(origin);
+            debug_assert_eq!(got, id);
+            if agreed {
+                g.agreed.insert(id);
+            }
         }
         g.install(t, true);
         Ok((g.version, ids))
@@ -862,7 +876,8 @@ impl TableHost for Live {
 
     fn create(&self, parent: Option<RecId>) -> RecId {
         let mut g = lock(&self.0);
-        let id = all(&g.table.entries).iter().map(|(e, _)| e.id).max().unwrap_or(0) + 1;
+        // Only trusted Lua runs, so what it creates is the user's own.
+        let id = g.issue(Origin::Own);
         let e = Entry { id, description: "No description".into(), addr: "0".into(), ..Entry::default() };
         // Past the depth limit the new record goes to the top level instead.
         let parent = parent.filter(|&p| depth_of(&g.table.entries, p as i64) < table::MAX_DEPTH);
@@ -994,7 +1009,7 @@ the table was not opened: these active scripts could not be disabled (open anywa
         if script {
             self.x.live.distrust_keeping_current();
         }
-        self.x.live.insert(add.entries, None, None, Some(Origin::Foreign), false)?;
+        self.x.live.insert(add.entries, None, None, Origin::Foreign, false)?;
         if script {
             let cur = self.x.live.state();
             let mut t = cur.table;
@@ -1142,8 +1157,23 @@ the table was not opened: these active scripts could not be disabled (open anywa
     /// Pastes (or drops) entries after entry `after`: new ids, inactive, every one of them
     /// untrusted until its own consent. `base`: the table version the UI saw.
     pub fn table_paste(&self, entries: Vec<Entry>, after: Option<i64>, base: Option<u64>) -> R<PasteOut> {
-        let (version, ids) = self.x.live.insert(entries, after, base, Some(Origin::Foreign), false)?;
+        let (version, ids) = self.x.live.insert(entries, after, base, Origin::Foreign, false)?;
         Ok(PasteOut { version, ids })
+    }
+
+    /// New entries the user made (add address, new script, new group, from results, the
+    /// structure dissector, a pointer scan, the disassembler ...): new ids after entry
+    /// `after`, inactive, the user's own. The only way the frontend adds entries of its own;
+    /// a put cannot bring in an id the backend did not issue.
+    pub fn table_new(&self, entries: Vec<Entry>, after: Option<i64>, base: Option<u64>) -> R<PasteOut> {
+        let (version, ids) = self.x.live.insert(entries, after, base, Origin::Own, false)?;
+        Ok(PasteOut { version, ids })
+    }
+
+    /// What entry `id` may do now (diagnostics and tests): `Caps::Full` only for the user's
+    /// own entries and those under consent in force.
+    pub fn table_caps(&self, id: i64) -> Caps {
+        self.x.live.caps(id)
     }
 
     /// An injection template at `addr` as a new script entry after `after`. A template for
@@ -1152,7 +1182,7 @@ the table was not opened: these active scripts could not be disabled (open anywa
         let script = self.aa_template(addr, kind)?;
         let remote = self.session()?.info.remote.is_some();
         let e = Entry { description: description.into(), script: Some(script), ..Entry::default() };
-        let (version, ids) = self.x.live.insert(vec![e], after, base, remote.then_some(Origin::Foreign), false)?;
+        let (version, ids) = self.x.live.insert(vec![e], after, base, if remote { Origin::Foreign } else { Origin::Own }, false)?;
         Ok(PasteOut { version, ids })
     }
 
@@ -1353,7 +1383,10 @@ mod tests {
     fn put_keeps_activation_and_rejects_stale() {
         let live = Live::default();
         let e = |id, kids| Entry { id, addr: "0x10".into(), children: kids, ..Entry::default() };
-        let v = live.put(Table { entries: vec![e(1, vec![e(2, vec![])])], ..Table::default() }, 0).unwrap();
+        // A put cannot bring in ids the backend did not issue.
+        assert!(live.put(Table { entries: vec![e(1, vec![])], ..Table::default() }, 0).unwrap_err().contains("not issued"));
+        let (v, ids) = live.insert(vec![e(7, vec![e(8, vec![])])], None, None, Origin::Own, false).unwrap();
+        assert_eq!(ids, [1]);
         let mut r = TableHost::get(&live, 2).unwrap();
         assert_eq!(r.parent, Some(1));
         r.active = true;
@@ -1377,5 +1410,9 @@ mod tests {
         TableHost::delete(&live, 1);
         assert_eq!(TableHost::ids(&live), [n]);
         assert!(live.frozen().is_empty());
+        // Ids never come back: the next one is past every id issued.
+        let (_, again) = live.insert(vec![e(1, vec![])], None, None, Origin::Foreign, false).unwrap();
+        assert_eq!(again, [n as i64 + 1]);
+        assert_eq!(live.caps(n as i64 + 1), Caps::None);
     }
 }

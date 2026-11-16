@@ -499,21 +499,20 @@ export function initTable(root) {
     edit(list.map((e) => e.id), (e) => { e.freeze_interval_ms = ms; });
   }
 
-  /** Inserts after the cursor (or at the end); returns the new ids. */
+  /** Inserts after the cursor (or at the end) through the backend, which issues the ids and
+   *  records them as the user's own (a put cannot add entries). */
   function add(items, { edit: editNow, then } = {}) {
-    const at = cursor;
-    let made = [];
-    commit(() => {
-      made = items.map((p) => entry(p));
-      const f = at != null ? find(at) : null;
-      if (f) f.list.splice(f.index + 1, 0, ...made); else roots.push(...made);
-      sel.clear(); made.forEach((e) => sel.add(e.id));
-      cursor = anchor = made[made.length - 1].id;
-    }).then(() => {
-      scrollToCursor();
+    chain = chain.then(async () => {
+      const r = await attempt(() => api.tableNew(items.map((p) => strip(entry(p))), cursor, version));
+      await refetch();
+      if (!r?.ids?.length) return;
+      sel.clear(); r.ids.forEach((id) => sel.add(id));
+      cursor = anchor = r.ids.at(-1);
+      render(); scrollToCursor();
       if (editNow) editCell(cursor, 'description');
       then?.(byId(cursor));
-    });
+    }).catch((e) => toast(e?.message || e));
+    return chain;
   }
   function removeIds(ids) {
     const out = [];
@@ -570,13 +569,20 @@ export function initTable(root) {
     const ids = topSelected().map((e) => e.id);
     if (!ids.length) return;
     let gid = null;
+    // The backend makes the group (after the first entry); then a put moves the entries in.
+    chain = chain.then(async () => {
+      const r = await attempt(() => api.tableNew([strip(entry({ description: 'Group', options: [...GROUP_DEFAULT] }))], ids[0], version));
+      await refetch();
+      gid = r?.ids?.[0] ?? null;
+    });
     commit(() => {
-      const at = find(ids[0]);
-      if (!at) return;
-      const g = entry({ description: 'Group', options: [...GROUP_DEFAULT] });
-      at.list.splice(at.index, 0, g);
+      const at = find(ids[0]), g = gid != null && byId(gid);
+      if (!at || !g) return;
+      removeIds(new Set([gid]));
+      const at2 = find(ids[0]);
+      at2.list.splice(at2.index, 0, g);
       g.children = removeIds(new Set(ids));
-      sel.clear(); sel.add(g.id); cursor = anchor = gid = g.id;
+      sel.clear(); sel.add(g.id); cursor = anchor = g.id;
     }).then(() => gid != null && editCell(gid, 'description'));
   }
   function move(dir) {

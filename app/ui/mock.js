@@ -2059,6 +2059,10 @@ const RC = {
     if (s === 'agreed') T.untrusted = untrusted().filter((id) => !ids.includes(id));
     return { ids, version: T.version };
   },
+  table_new({ entries, after, base }) {
+    if (base != null && base !== T.version) err(`stale table version ${base} (current ${T.version})`);
+    return { ids: insertForeign(entries, after ?? null, false), version: T.version };
+  },
   table_add_template({ addr, kind, description, after, base }) {
     if (base != null && base !== T.version) err(`stale table version ${base} (current ${T.version})`);
     const script = C.aa_template({ addr, kind });

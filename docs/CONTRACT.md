@@ -90,6 +90,8 @@ decreased decreased_by changed unchanged same_as_first`, plus `not: bool` to inv
 | `ptr_save_map` / `ptr_save_results` / `ptr_open_results` | `path` | – / – / `{count, max_level, target}` |
 | `table_get` | – | `{version, table, trust}`; the backend owns the live table (Lua and hotkeys change it too); `trust`: `own` (built in this session), `agreed`, `ask` (opened from a file, or loaded / merged by a script), `declined` |
 | `table_put` | `table, base` (version the edit is based on) | new version; rejects `stale table version …` (refetch, replay the edit); never changes activation; keeps an entry's (or the table's) `ct_extra` only when it is exactly what the backend holds for it, drops option names that are not `[A-Za-z0-9_]+` and colours that are not `#RRGGBB` |
+| `table_put` (ids) | | edits, moves, regroups and deletes only: an entry id the backend did not issue is rejected (`entry id N was not issued by HeapHook: add entries with table_new`); a put never changes an id's origin |
+| `table_new` | `entries, after?, base?` | `{version, ids}`: the user's own new entries (new address, script, group, from results, structures, pointer scans, the disassembler), new ids after entry `after` or at the end |
 | `table_open` / `table_export` | `path` (`.json` or `.CT`), `force?` | `{version, table}` (all inactive; the Lua script is NOT run; the current table's active scripts are disabled first, and if one cannot be the open is refused with `… could not be disabled …` unless `force`, which carries those entries over, still active, into a group) / – |
 | `table_trust` | `trust` | – (consent for a loaded table: its table script and the capabilities of the entries that came with it, on every route. `false` declines; if consent had been given it is withdrawn and the table's running Lua is stopped (see "Script consent"). `true` errors while Settings say never. Entry hotkeys without capabilities are not registered system-wide; a hotkey without Ctrl/Shift/Alt/Win never is) |
 | `aa_check` (no execution) | | never runs Lua: with capabilities `{$lua}` blocks count as empty text and registered commands expand to nothing; without them each directive that needs one is an error containing `is not available to this script` |
@@ -271,7 +273,11 @@ Trust is decided by origin, never by content, and the engine fails closed.
   `loadTable(f)`: under `table_trust`), or elsewhere (paste, merge, `loadTable(f, true)`, a
   remote template, an Auto Assemble session a file was loaded into: under
   `table_trust_entries`). It survives edits, `table_put`, moves, undo / redo and saves within
-  the session. Editing an untrusted entry never makes it trusted; consent does
+  the session. The backend issues every entry id (`table_new`, `table_paste`, `table_merge`,
+  `aa_assign`, `table_add_template`, Lua) and records its origin then; ids only grow until
+  another table is opened (never reused after a delete, undo or redo) and origins are never
+  forgotten before that, so an undo / redo brings an entry back with the origin and consent it
+  had. Editing an untrusted entry never makes it trusted; consent does
   (`table_trust`, `table_trust_entries`, `aa_trust`), and Settings `table_script: never`
   refuses it and withdraws consent already given. Auto Assemble window text is the user's own
   only through its session (`aa_session`), never because of what it says.
