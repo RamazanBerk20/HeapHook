@@ -1086,27 +1086,31 @@ fn hostile_regions_do_not_break_collection() {
 #[test]
 fn huge_result_index_and_header_are_refused() {
     let out = tmp("huge-index");
-    let h = serde_json::to_vec(&header(&["a.exe"], 2)).unwrap();
-    let data_start = 12 + h.len() as u64;
-    // count = 2^35 paths -> 2^23 index entries (64 MiB), all in a sparse file.
-    let count: u64 = 1 << 35;
-    let entries = count / 4096;
-    let index_off = count * 3;
-    let len = data_start + index_off + entries * 8 + 16;
-    let mut b = b"HHPTRS02".to_vec();
-    b.extend_from_slice(&(h.len() as u32).to_le_bytes());
-    b.extend_from_slice(&h);
-    std::fs::write(&out, &b).unwrap();
-    let file = std::fs::OpenOptions::new().write(true).open(&out).unwrap();
-    file.set_len(len).unwrap();
-    use std::io::{Seek, Write};
-    let mut file = file;
-    file.seek(std::io::SeekFrom::Start(len - 16)).unwrap();
-    file.write_all(&count.to_le_bytes()).unwrap();
-    file.write_all(&index_off.to_le_bytes()).unwrap();
-    drop(file);
-    let e = ResultFile::open(&out).unwrap_err();
-    assert!(e.to_string().contains("too many"), "{e}");
+    // 100+ GiB file: only cheap where set_len makes a sparse file (NTFS allocates it).
+    #[cfg(unix)]
+    {
+        let h = serde_json::to_vec(&header(&["a.exe"], 2)).unwrap();
+        let data_start = 12 + h.len() as u64;
+        // count = 2^35 paths -> 2^23 index entries (64 MiB), all in a sparse file.
+        let count: u64 = 1 << 35;
+        let entries = count / 4096;
+        let index_off = count * 3;
+        let len = data_start + index_off + entries * 8 + 16;
+        let mut b = b"HHPTRS02".to_vec();
+        b.extend_from_slice(&(h.len() as u32).to_le_bytes());
+        b.extend_from_slice(&h);
+        std::fs::write(&out, &b).unwrap();
+        let file = std::fs::OpenOptions::new().write(true).open(&out).unwrap();
+        file.set_len(len).unwrap();
+        use std::io::{Seek, Write};
+        let mut file = file;
+        file.seek(std::io::SeekFrom::Start(len - 16)).unwrap();
+        file.write_all(&count.to_le_bytes()).unwrap();
+        file.write_all(&index_off.to_le_bytes()).unwrap();
+        drop(file);
+        let e = ResultFile::open(&out).unwrap_err();
+        assert!(e.to_string().contains("too many"), "{e}");
+    }
     // A header length beyond the cap.
     let mut b = b"HHPTRS02".to_vec();
     b.extend_from_slice(&u32::MAX.to_le_bytes());

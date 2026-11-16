@@ -1744,7 +1744,8 @@ fn user_labels_resolve_and_survive_a_table_round_trip() {
     };
     app.table_put(tb, base).unwrap();
     assert_eq!(parse_addr(&app.resolve_address("hpvar").unwrap()).unwrap(), i32a);
-    assert_eq!(parse_addr(&app.resolve_address("[after_hp-4]").unwrap()).unwrap(), 123456);
+    // `[x]` reads pointer width; the high dword is the target's uninitialized struct padding.
+    assert_eq!(parse_addr(&app.resolve_address("[after_hp-4]").unwrap()).unwrap() & 0xffff_ffff, 123456);
     assert_eq!(app.resolve_many(&["after_hp".into(), "nosuchlabel".into()]).unwrap(), [Some(format!("{:#x}", i32a + 4)), None]);
     let dir = tempfile::tempdir().unwrap();
     for name in ["l.json", "l.CT"] {

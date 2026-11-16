@@ -493,7 +493,9 @@ mod tests {
         let sp = Spill::new(0).in_dir(Some(dir.path().to_path_buf()));
         let b = sp.put(vec![7; 4096]).unwrap();
         assert_eq!(&*b.load().unwrap(), &[7; 4096][..]);
-        // The file is open but unlinked: nothing to clean up after a crash.
+        // The file is open but unlinked: nothing to clean up after a crash. (Windows keeps a
+        // delete-on-close file listed until its handle closes, which a crash also does.)
+        #[cfg(unix)]
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
         assert_eq!(spill_dir(Some(dir.path())), dir.path());
 

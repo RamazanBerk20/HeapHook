@@ -434,23 +434,31 @@ fn lua_err(e: &Engine, src: &str) -> String {
 #[test]
 fn file_helpers_refuse_devices_and_huge_files() {
     let (e, _, _) = engine();
+    #[cfg(unix)]
     for f in ["md5file('/dev/zero')", "readRegionFromFile('/dev/zero', 0x20000000)", "md5file('/tmp')"] {
         let err = lua_err(&e, f);
         assert!(err.contains("not a regular file"), "{f}: {err}");
     }
     let dir = std::env::temp_dir().join(format!("hh-lua-l2-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
+    // Lua string literals for paths (Windows paths have backslashes).
+    let lit = |p: &std::path::Path| format!("{:?}", p.to_str().unwrap());
+    let err = lua_err(&e, &format!("md5file({})", lit(&dir)));
+    assert!(err.contains("not a regular file"), "directory: {err}");
     // A FIFO must be refused without blocking on open.
-    let fifo = dir.join("fifo");
-    if std::process::Command::new("mkfifo").arg(&fifo).status().is_ok_and(|s| s.success()) {
-        let err = lua_err(&e, &format!("md5file('{}')", fifo.display()));
-        assert!(err.contains("not a regular file"), "{err}");
+    #[cfg(unix)]
+    {
+        let fifo = dir.join("fifo");
+        if std::process::Command::new("mkfifo").arg(&fifo).status().is_ok_and(|s| s.success()) {
+            let err = lua_err(&e, &format!("md5file({})", lit(&fifo)));
+            assert!(err.contains("not a regular file"), "{err}");
+        }
     }
-    // Over the size cap (sparse: no disk space or memory used).
+    // Over the size cap (sparse on Unix; NTFS allocates the 1 GiB but never writes it).
     let big = dir.join("big");
     std::fs::File::create(&big).unwrap().set_len((1 << 30) + 1).unwrap();
     for f in ["md5file", "readRegionFromFile"] {
-        let err = lua_err(&e, &format!("{f}('{}', 0x20000000)", big.display()));
+        let err = lua_err(&e, &format!("{f}({}, 0x20000000)", lit(&big)));
         assert!(err.contains("larger than 1073741824 bytes"), "{f}: {err}");
     }
     // Streaming hash of a multi-chunk file matches the one-buffer hash.
@@ -458,7 +466,7 @@ fn file_helpers_refuse_devices_and_huge_files() {
     let f = dir.join("data");
     std::fs::write(&f, &data).unwrap();
     e.lua().globals().set("DATA", e.lua().create_string(&data).unwrap()).unwrap();
-    run(&e, &format!("assert(md5file('{}') == stringToMD5String(DATA))", f.display()));
+    run(&e, &format!("assert(md5file({}) == stringToMD5String(DATA))", lit(&f)));
     std::fs::remove_dir_all(&dir).unwrap();
 }
 

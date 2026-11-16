@@ -206,16 +206,18 @@ unsafe extern "C-unwind" fn file_gc_nowait(l: *mut ffi::lua_State) -> c_int {
         if p.is_null() || (*p).closef.is_none() || (*p).f.is_null() {
             return 0;
         }
-        #[cfg(unix)]
-        {
-            let fd = libc::fileno((*p).f as *mut libc::FILE);
-            let mut st: libc::stat = std::mem::zeroed();
-            if fd >= 0 && libc::fstat(fd, &mut st) == 0 {
-                let kind = st.st_mode & libc::S_IFMT;
-                if kind == libc::S_IFIFO || kind == libc::S_IFSOCK {
-                    (*p).closef = None;
-                    return 0;
-                }
+        let fd = libc::fileno((*p).f as *mut libc::FILE);
+        let mut st: libc::stat = std::mem::zeroed();
+        if fd >= 0 && libc::fstat(fd, &mut st) == 0 {
+            #[cfg(unix)]
+            let pipe = matches!(st.st_mode & libc::S_IFMT, libc::S_IFIFO | libc::S_IFSOCK);
+            // The MSVC CRT's `_fstat` reports a pipe (what `_popen` returns) as `_S_IFIFO`,
+            // a constant the libc crate does not define for Windows.
+            #[cfg(windows)]
+            let pipe = c_int::from(st.st_mode) & libc::S_IFMT == 0o01_0000;
+            if pipe {
+                (*p).closef = None;
+                return 0;
             }
         }
         match FILE_GC.load(Ordering::SeqCst) {
