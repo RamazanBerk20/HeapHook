@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/hh-core", "crates/hh-scan", "crates/hh-asm", "crates/hh-target", "crates/hh-debug", "crates/hh-ptr", "app/src-tauri", "crates/hh-lua", "crates/hh-tools", "crates/hh-inject", "crates/hh-net"]
 
 [workspace.package]
-version = "1.0.0-rc.1"
+version = "1.0.0-rc.2"
 license = "Apache-2.0"
 edition = "2024"
 

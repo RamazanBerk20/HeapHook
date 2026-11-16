@@ -1,4 +1,11 @@
-HeapHook 1.0.0-rc.1 is the first release candidate of an open-source memory scanner and debugger in the spirit of Cheat Engine.
+HeapHook 1.0.0-rc.2 is the second release candidate of an open-source memory scanner and debugger in the spirit of Cheat Engine.
+
+## Changes since 1.0.0-rc.1
+
+- Windows: closing a Lua interpreter no longer waits for a program a script started with `io.popen`.
+- Windows: shutting down `hh-server` now ends client connections, so a target a client had suspended is resumed.
+- The README states the Windows test coverage accurately.
+- Tests that assumed Unix-only behaviour are gated, and one test that read uninitialised padding is fixed. CI passes on Linux and Windows.
 
 ## Status
 
@@ -18,7 +25,7 @@ HeapHook 1.0.0-rc.1 is the first release candidate of an open-source memory scan
 | `hh-server-*` | Optional server for scanning processes on another machine |
 | `SHA256SUMS-*.txt` | Checksums |
 
-Linux packages carry the version `1.0.0+rc.1`: uninstall a release-candidate package before installing a later final release.
+Linux packages carry the version `1.0.0+rc.2`: uninstall a release-candidate package before installing a later final release.
 
 ## Before you use it
 

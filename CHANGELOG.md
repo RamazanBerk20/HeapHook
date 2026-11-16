@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.0.0-rc.2 - 2026-11-16
+
+- Windows: closing a Lua interpreter no longer waits for a program a script started with `io.popen`.
+- Windows: shutting down `hh-server` ends client connections, so a target a client had suspended is resumed.
+- README: Windows test coverage stated accurately.
+- Tests: Unix-only assumptions gated; a test that read uninitialised padding fixed. CI passes on Linux and Windows.
+- AUR recipes for `heaphook`, `heaphook-git` and `heaphook-bin` in `packaging/aur/`.
+
 ## 1.0.0-rc.1 - 2026-11-16
 
 First release candidate. Linux is the tested platform. The Windows build is compiled and unit-tested in CI but has not been run on Windows.

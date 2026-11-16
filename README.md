@@ -4,7 +4,7 @@ HeapHook is an open-source memory scanner, editor and debugger for Linux and Win
 
 ## Status
 
-This is release candidate 1.0.0-rc.1. Linux is the tested platform. On Windows the code builds and its platform-neutral unit tests pass in CI, but every test that attaches to a real process is Linux-only: opening a process, scanning it, the debugger and the remote server's live paths have never been exercised on Windows, by tests or by hand. Treat the Windows files as untested.
+This is release candidate 1.0.0-rc.2. Linux is the tested platform. On Windows the code builds and its platform-neutral unit tests pass in CI, but every test that attaches to a real process is Linux-only: opening a process, scanning it, the debugger and the remote server's live paths have never been exercised on Windows, by tests or by hand. Treat the Windows files as untested.
 
 Progress against the Cheat Engine feature list is tracked row by row in [docs/PARITY.md](docs/PARITY.md). Of 712 rows: 428 done, 2 engine only (implemented in a library crate, no UI), 68 partial, 181 planned, 33 needing a design decision.
 
@@ -128,7 +128,7 @@ Release bundles. Build the speedhack library first (it is packaged as a resource
 
 The packages land in `target/release/bundle/deb/` and `target/release/bundle/rpm/`. The AppImage and the Windows installer are built by CI only (`.github/workflows/release.yml`). CI (`.github/workflows/ci.yml`) runs clippy and the tests on Linux and builds and tests on Windows.
 
-Linux package version: `app/src-tauri/tauri.linux.conf.json` sets the Linux package version to `1.0.0+rc.1` instead of `1.0.0-rc.1`, because the rpm builder rejects a `-` in the version. The cost: dpkg and rpm sort `1.0.0+rc.1` after a final `1.0.0`, so uninstall a release-candidate package before installing the final release. Delete this override when the final 1.0.0 is cut.
+Linux package version: `app/src-tauri/tauri.linux.conf.json` sets the Linux package version to `1.0.0+rc.2` instead of `1.0.0-rc.2`, because the rpm builder rejects a `-` in the version. The cost: dpkg and rpm sort `1.0.0+rc.2` after a final `1.0.0`, so uninstall a release-candidate package before installing the final release. Delete this override when the final 1.0.0 is cut.
 
 ## Permissions on Linux
 
@@ -201,7 +201,7 @@ then connect HeapHook to `127.0.0.1:52736`. The debugger, speedhack and Create p
 - If HeapHook is force-killed while debugging, software breakpoint bytes (int3) stay in the target. Detach from the debugger before closing HeapHook.
 - `.CT` import was developed against the documented format and hand-written tables. If a table loads wrong, please report it.
 - Custom-type scripts defined at table level in Cheat Engine tables are not preserved on re-export.
-- Linux release candidate packages are versioned `1.0.0+rc.1` (see above).
+- Linux release candidate packages are versioned `1.0.0+rc.2` (see above).
 
 ## Responsible use
 
