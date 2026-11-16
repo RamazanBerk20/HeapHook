@@ -529,6 +529,7 @@ mod tests {
         std::fs::remove_dir_all(&d).unwrap();
     }
 
+    #[cfg(target_os = "linux")] // speedhack launch exists on Linux only
     #[test]
     fn speedhack_refuses_non_x86_64_elf() {
         let d = scratch("elf");

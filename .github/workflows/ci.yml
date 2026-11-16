@@ -20,8 +20,9 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev libsoup-3.0-dev build-essential
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: 1.97.1 # pinned: each new clippy adds lints; bump deliberately
           components: clippy
       - uses: Swatinem/rust-cache@v2
       - name: Build injection payload
@@ -31,7 +32,7 @@ jobs:
       - name: Allow ptrace of child processes
         run: sudo sysctl -w kernel.yama.ptrace_scope=0
       - name: Test
-        run: cargo test --workspace
+        run: cargo test --workspace --no-fail-fast
 
   windows:
     runs-on: windows-latest
@@ -42,4 +43,4 @@ jobs:
       - name: Build
         run: cargo build --workspace
       - name: Test
-        run: cargo test --workspace
+        run: cargo test --workspace --no-fail-fast
