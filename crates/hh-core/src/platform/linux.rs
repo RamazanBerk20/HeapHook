@@ -4,7 +4,7 @@
 use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions};
 use std::io;
-use std::os::unix::fs::FileExt;
+use std::os::unix::fs::{FileExt, MetadataExt};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -75,8 +75,42 @@ fn proc_dir(pid: Pid) -> String {
     }
 }
 
+/// The program image a pid runs: its start time (`/proc/<pid>/stat` field 22) and its
+/// executable's device and inode. A `/proc/<pid>/mem` descriptor belongs to the image that was
+/// running when it was opened.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Image {
+    start: u64,
+    dev: u64,
+    ino: u64,
+}
+
+fn image(pid: Pid) -> Option<Image> {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // Fields after the `(comm)`: state is field 3, so starttime (22) is the 20th.
+    let rest = stat.get(stat.rfind(')')? + 2..)?;
+    let start = rest.split_whitespace().nth(19)?.parse().ok()?;
+    let m = fs::metadata(format!("{}/exe", proc_dir(pid))).ok()?;
+    Some(Image { start, dev: m.dev(), ino: m.ino() })
+}
+
+/// A child of ours that has not exec'd yet (`Command::spawn` returns before the exec): its
+/// `/proc/<pid>/mem` is a copy of HeapHook (fork), or HeapHook itself (vfork / CLONE_VM).
+/// The kernel puts 16 fresh random bytes (AT_RANDOM) into every exec'd image, so finding
+/// ours at our address means the target is still our memory, whatever its exe says.
+fn not_started(mem: &File) -> bool {
+    let at = unsafe { libc::getauxval(libc::AT_RANDOM) };
+    if at == 0 {
+        return false;
+    }
+    let ours = unsafe { std::slice::from_raw_parts(at as *const u8, 16) };
+    let mut b = [0u8; 16];
+    mem.read_exact_at(&mut b, at).is_ok() && b == ours
+}
+
 pub fn open(pid: Pid) -> Result<Arc<dyn Process>> {
     let dir = proc_dir(pid);
+    let before = image(pid);
     // Opening mem needs the same ptrace access as everything else, so it doubles as the
     // permission check. The fd keeps the address space, even if this thread exits later.
     let mem = OpenOptions::new()
@@ -84,6 +118,18 @@ pub fn open(pid: Pid) -> Result<Arc<dyn Process>> {
         .write(true)
         .open(format!("{dir}/mem"))
         .map_err(|e| os_err(e, pid))?;
+    // The process itself is opened on purpose (HeapHook's own memory); anything else must be
+    // a different program image than ours, and the same image across the open.
+    if pid != std::process::id() {
+        if not_started(&mem) {
+            return Err(Error::Other(format!(
+                "process {pid} has not started its program yet (it is still a copy of HeapHook); try again"
+            )));
+        }
+        if image(pid) != before {
+            return Err(Error::Other(format!("process {pid} changed its program while being opened; try again")));
+        }
+    }
     // ELF class byte: 1 = 32-bit, 2 = 64-bit.
     let mut ident = [0u8; 5];
     let ptr_size =
@@ -94,6 +140,7 @@ pub fn open(pid: Pid) -> Result<Arc<dyn Process>> {
     Ok(Arc::new(LinuxProcess {
         pid,
         mem,
+        image: before,
         ptr_size,
         ptrace: Mutex::new(None),
     }))
@@ -102,6 +149,8 @@ pub fn open(pid: Pid) -> Result<Arc<dyn Process>> {
 struct LinuxProcess {
     pid: Pid,
     mem: File,
+    /// The image `mem` belongs to; the descriptor is used only while the pid still runs it.
+    image: Option<Image>,
     ptr_size: usize,
     /// Serializes ptrace sessions; caches the address of a `syscall` instruction.
     ptrace: Mutex<Option<Addr>>,
@@ -126,6 +175,21 @@ impl LinuxProcess {
                 self.gone_or(Error::NoAccess { addr })
             }
             _ => os_err(e, self.pid),
+        }
+    }
+
+    /// Whether `mem` still describes what the pid runs (a stale descriptor of another image
+    /// is never read or written). `write`: identity must be confirmed, not just unknown.
+    fn mem_ok(&self, write: bool) -> Result<()> {
+        let now = image(self.pid);
+        match (self.image, now) {
+            (Some(a), Some(b)) if a == b => Ok(()),
+            (None, _) if !write => Ok(()),
+            _ if !self.is_alive() => Err(Error::ProcessGone),
+            _ => Err(Error::Other(format!(
+                "process {} runs a different program than when it was opened; open it again",
+                self.pid
+            ))),
         }
     }
 
@@ -174,6 +238,7 @@ impl Memory for LinuxProcess {
         }
         // /proc/pid/mem reads with FOLL_FORCE, so it also gets pages that are mapped without
         // PROT_READ, and works where process_vm_readv is unavailable.
+        self.mem_ok(false)?;
         match self.mem.read_at(buf, addr) {
             Ok(0) => Err(self.gone_or(Error::NoAccess { addr })),
             Ok(n) => Ok(n),
@@ -196,6 +261,9 @@ impl Memory for LinuxProcess {
         let n = unsafe { libc::process_vm_writev(self.pid as i32, &local, 1, &remote, 1, 0) };
         let mut done = n.max(0) as usize;
         // The rest goes through /proc/pid/mem, which writes read-only pages (code) via COW.
+        if done < data.len() {
+            self.mem_ok(true)?;
+        }
         while done < data.len() {
             let at = addr
                 .checked_add(done as u64)

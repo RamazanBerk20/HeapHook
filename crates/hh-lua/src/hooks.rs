@@ -146,6 +146,10 @@ pub(crate) enum Mode {
 /// here with the capabilities it was given. `Caps::None` gets [`denied`]; only `Caps::Full`
 /// reaches anything that runs Lua or reads a file.
 pub(crate) fn for_caps(lua: &Lua, st: &Arc<State>, memrec: Option<RecId>, mode: Mode, caps: Caps) -> AaHooks {
+    // Full hooks for a record run its owners' code: they join the contamination set first.
+    if let (Caps::Full, Some(id), Mode::Run | Mode::Check) = (caps, memrec, mode) {
+        crate::api::contaminate(st, id);
+    }
     match (caps, mode) {
         (Caps::None, _) => denied(st),
         (Caps::Full, Mode::Run) => full(lua, st, memrec, false),

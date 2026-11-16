@@ -77,7 +77,9 @@ impl B<'_> {
         R: IntoLuaMulti,
         F: Fn(&Lua, &Arc<State>, A) -> LR<R> + Send + 'static,
     {
-        let st = self.st.clone();
+        // Weak: a discarded interpreter (parked, never closed) must not keep the engine's state,
+        // its process or its hosts alive.
+        let st = Arc::downgrade(self.st);
         let dead = self.dead.clone();
         // The error path itself (messages, tracebacks) keeps working while a reset is pending.
         let always = matches!(name, "traceback" | "errtext" | "aborted");
@@ -90,6 +92,9 @@ impl B<'_> {
                     return Err(mlua::Error::runtime("this Lua state was discarded"));
                 }
                 // A reset is pending: the state is being discarded, nothing more runs.
+                let Some(st) = st.upgrade() else {
+                    return Err(mlua::Error::runtime("this Lua state was discarded"));
+                };
                 if !always && st.reset_pending.load(Ordering::SeqCst) {
                     return Err(mlua::Error::runtime("the table's Lua was stopped"));
                 }
@@ -926,6 +931,17 @@ fn untrusted_note(st: &State, text: &str, e: String) -> String {
     }
 }
 
+/// The interpreter's contamination set (see `Engine::contamination`).
+pub(crate) fn contamination(st: &State) -> Vec<crate::Owner> {
+    st.contam.lock().unwrap().iter().copied().collect()
+}
+
+/// Code of record `id` is about to run with capabilities: its owners join the set.
+pub(crate) fn contaminate(st: &State, id: RecId) {
+    let owners = st.table().owners(id);
+    st.contam.lock().unwrap().extend(owners);
+}
+
 /// Records a refusal for want of capabilities (see `Engine::take_denied`); the message.
 pub(crate) fn deny(st: &State, id: RecId, what: &str) -> String {
     let msg = format!("{what}: needs your consent (without it Lua and file access are not available to it)");
@@ -1143,18 +1159,10 @@ fn install_records(h: &B) -> LR<()> {
         st.table().set_selected(&ids);
         Ok(())
     })?;
-    h.f("mr_create", |_, st, parent: Option<RecId>| Ok(st.table().create_as(parent, *st.principal.lock().unwrap())))?;
+    h.f("mr_create", |_, st, parent: Option<RecId>| Ok(st.table().create_owned(parent, &contamination(st))))?;
     h.f("mr_wrote", |_, st, id: RecId| {
-        st.table().wrote_executable(id, *st.principal.lock().unwrap());
+        st.table().wrote_executable(id, &contamination(st));
         Ok(())
-    })?;
-    h.f("principal", |_, st, ()| Ok(if *st.principal.lock().unwrap() == crate::Principal::Console { "console" } else { "table" }))?;
-    // Runs a callback the console registered, as the console.
-    h.f("as_console", |_, st, (f, args): (Function, MultiValue)| {
-        let old = std::mem::replace(&mut *st.principal.lock().unwrap(), crate::Principal::Console);
-        let r = f.call::<MultiValue>(args);
-        *st.principal.lock().unwrap() = old;
-        r
     })?;
     h.f("mr_delete", |_, st, id: RecId| {
         st.table().delete(id);
@@ -1174,6 +1182,8 @@ fn install_records(h: &B) -> LR<()> {
                     if t.caps(id) == Caps::None {
                         taint(st, x);
                     } else {
+                        // Its text is in the interpreter now: whoever's code it is counts.
+                        contaminate(st, id);
                         // Consented since: the same text is the user's to run.
                         st.tainted.lock().unwrap().retain(|t| t != x);
                     }
@@ -1313,7 +1323,7 @@ fn install_records(h: &B) -> LR<()> {
         let executable = matches!(key.as_str(), "Script" | "Hotkeys") || (key == "Type" && r.script.is_some());
         t.set(r).map_err(rt)?;
         if executable {
-            t.wrote_executable(id, *st.principal.lock().unwrap());
+            t.wrote_executable(id, &contamination(st));
         }
         Ok(())
     })?;
@@ -1369,6 +1379,9 @@ fn install_records(h: &B) -> LR<()> {
         } else if let Some(script) = &r.script {
             if execute && !script.trim().is_empty() {
                 let Some(p) = st.proc() else { return Ok((false, Some("no process opened".to_string()))) };
+                if caps == Caps::Full {
+                    contaminate(st, id);
+                }
                 match aa_run(lua, st, &*p, script, active, r.aa_state.as_ref(), (Some(id), caps)) {
                     Ok(s) => new_state = active.then_some(s),
                     Err(e) => return Ok((false, Some(denied(&e)))),

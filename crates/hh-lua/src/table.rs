@@ -10,17 +10,19 @@ use hh_tools::structure::Structure;
 
 pub type RecId = u32;
 
-/// Who the running Lua runs for. The host says it for the outermost entry
-/// ([`crate::Engine::exec_as`]); everything else (table scripts, timers, forms, hotkeys,
-/// record callbacks, `{$lua}` blocks) is `Table`. A callback registered while `Console` ran
-/// keeps running as `Console`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum Principal {
-    /// The user's own command in the console.
-    Console,
-    /// A table's code (the safe default).
-    #[default]
-    Table,
+/// A consent principal: whose code a record's script is, as the host tracks it. Once code of
+/// a principal has run in an interpreter, everything Lua makes or scripts there depends on
+/// that principal's consent too (the interpreter's contamination set, see
+/// [`crate::Engine::contamination`]); only a reset (a new interpreter) clears it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Owner {
+    /// The opened table of this generation (its table script and the entries that came with
+    /// it).
+    Table(u64),
+    /// An entry that came from elsewhere (paste, merge, ...), by id.
+    Entry(RecId),
+    /// What was loaded into an Auto Assemble window session, by session id.
+    Session(u64),
 }
 
 /// What a record's script may do beyond plain Auto Assembler. The host decides it per record
@@ -160,13 +162,19 @@ pub trait TableHost: Send + Sync {
     fn caps(&self, _id: RecId) -> Caps {
         Caps::None
     }
-    /// `createMemoryRecord` while `who` runs. Default: [`TableHost::create`].
-    fn create_as(&self, parent: Option<RecId>, _who: Principal) -> RecId {
+    /// Whose code record `id`'s script is (empty: the user's own). The engine adds them to its
+    /// contamination set before it runs that record's Lua with capabilities. Default: none.
+    fn owners(&self, _id: RecId) -> Vec<Owner> {
+        Vec::new()
+    }
+    /// `createMemoryRecord` while code of `owners` has run in the interpreter (empty: only the
+    /// user's own). The new record depends on all of them. Default: [`TableHost::create`].
+    fn create_owned(&self, parent: Option<RecId>, _owners: &[Owner]) -> RecId {
         self.create(parent)
     }
-    /// Lua running for `who` wrote executable content of record `id` (its script, hotkeys or
-    /// callbacks). Default: nothing.
-    fn wrote_executable(&self, _id: RecId, _who: Principal) {}
+    /// Lua wrote executable content of record `id` (its script, hotkeys or callbacks) while
+    /// code of `owners` had run: the record depends on them too. Default: nothing.
+    fn wrote_executable(&self, _id: RecId, _owners: &[Owner]) {}
     /// Trusted Lua is making record `id`'s script out of text it read from a record without
     /// capabilities: make `id` untrusted too (return true; it then asks for consent like a
     /// pasted entry), or refuse the assignment (false, the default).

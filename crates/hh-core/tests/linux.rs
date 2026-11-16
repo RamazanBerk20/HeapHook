@@ -525,3 +525,59 @@ fn is_root() -> bool {
         .lines()
         .any(|l| l.starts_with("Uid:") && l.split_whitespace().nth(2) == Some("0"))
 }
+
+/// A child held between fork and exec is still a copy of this process (a `vfork` /
+/// `CLONE_VM` child even shares its memory): it must never be opened as a target, or reads
+/// and writes through its `/proc/<pid>/mem` would hit this process.
+#[test]
+fn a_child_that_has_not_exec_d_is_refused() {
+    fn reap(pid: i32) {
+        unsafe {
+            libc::kill(pid, libc::SIGKILL);
+            libc::waitpid(pid, std::ptr::null_mut(), 0);
+        }
+    }
+    // fork, no exec: a copy of this image.
+    let pid = unsafe { libc::fork() };
+    if pid == 0 {
+        unsafe {
+            libc::sleep(30);
+            libc::_exit(0);
+        }
+    }
+    let r = hh_core::open(pid as u32);
+    reap(pid);
+    let e = r.err().expect("a forked copy of this process was opened");
+    assert!(e.to_string().contains("not started its program"), "{e}");
+
+    // CLONE_VM: shares this process's memory, like vfork before exec.
+    extern "C" fn held(_: *mut libc::c_void) -> libc::c_int {
+        unsafe {
+            libc::sleep(30);
+            libc::_exit(0)
+        }
+    }
+    let mut stack = vec![0u8; 256 << 10];
+    let top = unsafe { stack.as_mut_ptr().add(stack.len()) } as *mut libc::c_void;
+    let pid = unsafe { libc::clone(held, top, libc::CLONE_VM | libc::SIGCHLD, std::ptr::null_mut()) };
+    assert!(pid > 0);
+    let r = hh_core::open(pid as u32);
+    reap(pid);
+    drop(stack);
+    let e = r.err().expect("a child sharing this process's memory was opened");
+    assert!(e.to_string().contains("not started its program"), "{e}");
+
+    // After its exec a child opens as usual.
+    let mut c = Command::new("sleep").arg("30").spawn().unwrap();
+    let t0 = std::time::Instant::now();
+    let p = loop {
+        match hh_core::open(c.id()) {
+            Ok(p) => break p,
+            Err(_) if t0.elapsed() < std::time::Duration::from_secs(5) => std::thread::sleep(std::time::Duration::from_millis(10)),
+            Err(e) => panic!("{e}"),
+        }
+    };
+    assert!(!p.modules().unwrap().is_empty());
+    let _ = c.kill();
+    let _ = c.wait();
+}

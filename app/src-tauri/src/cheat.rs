@@ -12,7 +12,7 @@ use std::sync::Mutex;
 
 use hh_asm::AaState;
 use hh_core::{Addr, Error, Result as HResult};
-use hh_lua::{Caps, RecId, Record, RecordHotkey, TableHost};
+use hh_lua::{Caps, Owner, RecId, Record, RecordHotkey, TableHost};
 use hh_scan::{Fmt, FreezeMode, FrozenEntry, FrozenEntryEx};
 use serde::Serialize;
 
@@ -45,6 +45,10 @@ pub enum Origin {
     /// script file assigned from the Auto Assemble window, a template that embeds a remote
     /// target's names): under its own consent.
     Foreign,
+    /// Created or scripted by Lua while code of other principals had run in the interpreter
+    /// (`Inner::derived` holds them): it works only while every one of them is consented, or
+    /// once the user consents to the record itself.
+    Derived,
 }
 
 /// What an Auto Assemble window's content is.
@@ -80,8 +84,10 @@ struct Inner {
     origin: HashMap<i64, Origin>,
     /// The last id issued; ids only grow until another table is opened.
     next_id: i64,
-    /// [`Origin::Foreign`] entries the user consented to.
+    /// [`Origin::Foreign`] and [`Origin::Derived`] entries the user consented to.
     agreed: HashSet<i64>,
+    /// [`Origin::Derived`] entry id -> the principals its content depends on.
+    derived: HashMap<i64, std::collections::BTreeSet<Owner>>,
     /// Settings say never to run a loaded table's Lua: nothing but the user's own runs Lua.
     never: bool,
     /// Auto Assemble window sessions (`aa_session`).
@@ -152,14 +158,43 @@ impl Inner {
             Some(Origin::Own) => true,
             Some(Origin::Table) => self.trust.allows() && !self.never,
             Some(Origin::Foreign) => self.agreed.contains(&id) && !self.never,
+            Some(Origin::Derived) => {
+                !self.never && (self.agreed.contains(&id) || self.derived.get(&id).is_some_and(|o| o.iter().all(|o| self.owner_consented(*o))))
+            }
         };
         if ok { Caps::Full } else { Caps::None }
+    }
+
+    /// Whether code of principal `o` may run now: the table of that generation is open and
+    /// trusted, the entry still exists and is agreed, the session's file is agreed.
+    fn owner_consented(&self, o: Owner) -> bool {
+        !self.never
+            && match o {
+                Owner::Table(g) => g == self.generation && self.trust.allows(),
+                Owner::Entry(n) => {
+                    let n = n as i64;
+                    matches!(self.origin.get(&n), Some(Origin::Foreign | Origin::Derived)) && self.agreed.contains(&n) && all(&self.table.entries).iter().any(|(e, _)| e.id == n)
+                }
+                Owner::Session(s) => self.aa.get(&s) == Some(&AaSess::File { agreed: true }),
+            }
+    }
+
+    /// Whose code entry `id`'s content is (empty: the user's own).
+    fn owners_of(&self, id: i64) -> std::collections::BTreeSet<Owner> {
+        match self.origin.get(&id) {
+            Some(Origin::Table) => [Owner::Table(self.generation)].into(),
+            Some(Origin::Foreign) => [Owner::Entry(id as RecId)].into(),
+            // Adopted by the user (its own consent): the record itself is the principal.
+            Some(Origin::Derived) if self.agreed.contains(&id) => [Owner::Entry(id as RecId)].into(),
+            Some(Origin::Derived) => self.derived.get(&id).cloned().unwrap_or_default(),
+            _ => Default::default(),
+        }
     }
 
     fn st(&self) -> TableState {
         let mut untrusted: Vec<i64> = all(&self.table.entries)
             .into_iter()
-            .filter(|(e, _)| self.origin.get(&e.id) == Some(&Origin::Foreign) && !self.agreed.contains(&e.id))
+            .filter(|(e, _)| matches!(self.origin.get(&e.id), Some(Origin::Foreign | Origin::Derived)) && !self.agreed.contains(&e.id) && self.caps(e.id) == Caps::None)
             .map(|(e, _)| e.id)
             .collect();
         untrusted.sort_unstable();
@@ -444,7 +479,7 @@ impl Live {
             Grant::Entries(ids) => {
                 let mut under = Vec::new();
                 for (e, _) in all(&g.table.entries).into_iter().filter(|(e, _)| ids.contains(&e.id)) {
-                    under.extend(all(std::slice::from_ref(e)).into_iter().map(|(c, _)| c.id).filter(|c| g.origin.get(c) == Some(&Origin::Foreign)));
+                    under.extend(all(std::slice::from_ref(e)).into_iter().map(|(c, _)| c.id).filter(|c| matches!(g.origin.get(c), Some(Origin::Foreign | Origin::Derived))));
                 }
                 g.agreed.extend(under);
             }
@@ -531,6 +566,27 @@ impl Live {
             Some(AaSess::Typed) => Caps::Full,
             Some(AaSess::File { agreed: true }) if !g.never => Caps::Full,
             _ => Caps::None,
+        }
+    }
+
+    /// The principal of what session `s` runs, when it is a file the user agreed to.
+    pub(crate) fn aa_owner(&self, s: Option<u64>) -> Option<Owner> {
+        let g = lock(&self.0);
+        let s = s?;
+        (g.aa.get(&s) == Some(&AaSess::File { agreed: true }) && !g.never).then_some(Owner::Session(s))
+    }
+
+    /// Whether code of `o` may run now (see `Inner::owner_consented`).
+    pub(crate) fn owner_consented(&self, o: Owner) -> bool {
+        lock(&self.0).owner_consented(o)
+    }
+
+    /// A readable name for principal `o` (console notes).
+    pub(crate) fn owner_name(&self, o: Owner) -> String {
+        match o {
+            Owner::Table(_) => "the table".into(),
+            Owner::Entry(n) => self.entry(n as i64).map_or_else(|| format!("entry {n}"), |e| format!("the entry \"{}\"", e.description)),
+            Owner::Session(_) => "a script file in the Auto Assemble window".into(),
         }
     }
 
@@ -687,6 +743,7 @@ impl Live {
         g.trust = Trust::Ask;
         g.origin = origin;
         g.agreed = agreed;
+        g.derived.clear();
         g.next_id = next;
         g.generation += 1;
         g.saved = content_hash(&g.table);
@@ -935,21 +992,24 @@ impl TableHost for Live {
         Ok(())
     }
 
+    /// Only for callers that cannot say who runs: the engine always uses `create_owned`.
     fn create(&self, parent: Option<RecId>) -> RecId {
-        self.create_as(parent, hh_lua::Principal::Table)
+        self.create_owned(parent, &[])
     }
 
-    /// What Lua creates belongs to whoever runs: the user's console command makes the user's
-    /// own record; a table's code makes a record of that table (it loses its abilities with the
-    /// table's consent). In a table built in this session (no file opened) all is the user's.
-    fn create_as(&self, parent: Option<RecId>, who: hh_lua::Principal) -> RecId {
+    /// What Lua creates depends on every principal whose code has run in the interpreter
+    /// (`Derived`); only in a clean interpreter (only the user's own code ran) is it the
+    /// user's own. The same in file tables and in tables built in this session.
+    fn create_owned(&self, parent: Option<RecId>, owners: &[Owner]) -> RecId {
         let mut g = lock(&self.0);
         // No ids left: id 0 names no record (every later use of it fails).
         if g.next_id >= u32::MAX as i64 {
             return 0;
         }
-        let origin = if who == hh_lua::Principal::Console || g.trust == Trust::Own { Origin::Own } else { Origin::Table };
-        let id = g.issue(origin);
+        let id = g.issue(if owners.is_empty() { Origin::Own } else { Origin::Derived });
+        if !owners.is_empty() {
+            g.derived.insert(id, owners.iter().copied().collect());
+        }
         let e = Entry { id, description: "No description".into(), addr: "0".into(), ..Entry::default() };
         // Past the depth limit the new record goes to the top level instead.
         let parent = parent.filter(|&p| depth_of(&g.table.entries, p as i64) < table::MAX_DEPTH);
@@ -998,12 +1058,29 @@ impl TableHost for Live {
         Live::caps(self, id as i64)
     }
 
-    /// A table's code wrote a record's script, hotkeys or callbacks: the record is the table's
-    /// from now on (it can only lose privilege this way, never gain it).
-    fn wrote_executable(&self, id: RecId, who: hh_lua::Principal) {
+    fn owners(&self, id: RecId) -> Vec<Owner> {
+        lock(&self.0).owners_of(id as i64).into_iter().collect()
+    }
+
+    /// Lua wrote a record's script, hotkeys or callbacks while code of `owners` had run: the
+    /// record depends on them too (its owner set only grows; privilege only shrinks), and a
+    /// consent given to it before no longer covers the new content.
+    fn wrote_executable(&self, id: RecId, owners: &[Owner]) {
+        if owners.is_empty() {
+            return;
+        }
         let mut g = lock(&self.0);
-        if who == hh_lua::Principal::Table && g.trust != Trust::Own && g.origin.get(&(id as i64)) == Some(&Origin::Own) {
-            g.origin.insert(id as i64, Origin::Table);
+        let id = id as i64;
+        if !g.origin.contains_key(&id) {
+            return;
+        }
+        let cur = g.owners_of(id);
+        let mut new = cur.clone();
+        new.extend(owners.iter().copied());
+        if new != cur {
+            g.origin.insert(id, Origin::Derived);
+            g.derived.insert(id, new);
+            g.agreed.remove(&id);
             g.bump();
         }
     }
@@ -1041,11 +1118,15 @@ impl App {
             return Err(format!("stale table version {base} (current {})", cur.version));
         }
         let gone = removed_active_scripts(&cur.table, &t);
-        if gone.is_empty() {
-            return self.x.live.put(t, base);
-        }
-        self.table_set_active(&gone, false).map_err(|e| format!("{e}\nnot deleted: the script could not be disabled"))?;
-        self.x.live.put(t, self.x.live.version())
+        let r = if gone.is_empty() {
+            self.x.live.put(t, base)
+        } else {
+            self.table_set_active(&gone, false).map_err(|e| format!("{e}\nnot deleted: the script could not be disabled"))?;
+            self.x.live.put(t, self.x.live.version())
+        };
+        // A deleted consented entry whose code ran: its Lua must go too.
+        self.lua_settle();
+        r
     }
 
     /// Undo (`redo` false) or redo one table edit. Active scripts the step removes are
@@ -1057,6 +1138,7 @@ impl App {
             self.table_set_active(&gone, false)?;
         }
         let st = self.x.live.step_history(redo)?;
+        self.lua_settle();
         self.sync_freeze();
         Ok(st)
     }
@@ -1105,6 +1187,8 @@ the table was not opened: these active scripts could not be disabled (open anywa
             t.lua_script = add.lua_script;
             self.x.live.put(t, cur.version)?;
         }
+        // The table asks again: if its code ran, Lua restarts.
+        self.lua_settle();
         Ok(self.x.live.state())
     }
 
@@ -1202,6 +1286,7 @@ the table was not opened: these active scripts could not be disabled (open anywa
             let r = f();
             (r, self.x.lua.engine.take_denied())
         };
+        self.lua_settle();
         match denied.first() {
             Some((id, msg)) => Err(self.denied_error(*id as i64, msg)),
             None => Ok(r),
@@ -1212,7 +1297,7 @@ the table was not opened: these active scripts could not be disabled (open anywa
     pub(crate) fn denied_error(&self, id: i64, msg: &str) -> String {
         let what = self.x.live.entry(id).map_or_else(|| msg.to_string(), |e| e.description);
         match self.x.live.origin(id) {
-            Some(Origin::Foreign) => self.entry_consent_error(&what),
+            Some(o @ (Origin::Foreign | Origin::Derived)) => self.entry_consent_error(&what, o == Origin::Derived),
             _ => self.consent_error(&what),
         }
     }
@@ -1229,12 +1314,18 @@ the table was not opened: these active scripts could not be disabled (open anywa
         }
     }
 
-    /// Why an entry that came from another table does not get Lua or file access yet.
-    pub(crate) fn entry_consent_error(&self, what: &str) -> String {
+    /// Why an entry that came from another table, or that Lua made while a table's or an
+    /// entry's Lua had run (`derived`), does not get Lua or file access yet.
+    pub(crate) fn entry_consent_error(&self, what: &str, derived: bool) -> String {
+        let from = if derived {
+            "it was made or scripted by Lua after a table's or an entry's Lua had run"
+        } else {
+            "it came from another table (pasted, merged or dropped in)"
+        };
         if lock(&self.x.settings).table_script == "never" {
-            return format!("{what}: not run: it needs Lua or file access, it came from another table and Settings say never to run a table's Lua");
+            return format!("{what}: not run: it needs Lua or file access, {from} and Settings say never to run a table's Lua");
         }
-        format!("{NEEDS_ENTRY_CONSENT} {what}: this entry came from another table (pasted, merged or dropped in) and runs Lua code or reads files, which can use your files and the process")
+        format!("{NEEDS_ENTRY_CONSENT} {what}: {from}; it runs Lua code or reads files, which can use your files and the process")
     }
 
     /// The user's yes for the entries that came from another table (the subtrees of `ids`);
@@ -1329,6 +1420,27 @@ the table was not opened: these active scripts could not be disabled (open anywa
     /// every global, including ones typed in the console, is gone. Called when consent is
     /// withdrawn, Settings turn to "never", and another table replaces this one (open, drop,
     /// Lua `loadTable(f)`). Not on a process change: the table and its consent stay the same.
+    /// After Lua ran or consent changed. If code of a principal that is no longer consented
+    /// has run in the interpreter (table trust withdrawn, an agreed entry deleted, "never",
+    /// another table), a reset: nothing of it may keep running, and the console is clean
+    /// again. Otherwise, the first time code of a consent principal has run since the last
+    /// reset, a console note: what Lua creates now depends on that consent too.
+    pub(crate) fn lua_settle(&self) {
+        let s = self.x.lua.engine.contamination();
+        if s.is_empty() {
+            return;
+        }
+        if let Some(o) = s.iter().find(|o| !self.x.live.owner_consented(**o)) {
+            let why = format!("{} has no consent any more", self.x.live.owner_name(*o));
+            self.reset_lua(&why);
+            return;
+        }
+        if !self.x.lua.noted.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            let names: Vec<String> = s.iter().map(|o| self.x.live.owner_name(*o)).collect();
+            self.x.lua.console.push("info", &format!("-- Lua from {} has run in this session: records created or scripted from now on depend on its consent too (until Lua restarts)", names.join(", ")));
+        }
+    }
+
     pub(crate) fn reset_lua(&self, why: &str) {
         self.x.lua.engine.interrupt_handle().interrupt();
         self.x.lua.console.cancel();
@@ -1337,6 +1449,7 @@ the table was not opened: these active scripts could not be disabled (open anywa
             self.x.lua.console.push("err", &format!("resetting the Lua engine: {e}"));
         }
         self.x.lua.refresh_onbp();
+        self.x.lua.noted.store(false, std::sync::atomic::Ordering::SeqCst);
         self.x.lua.console.push("info", &format!("-- Lua was reset ({why}): every timer, form, hotkey and callback of the table is gone, and so are globals defined in this console"));
     }
 

@@ -298,14 +298,19 @@ Trust is decided by origin, never by content, and the engine fails closed.
   coroutine or callback of the old one survives; console globals are lost too, and the console
   log says "Lua was reset"). A `loadTable(f)` from a script ends that script. A process change
   does not reset Lua.
-- **Principal.** Lua runs for the user only while their console command (`lua_exec`) runs, or
-  in a callback that command registered (timer, form event, hotkey, record callback,
-  breakpoint function); everything else (table script, `{$lua}`, other callbacks) runs for the
-  table. Records Lua creates for the table, and the user's records whose script, hotkeys or
-  callbacks the table's Lua writes, belong to the table from then on (`Origin::Table`: they
-  lose their abilities with its consent). In a table built in this session all stays the
-  user's.
-- **Finalizers.** Scripts cannot install `__gc`; a discarded interpreter is never closed.
+- **Contamination.** Each Lua interpreter keeps the set of consent principals (the opened
+  table of a generation, an agreed foreign entry, an agreed Auto Assemble file) whose code has
+  run in it; the host adds a principal before it runs that principal's content with
+  capabilities. While the set is not empty, every record Lua creates or scripts (also from the
+  console) depends on all of it (`Origin::Derived`): it has capabilities only while each
+  principal is consented, or after `table_trust_entries` for the record itself. The user's own
+  code adds nothing; in a clean interpreter what Lua creates is the user's own. When any
+  principal in the set loses consent (or its entry is deleted), the interpreter is reset.
+- **Finalizers.** Scripts cannot install `__gc`. A discarded interpreter in which only the user's
+  own Lua ran is closed; any other is parked unclosed (its host functions refuse, it cannot run
+  again). At most `max_parked` (16) are parked, `max_parked_bytes` (512 MiB) in all; beyond that
+  the oldest is closed after its allocator is capped at its current size. `app_info` reports
+  `lua_parked` and `lua_parked_bytes`.
 - **Taint.** A script trusted Lua takes from an untrusted entry (`memrec.Script`) stays
   untrusted: `autoAssemble` of text containing it runs without capabilities, and assigning it
   to another record's `Script` makes that record untrusted (Foreign).

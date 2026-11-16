@@ -219,7 +219,7 @@ Lua in a table can read, change and delete your files, start programs and use th
 - Settings > Lua > "Allow Lua scripts to access files and run programs": turn it off to stop that access. It applies after a restart. Scripts can still read and change the attached process.
 - An Auto Assembler script loaded from a file asks before its `{$lua}` or `loadbinary` runs. A script you type yourself runs without asking.
 
-- Withdrawing consent ("Do not trust" after a yes, or turning Settings to "Never run") and opening another table stop the table's Lua completely: HeapHook starts a new Lua interpreter, so its timers, forms, hotkeys, callbacks and anything else it defined are gone.
+- Withdrawing consent ("Do not trust" after a yes, or turning Settings to "Never run"), opening another table, and deleting an agreed entry whose Lua has run stop that Lua: HeapHook starts a new Lua interpreter, so timers, forms, hotkeys, callbacks and globals defined in it (also from the console) are gone. Programs a script started are not stopped.
 - If trusted Lua copies the script of an entry that waits for consent into another entry, that entry waits for consent too. HeapHook follows the text only as long as the script copies or embeds it: text a script rewrites (for example with `gsub`) is no longer recognised, so trust scripts that edit other entries only as far as you trust the table.
 - A label or `registersymbol` can never take the name of a loaded module; module names always win. Labels that came with a table you have not trusted are marked in the Labels dialog.
 
@@ -229,7 +229,10 @@ Limits to know:
 2. HeapHook follows a script's text from an untrusted entry only while Lua copies it unchanged. A trusted table that rewrites such text, or builds a script from an entry's description, takes responsibility for running it.
 3. Withdrawing consent, switching to "Never run", or opening another table restarts Lua: globals typed in the console are lost too. Patches a script already made stay in the game until you disable them, and disabling a script whose consent was withdrawn may ask for consent again.
 4. Consent is given to where an entry came from, not to its text: undo can bring back text you removed before you agreed.
-5. Records that a table's Lua creates or scripts belong to that table. They lose their abilities (Lua, file access, hotkeys outside HeapHook) when the table's consent is withdrawn.
+5. Once Lua from a trusted table or from an entry you agreed to has run, every record Lua creates or scripts in that session, also from the Lua console, depends on that consent (and on every other one whose Lua has run). Such a record works only while all of them are consented, or once you agree to the record itself ("Trust this entry"). When one of those consents ends (you withdraw it, switch to "Never run", open another table, or delete an agreed entry whose Lua ran), Lua restarts and the record loses Lua, file access and hotkeys outside HeapHook. The console says when this starts to apply.
+6. A `{$lua}` block you type in the Auto Assemble window counts as your own code, but what it creates follows point 5.
+7. Programs a trusted script started keep running after its consent ends: HeapHook cannot stop them.
+8. When Lua restarts after a trusted table's or an entry's Lua has run, HeapHook keeps the old interpreter in memory instead of closing it (closing could run code it left behind): it keeps up to 16 withdrawn interpreters (512 MiB in all) and frees older ones, which are first cut off from memory and from HeapHook. A restart when only your own Lua had run frees the old interpreter at once.
 
 Open tables only from sources you trust.
 
@@ -346,7 +349,7 @@ The Lua view (Ctrl 5) runs Lua against the opened process. Ctrl Enter runs the t
 
 HeapHook implements part of Cheat Engine's Lua API. If a function you need is missing, check PARITY.md.
 
-When consent for a table's Lua is withdrawn, when Settings turn to "Never run", and when another table is opened (also by a script's `loadTable`), HeapHook discards the Lua interpreter and starts a new one. Globals you defined in the console are lost then too; the console says so ("Lua was reset"). A `loadTable(file)` call ends the script that made it. Changing the target process does not reset Lua.
+When consent for Lua that has run is withdrawn (the table's, or an entry's, also by deleting an agreed entry), when Settings turn to "Never run", and when another table is opened (also by a script's `loadTable`), HeapHook discards the Lua interpreter and starts a new one. While a trusted table's or an agreed entry's Lua has run, records you create or script from the console depend on that consent as well, until Lua restarts; the console says so the first time ("Lua from ... has run in this session"). Globals you defined in the console are lost then too; the console says so ("Lua was reset"). A `loadTable(file)` call ends the script that made it. Changing the target process does not reset Lua.
 
 ### Table scripts and forms
 

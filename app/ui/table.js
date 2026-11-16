@@ -216,7 +216,7 @@ export function initTable(root) {
     const mode = isValue(e) && e.freeze_mode !== 'exact'
       ? h('span.mode', { title: MODES.find((m) => m[0] === e.freeze_mode)[1], html: icon(e.freeze_mode === 'allow_increase' ? 'up' : 'down') }) : null;
     const marks = [
-      untrusted.has(e.id) ? h('span.mark.untrusted', { title: 'Came from another table: its Lua, file access and callbacks wait for your consent', 'aria-label': 'untrusted entry', role: 'img', html: icon('shield') }) : null,
+      untrusted.has(e.id) ? h('span.mark.untrusted', { title: 'Came from another table, or made by Lua after a table\'s or an entry\'s Lua ran: its Lua, file access and callbacks wait for your consent', 'aria-label': 'untrusted entry', role: 'img', html: icon('shield') }) : null,
       failing.has(e.id) ? h('span.mark.freeze-fail', { role: 'img', 'aria-label': 'Freezing fails: ' + failing.get(e.id), title: `Freezing fails: ${failing.get(e.id)} (HeapHook keeps retrying)`, html: icon('info') }) : null,
       isValue(e) && e.freeze_interval_ms ? h('span.mark', { role: 'img', 'aria-label': `Own freeze interval ${e.freeze_interval_ms} ms`, title: `Freezes every ${e.freeze_interval_ms} ms (its own interval)`, html: icon('clock') }) : null,
       e.hotkeys.length ? h('span.mark', { title: e.hotkeys.map((k) => comboText(k.keys)).join(', '), html: icon('key') }) : null,
@@ -404,10 +404,10 @@ export function initTable(root) {
       }
     }
   }
-  /** Entries pasted, merged or dropped in from another table: their Lua asks for itself. */
+  /** Entries pasted, merged or dropped in from another table, or made by Lua that depends on others' consent: their Lua asks for itself. */
   async function askEntryTrust({ ids = [] } = {}, msg = '') {
     const gen = tableGen;
-    if (state.settings.table_script === 'never') { toast('Not run: it runs Lua from another table, and Settings say never to run a table\'s Lua', 'info'); return false; }
+    if (state.settings.table_script === 'never') { toast('Not run: it runs Lua that needs your consent, and Settings say never to run a table\'s Lua', 'info'); return false; }
     const under = new Set();
     for (const id of ids) { const e = byId(id); if (e) walk([e], (x) => { if (untrusted.has(x.id)) under.add(x.id); }); }
     const list = [...under].map(byId).filter(Boolean);
@@ -416,8 +416,8 @@ export function initTable(root) {
       list.length > 8 ? h('p.hint', null, `and ${list.length - 8} more`) : null,
       list[0]?.script ? h('div', null, h('p.hint', null, 'Start of the first script:'), codeView(list[0].script, 10)) : null);
     const r = await modal({
-      title: 'Run Lua from another table?',
-      text: 'These entries came into this table from another one (pasted, merged or dropped in) and run Lua code when activated. That code runs with your user account\'s rights: it can read, change and delete your files, start programs and change the attached process. Agree only if you trust where they came from.',
+      title: 'Run Lua of these entries?',
+      text: 'These entries came into this table from another one (pasted, merged or dropped in), or Lua made or scripted them after a table\'s or an entry\'s Lua had run, and they run Lua code when activated. That code runs with your user account\'s rights: it can read, change and delete your files, start programs and change the attached process. Agree only if you trust where they came from and what they contain.',
       quote: msg.slice(NEEDS_ENTRIES.length).split(':')[0].trim() || null, quoteLabel: 'Wanted by the entry', body,
       buttons: [{ label: list.length > 1 ? `Trust these ${list.length} entries` : 'Trust this entry', value: 'trust' }, { label: 'Do not run', value: 'cancel', kbd: 'Esc', primary: true, focus: true }],
       consent: true,

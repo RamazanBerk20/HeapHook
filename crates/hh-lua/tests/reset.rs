@@ -185,6 +185,8 @@ fn finalizers_of_a_discarded_state_never_run() {
     drop(make());
     drop(lua);
     rec.out.lock().unwrap().clear();
+    // A table's code ran in it: it is kept, not closed.
+    e.add_owners(&[hh_lua::Owner::Table(1)]);
     e.reset().unwrap();
     e.exec("collectgarbage() collectgarbage()", "console").unwrap();
     assert!(rec.out.lock().unwrap().is_empty(), "{:?}", rec.out.lock().unwrap());
@@ -202,4 +204,55 @@ fn scripts_cannot_install_finalizers() {
     e.exec("local mt = {} x = setmetatable({}, mt) mt.__gc = function() print('gc') end x = nil collectgarbage() collectgarbage()", "c").unwrap();
     assert_eq!(e.exec("local ok, t = autoAssemble('[ENABLE]\\n[DISABLE]\\n') return getmetatable(t.__state), debug.setmetatable, debug.getregistry", "c").unwrap(), ["false", "nil", "nil"]);
     assert!(!rec.out.lock().unwrap().iter().any(|l| l == "gc"));
+}
+
+/// A clean interpreter (only the user's own code ran) is closed, not kept.
+#[test]
+fn a_clean_reset_keeps_nothing() {
+    let e = Engine::new(EngineOptions { max_parked: 1000, ..EngineOptions::default() }).unwrap();
+    let marker = Arc::new(Mutex::new(0));
+    let m2 = marker.clone();
+    let lua = e.lua();
+    // A finalizer from Rust in a clean state runs at close: proof it was closed.
+    let fin = lua.create_function(move |_, ()| {
+        *m2.lock().unwrap() += 1;
+        Ok(())
+    }).unwrap();
+    let t = lua.create_table().unwrap();
+    let mt = lua.create_table().unwrap();
+    mt.set("__gc", fin).unwrap();
+    t.set_metatable(Some(mt)).unwrap();
+    lua.globals().set("x", t).unwrap();
+    drop(lua);
+    e.exec("y = 1", "console").unwrap();
+    e.reset().unwrap();
+    assert_eq!(*marker.lock().unwrap(), 1, "the clean state was not closed");
+}
+
+/// Beyond the cap the oldest kept interpreter is closed; even then its host functions refuse
+/// (a finalizer that slipped through reaches nothing of HeapHook).
+#[test]
+fn the_cap_closes_the_oldest_and_its_host_functions_refuse() {
+    let (_, _p, rec, _ui, _dbg) = setup();
+    let e = Engine::new(EngineOptions { max_parked: 3, ..EngineOptions::default() }).unwrap();
+    e.set_host(rec.clone());
+    let lua = e.lua();
+    // The prelude's `print` (a host function) as a finalizer, put there from Rust.
+    let t = lua.create_table().unwrap();
+    let mt = lua.create_table().unwrap();
+    mt.set("__gc", lua.globals().get::<mlua::Function>("print").unwrap()).unwrap();
+    t.set_metatable(Some(mt)).unwrap();
+    lua.globals().set("held", t).unwrap();
+    drop(lua);
+    rec.out.lock().unwrap().clear();
+    for i in 0..6 {
+        e.add_owners(&[hh_lua::Owner::Table(i)]);
+        e.reset().unwrap();
+        assert!(hh_lua::parked_stats().0 <= 3 + 3, "{:?}", hh_lua::parked_stats());
+    }
+    e.add_owners(&[hh_lua::Owner::Table(9)]);
+    e.reset().unwrap();
+    // (+1: a test running alongside may have kept one since)
+    assert!(hh_lua::parked_stats().0 <= 4, "the cap: {:?}", hh_lua::parked_stats());
+    assert!(rec.out.lock().unwrap().is_empty(), "a closed state's finalizer reached the host: {:?}", rec.out.lock().unwrap());
 }

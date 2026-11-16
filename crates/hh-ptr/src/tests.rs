@@ -1058,9 +1058,7 @@ fn sparse_pointer_map_is_refused_without_reserving() {
     std::fs::OpenOptions::new().write(true).open(&f).unwrap().set_len(20 + hlen + count * 16).unwrap();
     let e = PointerMap::load(&f).unwrap_err();
     assert!(e.to_string().contains("limit"), "{e}");
-    // A huge JSON header length is refused too.
-    let mut b = std::fs::read(&f).unwrap();
-    b.truncate(20 + hlen as usize);
+    // A huge JSON header length is refused too. (The file is ~4 GiB sparse now: keep `b`.)
     b[8..12].copy_from_slice(&u32::MAX.to_le_bytes());
     std::fs::write(&f, &b).unwrap();
     std::fs::OpenOptions::new().write(true).open(&f).unwrap().set_len(u32::MAX as u64 + 64).unwrap();

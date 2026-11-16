@@ -571,7 +571,9 @@ impl App {
     pub fn app_info(&self) -> R<serde_json::Value> {
         // `lua_allow_os`: what the running Lua engine allows (a changed setting applies after a restart).
         Ok(serde_json::json!({"version": env!("CARGO_PKG_VERSION"), "license": "Apache-2.0", "platform": std::env::consts::OS,
-            "lua_allow_os": self.x.lua.engine.allow_os()}))
+            "lua_allow_os": self.x.lua.engine.allow_os(),
+            // Withdrawn interpreters kept in memory (see hh_lua::Engine::reset).
+            "lua_parked": hh_lua::parked_stats().0, "lua_parked_bytes": hh_lua::parked_stats().1}))
     }
 
     pub fn resolve_address(&self, expr: &str) -> R<String> {
@@ -824,6 +826,10 @@ impl App {
         let mut work = before.clone();
         let r = {
             let _g = self.x.lua.enter();
+            // A file the user agreed to: its code runs in the interpreter from now on.
+            if let Some(o) = self.x.live.aa_owner(session) {
+                self.x.lua.engine.add_owners(&[o]);
+            }
             let mut hooks = self.x.lua.engine.aa_hooks_with(None, false, caps);
             hooks.aob_unique = unique;
             // With capabilities: file reads as Settings allow them.
@@ -846,6 +852,7 @@ impl App {
             cur.unregister(n);
         }
         drop(cur);
+        self.lua_settle();
         r.map_err(|e| {
             let e = e.to_string();
             if caps == hh_lua::Caps::None && (e.contains(hh_asm::NOT_AVAILABLE) || self.x.lua.engine.has_symbol_lookup()) {

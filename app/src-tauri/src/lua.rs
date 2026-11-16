@@ -418,13 +418,15 @@ pub struct LuaCtx {
     busy: AtomicBool,
     /// The script defines `debugger_onBreakpoint`: every breakpoint hit goes to Lua first.
     pub(crate) onbp: AtomicBool,
+    /// The console was told that code of a consent principal has run in this interpreter.
+    pub(crate) noted: AtomicBool,
 }
 
 impl LuaCtx {
     pub(crate) fn new(live: Arc<Live>) -> LuaCtx {
         let console = Arc::new(Console::default());
         let engine = LazyEngine { cell: OnceLock::new(), allow_os: AtomicBool::new(EngineOptions::default().allow_os), live, console: console.clone() };
-        LuaCtx { engine, run: ReLock::default(), console, busy: AtomicBool::new(false), onbp: AtomicBool::new(false) }
+        LuaCtx { engine, run: ReLock::default(), console, busy: AtomicBool::new(false), onbp: AtomicBool::new(false), noted: AtomicBool::new(false) }
     }
 
     pub(crate) fn enter(&self) -> ReGuard<'_> {
@@ -515,12 +517,11 @@ impl App {
         }
         let _g = l.enter();
         l.busy.store(true, SeqCst);
-        // The console's command is the user's own; the table script is the table's.
-        let who = if echo { hh_lua::Principal::Console } else { hh_lua::Principal::Table };
-        let r = l.engine.exec_as(code, name, who);
+        let r = l.engine.exec(code, name);
         l.busy.store(false, SeqCst);
         l.refresh_onbp();
         drop(_g);
+        self.lua_settle();
         match r {
             Ok(vals) => {
                 if !vals.is_empty() {
@@ -555,8 +556,18 @@ impl App {
         if !self.x.live.trust().allows() {
             return Err(self.consent_error("The table's Lua script"));
         }
+        // The table's code runs in this interpreter from now on (unless it is the user's own).
+        if self.x.live.trust() != crate::cheat::Trust::Own {
+            self.x.lua.engine.add_owners(&[hh_lua::Owner::Table(self.x.live.generation())]);
+        }
         self.x.lua.console.push("info", "-- running the table's Lua script");
         self.lua_run(&src, "table script", false)
+    }
+
+    /// The consent principals whose code has run in the current Lua interpreter (tests,
+    /// diagnostics).
+    pub fn lua_contamination(&self) -> Vec<hh_lua::Owner> {
+        self.x.lua.engine.contamination()
     }
 
     /// Stops the running script (and answers its open dialog with "cancel"); any thread.
@@ -626,6 +637,8 @@ impl App {
         if let Err(e) = &r {
             self.x.lua.console.push("err", e);
         }
+        drop(_g);
+        self.lua_settle();
         r
     }
 
@@ -636,6 +649,8 @@ impl App {
         if let Err(e) = &r {
             self.x.lua.console.push("err", e);
         }
+        drop(_g);
+        self.lua_settle();
         r
     }
 
@@ -721,6 +736,7 @@ impl App {
         if !hits.is_empty() && lock(&self.x.settings).hotkey_sound {
             self.x.lua.console.sound.fetch_add(1, SeqCst);
         }
+        self.lua_settle();
         if errs.is_empty() { Ok(hits.len()) } else { Err(errs.join("\n")) }
     }
 
@@ -811,6 +827,7 @@ impl App {
                         }
                         l.refresh_onbp();
                     }
+                    app.lua_settle();
                     app.dispatch_lua_break();
                     if app.x.live.take_dirty() || last_sync.elapsed() >= FREEZE_RESYNC {
                         app.sync_freeze();

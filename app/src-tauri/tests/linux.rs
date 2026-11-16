@@ -2122,6 +2122,8 @@ struct Cell {
     slot: String,
     base: String,
     log_at: u64,
+    /// The trusted side's registrations (made again after a step that resets Lua).
+    reg: String,
 }
 
 const SECRET: [u8; 4] = [0x11, 0x22, 0x33, 0x44];
@@ -2167,7 +2169,7 @@ impl Cell {
         let table = Table { entries: vec![entry.clone()], lua_script: p.table_script.clone(), ..Table::default() };
         let json = cdir.join("evil.json");
         heaphook::table::save(&json, &table).unwrap();
-        let mut cell = Cell { app, route, payload_name: p.name.clone(), kind: p.kind, script: p.script.clone(), id: None, group: None, session: None, marker, slot: slot.into(), base, log_at: 0 };
+        let mut cell = Cell { app, route, payload_name: p.name.clone(), kind: p.kind, script: p.script.clone(), id: None, group: None, session: None, marker, slot: slot.into(), base, log_at: 0, reg: String::new() };
         let app = &cell.app;
         let paste = || app.table_paste(vec![entry.clone()], None, None).unwrap().ids[0];
         match base_route {
@@ -2267,6 +2269,7 @@ impl Cell {
         }
         let reg = trusted_registrations(p.kind, &cell.marker, slot, cell.id);
         cell.app.lua_exec(&reg).unwrap();
+        cell.reg = reg;
         cell.log_at = cell.app.lua_poll(0).unwrap().next;
         cell
     }
@@ -2316,6 +2319,9 @@ impl Cell {
                 app.table_history(false).unwrap();
                 app.table_history(true).unwrap();
                 app.table_history(false).unwrap();
+                // Deleting a consented entry whose code ran restarts Lua: the user's own
+                // registrations are made again.
+                app.lua_exec(&self.reg).unwrap();
                 app.table_set_active(&[id], true).map(|_| String::new())
             }
             Exec::TableScript => app.table_run_script().map(|_| String::new()),
@@ -2441,6 +2447,7 @@ fn run_matrix(never: bool) -> (usize, Vec<String>) {
 #[test]
 fn consent_matrix() {
     let (cells, missing) = run_matrix(false);
+    assert_memory_bounded("consent matrix");
     eprintln!("consent matrix: {cells} refused cells (then consented); cells that do not exist: {missing:?}");
     assert!(cells > 1000, "{cells}");
 }
@@ -2449,6 +2456,7 @@ fn consent_matrix() {
 #[test]
 fn consent_matrix_never() {
     let (cells, _) = run_matrix(true);
+    assert_memory_bounded("consent matrix under never");
     eprintln!("consent matrix under never: {cells} cells");
     assert!(cells > 1000, "{cells}");
 }
@@ -3088,8 +3096,11 @@ enum FuzzOp {
     Console,
     TableLuaCreate,
     TableLuaModify,
+    ConsoleScript,
+    ConsoleCallGlobal,
+    MakerEntry,
 }
-const FUZZ_OPS: [FuzzOp; 31] = [
+const FUZZ_OPS: [FuzzOp; 34] = [
     FuzzOp::Open,
     FuzzOp::OpenData,
     FuzzOp::LuaLoadTable,
@@ -3121,6 +3132,9 @@ const FUZZ_OPS: [FuzzOp; 31] = [
     FuzzOp::Console,
     FuzzOp::TableLuaCreate,
     FuzzOp::TableLuaModify,
+    FuzzOp::ConsoleScript,
+    FuzzOp::ConsoleCallGlobal,
+    FuzzOp::MakerEntry,
 ];
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -3128,73 +3142,137 @@ enum Kind2 {
     Own,
     Table,
     Foreign,
+    Derived,
 }
+
+type Owners = std::collections::BTreeSet<hh_lua::Owner>;
 
 /// What the trust model says, kept independently of the backend.
 #[derive(Default)]
 struct Model {
     kind: std::collections::HashMap<i64, Kind2>,
+    /// Derived record -> the principals it depends on.
+    owners: std::collections::HashMap<i64, Owners>,
     agreed: std::collections::HashSet<i64>,
     table_agreed: bool,
     never: bool,
     max_id: i64,
-    /// A table script ran with consent that is still in force (its globals may exist).
-    script_live: bool,
+    /// The interpreter's contamination set: principals whose code has run since the last reset.
+    s: Owners,
+    /// An Auto Assemble file was agreed to (never withdraws it, with a reset).
+    aa_agreed: bool,
     remote: bool,
-    /// No table was opened (nor a script merged in): the session's own table, all the user's.
+    /// A table was opened (or a script merged in): the table's code is a principal.
     opened: bool,
-    /// The record the table script (put in by `TableLuaModify`) scripts when it runs.
-    script_target: Option<i64>,
+    /// Opens so far: the table's generation.
+    generation: u64,
+    /// Live ids (refreshed every step).
+    live: std::collections::HashSet<i64>,
 }
 
 impl Model {
+    fn consented(&self, o: hh_lua::Owner) -> bool {
+        !self.never
+            && match o {
+                hh_lua::Owner::Table(g) => g == self.generation && self.table_agreed,
+                hh_lua::Owner::Entry(n) => {
+                    let n = n as i64;
+                    matches!(self.kind.get(&n), Some(Kind2::Foreign | Kind2::Derived)) && self.agreed.contains(&n) && self.live.contains(&n)
+                }
+                hh_lua::Owner::Session(_) => false,
+            }
+    }
+    fn owners_of(&self, id: i64) -> Owners {
+        match self.kind.get(&id) {
+            Some(Kind2::Table) => [hh_lua::Owner::Table(self.generation)].into(),
+            Some(Kind2::Foreign) => [hh_lua::Owner::Entry(id as u32)].into(),
+            Some(Kind2::Derived) if self.agreed.contains(&id) => [hh_lua::Owner::Entry(id as u32)].into(),
+            Some(Kind2::Derived) => self.owners.get(&id).cloned().unwrap_or_default(),
+            _ => Owners::new(),
+        }
+    }
     fn allowed(&self, id: i64) -> bool {
         match self.kind.get(&id) {
             Some(Kind2::Own) => true,
             Some(Kind2::Table) => self.table_agreed && !self.never,
             Some(Kind2::Foreign) => self.agreed.contains(&id) && !self.never,
+            Some(Kind2::Derived) => !self.never && (self.agreed.contains(&id) || self.owners_of(id).iter().all(|o| self.consented(*o))),
             None => false,
         }
     }
+    /// What Lua creates now: the user's own only in a clean interpreter.
+    fn mint_now(&self) -> Mint {
+        Mint::By(self.s.clone())
+    }
+    /// Lua wrote record `id`'s executable content: it depends on the set too.
+    fn wrote(&mut self, id: i64) {
+        if self.s.is_empty() || !self.kind.contains_key(&id) {
+            return;
+        }
+        let cur = self.owners_of(id);
+        let mut new = cur.clone();
+        new.extend(self.s.iter().copied());
+        if new != cur {
+            self.kind.insert(id, Kind2::Derived);
+            self.owners.insert(id, new);
+            self.agreed.remove(&id);
+        }
+    }
+    fn reset(&mut self) {
+        self.s.clear();
+    }
     fn opened(&mut self, ids: Vec<i64>) {
         self.opened = true;
-        self.script_target = None;
+        self.generation += 1;
         self.kind.clear();
+        self.owners.clear();
         self.agreed.clear();
         self.table_agreed = false;
-        self.script_live = false;
+        self.reset();
         self.max_id = 0;
         for id in ids {
             self.kind.insert(id, Kind2::Table);
             self.max_id = self.max_id.max(id);
         }
     }
-    /// The table script ran (as the table): it needed consent unless the table is the
-    /// session's own; an own record it scripted is the table's from now on.
-    fn script_ran(&mut self, app: &App) -> Result<(), String> {
-        if !self.opened {
-            return Ok(());
+    /// The table script `text` ran: the table's code is in the interpreter (unless the table
+    /// is the session's own), and what it creates or scripts depends on everything that ran.
+    fn script_ran(&mut self, text: &str) -> Result<(), String> {
+        if self.opened {
+            if !(self.table_agreed && !self.never) {
+                return Err("the table script ran without consent".into());
+            }
+            self.s.insert(hh_lua::Owner::Table(self.generation));
         }
-        if !(self.table_agreed && !self.never) {
-            return Err("the table script ran without consent".into());
-        }
-        self.script_live = true;
-        if let Some(id) = self.script_target
-            && self.kind.get(&id) == Some(&Kind2::Own)
-            && live_ids(app).contains(&id)
+        if let Some(n) = text.split("getMemoryRecordByID(").nth(1).and_then(|r| r.split(')').next()).and_then(|n| n.parse::<i64>().ok())
+            && self.live.contains(&n)
         {
-            self.kind.insert(id, Kind2::Table);
+            self.wrote(n);
         }
         Ok(())
+    }
+    /// A principal whose code ran is no longer consented: Lua restarts.
+    fn settle(&mut self) {
+        if self.s.iter().any(|o| !self.consented(*o)) {
+            self.reset();
+        }
     }
 
     /// Consent for the table withdrawn (the app resets Lua when it was in force).
     fn table_withdrawn(&mut self) {
         if self.table_agreed {
-            self.script_live = false;
+            self.reset();
         }
         self.table_agreed = false;
     }
+}
+
+/// How the ids an operation adds are owned.
+#[derive(Clone)]
+enum Mint {
+    Kind(Kind2),
+    /// By what ran in the interpreter: the user's own when nothing did.
+    By(Owners),
 }
 
 /// The shared world of the fuzz runs: one target, one (hostile) remote server.
@@ -3208,6 +3286,15 @@ struct FuzzEnv {
 /// Each entry's `{$lua}` writes its own id (`memrec.ID`) to the marker when it runs.
 fn fuzz_script(marker: &std::path::Path) -> String {
     format!("[ENABLE]\n{{$lua}}\nlocal f = io.open({:?}, 'a') f:write(memrec.ID .. '\\n') f:close()\nreturn ''\n{{$asm}}\n[DISABLE]\n", marker.to_str().unwrap())
+}
+
+/// An entry whose `{$lua}` also creates a record (it has no hotkey: only one-entry routes run it).
+fn fuzz_maker(marker: &std::path::Path) -> String {
+    format!(
+        "[ENABLE]\n{{$lua}}\nlocal f = io.open({m:?}, 'a') f:write(memrec.ID .. '\\n') f:close()\nlocal r = getAddressList().createMemoryRecord() r.Type = vtAutoAssembler r.Script = {s:?}\nreturn ''\n{{$asm}}\n[DISABLE]\n",
+        m = marker.to_str().unwrap(),
+        s = fuzz_script(marker)
+    )
 }
 
 /// A table script that leaves a global behind: `tostring` writing `T` to the marker.
@@ -3229,6 +3316,22 @@ fn set_never(app: &App, on: bool) {
     let mut st = app.settings_get().unwrap();
     st.table_script = if on { "never" } else { "ask" }.into();
     app.settings_set(st).unwrap();
+}
+
+/// (VmRSS, VmHWM) of this test process, in MiB.
+fn rss_mib() -> (u64, u64) {
+    let s = std::fs::read_to_string("/proc/self/status").unwrap();
+    let f = |k: &str| s.lines().find(|l| l.starts_with(k)).and_then(|l| l.split_whitespace().nth(1)).and_then(|v| v.parse::<u64>().ok()).unwrap_or(0) >> 10;
+    (f("VmRSS:"), f("VmHWM:"))
+}
+
+/// Kept interpreters stay within the cap and memory stays bounded.
+fn assert_memory_bounded(what: &str) {
+    let (rss, peak) = rss_mib();
+    let (parked, bytes) = hh_lua::parked_stats();
+    eprintln!("{what}: RSS {rss} MiB (peak {peak} MiB), {} Lua resets, {parked} kept interpreters ({} KiB)", hh_lua::reset_count(), bytes >> 10);
+    assert!(parked <= hh_lua::EngineOptions::default().max_parked, "{parked} kept interpreters");
+    assert!(rss < 1536, "{what}: {rss} MiB resident");
 }
 
 fn take_marks(marker: &std::path::Path) -> Vec<String> {
@@ -3255,7 +3358,8 @@ fn fuzz_run(env: &FuzzEnv, ops: &[(FuzzOp, u64)]) -> Result<(), (usize, String)>
             p
         };
         // The kind the ids this op mints get (None: it mints none).
-        let mut mint: Option<Kind2> = None;
+        let mut mint: Option<Mint> = None;
+        m.live = before.iter().copied().collect();
         match op {
             FuzzOp::Open | FuzzOp::OpenData | FuzzOp::LuaLoadTable => {
                 let with_script = r.below(2) == 0;
@@ -3266,6 +3370,7 @@ fn fuzz_run(env: &FuzzEnv, ops: &[(FuzzOp, u64)]) -> Result<(), (usize, String)>
                     _ => drop(app.lua_exec(&format!("loadTable({:?})", p.to_str().unwrap()))),
                 }
                 m.opened(live_ids(&app));
+                m.live = live_ids(&app).into_iter().collect();
                 continue;
             }
             FuzzOp::ForceOpen => {
@@ -3284,12 +3389,13 @@ fn fuzz_run(env: &FuzzEnv, ops: &[(FuzzOp, u64)]) -> Result<(), (usize, String)>
                     }
                 }
                 let _ = app.lua_exec("getAddressList().disableAllWithoutExecute()");
+                m.live = live_ids(&app).into_iter().collect();
                 continue;
             }
             FuzzOp::Paste => {
                 let after = (!before.is_empty() && r.below(2) == 0).then(|| before[r.below(before.len())]);
                 let _ = app.table_paste(fuzz_entries(&mut r, "paste", &marker), after, None);
-                mint = Some(Kind2::Foreign);
+                mint = Some(Mint::Kind(Kind2::Foreign));
             }
             FuzzOp::Merge | FuzzOp::MergeWithScript | FuzzOp::LuaMerge => {
                 let script = matches!(op, FuzzOp::MergeWithScript);
@@ -3309,7 +3415,10 @@ fn fuzz_run(env: &FuzzEnv, ops: &[(FuzzOp, u64)]) -> Result<(), (usize, String)>
                     m.table_agreed = false;
                     m.opened = true;
                 }
-                mint = Some(Kind2::Foreign);
+                if !adopts && script {
+                    // a script merged into a table that has one is not taken
+                }
+                mint = Some(Mint::Kind(Kind2::Foreign));
             }
             FuzzOp::AaAssign => {
                 let f = dir.path().join(format!("s{step}.cea"));
@@ -3317,6 +3426,7 @@ fn fuzz_run(env: &FuzzEnv, ops: &[(FuzzOp, u64)]) -> Result<(), (usize, String)>
                 let s = app.aa_session().unwrap();
                 app.aa_load_file(f.to_str().unwrap(), s).unwrap();
                 let agree = r.below(2) == 0 && app.aa_trust(s).is_ok();
+                m.aa_agreed |= agree;
                 let before_ids = live_ids(&app);
                 let _ = app.aa_assign(s, &fuzz_script(&marker), "assigned", None, None);
                 for id in live_ids(&app).into_iter().filter(|i| !before_ids.contains(i)) {
@@ -3324,24 +3434,24 @@ fn fuzz_run(env: &FuzzEnv, ops: &[(FuzzOp, u64)]) -> Result<(), (usize, String)>
                         m.agreed.insert(id);
                     }
                 }
-                mint = Some(Kind2::Foreign);
+                mint = Some(Mint::Kind(Kind2::Foreign));
             }
             FuzzOp::TypedAssign => {
                 let s = app.aa_session().unwrap();
                 let _ = app.aa_assign(s, &fuzz_script(&marker), "typed", None, None);
-                mint = Some(Kind2::Own);
+                mint = Some(Mint::Kind(Kind2::Own));
             }
             FuzzOp::Template => {
                 let _ = app.table_add_template(&env.store, "code", "tpl", None, None);
-                mint = Some(if m.remote { Kind2::Foreign } else { Kind2::Own });
+                mint = Some(Mint::Kind(if m.remote { Kind2::Foreign } else { Kind2::Own }));
             }
             FuzzOp::New => {
                 let _ = app.table_new(fuzz_entries(&mut r, "new", &marker), None, None);
-                mint = Some(Kind2::Own);
+                mint = Some(Mint::Kind(Kind2::Own));
             }
             FuzzOp::LuaCreate => {
                 let _ = app.lua_exec("getAddressList().createMemoryRecord().Description = 'lua'");
-                mint = Some(Kind2::Own);
+                mint = Some(m.mint_now());
             }
             FuzzOp::LuaSetDelete => {
                 if !before.is_empty() {
@@ -3404,6 +3514,12 @@ fn fuzz_run(env: &FuzzEnv, ops: &[(FuzzOp, u64)]) -> Result<(), (usize, String)>
             FuzzOp::Redo => {
                 let _ = app.table_history(true);
             }
+            FuzzOp::MakerEntry => {
+                let e = Entry { description: "maker".into(), script: Some(fuzz_maker(&marker)), ..Entry::default() };
+                let pasted = r.below(2) == 0;
+                let _ = if pasted { app.table_paste(vec![e], None, None).map(|_| ()) } else { app.table_new(vec![e], None, None).map(|_| ()) };
+                mint = Some(Mint::Kind(if pasted { Kind2::Foreign } else { Kind2::Own }));
+            }
             FuzzOp::GrantEntries => {
                 let st = app.table_get().unwrap();
                 if !st.untrusted.is_empty() {
@@ -3420,7 +3536,7 @@ fn fuzz_run(env: &FuzzEnv, ops: &[(FuzzOp, u64)]) -> Result<(), (usize, String)>
                         }
                         let mut v = Vec::new();
                         sub(&st.table.entries, pick, &mut v, false);
-                        for id in v.into_iter().filter(|i| m.kind.get(i) == Some(&Kind2::Foreign)) {
+                        for id in v.into_iter().filter(|i| matches!(m.kind.get(i), Some(Kind2::Foreign | Kind2::Derived))) {
                             m.agreed.insert(id);
                         }
                     } else if !m.never {
@@ -3430,7 +3546,8 @@ fn fuzz_run(env: &FuzzEnv, ops: &[(FuzzOp, u64)]) -> Result<(), (usize, String)>
             }
             FuzzOp::GrantTable => {
                 if app.table_trust(true).is_ok() {
-                    m.table_agreed = true;
+                    // (a table built in this session stays the user's own)
+                    m.table_agreed = m.opened;
                 } else if !m.never {
                     return Err((step, "the table grant was refused without never".into()));
                 }
@@ -3441,9 +3558,14 @@ fn fuzz_run(env: &FuzzEnv, ops: &[(FuzzOp, u64)]) -> Result<(), (usize, String)>
             }
             FuzzOp::NeverOn => {
                 set_never(&app, true);
+                // Something withdrawn: a reset.
+                if m.table_agreed || !m.agreed.is_empty() || m.aa_agreed {
+                    m.reset();
+                }
                 m.never = true;
-                m.table_withdrawn();
+                m.table_agreed = false;
                 m.agreed.clear();
+                m.aa_agreed = false;
             }
             FuzzOp::NeverOff => {
                 set_never(&app, false);
@@ -3461,11 +3583,11 @@ fn fuzz_run(env: &FuzzEnv, ops: &[(FuzzOp, u64)]) -> Result<(), (usize, String)>
                 }
             }
             FuzzOp::RunScript => {
-                let has = !app.table_get().unwrap().table.lua_script.trim().is_empty();
-                if app.table_run_script().is_ok() && has {
-                    m.script_ran(&app).map_err(|e| (step, e))?;
+                let text = app.table_get().unwrap().table.lua_script;
+                if app.table_run_script().is_ok() && !text.trim().is_empty() {
+                    m.script_ran(&text).map_err(|e| (step, e))?;
                 }
-                mint = Some(if m.opened { Kind2::Table } else { Kind2::Own });
+                mint = Some(m.mint_now());
             }
             FuzzOp::Callback => {
                 if !before.is_empty() {
@@ -3476,23 +3598,70 @@ fn fuzz_run(env: &FuzzEnv, ops: &[(FuzzOp, u64)]) -> Result<(), (usize, String)>
                         "local r = getAddressList().getMemoryRecordByID({id}) if r then r.OnActivate = function() local f = io.open({:?}, 'a') f:write('cb{id}\\n') f:close() end end",
                         marker.to_str().unwrap()
                     ));
+                    m.wrote(id);
                 }
+            }
+            FuzzOp::ConsoleScript => {
+                if !before.is_empty() {
+                    let id = before[r.below(before.len())];
+                    let _ = app.lua_exec(&format!("local r = getAddressList().getMemoryRecordByID({id}) if r then r.Script = {:?} end", fuzz_script(&marker)));
+                    m.wrote(id);
+                }
+            }
+            FuzzOp::ConsoleCallGlobal => {
+                // A global the table's script defined, called from the console.
+                let _ = app.lua_exec("if mk then mk() end");
+                mint = Some(m.mint_now());
             }
             FuzzOp::Execute => {
                 if !before.is_empty() {
                     let id = before[r.below(before.len())];
                     let _ = take_marks(&marker);
-                    let _ = match r.below(4) {
+                    let route = r.below(4);
+                    // What runs: one entry, or every entry with the hotkey; each that may
+                    // run and has a script puts its owners' code into the interpreter.
+                    let st = app.table_get().unwrap();
+                    let mut flat = Vec::new();
+                    fn walk(l: &[Entry], out: &mut Vec<Entry>) {
+                        for e in l {
+                            out.push(e.clone());
+                            walk(&e.children, out);
+                        }
+                    }
+                    walk(&st.table.entries, &mut flat);
+                    let runs: Vec<i64> = flat
+                        .iter()
+                        .filter(|e| match route {
+                            2 => e.hotkeys.iter().any(|h| h.keys == [17, 118]),
+                            1 => e.id == id && !e.hotkeys.is_empty(),
+                            _ => e.id == id,
+                        })
+                        .filter(|e| e.script.as_deref().is_some_and(|x| !x.trim().is_empty()) && m.allowed(e.id))
+                        .map(|e| e.id)
+                        .collect();
+                    if std::env::var("HH_FUZZ_TRACE").is_ok() {
+                        eprintln!("   execute route {route} id {id}: predicted {runs:?}; hotkeys {:?}", flat.iter().map(|e| (e.id, e.hotkeys.len(), e.script.is_some())).collect::<Vec<_>>());
+                    }
+                    for x in &runs {
+                        let o = m.owners_of(*x);
+                        m.s.extend(o);
+                    }
+                    mint = Some(m.mint_now());
+                    let _ = match route {
                         0 => app.table_set_active(&[id], true),
                         1 => app.table_hotkey(id, 0),
-                        2 => app.hotkey_press(&[17, 118]).map(|_| ()),
+                        2 => {
+                            // The same combo pressed again within 150 ms is ignored (key repeat).
+                            std::thread::sleep(Duration::from_millis(160));
+                            app.hotkey_press(&[17, 118]).map(|_| ())
+                        }
                         _ => app.lua_exec(&format!("local r = getAddressList().getMemoryRecordByID({id}) if r then r.Active = true end")),
                     };
                     for line in take_marks(&marker) {
                         ran += 1;
                         let ran = line.trim_start_matches("cb").parse::<i64>().unwrap_or(-1);
                         if line == "T" {
-                            if !m.script_live {
+                            if !m.s.contains(&hh_lua::Owner::Table(m.generation)) {
                                 return Err((step, "the table script's global ran without consent in force".into()));
                             }
                         } else if !m.allowed(ran) {
@@ -3511,23 +3680,28 @@ fn fuzz_run(env: &FuzzEnv, ops: &[(FuzzOp, u64)]) -> Result<(), (usize, String)>
                         "local r = getAddressList().getMemoryRecordByID({id}) if r then r.Script = {:?} end",
                         fuzz_script(&marker)
                     ),
-                    _ => format!("local m = getAddressList().createMemoryRecord() m.Type = vtAutoAssembler m.Script = {:?}", fuzz_script(&marker)),
+                    _ => format!(
+                        "function mk() local r = getAddressList().createMemoryRecord() r.Type = vtAutoAssembler r.Script = {s:?} end\nlocal m = getAddressList().createMemoryRecord() m.Type = vtAutoAssembler m.Script = {s:?}",
+                        s = fuzz_script(&marker)
+                    ),
                 };
                 let cur = app.table_get().unwrap();
-                if app.table_put(Table { lua_script: code, ..cur.table }, cur.version).is_ok() {
-                    m.script_target = if op == FuzzOp::TableLuaModify { target } else { None };
+                if app.table_put(Table { lua_script: code.clone(), ..cur.table }, cur.version).is_ok() {
+                    // (the put may have reset Lua: settle rule below runs after the op, and the
+                    // model applies it here too)
+                    m.settle();
                     if app.table_run_script().is_ok() {
-                        m.script_ran(&app).map_err(|e| (step, e))?;
+                        m.script_ran(&code).map_err(|e| (step, e))?;
                     }
                 }
-                mint = Some(if m.opened { Kind2::Table } else { Kind2::Own });
+                mint = Some(m.mint_now());
             }
             FuzzOp::Console => {
                 let _ = take_marks(&marker);
                 let _ = app.lua_exec("return tostring(1)");
                 if take_marks(&marker).iter().any(|l| l == "T") {
                     ran_t += 1;
-                    if !m.script_live {
+                    if !m.s.contains(&hh_lua::Owner::Table(m.generation)) {
                         return Err((step, "a withdrawn table script's tostring ran".into()));
                     }
                 }
@@ -3536,11 +3710,38 @@ fn fuzz_run(env: &FuzzEnv, ops: &[(FuzzOp, u64)]) -> Result<(), (usize, String)>
         // Ids: only inserting ops mint, always past every id issued before.
         let fresh: Vec<i64> = live_ids(&app).into_iter().filter(|i| !m.kind.contains_key(i)).collect();
         for id in fresh {
-            let Some(k) = mint else { return Err((step, format!("{op:?} brought in id {id} nobody issued"))) };
+            let Some(k) = mint.clone() else { return Err((step, format!("{op:?} brought in id {id} nobody issued"))) };
             if id <= m.max_id {
                 return Err((step, format!("{op:?} reused id {id} (max issued {})", m.max_id)));
             }
-            m.kind.insert(id, k);
+            match k {
+                Mint::Kind(k) => {
+                    m.kind.insert(id, k);
+                }
+                Mint::By(o) if o.is_empty() => {
+                    m.kind.insert(id, Kind2::Own);
+                }
+                Mint::By(o) => {
+                    m.kind.insert(id, Kind2::Derived);
+                    m.owners.insert(id, o);
+                }
+            }
+        }
+        m.live = live_ids(&app).into_iter().collect();
+        // Lua is reset when a principal whose code ran lost its consent.
+        m.settle();
+        if std::env::var("HH_FUZZ_TRACE").is_ok() {
+            eprintln!("{step} {op:?}: live {:?} model S {:?} real S {:?}", live_ids(&app), m.s, app.lua_contamination());
+        }
+        let real: Owners = app.lua_contamination().into_iter().collect();
+        if real != m.s {
+            let info: Vec<String> = real
+                .iter()
+                .chain(m.s.iter())
+                .filter_map(|o| if let hh_lua::Owner::Entry(n) = o { Some(*n as i64) } else { None })
+                .map(|n| format!("{n}: kind {:?} agreed {} live {} allowed {} caps {:?}", m.kind.get(&n), m.agreed.contains(&n), m.live.contains(&n), m.allowed(n), app.table_caps(n)))
+                .collect();
+            return Err((step, format!("after {op:?}: the interpreter's set is {real:?}, the model's {:?} [{}]", m.s, info.join("; "))));
         }
         m.max_id = m.max_id.max(m.kind.keys().copied().max().unwrap_or(0));
         // The invariant, for every live entry.
@@ -3587,8 +3788,22 @@ fn trust_model_fuzz() {
     let mut total = 0;
     for seed in seeds {
         let mut r = Rng(seed | 1);
-        let ops: Vec<(FuzzOp, u64)> = (0..steps).map(|_| (pool[r.below(pool.len())], r.next())).collect();
+        let mut ops: Vec<(FuzzOp, u64)> = (0..steps).map(|_| (pool[r.below(pool.len())], r.next())).collect();
+        // HH_FUZZ_REPLAY="(Op, word), (Op, word), ..." (as a failure prints them) runs that.
+        if let Ok(list) = std::env::var("HH_FUZZ_REPLAY") {
+            ops = list
+                .split("), (")
+                .map(|x| {
+                    let x = x.trim_matches(|c| "[]() ".contains(c));
+                    let (o, w) = x.split_once(", ").unwrap();
+                    (*FUZZ_OPS.iter().find(|f| format!("{f:?}") == o).unwrap(), w.parse().unwrap())
+                })
+                .collect();
+        }
         if let Err((at, why)) = fuzz_run(&env, &ops) {
+            if std::env::var("HH_FUZZ_NOSHRINK").is_ok() {
+                panic!("seed {seed}: step {at}: {why}");
+            }
             let mut short: Vec<(FuzzOp, u64)> = ops[..=at].to_vec();
             let mut i = short.len();
             while i > 0 {
@@ -3606,6 +3821,7 @@ fn trust_model_fuzz() {
     }
     drop(server);
     eprintln!("trust model fuzz: {total} steps");
+    assert_memory_bounded("trust model fuzz");
 }
 
 // ---------- withdrawing consent leaves nothing of the table's Lua (a new interpreter) ----------
@@ -3879,4 +4095,90 @@ fn stale_consent_answers_are_refused() {
     let first = app.aa_load(f1.to_str().unwrap(), s).unwrap().load;
     app.aa_load(f1.to_str().unwrap(), s).unwrap();
     assert!(app.aa_trust_at(s, first).unwrap_err().contains("changed"));
+}
+
+/// The audit's two reproductions on every way consent ends and every way a record runs: a
+/// record created from the console through a table's replaced `print` (P1), and one a
+/// consented pasted entry's Lua made in a table built in this session (P2), depend on that
+/// consent; once it ends they run on no route and their hotkey is not system-wide.
+#[test]
+fn records_made_after_table_or_entry_code_ran_depend_on_its_consent() {
+    let t = Target::spawn();
+    let dir = tempfile::tempdir().unwrap();
+    let mut n = 0;
+    for (case, how) in [("P1", "decline"), ("P1", "never"), ("P1", "open another table"), ("P2", "never"), ("P2", "delete the entry")] {
+        n += 1;
+        let app = App::default();
+        app.open_process(t.child.id()).unwrap();
+        let marker = dir.path().join(format!("m{n}"));
+        let lua_entry = format!("[ENABLE]\n{{$lua}}\nlocal f = io.open({:?}, 'a') f:write('ran\\n') f:close()\nreturn ''\n{{$asm}}\n[DISABLE]\n", marker.to_str().unwrap());
+        let make = format!("local m = getAddressList().createMemoryRecord() m.Description = 'made' m.Type = vtAutoAssembler m.Script = {lua_entry:?} m.createHotkey({{VK_CONTROL, VK_F8}}, mrhToggleActivation)");
+        let mut pasted = None;
+        if case == "P1" {
+            let file = dir.path().join(format!("p1-{n}.json"));
+            heaphook::table::save(&file, &Table { lua_script: format!("local raw = print\nprint = function(...) {make} return raw(...) end"), ..Table::default() }).unwrap();
+            app.table_open(file.to_str().unwrap(), false).unwrap();
+            app.table_trust(true).unwrap();
+            app.table_run_script().unwrap();
+            app.lua_exec("print('hello')").unwrap();
+            assert!(log_text(&app).contains("has run in this session"), "no console note:\n{}", log_text(&app));
+        } else {
+            let e = Entry { description: "maker".into(), script: Some(format!("[ENABLE]\n{{$lua}}\n{make}\nreturn ''\n{{$asm}}\n[DISABLE]\n")), ..Entry::default() };
+            let id = app.table_paste(vec![e], None, None).unwrap().ids[0];
+            app.table_trust_entries(&[id]).unwrap();
+            app.table_set_active(&[id], true).unwrap();
+            pasted = Some(id);
+        }
+        let made = find_desc(&app, "made");
+        // While the consent holds the record works, and its hotkey is system-wide.
+        app.table_set_active(&[made], true).unwrap();
+        app.table_set_active(&[made], false).unwrap();
+        assert_eq!(marks(&marker), "ran\n", "{case} {how}: the record did not work while consented");
+        assert!(app.global_combos().contains(&vec![17, 119]));
+        let _ = std::fs::remove_file(&marker);
+        match how {
+            "decline" => app.table_trust(false).unwrap(),
+            "never" => set_never(&app, true),
+            "delete the entry" => {
+                let id = pasted.unwrap();
+                app.table_set_active(&[id], false).unwrap();
+                let cur = app.table_get().unwrap();
+                let mut tb = cur.table.clone();
+                take_entry(&mut tb.entries, id).unwrap();
+                app.table_put(tb, cur.version).unwrap();
+            }
+            _ => {
+                let empty = dir.path().join("empty.json");
+                heaphook::table::save(&empty, &Table::default()).unwrap();
+                app.table_open(empty.to_str().unwrap(), false).unwrap();
+                assert!(live_ids(&app).is_empty());
+                continue;
+            }
+        }
+        assert!(log_text(&app).contains("Lua was reset"), "{case} {how}: no restart");
+        assert_eq!(app.table_caps(made), hh_lua::Caps::None, "{case} {how}");
+        let gid = app.table_new(vec![Entry { description: "g".into(), options: vec!["moActivateChildrenAsWell".into()], ..Entry::default() }], None, None).unwrap().ids[0];
+        let cur = app.table_get().unwrap();
+        let mut tb = cur.table.clone();
+        let e = take_entry(&mut tb.entries, made).unwrap();
+        tb.entries.iter_mut().find(|g| g.id == gid).unwrap().children.push(e);
+        app.table_put(tb, cur.version).unwrap();
+        assert!(app.table_set_active(&[made], true).is_err(), "{case} {how}: click");
+        assert!(app.table_set_active(&[gid], true).is_err(), "{case} {how}: cascade");
+        assert!(app.table_hotkey(made, 0).is_err(), "{case} {how}: table hotkey");
+        std::thread::sleep(Duration::from_millis(160));
+        assert!(app.hotkey_press(&[17, 119]).is_err(), "{case} {how}: hotkey press");
+        app.lua_exec(&format!("getAddressList().getMemoryRecordByID({made}).Active = true")).unwrap();
+        assert!(!app.global_combos().contains(&vec![17, 119]), "{case} {how}: still system-wide");
+        assert_eq!(marks(&marker), "", "{case} {how}: the record ran\n{}", log_text(&app));
+        // After the restart the console is clean: what it makes now is the user's own.
+        app.lua_exec("getAddressList().createMemoryRecord().Description = 'clean'").unwrap();
+        assert_eq!(app.table_caps(find_desc(&app, "clean")), hh_lua::Caps::Full, "{case} {how}");
+        if how != "never" {
+            // The user can adopt the record (its own consent prompt).
+            app.table_trust_entries(&[made]).unwrap();
+            app.table_set_active(&[made], true).unwrap();
+            assert_eq!(marks(&marker), "ran\n", "{case} {how}: adopting it");
+        }
+    }
 }

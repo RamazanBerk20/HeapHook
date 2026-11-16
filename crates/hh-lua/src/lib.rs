@@ -55,7 +55,7 @@ mod ui;
 
 pub use api::button_result;
 pub use debug::{BpMethod, BpTrigger, BreakEvent, BreakResult, BreakpointSpec, ContinueMode, DebugHost, RegContext};
-pub use table::{Caps, MemTable, Principal, RecId, Record, RecordHotkey, TableHost};
+pub use table::{Caps, MemTable, Owner, RecId, Record, RecordHotkey, TableHost};
 pub use ui::{ChangeLog, Control, ControlId, ControlNode, MAX_CONTROLS, MAX_DEPTH, MAX_PROP_BYTES, MAX_UI_BYTES, Prop, UiChange, UiHost, UiSnapshot, change_size};
 
 /// Cheat Engine functions that exist as names but are not available: calling one raises a
@@ -222,6 +222,12 @@ pub struct EngineOptions {
     /// Most memory the Lua state may allocate, in bytes; exceeding it is an ordinary script
     /// error ("not enough memory"). `None` = unlimited. Default 1 GiB.
     pub memory_limit: Option<usize>,
+    /// Most discarded interpreters kept (see [`Engine::reset`]); the oldest is closed beyond
+    /// it. Default 16.
+    pub max_parked: usize,
+    /// Most Lua memory all kept interpreters may hold together (each counted as its used
+    /// memory when it was kept); the oldest are closed beyond it. Default 512 MiB.
+    pub max_parked_bytes: usize,
 }
 
 impl Default for EngineOptions {
@@ -230,6 +236,8 @@ impl Default for EngineOptions {
             allow_os: true,
             budget: Some(Duration::from_secs(30)),
             memory_limit: Some(1 << 30),
+            max_parked: 16,
+            max_parked_bytes: 512 << 20,
         }
     }
 }
@@ -293,8 +301,12 @@ pub(crate) struct State {
     memory_limit: Mutex<Option<usize>>,
     /// The engine's interpreter slot, for a reset performed when the outermost guard drops.
     core: OnceLock<std::sync::Weak<Mutex<Core>>>,
-    /// Who the outermost entry runs for (see [`Principal`]).
-    principal: Mutex<Principal>,
+    /// The consent principals whose code has run in this interpreter (see [`Owner`]); only a
+    /// reset clears it.
+    contam: Mutex<std::collections::BTreeSet<Owner>>,
+    /// Caps for kept interpreters (see [`EngineOptions::max_parked`]).
+    max_parked: usize,
+    max_parked_bytes: usize,
     pub(crate) ui: ui::UiState,
     pub(crate) dbg: debug::DebugState,
     pub(crate) ext: ext::ExtState,
@@ -359,8 +371,6 @@ pub(crate) fn guard(st: &Arc<State>) -> Guard {
         }
         g.owner = Some(me);
         g.depth = 1;
-        // Every outermost entry runs for the table unless the host says otherwise.
-        *st.principal.lock().unwrap() = Principal::Table;
         st.interrupt.store(false, Ordering::SeqCst);
         *st.abort.lock().unwrap() = None;
         *st.deadline.lock().unwrap() = st.budget.lock().unwrap().map(|b| Instant::now() + b);
@@ -410,13 +420,57 @@ struct Core {
     dead: Arc<AtomicBool>,
 }
 
-/// Discarded interpreters, never closed: closing a Lua state runs every pending `__gc`
-/// finalizer, and Lua 5.3 runs finalizers with hooks off, so a table's finalizer would run
-/// with OS access exactly when its consent is withdrawn. Their garbage collector is stopped
-/// and their host functions refuse, so nothing of them runs again. shortcut: a bounded leak
-/// for the process lifetime (each at most the Lua memory limit, one per reset; resets only
-/// follow user actions: withdrawing consent, "never", opening a table).
-static PARKED: Mutex<Vec<Core>> = Mutex::new(Vec::new());
+/// A discarded interpreter in which table or foreign code ran, kept instead of closed.
+struct Parked {
+    lua: Lua,
+    /// Its used memory when it was kept.
+    bytes: usize,
+}
+
+/// Discarded interpreters in which code of a consent principal ran: closing a Lua state runs
+/// every pending `__gc` finalizer, and Lua 5.3 runs finalizers with hooks off, so such code's
+/// finalizer would run exactly when its consent is withdrawn. So they are kept, collector
+/// stopped, host functions refusing, an error hook on every call and instruction. A clean
+/// interpreter (only the user's own code ran) is closed at once.
+///
+/// Bounded ([`EngineOptions::max_parked`], [`EngineOptions::max_parked_bytes`]): beyond the
+/// cap the oldest kept state is closed. Residual risk, stated: closing runs its pending
+/// finalizers. Scripts cannot install `__gc` (the prelude's `setmetatable` refuses it, host
+/// userdata metatables are locked, there is no `debug.setmetatable`), host functions refuse
+/// on a dead state, and its allocator is capped at what it already uses, so a finalizer that
+/// slipped through could run plain Lua only, without HeapHook's API and without allocating.
+static PARKED: Mutex<std::collections::VecDeque<Parked>> = Mutex::new(std::collections::VecDeque::new());
+
+static RESETS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Interpreters discarded by [`Engine::reset`] in this process (diagnostics).
+pub fn reset_count() -> usize {
+    RESETS.load(Ordering::SeqCst)
+}
+
+/// (kept interpreters, Lua bytes they held when kept), over every engine of the process.
+pub fn parked_stats() -> (usize, usize) {
+    let p = PARKED.lock().unwrap();
+    (p.len(), p.iter().map(|x| x.bytes).sum())
+}
+
+/// Keeps `lua` (see [`PARKED`]) and closes the oldest kept ones beyond the caps.
+fn park(lua: Lua, max: usize, max_bytes: usize) {
+    let bytes = lua.used_memory();
+    let mut gone = Vec::new();
+    {
+        let mut p = PARKED.lock().unwrap();
+        p.push_back(Parked { lua, bytes });
+        while p.len() > max.max(1) || (p.len() > 1 && p.iter().map(|x| x.bytes).sum::<usize>() > max_bytes) {
+            gone.extend(p.pop_front());
+        }
+    }
+    for old in gone {
+        // Nothing may grow: a finalizer that slipped through cannot allocate.
+        let _ = old.lua.set_memory_limit(old.lua.used_memory().max(1));
+        drop(old);
+    }
+}
 
 /// A Lua state with the Cheat Engine API. Cheap to clone (shared state; every clone sees a
 /// [`Engine::reset`]).
@@ -455,12 +509,23 @@ fn do_reset(st: &Arc<State>, slot: &Arc<Mutex<Core>>) -> Result<()> {
     st.denied.lock().unwrap().clear();
     st.tainted.lock().unwrap().clear();
     st.allocs.lock().unwrap().clear();
+    let clean = std::mem::take(&mut *st.contam.lock().unwrap()).is_empty();
+    RESETS.fetch_add(1, Ordering::SeqCst);
     *st.speed.lock().unwrap() = 1.0;
     st.reset_pending.store(false, Ordering::SeqCst);
     let core = build_core(st)?;
-    let old = std::mem::replace(&mut *slot.lock().unwrap(), core);
-    // Parked, never dropped: dropping the last handle would close the state.
-    PARKED.lock().unwrap().push(old);
+    let replaced = std::mem::replace(&mut *slot.lock().unwrap(), core);
+    drop(replaced);
+    // Only the Lua handle is kept: the prelude's functions and every Rust-side handle go now.
+    let Core { lua, i, dead: _ } = old;
+    drop(i);
+    if clean {
+        // Only the user's own code ran in it: closed like any state.
+        drop(lua);
+    } else {
+        // Kept, not closed: closing would run its finalizers.
+        park(lua, st.max_parked, st.max_parked_bytes);
+    }
     *st.abort.lock().unwrap() = None;
     Ok(())
 }
@@ -473,8 +538,11 @@ fn build_core(st: &Arc<State>) -> Result<Core> {
         lua.set_memory_limit(m).map_err(lua_err)?;
     }
     *st.weak.write().unwrap() = Some(lua.weak());
-    let hook_st = st.clone();
-    lua.set_global_hook(HookTriggers::new().every_nth_instruction(1000), move |_, _| hook_st.check().map(|_| VmState::Continue))
+    let hook_st = Arc::downgrade(st);
+    lua.set_global_hook(HookTriggers::new().every_nth_instruction(1000), move |_, _| match hook_st.upgrade() {
+        Some(st) => st.check().map(|_| VmState::Continue),
+        None => Err(mlua::Error::runtime("this Lua state was discarded")),
+    })
         .map_err(lua_err)?;
     let dead = Arc::new(AtomicBool::new(false));
     let i = api::install(&lua, st, st.allow_os, &dead).map_err(lua_err)?;
@@ -522,7 +590,9 @@ impl Engine {
             lua_hotkeys: Mutex::new(Default::default()),
             memory_limit: Mutex::new(opts.memory_limit),
             core: OnceLock::new(),
-            principal: Mutex::new(Principal::Table),
+            contam: Mutex::new(Default::default()),
+            max_parked: opts.max_parked,
+            max_parked_bytes: opts.max_parked_bytes,
             ui: ui::UiState::default(),
             dbg: debug::DebugState::default(),
             ext: ext::ExtState::default(),
@@ -655,15 +725,7 @@ impl Engine {
     /// Runs a chunk (table script, console line). Returns its results converted with
     /// `tostring`. Errors carry the message, `name:line:` position and a traceback.
     pub fn exec(&self, src: &str, name: &str) -> Result<Vec<String>> {
-        self.exec_as(src, name, Principal::Table)
-    }
-
-    /// [`Engine::exec`] for `who`: [`Principal::Console`] for a command the user typed (what
-    /// it creates is theirs, and callbacks it registers keep running as theirs);
-    /// [`Engine::exec`] runs as [`Principal::Table`].
-    pub fn exec_as(&self, src: &str, name: &str, who: Principal) -> Result<Vec<String>> {
         self.entry(|| {
-            *self.st.principal.lock().unwrap() = who;
             let lua = self.lua();
             let f = lua.load(src).set_name(format!("={name}")).set_mode(ChunkMode::Text).into_function().map_err(lua_err)?;
             let r = self.call(f, MultiValue::new())?;
@@ -865,6 +927,18 @@ impl Engine {
     pub fn aa_hooks_with(&self, memrec: Option<RecId>, syntax_check: bool, caps: Caps) -> AaHooks {
         let mode = if syntax_check { hooks::Mode::Check } else { hooks::Mode::Run };
         hooks::for_caps(&self.lua(), &self.st, memrec, mode, caps)
+    }
+
+    /// Code of `owners` is about to run in this interpreter (the host runs a table script or a
+    /// record's Lua with capabilities): it joins the contamination set before it runs.
+    pub fn add_owners(&self, owners: &[Owner]) {
+        self.st.contam.lock().unwrap().extend(owners.iter().copied());
+    }
+
+    /// The consent principals whose code has run in this interpreter since it was created (or
+    /// reset), sorted. Everything Lua creates or scripts here depends on all of them.
+    pub fn contamination(&self) -> Vec<Owner> {
+        self.st.contam.lock().unwrap().iter().copied().collect()
     }
 
     /// Whether `registerSymbolLookupCallback` functions are registered: a script run without

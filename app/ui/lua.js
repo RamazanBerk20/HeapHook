@@ -182,7 +182,7 @@ export function initLua({ openTableScript }) {
     e.preventDefault(); e.stopPropagation();
     api.hotkeyPress(c).catch((err) => {
       const m = String(err?.message || err);
-      if (m.includes('needs consent: entries:')) toast('This hotkey\'s entry came from another table: activate it once in the cheat table to answer whether its Lua may run', 'info');
+      if (m.includes('needs consent: entries:')) toast('This hotkey\'s entry needs your consent: activate it once in the cheat table to answer whether its Lua may run', 'info');
       else if (m.includes('needs consent:')) emit('table:consent');
       else toast(err);
     });
